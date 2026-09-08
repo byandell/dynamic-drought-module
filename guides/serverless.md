@@ -6,7 +6,10 @@ Explain how this repo uses `npm` or other tools to launch an interactive website
 
 **Model Answer:**
 
-This guide explains how this repository uses **Node.js**, **npm**, **Vite**, and **GitHub Actions** to build, verify, and host a serverless interactive, high-performance web mapping application on **GitHub Pages**. It is written for developers, data scientists, and researchers who may be more familiar with Python, R, or traditional server architectures than the modern JavaScript/TypeScript ecosystem.
+This guide explains how this repository uses **Node.js**, **npm**, **Vite**, and **GitHub Actions** to build, verify, and host a interactive, high-performance web mapping application on **GitHub Pages**,
+which acts as a "serverless"
+[high-speed static file server (CDN)](https://blog.blazingcdn.com/en-us/boost-repo-speeds-github-cdn-tips-faster-delivery).
+It is written for developers, data scientists, and researchers who may be more familiar with Python, R, or traditional server architectures than the modern JavaScript/TypeScript ecosystem.
 
 ---
 
@@ -47,7 +50,9 @@ flowchart TD
   - All source TypeScript code is compiled down beforehand into static HTML, JavaScript, and CSS.
   - The map rendering engine (MapLibre GL JS) uses the visitor's computer/phone GPU via WebGL.
   - Data layers are either pre-compiled into static vector tile archives (`.pmtiles` and `.geojson` in `public/data/`) or fetched directly from public REST endpoints (USGS stream gauges, NIFC wildfires, etc.).
-  - GitHub Pages simply acts as a high-speed static file server (CDN) delivering those static files to the browser.
+  - GitHub Pages simply acts as a
+[high-speed static file server (CDN)](https://blog.blazingcdn.com/en-us/boost-repo-speeds-github-cdn-tips-faster-delivery)
+delivering those static files to the browser.
 
 ---
 

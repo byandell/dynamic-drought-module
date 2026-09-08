@@ -134,32 +134,22 @@ flowchart TB
     end
 
     %% Bottom Subgraph: Client WebGL Execution
-    subgraph ColClient ["Client WebGL Execution"]
-        direction TB
-        SpacerC[" "]
-        InL[" "]
-        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><ul><li>MapLibre GL JS (WebGL GPU)<li>Streams vector tiles on demand<li>100% serverless • Zero upkeep</ul>"])
-        InR[" "]
-        SpacerC ~~~ Browser
-        InL ==>|streams bundle & tiles| Browser
-        InR ==>|direct browser queries| Browser
-    end
+    Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><ul><li>MapLibre GL JS (WebGL GPU)<li>Streams vector tiles on demand<li>serverless, zero upkeep</ul>"])
 
     %% Connections from Dev
     Dev ==>|npm run build| Build
     Dev ==>|partner alignment| Tribal
 
-    %% Connections from CDN and ColData to sides of Browser
-    CDN --- InL
-    Feeds --- InR
+    %% Connections from CDN and ColData to Browser
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
 
     %% Closed loop feedback (preserves top-down DAG ranking)
-    Dev <-.-|field insights & telemetry| Browser
+    Browser -.->|field insights & telemetry| Dev
 
     %% Subgraph Styling
     style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
     style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
-    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
 
     %% Node Styling
     style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
@@ -169,10 +159,7 @@ flowchart TB
     style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
     style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
 
-    %% Spacers and Waypoints
+    %% Spacers
     style SpacerB fill:none,stroke:none,color:transparent
     style SpacerD fill:none,stroke:none,color:transparent
-    style SpacerC fill:none,stroke:none,color:transparent
-    style InL fill:none,stroke:none,color:transparent
-    style InR fill:none,stroke:none,color:transparent
 ```
