@@ -1,5 +1,12 @@
 # Dynamic Drought Module Guides
 
+**NB:**
+This is experimental subject to review by Patrick Freeland.
+This page uses [raw.githack.com](https://raw.githack.com) to display rendered
+Quarto slides and other materials.
+A more sustainable presentation may be
+done via GitHub Actions.
+
 These guides are a collaboration between Patrick Freeland and Brian Yandell.
 The goal is to reveal what is being done with this clever repo and how others
 might build of this work.
