@@ -13,6 +13,7 @@ might build of this work.
 
 - [Serverless](serverless.md)
 - [Serverless Slides](https://raw.githack.com/byandell/dynamic-drought-module/main/guides/serverless_slides.html) ([source](serverless_slides.qmd))
+- [Architecture Views](arch.md) ([slides](https://raw.githack.com/byandell/dynamic-drought-module/main/guides/arch.html)) ([source](arch.qmd))
 
 Other things to be added will depend on future discussions.
 Brian is particularly interested in understanding the `skills.md` that Patrick
