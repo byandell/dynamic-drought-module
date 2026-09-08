@@ -442,7 +442,7 @@
   <meta name="generator" content="quarto-1.6.33">
 
   <meta name="author" content="ATNI Climate / DDM Engineering">
-  <title>Dynamic Drought Module (DDM)</title>
+  <title>Serverless Dynamic Drought Module (DDM)</title>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, minimal-ui">
@@ -3680,7 +3680,7 @@ z-index: 1000;
     <div class="slides">
 
 <section id="title-slide" class="quarto-title-block center">
-  <h1 class="title">Dynamic Drought Module (DDM)</h1>
+  <h1 class="title">Serverless Dynamic Drought Module (DDM)</h1>
   <p class="subtitle">Interactive Web Mapping, npm Tooling, and GitHub Pages Deployment</p>
 
 <div class="quarto-title-authors">
@@ -3693,8 +3693,8 @@ ATNI Climate / DDM Engineering
 
 </section>
 <section>
-<section id="dynamic-drought-module-architecture-deployment" class="title-slide slide level1 center">
-<h1>Dynamic Drought Module: Architecture &amp; Deployment</h1>
+<section id="serverless-dynamic-drought-module-architecture-deployment" class="title-slide slide level1 center">
+<h1>Serverless Dynamic Drought Module: Architecture &amp; Deployment</h1>
 
 </section>
 <section id="overview-repository-documents" class="slide level2">
@@ -3754,8 +3754,8 @@ display:block!important;
 </ul>
 </div></div>
 </section>
-<section id="high-level-system-architecture" class="slide level2">
-<h2>High-Level System Architecture</h2>
+<section id="high-level-system-architecture-original" class="slide level2">
+<h2>High-Level System Architecture (Original)</h2>
 <div class="cell" data-reveal="true" data-layout-align="default">
 <div class="cell-output-display">
 <div>
@@ -3784,6 +3784,84 @@ display:block!important;
 
     Dist --&gt; GHA
     CDN --&gt; Browser
+</pre>
+</div>
+<p></p></figure><p></p>
+</div>
+</div>
+</div>
+</section>
+<section id="high-level-system-architecture" class="slide level2">
+<h2>High-Level System Architecture</h2>
+<div class="cell" data-reveal="true" data-layout-align="default">
+<div class="cell-output-display">
+<div>
+<p></p><figure class><p></p>
+<div>
+<pre class="mermaid mermaid-js">%%{init: {
+  &#39;theme&#39;: &#39;dark&#39;,
+  &#39;themeVariables&#39;: {
+    &#39;fontSize&#39;: &#39;14px&#39;,
+    &#39;fontFamily&#39;: &#39;Inter, system-ui, sans-serif&#39;
+  },
+  &#39;flowchart&#39;: {
+    &#39;rankSpacing&#39;: 28,
+    &#39;nodeSpacing&#39;: 36,
+    &#39;curve&#39;: &#39;basis&#39;
+  }
+}}%%
+flowchart TB
+    %% Apex Top
+    Dev([&quot;💻 &lt;b&gt;TypeScript &amp; Map Source&lt;/b&gt;&lt;br/&gt;• MapLibre UI &amp; signals&lt;br/&gt;• Layer styles &amp; configs&quot;])
+
+    %% Left Column: Build &amp; Edge CDN (Vertical)
+    subgraph ColBuild [&quot;Build &amp; Edge CDN&quot;]
+        direction TB
+        Build([&quot;⚙️ &lt;b&gt;Vite + npm Engine&lt;/b&gt;&lt;br/&gt;• Strict tsc typecheck&lt;br/&gt;• Minifies &amp; chunks assets&quot;])
+        CDN{{&quot;🌐 &lt;b&gt;GitHub Pages Edge&lt;/b&gt;&lt;br/&gt;• Global HTTPS CDN&lt;br/&gt;• Byte-range slicing&quot;}}
+        Build ==&gt;|compiles| CDN
+    end
+
+    %% Right Column Container: Community on top, Browser directly under it
+    subgraph ColRight [&quot; &quot;]
+        direction TB
+        subgraph ColData [&quot;Community &amp; Telemetry&quot;]
+            direction LR
+            Tribal([&quot;🌲 &lt;b&gt;Tribal Climate Partners&lt;/b&gt;&lt;br/&gt;• Co-design requirements&lt;br/&gt;• Hazard indicator zones&quot;])
+            Feeds[(&quot;📡 &lt;b&gt;Live Remote Feeds&lt;/b&gt;&lt;br/&gt;• USGS streamflow telemetry&lt;br/&gt;• NIFC wildfire &amp; NOAA drought&quot;)]
+            Tribal ==&gt;|metrics &amp; zones| Feeds
+        end
+
+        subgraph ColClient [&quot;Client WebGL Execution&quot;]
+            Browser([&quot;🖥️ &lt;b&gt;Visitor Browser (Client GPU)&lt;/b&gt;&lt;br/&gt;• MapLibre GL JS (WebGL GPU)&lt;br/&gt;• Streams vector tiles on demand&lt;br/&gt;• 100% serverless • Zero upkeep&quot;])
+        end
+
+        ColData ==&gt;|direct browser queries| ColClient
+    end
+
+    %% Connections from Dev
+    Dev ==&gt;|npm run build| Build
+    Dev ==&gt;|partner alignment| ColData
+
+    %% Diagonal stream from CDN across to Browser
+    CDN ==&gt;|streams bundle &amp; tiles| Browser
+
+    %% Closed loop feedback (preserves top-down DAG ranking)
+    Dev &lt;-.-|field insights &amp; telemetry| Browser
+
+    %% Subgraph Styling
+    style ColRight fill:none,stroke:none
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
 </pre>
 </div>
 <p></p></figure><p></p>
@@ -4067,6 +4145,78 @@ display:block!important;
 
     Concurrency --&gt; BuildJob
     DeployJob ==&gt;|triggers on success| VerifyWorkflow
+</pre>
+</div>
+<p></p></figure><p></p>
+</div>
+</div>
+</div>
+</section>
+<section id="new-version" class="slide level2">
+<h2>New Version</h2>
+<div class="cell" data-reveal="true" data-layout-align="default">
+<div class="cell-output-display">
+<div>
+<p></p><figure class><p></p>
+<div>
+<pre class="mermaid mermaid-js">---
+config:
+  flowchart:
+    curve: cardinal
+  layout: dagre
+---
+flowchart TB
+ subgraph BuildJob[&quot;Build · Gate&quot;]
+    direction LR
+        Setup[&quot;Set up Node 24.20.0&lt;br&gt;npm ci&quot;]
+        Gate{&quot;npm run gate&lt;br&gt;typecheck · build&lt;br&gt;budgets · tests&quot;}
+        UploadArtifact[&quot;Publish package&lt;br&gt;upload-pages-artifact&quot;]
+  end
+ subgraph DeployJob[&quot;Deploy · Pages&quot;]
+    direction LR
+        HeadCheck{&quot;Confirm HEAD&lt;br&gt;of main&quot;}
+        DeployPages[&quot;Write to CDN&lt;br&gt;30s retry&quot;]
+  end
+ subgraph BrowserJob[&quot;Browser · Advisory&quot;]
+    direction LR
+        Playwright[&quot;Playwright suite&lt;br&gt;8 parallel shards&quot;]
+  end
+ subgraph DeployWorkflow[&quot;deploy.yml · GitHub Actions&quot;]
+    direction LR
+        BuildJob
+        DeployJob
+        BrowserJob
+  end
+ subgraph VerifyWorkflow[&quot;verify-live.yml · Post-Deploy Proof&quot;]
+    direction LR
+        LiveProof((&quot;Probe live site&lt;br&gt;SHA &amp;amp; nonce&lt;br&gt;PMTiles byte-range&lt;br&gt;browser smoke&lt;br&gt;divergence on fail&quot;))
+  end
+    Push((&quot;Push to&lt;br&gt;main&quot;)) --&gt; Concurrency[&quot;Concurrency Gate&lt;br&gt;group: pages&quot;]
+    Setup --&gt; Gate
+    Gate --&gt; UploadArtifact
+    HeadCheck --&gt; DeployPages
+    BuildJob -- needs: build --&gt; DeployJob
+    BuildJob -. parallel advisory .-&gt; BrowserJob
+    Concurrency --&gt; BuildJob
+    DeployJob == success ==&gt; VerifyWorkflow
+    VerifyWorkflow -. next deployment .-&gt; Push
+
+     Setup:::build
+     Gate:::control
+     UploadArtifact:::build
+     HeadCheck:::control
+     DeployPages:::deploy
+     BuildJob:::build
+     DeployJob:::deploy
+     LiveProof:::verify
+     Push:::trigger
+     Concurrency:::trigger
+     VerifyWorkflow:::verify
+    classDef trigger stroke:#818cf8,fill:#eef2ff,stroke-width:2px
+    classDef control stroke:#a78bfa,fill:#f5f3ff,stroke-width:2px
+    classDef build stroke:#2dd4bf,fill:#f0fdfa,stroke-width:2px
+    classDef deploy stroke:#fb923c,fill:#fff7ed,stroke-width:2px
+    classDef verify stroke:#4ade80,fill:#f0fdf4,stroke-width:2px
 </pre>
 </div>
 <p></p></figure><p></p>

@@ -1,0 +1,1021 @@
+---
+title: "DDM Architecture Flowchart Design History & Intermediate Options"
+subtitle: "Evolution of System Architecture Flowcharts (Options 1 through 3-V3)"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    theme: dark
+    embed-resources: true
+    code-fold: show
+mermaid:
+  theme: dark
+---
+
+**Prompts:**
+
+- Create a quarto slide deck from [serverless.md](serverless.md). Link to [DEVELOPER.md](../DEVELOPER.md) and [README.md](../README.md) (and [ROADMAP.md](../ROADMAP.md)) for a useful overview.
+- On slide 5 of guides/serverless_slides.qmd, rearrange mermaid in a circle/oval. That is, fill up the space and have it appear more organic.
+- I like this current diagram. You just need to make it slightly more horizontal, such as moving the visitor browser to the right
+- For the future, show me a series of diagrams and let me give you feedback. I don't like the ones that are mostly horizontal, instead preferring ones that are part horizontal, part vertical
+- I prefer Option 1 over Option 2
+- For option 1, move the Visitor Browser to the right and adjust arrows.
+- Option 3 looks good, but move Visitor Browser to the empty area to the right, and have curved arrows to it. Then we are very close.
+- Option 3A looks good. If you put GitHub and Live Remote Feeds vertically offset (with diagonal down) you would have more horizontal space to work with and could have slightly larger fots.
+- Option 3C works. Put Community & Telemetry horizontal rather than vertical, being partly above Client GPU Execution, and it should work well with space and aesthetics.
+- Almost. For Optin 3-V3, put Community and Live horizontal but keep Build and GitHub vertical.
+- In new Option 3-V3, move Client WebGL Execution to right under Community & Telemetry, and both those ups slightly so all fits on page. This will have a slight but pleasing asymmetry.
+- Slide 1 looks like it. Save mermaid into severless_slides.qmd. 
+- Save intermediate options mermaid code in `guides/mermaid.qmd`.
+
+# DDM Architecture Flowchart Design History
+
+This document archives all intermediate and final Mermaid diagrams explored during the co-design and architectural layout refinement of the **Dynamic Drought Module (DDM)** high-level system architecture (Slide 5 of [serverless_slides.qmd](file:///Users/brianyandell/Documents/GitHub/dynamic-drought-module/guides/serverless_slides.qmd)).
+
+## 1. Selected Architecture: Option 3-V3 (Final Asymmetric Layout)
+
+**Status**: Active in `guides/serverless_slides.qmd` (Slide 5).  
+**Key Characteristics**: Vertical `Build & Edge CDN` on the left, horizontal `Community & Telemetry` on the right, and `Client WebGL Execution` positioned directly underneath `Community & Telemetry`. Utilizing compact rank spacing (`rankSpacing: 28`, `nodeSpacing: 36`) and `basis` curve splines, the diagram fits comfortably on the 1280×720 slide canvas with zero bottom cutoff.
+
+```{mermaid}
+%%{init: {
+  'theme': 'dark',
+  'themeVariables': {
+    'fontSize': '14px',
+    'fontFamily': 'Inter, system-ui, sans-serif'
+  },
+  'flowchart': {
+    'rankSpacing': 28,
+    'nodeSpacing': 36,
+    'curve': 'basis'
+  }
+}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Left Column: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typecheck<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS CDN<br/>• Byte-range slicing"}}
+        Build ==>|compiles| CDN
+    end
+
+    %% Right Column Container: Community on top, Browser directly under it
+    subgraph ColRight [" "]
+        direction TB
+        subgraph ColData ["Community & Telemetry"]
+            direction LR
+            Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+            Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+            Tribal ==>|metrics & zones| Feeds
+        end
+
+        subgraph ColClient ["Client WebGL Execution"]
+            Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+        end
+
+        ColData ==>|direct browser queries| ColClient
+    end
+
+    %% Connections from Dev
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| ColData
+
+    %% Diagonal stream from CDN across to Browser
+    CDN ==>|streams bundle & tiles| Browser
+
+    %% Closed loop feedback (preserves top-down DAG ranking)
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColRight fill:none,stroke:none
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+---
+
+## 2. Option 3 Refinements & Evolution
+
+The sequence below demonstrates the iterative path leading to Option 3-V3.
+
+### Option 3-V3 Asymmetric: Community & Client Moved Up
+
+**Stage**: Option 3-V3 Asymmetric: Moving Right Stack Up (Step 668)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px', 'fontFamily': 'Inter, system-ui, sans-serif'}}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals • Layer styles"])
+
+    %% Left Column: Build & Edge (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typecheck<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS CDN<br/>• Byte-range slicing"}}
+        Build ==>|compiles| CDN
+    end
+
+    %% Right Top: Community & Telemetry (Horizontal, beside Build)
+    subgraph ColData ["Community & Telemetry"]
+        direction LR
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right Bottom: Client WebGL Execution (Right under Community & Telemetry)
+    subgraph ColClient ["Client WebGL Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    %% Dev branches
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    %% Right column vertical flow (Community down to Browser)
+    Feeds ==>|direct browser queries| Browser
+
+    %% Cross-column diagonal stream from CDN to Browser
+    CDN ==>|streams bundle & tiles| Browser
+
+    %% Closed loop feedback
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V3: Balanced System Architecture
+
+**Stage**: Option 3-V3: Balanced System Architecture (Compact Spacing Budget) (Step 641)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px', 'fontFamily': 'Inter, system-ui, sans-serif'}}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals • Layer styles"])
+
+    %% Left: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict typecheck • Chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• HTTPS CDN • Byte-range slicing"}}
+        Build ==>|compiles| CDN
+    end
+
+    %% Right Top: Community & Telemetry (Horizontal!)
+    subgraph ColData ["Community & Telemetry"]
+        direction LR
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right Bottom: Client WebGL Execution
+    subgraph ColClient ["Client WebGL Execution"]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• 100% serverless • Zero backend upkeep"])
+    end
+
+    %% Forward Connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| ColData
+
+    CDN ==>|streams bundle & tiles| Browser
+    ColData ==>|direct browser queries| Browser
+
+    %% Closed loop feedback
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V3: Perfect Layout
+
+**Stage**: Option 3-V3: Perfect Layout with Backward Arrow Fix (Dagre Cycle Inversion Resolution) (Step 633)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '16px', 'fontFamily': 'Inter, system-ui, sans-serif'}}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styles & core configs"])
+
+    %% Left: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Right Top: Community & Telemetry (Horizontal!)
+    subgraph ColData ["Community & Telemetry"]
+        direction LR
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right Bottom: Client WebGL Execution
+    subgraph ColClient ["Client WebGL Execution"]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero backend upkeep"])
+    end
+
+    %% Forward Connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| ColData
+
+    CDN ==>|streams bundle & tiles| Browser
+    ColData ==>|direct browser queries| Browser
+
+    %% Closed loop feedback (defined Top <-.- Bottom to preserve top-down DAG ranking!)
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V3: Horizontal Community, Vertical Build, Browser on Right
+
+**Stage**: Option 3-V3: Initial Horizontal Community with Vertical Build (Step 625)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '16px', 'fontFamily': 'Inter, system-ui, sans-serif'}}}%%
+flowchart TB
+    %% Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styles & core configs"])
+
+    %% Left: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Right Top: Community & Telemetry (Horizontal!)
+    subgraph ColData ["Community & Telemetry"]
+        direction LR
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right Bottom: Client GPU Execution
+    subgraph ColClient ["Client WebGL Execution"]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero backend upkeep"])
+    end
+
+    %% Connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| ColData
+
+    CDN ==>|streams bundle & tiles| Browser
+    ColData ==>|direct browser queries| Browser
+
+    %% Closed loop feedback
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V1: Flowchart LR with Staggered Diagonal Layout
+
+**Stage**: Option 3 Explorations: Variations V1, V2, and V3 (Step 584)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '16px'}}}%%
+flowchart LR
+    %% Source
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styles & configs"])
+
+    %% Left: Build & Edge CDN
+    subgraph ColBuild ["Build & Edge CDN"]
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Center/Top: Community & Telemetry (Horizontal, offset)
+    subgraph ColData ["Community & Telemetry"]
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow data<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right/Bottom: Client GPU Execution (under Feeds)
+    subgraph ColClient ["Client GPU Execution"]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero backend upkeep"])
+    end
+
+    %% Connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V2: Staggered Diagonal with Offset Feed
+
+**Stage**: Option 3 Explorations: Variations V1, V2, and V3 (Step 584)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '16px'}}}%%
+flowchart LR
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styles & configs"])
+
+    subgraph ColBuild ["Build & Edge CDN"]
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    Dev ==>|npm run build| Build
+
+    subgraph ColData ["Community & Telemetry"]
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    CDN ==>|streams bundle & tiles| Tribal
+
+    subgraph ColClient ["Client GPU Execution"]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    CDN ==>|tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+    Browser -.->|telemetry loop| Dev
+
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3-V3: Horizontal Community partly above Client Browser
+
+**Stage**: Option 3 Explorations: Variations V1, V2, and V3 (Step 584)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '16px'}}}%%
+flowchart TB
+    %% Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styles & configs"])
+
+    %% Left Side: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Right Side: Container with Community on top, Browser below
+    subgraph RightSide ["Community Co-Design & Client WebGL"]
+        direction TB
+        subgraph ColData ["Community & Telemetry"]
+            direction LR
+            Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+            Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+            Tribal ==>|metrics & zones| Feeds
+        end
+
+        subgraph ColClient ["Client GPU Execution"]
+            Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+        end
+
+        ColData ~~~ ColClient
+    end
+
+    %% Branching from Dev
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    %% Connections to Browser
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Closed-loop Feedback to Dev
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style RightSide fill:none,stroke:none
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3C Refined: Horizontal Community & Telemetry
+
+**Stage**: Option 3C Refined: Horizontal Community & Telemetry (Step 576)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '15px'}}}%%
+flowchart TB
+    %% Apex Source
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive signals<br/>• Layer styling & core configs"])
+
+    %% Left Column: Local Build & Edge Delivery (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Top/Center: Community Co-Design & Remote Data (Horizontal!)
+    subgraph ColData ["Community & Telemetry"]
+        direction LR
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow data<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right: Client GPU Execution (under Feeds / on right)
+    subgraph ColClient ["Client GPU Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU rendering)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero backend upkeep"])
+    end
+
+    %% Source distribution
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    %% Connections to Browser
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Closed loop feedback
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3C: TB with Locked Right Column
+
+**Stage**: Option 3C & 3D: Column Locking & Spacer Techniques (Step 566)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart TB
+    %% Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Column 1: Local Build & Edge Delivery (Left)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Column 2: Community Co-Design & Remote Data (Center)
+    subgraph ColData ["Community & Telemetry"]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Column 3: Client GPU Execution (Right)
+    subgraph ColClient ["Client GPU Execution"]
+        direction TB
+        Spacer3[" "]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+        Spacer3 ~~~ Browser
+    end
+
+    %% Dev branches across top
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+    Dev ~~~ Spacer3
+
+    %% Curved connections into Browser on the right
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Closed loop feedback
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Spacer styling to make it invisible
+    style Spacer3 fill:none,stroke:none,color:transparent
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3D: TB with Feeds on Left, Build in Center, Browser on Right
+
+**Stage**: Option 3C & 3D: Column Locking & Spacer Techniques (Step 566)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart TB
+    %% Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Column 1: Community Co-Design (Left)
+    subgraph ColData ["Community & Telemetry"]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Column 2: Build & Edge (Center)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Column 3: Browser (Right)
+    subgraph ColClient ["Client GPU Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    %% Invisible edge forcing ColBuild and ColClient side-by-side
+    ColBuild ~~~ ColClient
+
+    Dev ==>|partner alignment| Tribal
+    Dev ==>|npm run build| Build
+
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    Browser -.->|field insights & telemetry| Dev
+
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3A: Flowchart LR with TB Subgraphs
+
+**Stage**: Option 3A & 3B: Browser Shifted Right with Curved Arrows (Step 556)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart LR
+    %% Apex / Source
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Column 1: Local Build & Edge Delivery
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Column 2: Community Co-Design & Remote Data
+    subgraph ColData ["Community & Telemetry"]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow data<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Column 3: Client WebGL Execution on the Right
+    subgraph ColClient ["Client WebGL Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    %% Inter-column connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Curved closed loop feedback
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3B: Hybrid Flow with Browser Anchored Right
+
+**Stage**: Option 3A & 3B: Browser Shifted Right with Curved Arrows (Step 556)  
+
+```{mermaid}
+%%{init: {'theme': 'dark', 'themeVariables': {'fontSize': '14px'}}}%%
+flowchart TB
+    %% Level 1: Source & Client Header
+    subgraph TopRow ["Top Source & Cloud Execution"]
+        direction LR
+        Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+    end
+
+    %% Middle Left: Build & Edge
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range slicing"}}
+        Build ==>|compiles| CDN
+    end
+
+    %% Middle Center: Community & Remote Feeds
+    subgraph ColData ["Community & Telemetry"]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Right: Visitor Browser in dedicated right area
+    subgraph ColClient ["Client WebGL Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    %% Invisible alignment spacer to pull ColClient to the right rank
+    Dev ~~~ Browser
+
+    %% Connections
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style TopRow fill:none,stroke:none
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 3: Browser in Right Area
+
+**Stage**: Option 3: Browser Shifted to Right Column (`ColClient`) (Step 531)  
+
+```{mermaid}
+flowchart TB
+    %% Center Top Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Left Column: Community Co-Design & Remote Data
+    subgraph ColLeft ["Community & Telemetry"]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow data<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Center Column: Local Build & Edge Delivery
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• Byte-range request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    %% Right Column: Client GPU Browser (in the right empty area)
+    subgraph ColClient ["Client GPU Execution"]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    %% Branching from Dev
+    Dev ==>|partner alignment| Tribal
+    Dev ==>|npm run build| Build
+
+    %% Curved Connections to Browser on the Right
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Closed-loop Feedback to Dev
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Subgraph Styling
+    style ColLeft fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:14,ry:14
+
+    %% Organic Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+
+---
+
+## 3. Early Options: Option 1 & Option 2 Baselines
+
+
+### Option 1A: Browser Shifted Right
+
+**Stage**: Option 1A & 1B: Early Horizontal Offsets (Step 502)  
+
+```{mermaid}
+flowchart TB
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive state<br/>• Layer configs & styling"])
+
+    subgraph LeftCol [" "]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Tree-shaking & chunking"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• HTTP Range-request slicing"}}
+        Build ==>|compiles assets| CDN
+    end
+
+    subgraph MidCol [" "]
+        direction TB
+        Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator priorities"])
+        Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    subgraph RightCol [" "]
+        direction TB
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+    end
+
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    CDN ==>|streams bundle & tiles| Browser
+    Feeds ==>|direct browser queries| Browser
+    Browser -.->|field insights & telemetry| Dev
+
+    style LeftCol fill:none,stroke:none
+    style MidCol fill:none,stroke:none
+    style RightCol fill:none,stroke:none
+
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 1B: Browser Offset to the Right (Organic Flow)
+
+**Stage**: Option 1A & 1B: Early Horizontal Offsets (Step 502)  
+
+```{mermaid}
+flowchart TB
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive state<br/>• Layer configs & styling"])
+
+    Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Tree-shaking & chunking"])
+    CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• HTTP Range-request slicing"}}
+
+    Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator priorities"])
+    Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+
+    Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+
+    Dev ==>|npm run build| Build
+    Build ==>|compiles assets| CDN
+
+    Dev ==>|partner alignment| Tribal
+    Tribal ==>|metrics & zones| Feeds
+
+    Feeds ==>|direct browser queries| Browser
+    CDN ==>|streams bundle & tiles| Browser
+
+    Feeds ~~~ Browser
+    Browser -.->|field insights & telemetry| Dev
+
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 1: Browser on the Right (Swapped Arcs)
+
+**Stage**: Option 1 & Option 2 Baselines: 3-Column Pipeline vs. Organic Oval Loop (Step 487)  
+
+```{mermaid}
+flowchart TB
+    %% Top Apex
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive state<br/>• Layer configs & styling"])
+
+    %% Left Arc: Community Partners & Remote Data Feeds
+    Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator priorities"])
+    Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+
+    %% Right Arc: Build Engine & Edge Delivery Pipeline
+    Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typechecking<br/>• Tree-shaking & chunking"])
+    CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• HTTP Range-request slicing"}}
+
+    %% Bottom-Right: Client-Side WebGL Rendering
+    Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+
+    %% Left Arc Flow (Community Co-Design & Telemetry)
+    Dev ==>|partner alignment| Tribal
+    Tribal ==>|metrics & zones| Feeds
+
+    %% Right Arc Flow (Build & Deploy)
+    Dev ==>|npm run build| Build
+    Build ==>|compiles assets| CDN
+    CDN ==>|streams bundle & tiles| Browser
+
+    %% Cross-feed: Live data direct to Browser
+    Feeds ==>|direct browser queries| Browser
+
+    %% Closed loop feedback
+    Browser -.->|field insights & telemetry| Dev
+
+    %% Organic Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
+### Option 2: 3-Column Wide Oval (Part Horizontal, Part Vertical)
+
+**Stage**: Option 1 & Option 2 Baselines: 3-Column Pipeline vs. Organic Oval Loop (Step 487)  
+
+```{mermaid}
+flowchart TB
+    subgraph ColLeft [" "]
+        direction TB
+        Tribal(["🌲 <b>Tribal Partners</b><br/>• Co-design priorities<br/>• Hazard indicator zones"])
+        Feeds[("📡 <b>Live Feeds</b><br/>• USGS streamflow<br/>• NIFC fire & NOAA drought")]
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    subgraph ColMid [" "]
+        direction TB
+        Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & reactive state<br/>• Layer styling & configurations"])
+        Dist[("📦 <b>Static dist/ Bundle</b><br/>• SHA-stamped index.html<br/>• Cloud-optimized .pmtiles")]
+        Dev -.->|continuous evolution| Dist
+    end
+
+    subgraph ColRight [" "]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typecheck<br/>• Tree-shaking & chunking"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS distribution<br/>• HTTP byte-range slicing"}}
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS engine<br/>• 100% serverless WebGL"])
+        Build ==>|compiles assets| CDN
+        CDN ==>|streams tiles & bundle| Browser
+    end
+
+    Dev ==>|partner alignment| Tribal
+    Dev ==>|npm run build| Build
+    Feeds ==>|direct live telemetry| Browser
+    Browser -.->|user feedback & telemetry| Dev
+
+    style ColLeft fill:none,stroke:none
+    style ColMid fill:none,stroke:none
+    style ColRight fill:none,stroke:none
+
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style Dist fill:#172554,stroke:#60a5fa,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```

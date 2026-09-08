@@ -1,5 +1,5 @@
 ---
-title: "Dynamic Drought Module (DDM)"
+title: "Serverless Dynamic Drought Module (DDM)"
 subtitle: "Interactive Web Mapping, npm Tooling, and GitHub Pages Deployment"
 author: "ATNI Climate / DDM Engineering"
 format:
@@ -16,7 +16,7 @@ mermaid:
   theme: dark
 ---
 
-# Dynamic Drought Module: Architecture & Deployment
+# Serverless Dynamic Drought Module: Architecture & Deployment
 
 ## Overview & Repository Documents
 
@@ -65,7 +65,7 @@ Why can a complex mapping application run on **GitHub Pages** without a server?
 :::
 :::
 
-## High-Level System Architecture
+## High-Level System Architecture (Original)
 
 ```{mermaid}
 flowchart LR
@@ -92,6 +92,76 @@ flowchart LR
     Dist --> GHA
     CDN --> Browser
 ```
+
+## High-Level System Architecture
+
+```{mermaid}
+%%{init: {
+  'theme': 'dark',
+  'themeVariables': {
+    'fontSize': '14px',
+    'fontFamily': 'Inter, system-ui, sans-serif'
+  },
+  'flowchart': {
+    'rankSpacing': 28,
+    'nodeSpacing': 36,
+    'curve': 'basis'
+  }
+}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><br/>• MapLibre UI & signals<br/>• Layer styles & configs"])
+
+    %% Left Column: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        Build(["⚙️ <b>Vite + npm Engine</b><br/>• Strict tsc typecheck<br/>• Minifies & chunks assets"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><br/>• Global HTTPS CDN<br/>• Byte-range slicing"}}
+        Build ==>|compiles| CDN
+    end
+
+    %% Right Column Container: Community on top, Browser directly under it
+    subgraph ColRight [" "]
+        direction TB
+        subgraph ColData ["Community & Telemetry"]
+            direction LR
+            Tribal(["🌲 <b>Tribal Climate Partners</b><br/>• Co-design requirements<br/>• Hazard indicator zones"])
+            Feeds[("📡 <b>Live Remote Feeds</b><br/>• USGS streamflow telemetry<br/>• NIFC wildfire & NOAA drought")]
+            Tribal ==>|metrics & zones| Feeds
+        end
+
+        subgraph ColClient ["Client WebGL Execution"]
+            Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><br/>• MapLibre GL JS (WebGL GPU)<br/>• Streams vector tiles on demand<br/>• 100% serverless • Zero upkeep"])
+        end
+
+        ColData ==>|direct browser queries| ColClient
+    end
+
+    %% Connections from Dev
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| ColData
+
+    %% Diagonal stream from CDN across to Browser
+    CDN ==>|streams bundle & tiles| Browser
+
+    %% Closed loop feedback (preserves top-down DAG ranking)
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColRight fill:none,stroke:none
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+```
+
 
 ## Tooling Rosetta Stone: Runtime & Package Management
 
