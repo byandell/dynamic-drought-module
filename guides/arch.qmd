@@ -1,0 +1,178 @@
+---
+format:
+  revealjs:
+    theme: dark
+    transition: slide
+    slide-number: true
+    embed-resources: true
+    scrollable: true
+    width: 1280
+    height: 720
+    css: slides.css
+mermaid:
+  theme: dark
+---
+
+## High-Level System Architecture (Original) {.centered-flowchart .left-nodes}
+
+```{mermaid}
+%%{init: {
+  'theme': 'dark',
+  'themeVariables': {
+    'fontSize': '15px',
+    'fontFamily': 'Inter, system-ui, sans-serif'
+  },
+  'flowchart': {
+    'nodeSpacing': 28,
+    'rankSpacing': 38,
+    'padding': 16
+  }
+}}%%
+flowchart LR
+    subgraph Dev["Phase 1: Local Build"]
+        direction TB
+        Src["<b>Source Code</b><ul><li>TypeScript modules<li>CSS & Assets</ul>"]
+        BuildEngine["<b>Node.js + npm + Vite</b><ul><li>tsc typechecks<li>Vite bundles & minifies<li>Chunks MapLibre & PMTiles</ul>"]
+        Dist["<b>Production Bundle (dist/)</b><ul><li>index.html (SHA stamp)<li>Optimized JS & CSS<li>Vector tiles & GeoJSON</ul>"]
+        Src --> BuildEngine --> Dist
+    end
+
+    subgraph Hosting["Phase 2: Pages Hosting"]
+        direction TB
+        GHA["<b>GitHub Actions (deploy.yml)</b><ul><li>Checks out commit & gates<li>Uploads dist/ artifact<li>Publishes to Pages</ul>"]
+        CDN["<b>GitHub Pages CDN</b><ul><li>Global HTTPS hosting<li>HTTP Range-request support</ul>"]
+        GHA --> CDN
+    end
+
+    subgraph Client["Phase 3: Client Browser"]
+        direction TB
+        Browser["<b>Visitor Browser</b><ul><li>Loads HTML, JS, CSS from CDN<li>MapLibre GL JS (WebGL GPU)<li>Streams .pmtiles on demand<li>Public APIs (USGS, NIFC, NOAA)</ul>"]
+    end
+
+    Dist --> GHA
+    CDN --> Browser
+```
+
+
+## High-Level System Architecture (Top Down Flow) {.centered-flowchart .left-nodes}
+
+```{mermaid}
+%%{init: {
+  'theme': 'dark',
+  'themeVariables': {
+    'fontSize': '14.5px',
+    'fontFamily': 'Inter, system-ui, sans-serif'
+  },
+  'flowchart': {
+    'nodeSpacing': 26,
+    'rankSpacing': 22,
+    'padding': 12
+  }
+}}%%
+flowchart TB
+    subgraph Dev ["Phase 1: Local Build"]
+        direction LR
+        Src["<b>Source Code</b><ul><li>TypeScript modules<li>CSS & Assets</ul>"]
+        BuildEngine["<b>Node.js + npm + Vite</b><ul><li>tsc typechecks<li>Vite bundles & minifies<li>Chunks MapLibre & PMTiles</ul>"]
+        Dist["<b>Production Bundle (dist/)</b><ul><li>index.html (SHA stamp)<li>Optimized JS & CSS<li>Vector tiles & GeoJSON</ul>"]
+        Src --> BuildEngine --> Dist
+    end
+
+    subgraph Hosting ["Phase 2: Pages Hosting"]
+        direction LR
+        GHA["<b>GitHub Actions (deploy.yml)</b><ul><li>Checks out commit & gates<li>Uploads dist/ artifact<li>Publishes to Pages</ul>"]
+        CDN["<b>GitHub Pages CDN</b><ul><li>Global HTTPS hosting<li>HTTP Range-request support</ul>"]
+        GHA --> CDN
+    end
+
+    subgraph Client ["Phase 3: Client Browser"]
+        direction LR
+        Browser["<b>Visitor Browser</b><ul><li>Loads HTML, JS, CSS from CDN<li>MapLibre GL JS (WebGL GPU)<li>Streams .pmtiles on demand<li>Public APIs (USGS, NIFC, NOAA)</ul>"]
+    end
+
+    Dev ==> Hosting ==> Client
+```
+
+## High-Level System Architecture (Organic) {.centered-flowchart .left-nodes}
+
+```{mermaid}
+%%{init: {
+  'theme': 'dark',
+  'themeVariables': {
+    'fontSize': '14px',
+    'fontFamily': 'Inter, system-ui, sans-serif'
+  },
+  'flowchart': {
+    'rankSpacing': 28,
+    'nodeSpacing': 36,
+    'padding': 18,
+    'curve': 'basis'
+  }
+}}%%
+flowchart TB
+    %% Apex Top
+    Dev(["💻 <b>TypeScript & Map Source</b><ul><li>MapLibre UI & signals<li>Layer styles & configs</ul>"])
+
+    %% Left Column: Build & Edge CDN (Vertical)
+    subgraph ColBuild ["Build & Edge CDN"]
+        direction TB
+        SpacerB[" "]
+        Build(["⚙️ <b>Vite + npm Engine</b><ul><li>Strict tsc typecheck<li>Minifies & chunks assets</ul>"])
+        CDN{{"🌐 <b>GitHub Pages Edge</b><ul><li>Global HTTPS CDN<li>HTTP Range-request support</ul>"}}
+        SpacerB ~~~ Build
+        Build ==>|compiles| CDN
+    end
+
+    %% Right Column: Community & Telemetry (Vertical)
+    subgraph ColData ["Community & Telemetry"]
+        direction TB
+        SpacerD[" "]
+        Tribal(["🌲 <b>Tribal Climate Partners</b><ul><li>Co-design requirements<li>Hazard indicator zones</ul>"])
+        Feeds[("📡 <b>Live Remote Feeds</b><ul><li>USGS streamflow telemetry<li>NIFC wildfire & NOAA drought</ul>")]
+        SpacerD ~~~ Tribal
+        Tribal ==>|metrics & zones| Feeds
+    end
+
+    %% Bottom Subgraph: Client WebGL Execution
+    subgraph ColClient ["Client WebGL Execution"]
+        direction TB
+        SpacerC[" "]
+        InL[" "]
+        Browser(["🖥️ <b>Visitor Browser (Client GPU)</b><ul><li>MapLibre GL JS (WebGL GPU)<li>Streams vector tiles on demand<li>100% serverless • Zero upkeep</ul>"])
+        InR[" "]
+        SpacerC ~~~ Browser
+        InL ==>|streams bundle & tiles| Browser
+        InR ==>|direct browser queries| Browser
+    end
+
+    %% Connections from Dev
+    Dev ==>|npm run build| Build
+    Dev ==>|partner alignment| Tribal
+
+    %% Connections from CDN and ColData to sides of Browser
+    CDN --- InL
+    Feeds --- InR
+
+    %% Closed loop feedback (preserves top-down DAG ranking)
+    Dev <-.-|field insights & telemetry| Browser
+
+    %% Subgraph Styling
+    style ColBuild fill:none,stroke:#6366f1,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColData fill:none,stroke:#3b82f6,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+    style ColClient fill:none,stroke:#10b981,stroke-width:1.5px,stroke-dasharray: 4 4,rx:12,ry:12
+
+    %% Node Styling
+    style Dev fill:#1e293b,stroke:#38bdf8,stroke-width:2px,color:#f8fafc
+    style Build fill:#1e1e38,stroke:#818cf8,stroke-width:2px,color:#f8fafc
+    style CDN fill:#0f2937,stroke:#2dd4bf,stroke-width:2px,color:#f8fafc
+    style Browser fill:#0d3326,stroke:#34d399,stroke-width:2px,color:#f8fafc
+    style Feeds fill:#382414,stroke:#fb923c,stroke-width:2px,color:#f8fafc
+    style Tribal fill:#27272a,stroke:#a1a1aa,stroke-width:2px,color:#f8fafc
+
+    %% Spacers and Waypoints
+    style SpacerB fill:none,stroke:none,color:transparent
+    style SpacerD fill:none,stroke:none,color:transparent
+    style SpacerC fill:none,stroke:none,color:transparent
+    style InL fill:none,stroke:none,color:transparent
+    style InR fill:none,stroke:none,color:transparent
+```
