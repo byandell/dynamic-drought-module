@@ -1,9 +1,17 @@
 # What is a Harness?
 
-**Prompt:**
+## References
+
+- [Anthropic courses](https://anthropic.skilljar.com/)
+- [Introduction to agent skills](https://anthropic.skilljar.com/introduction-to-agent-skills)
+- [Harness design for long-running application development \ Anthropic](https://www.anthropic.com/engineering/harness-design-long-running-apps)
+
+## Prompt
+
 Let's describe the "harness" that the content analysis process is able to identify important information, make connections across the plans, etc. I am trying to explain our work to a colleague, and need help with a bit more articulation, how we are using subagents, skills, etc. and things Like the OCR core; if possible to create a "slide deck" on a web page
 
-**Response:**
+## Response
+
 The harness we created is a local-first execution and assurance framework around the OCR engine. It
 is broader than a test suite: it governs how documents enter the engine, how work is identified, how
 outputs become durable, how interrupted jobs resume, and how every result can later be evaluated and
