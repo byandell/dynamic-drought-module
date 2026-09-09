@@ -3770,9 +3770,9 @@ flowchart TB
     &#39;fontFamily&#39;: &#39;Inter, system-ui, sans-serif&#39;
   },
   &#39;flowchart&#39;: {
-    &#39;rankSpacing&#39;: 28,
+    &#39;rankSpacing&#39;: 16,
     &#39;nodeSpacing&#39;: 36,
-    &#39;padding&#39;: 18,
+    &#39;padding&#39;: 12,
     &#39;curve&#39;: &#39;basis&#39;
   }
 }}%%
@@ -3783,7 +3783,7 @@ flowchart TB
     %% Left Column: Build &amp; Edge CDN (Vertical)
     subgraph ColBuild [&quot;Build &amp; Edge CDN&quot;]
         direction TB
-        SpacerB[&quot; &quot;]
+        SpacerB[&quot;&lt;div style=&#39;height:1px;line-height:1px;font-size:1px&#39;&gt;&lt;/div&gt;&quot;]
         Build([&quot;⚙️ &lt;b&gt;Vite + npm Engine&lt;/b&gt;&lt;ul&gt;&lt;li&gt;Strict tsc typecheck&lt;li&gt;Minifies &amp; chunks assets&lt;/ul&gt;&quot;])
         CDN{{&quot;🌐 &lt;b&gt;GitHub Pages Edge&lt;/b&gt;&lt;ul&gt;&lt;li&gt;Global HTTPS CDN&lt;li&gt;HTTP Range-request support&lt;/ul&gt;&quot;}}
         SpacerB ~~~ Build
@@ -3793,9 +3793,9 @@ flowchart TB
     %% Right Column: Community &amp; Telemetry (Vertical)
     subgraph ColData [&quot;Community &amp; Telemetry&quot;]
         direction TB
-        SpacerD[&quot; &quot;]
+        SpacerD[&quot;&lt;div style=&#39;height:1px;line-height:1px;font-size:1px&#39;&gt;&lt;/div&gt;&quot;]
         Tribal([&quot;🌲 &lt;b&gt;Tribal Climate Partners&lt;/b&gt;&lt;ul&gt;&lt;li&gt;Co-design requirements&lt;li&gt;Hazard indicator zones&lt;/ul&gt;&quot;])
-        Feeds[(&quot;📡 &lt;b&gt;Live Remote Feeds&lt;/b&gt;&lt;ul&gt;&lt;li&gt;USGS streamflow telemetry&lt;li&gt;NIFC wildfire &amp; NOAA drought&lt;/ul&gt;&quot;)]
+        Feeds[(&quot;📡 &lt;b&gt;Live Remote Feeds&lt;/b&gt;&lt;ul&gt;&lt;li&gt;USGS streamflow telemetry&lt;li&gt;NIFC wildfire&lt;li&gt;NOAA drought&lt;/ul&gt;&quot;)]
         SpacerD ~~~ Tribal
         Tribal ==&gt;|metrics &amp; zones| Feeds
     end

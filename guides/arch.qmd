@@ -103,9 +103,9 @@ flowchart TB
     'fontFamily': 'Inter, system-ui, sans-serif'
   },
   'flowchart': {
-    'rankSpacing': 28,
+    'rankSpacing': 16,
     'nodeSpacing': 36,
-    'padding': 18,
+    'padding': 12,
     'curve': 'basis'
   }
 }}%%
@@ -116,7 +116,7 @@ flowchart TB
     %% Left Column: Build & Edge CDN (Vertical)
     subgraph ColBuild ["Build & Edge CDN"]
         direction TB
-        SpacerB[" "]
+        SpacerB["<div style='height:1px;line-height:1px;font-size:1px'></div>"]
         Build(["⚙️ <b>Vite + npm Engine</b><ul><li>Strict tsc typecheck<li>Minifies & chunks assets</ul>"])
         CDN{{"🌐 <b>GitHub Pages Edge</b><ul><li>Global HTTPS CDN<li>HTTP Range-request support</ul>"}}
         SpacerB ~~~ Build
@@ -126,9 +126,9 @@ flowchart TB
     %% Right Column: Community & Telemetry (Vertical)
     subgraph ColData ["Community & Telemetry"]
         direction TB
-        SpacerD[" "]
+        SpacerD["<div style='height:1px;line-height:1px;font-size:1px'></div>"]
         Tribal(["🌲 <b>Tribal Climate Partners</b><ul><li>Co-design requirements<li>Hazard indicator zones</ul>"])
-        Feeds[("📡 <b>Live Remote Feeds</b><ul><li>USGS streamflow telemetry<li>NIFC wildfire & NOAA drought</ul>")]
+        Feeds[("📡 <b>Live Remote Feeds</b><ul><li>USGS streamflow telemetry<li>NIFC wildfire<li>NOAA drought</ul>")]
         SpacerD ~~~ Tribal
         Tribal ==>|metrics & zones| Feeds
     end
