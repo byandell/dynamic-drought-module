@@ -11,6 +11,7 @@ These guides are a collaboration between Patrick Freeland and Brian Yandell.
 The goal is to reveal what is being done with this clever repo and how others
 might build of this work.
 
+- [Harness](harness.md) (What is a Harness?)
 - [Serverless](serverless.md)
 - [Serverless Slides](https://raw.githack.com/byandell/dynamic-drought-module/main/guides/serverless_slides.html) ([source](serverless_slides.qmd))
 - [Architecture Views](arch.md) ([slides](https://raw.githack.com/byandell/dynamic-drought-module/main/guides/arch.html)) ([source](arch.qmd))
