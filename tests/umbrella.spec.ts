@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 import {
   gotoApp,
   layerCheckbox,
@@ -16,6 +16,8 @@ import {
   syntheticBiaBody
 } from './tribal-fixtures';
 import { installMinimapAnalysisStubs } from './minimap-fixtures';
+import { installDefaultNifcStub, nifcStubLog } from './wildfire-fixtures';
+import { TRIBAL_NATIONS_GROUP } from '../src/config/layer-groups';
 
 /**
  * The Tribal Nations umbrella UI (Unit F, D-0.7.0-033): the featured group
@@ -38,6 +40,47 @@ const COUNT = `${UMBRELLA} .layer-umbrella-count`;
 const MEMBERS = ['aiannh', 'bia-reservations'] as const;
 const BUTTON_SET = ['aiannh', 'bia-reservations'] as const;
 
+for (const width of [1440, 820]) {
+  test('D3 opaque umbrella actions preserve keyboard behavior with neutral focus at ' + width, async ({ page }) => {
+    await page.setViewportSize({ width, height: 900 });
+    await gotoApp(page, '?view=console&layers=none&flow=off');
+    const command = page.locator(CTA);
+    const disclosure = page.locator(DETAILS_TOGGLE);
+    await expect(command).toBeVisible();
+    await expect(command).toHaveCSS('background-color', 'rgb(30, 36, 44)');
+    await expect(command).toHaveCSS('color', 'rgb(232, 236, 240)');
+    await expect(command).toHaveCSS('border-top-color', 'rgb(138, 148, 166)');
+    await command.hover();
+    await expect(command).toHaveCSS('background-color', 'rgb(42, 49, 56)');
+    await expect(command).toHaveCSS('color', 'rgb(232, 236, 240)');
+    await expect(command).toHaveCSS('border-top-color', 'rgb(138, 148, 166)');
+    await disclosure.focus();
+    await page.keyboard.press('Enter');
+    await expect(disclosure).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator(CONTROLS)).toBeVisible();
+    await expect(disclosure).toHaveCSS('outline-color', 'rgb(255, 255, 255)');
+    await expect(disclosure).toHaveCSS('outline-width', '2px');
+    await expect(disclosure).toHaveCSS('outline-offset', '0px');
+    await expect(disclosure).toHaveCSS('box-shadow', 'rgb(1, 11, 19) 0px 0px 0px 4px');
+    await page.keyboard.press('Enter');
+    await expect(disclosure).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator(CONTROLS)).toBeHidden();
+    await command.focus();
+    await expect(command).toHaveCSS('outline-color', 'rgb(255, 255, 255)');
+    await expect(command).toHaveCSS('outline-width', '2px');
+    await expect(command).toHaveCSS('outline-offset', '0px');
+    await expect(command).toHaveCSS('box-shadow', 'rgb(1, 11, 19) 0px 0px 0px 4px');
+    await page.keyboard.press('Enter');
+    await expect.poll(async () => {
+      const layers = await urlLayers(page);
+      return BUTTON_SET.every(key => layers.has(key));
+    }).toBe(true);
+    await expect(page.locator(COUNT)).toHaveText('2 of 2 selected');
+    // A toggle like the Brief-door control (P3-03, 2026-11-05): pressed now.
+    await expect(command).toHaveAttribute('aria-pressed', 'true');
+  });
+}
+
 test.describe('the Tribal Nations umbrella (console catalog)', () => {
   test('structure: the four role groups hold, the umbrella is a card inside Place, members stay mounted', async ({
     page
@@ -53,13 +96,15 @@ test.describe('the Tribal Nations umbrella (console catalog)', () => {
     await expect(umbrella).toHaveAttribute('role', 'group');
     expect(await umbrella.getAttribute('data-layer-key')).toBeNull();
 
-    // The command button: accessible name, effect description, no
-    // disclosure semantics (it is a command, not a toggle).
+    // The toggle button (found-006; P3-03 of the 2026-11-05 look): its name,
+    // pressed state and description follow the pair, which a default boot
+    // has on; no disclosure semantics.
     const cta = page.locator(CTA);
     await expect(cta).toBeVisible();
-    await expect(cta).toHaveAccessibleName('Show Tribal Nations layers');
+    await expect(cta).toHaveAccessibleName('Hide Tribal Nations layers');
+    await expect(cta).toHaveAttribute('aria-pressed', 'true');
+    await expect(cta).toHaveAccessibleDescription(TRIBAL_NATIONS_GROUP.actionOffDescription);
     expect(await cta.getAttribute('aria-expanded')).toBeNull();
-    expect(await cta.getAttribute('aria-pressed')).toBeNull();
 
     // Members are permanently mounted (hidden, not unmounted): read-only
     // locators resolve the live pair with their exact contract attributes.
@@ -140,62 +185,47 @@ test.describe('the Tribal Nations umbrella (console catalog)', () => {
     await expect(page.locator(COUNT)).toHaveText('2 of 2 selected');
   });
 
-  test('an all-on click is a clean no-op and the button stays enabled and reusable', async ({
+  test('an all-on press hides the pair and the name and pressed state follow the layers (P3-03)', async ({
     page
   }) => {
-    // Count the live requests so the no-op is proven at the network layer,
-    // not only in the URL.
-    let liveRequests = 0;
-    const counted = async (pattern: string, body: unknown): Promise<void> => {
-      await routeBoundary(page, pattern, (route) => {
-        liveRequests += 1;
-        void route.fulfill({
-          contentType: 'application/geo+json',
-          body: JSON.stringify(body)
-        });
-      });
-    };
-    await counted(AIANNH_ROUTE, syntheticAiannhBody());
-    await counted(BIA_ROUTE, syntheticBiaBody());
+    // P3-03 (the look of 2026-11-05): with both layers on, the button used to
+    // say "Show ... / Turns on" and a press did nothing. It is now the same
+    // toggle as the Brief-door control (found-006).
+    await routeBoundary(page, AIANNH_ROUTE, (route) =>
+      route.fulfill({ contentType: 'application/geo+json', body: JSON.stringify(syntheticAiannhBody()) })
+    );
+    await routeBoundary(page, BIA_ROUTE, (route) =>
+      route.fulfill({ contentType: 'application/geo+json', body: JSON.stringify(syntheticBiaBody()) })
+    );
 
     await gotoApp(page, '?view=console&layers=aiannh,bia-reservations');
-    await expect(page.locator(COUNT)).toHaveText('2 of 2 selected');
-    const before = await urlLayers(page);
-
-    // Wait for the live-request stream to go QUIET before snapshotting: the
-    // boot region fit's debounced viewport refresh can legitimately land
-    // after the pills settle, and it must not be mistaken for CTA work.
-    let lastSeen = -1;
-    await expect
-      .poll(
-        () => {
-          const stable = liveRequests === lastSeen;
-          lastSeen = liveRequests;
-          return stable;
-        },
-        { intervals: [700], timeout: 20_000 }
-      )
-      .toBe(true);
-    const requestsBefore = liveRequests;
-
     const cta = page.locator(CTA);
-    await expect(cta).toBeEnabled();
-    await cta.click();
-    // Give a would-be regression time to fire, then prove nothing moved.
-    await page.waitForTimeout(750);
-    expect(liveRequests).toBe(requestsBefore);
-    expect([...(await urlLayers(page))].sort()).toEqual([...before].sort());
     await expect(page.locator(COUNT)).toHaveText('2 of 2 selected');
-    await expect(cta).toBeEnabled();
+    await expect(cta).toHaveAttribute('aria-pressed', 'true');
+    await expect(cta).toHaveAccessibleName('Hide Tribal Nations layers');
+    await expect(cta).toHaveAccessibleDescription(TRIBAL_NATIONS_GROUP.actionOffDescription);
 
-    // Reusability (never a once-only handler): turn ONE member off, click
-    // again, and only the missing member returns.
-    await openTribalNationsDetails(page);
-    await layerCheckbox(page, 'aiannh').uncheck();
-    await expect(page.locator(COUNT)).toHaveText('1 of 2 selected');
     await cta.click();
-    await expect(layerCheckbox(page, 'aiannh')).toBeChecked();
+    for (const key of BUTTON_SET) {
+      await expect(layerCheckbox(page, key)).not.toBeChecked();
+    }
+    await expect(page.locator(COUNT)).toHaveText('0 of 2 selected');
+    await expect(cta).toHaveAttribute('aria-pressed', 'false');
+    await expect(cta).toHaveAccessibleName('Show Tribal Nations layers');
+    await expect(cta).toHaveAccessibleDescription(TRIBAL_NATIONS_GROUP.actionDescription);
+
+    // A partial set reads unpressed and its press completes the pair.
+    await openTribalNationsDetails(page);
+    await layerCheckbox(page, 'aiannh').check();
+    await expect(page.locator(COUNT)).toHaveText('1 of 2 selected');
+    await expect(cta).toHaveAttribute('aria-pressed', 'false');
+    await cta.click();
+    for (const key of BUTTON_SET) {
+      await expect(layerCheckbox(page, key)).toBeChecked();
+    }
     await expect(page.locator(COUNT)).toHaveText('2 of 2 selected');
+    await expect(cta).toHaveAttribute('aria-pressed', 'true');
+    await expect(cta).toBeEnabled();
   });
 
   test('keyboard: the CTA and disclosure are native tab stops; collapsed children are skipped', async ({
@@ -263,7 +293,7 @@ test.describe('the Tribal Nations umbrella (console catalog)', () => {
 
 test.describe('URL intent durability (the final-pass finding 1 pair)', () => {
   /** Gate both live routes open so no activation can settle. */
-  async function holdAllTribal(page: import('@playwright/test').Page): Promise<() => void> {
+  async function holdAllTribal(page: import('./offline-test').Page): Promise<() => void> {
     const releases: Array<() => void> = [];
     const hold = async (pattern: string, body: unknown): Promise<void> => {
       const gate = new Promise<void>((resolve) => releases.push(resolve));
@@ -330,17 +360,27 @@ test.describe('URL intent durability (the final-pass finding 1 pair)', () => {
 });
 
 test.describe('partial-outage visibility (the final-pass finding 2)', () => {
-  // The Unit I default boot selects the two present-day layers; the BIA
-  // outage unchecks one, leaving one selected and one unavailable.
-  const HEALTH_DEGRADED = '1 of 2 selected · 1 unavailable';
+  // The Unit I default boot selects the two present-day layers. Since
+  // found-073 (2026-09-27) a failed layer of the committed composition stays
+  // checked (M5's rule, extended from the recipe to the composition), so the
+  // BIA outage leaves both selected and one unavailable; it used to uncheck
+  // BIA and demote the Drought view to a custom set.
+  // The visible line is the fault alone (visual uniformity wave 1, D5); the
+  // selected count reads in the action's accessible name.
+  const HEALTH_DEGRADED = '1 unavailable';
   const BRIEF_HEALTH =
     '.tribal-nations-brief-row:not(.tribal-nations-at-hand-row) .tribal-nations-health';
+  // found-073's pin: the failed layer stays checked, so the name still reads
+  // "2 of 2 selected" beside the fault.
+  const BRIEF_ACTION =
+    '.tribal-nations-brief-row:not(.tribal-nations-at-hand-row) .tribal-nations-brief-action';
+  const NAME_DEGRADED = 'Hide Tribal Nations layers, 2 of 2 selected · 1 unavailable';
 
-  async function oneAgencyDown(page: import('@playwright/test').Page): Promise<void> {
+  async function oneAgencyDown(page: import('./offline-test').Page): Promise<void> {
     await routeGeojsonPair(page);
     await routeBoundary(page, BIA_ROUTE, (route) => route.abort('failed'));
   }
-  async function routeGeojsonPair(page: import('@playwright/test').Page): Promise<void> {
+  async function routeGeojsonPair(page: import('./offline-test').Page): Promise<void> {
     await routeBoundary(page, AIANNH_ROUTE, (route) =>
       route.fulfill({
         contentType: 'application/geo+json',
@@ -357,6 +397,7 @@ test.describe('partial-outage visibility (the final-pass finding 2)', () => {
     await expect(page.locator(BRIEF_HEALTH)).toHaveText(HEALTH_DEGRADED, {
       timeout: 25_000
     });
+    await expect(page.locator(BRIEF_ACTION)).toHaveAccessibleName(NAME_DEGRADED);
   });
 
   test('brief embed at 400x600: the outage is visible with zero island requests', async ({
@@ -370,6 +411,9 @@ test.describe('partial-outage visibility (the final-pass finding 2)', () => {
     });
     await oneAgencyDown(page);
     await installMinimapAnalysisStubs(page);
+    // A raw boot misses gotoApp's WFIGS default, and the WA briefing sends
+    // its bounded WFIGS read: answer it from the fixture (found-078, J12).
+    await installDefaultNifcStub(page, 'fixture');
     // select= opens the briefing (the boot-time explicit opener since
     // S2, D-0.7.0-041); select= keeps the brief door, so the embed still
     // never mounts the island.
@@ -380,7 +424,11 @@ test.describe('partial-outage visibility (the final-pass finding 2)', () => {
     await expect(page.locator(BRIEF_HEALTH)).toHaveText(HEALTH_DEGRADED, {
       timeout: 25_000
     });
+    await expect(page.locator(BRIEF_ACTION)).toHaveAccessibleName(NAME_DEGRADED);
     expect(islandRequests).toEqual([]);
+    // The briefing's WFIGS read was answered by the fixture, not the live
+    // service (found-078).
+    await expect.poll(() => nifcStubLog(page).length).toBeGreaterThan(0);
   });
 });
 
@@ -399,9 +447,13 @@ test.describe('partial-outage visibility on mobile (390x844)', () => {
 
     await page.locator('#mobile-footer-nav button[data-tab="place"]').click();
     await expect(page.locator('#sheet-at-hand')).toBeVisible();
+    // found-073: the failed BIA layer stays checked in the committed view.
     await expect(page.locator('#tribal-nations-at-hand-health')).toHaveText(
-      '1 of 2 selected · 1 unavailable',
+      '1 unavailable',
       { timeout: 25_000 }
+    );
+    await expect(page.locator('#tribal-nations-at-hand-action')).toHaveAccessibleName(
+      'Hide Tribal Nations layers, 2 of 2 selected · 1 unavailable'
     );
   });
 });
@@ -411,7 +463,10 @@ test.describe('the Brief-door Tribal Nations action', () => {
     await gotoApp(page);
     const action = page.locator('#tribal-nations-brief-action');
     await expect(action).toBeVisible();
-    await expect(action).toHaveAccessibleName('Show Tribal Nations layers');
+    // Both Tribal members (aiannh, bia-reservations) default on (found-006):
+    // a bare boot is the pressed state, so the accessible name reads Hide.
+    await expect(action).toHaveAccessibleName('Hide Tribal Nations layers, 2 of 2 selected');
+    await expect(action).toHaveAttribute('aria-pressed', 'true');
   });
 
   test('activating from the Brief action reaches the map on desktop too', async ({ page }) => {
@@ -458,15 +513,15 @@ test.describe('the Brief-door action at 400px (mobile and embed)', () => {
   }) => {
     await gotoApp(page, '?view=console&layers=');
 
-    // The Place door opens the at-hand summary at the half detent (the
-    // surface that REPLACES the report on mobile).
+    // The Place door opens the at-hand summary in its full-screen window
+    // (the surface that REPLACES the report on mobile).
     await page.locator('#mobile-footer-nav button[data-tab="place"]').click();
-    await expect(page.locator('#app')).toHaveAttribute('data-sheet-detent', 'half');
+    await expect(page.locator('#app')).toHaveAttribute('data-sheet-detent', 'full');
     await expect(page.locator('#sheet-at-hand')).toBeVisible();
 
     const atHandAction = page.locator('#tribal-nations-at-hand-action');
     await expect(atHandAction).toBeVisible();
-    await expect(atHandAction).toHaveAccessibleName('Show Tribal Nations layers');
+    await expect(atHandAction).toHaveAccessibleName('Show Tribal Nations layers, 0 of 2 selected');
     // The report-hosted twin is not this surface's instance.
     await expect(page.locator('#tribal-nations-brief-action')).not.toBeVisible();
 
@@ -488,6 +543,9 @@ test.describe('the Brief-door action at 400px (mobile and embed)', () => {
     await routeAllTribalFixtures(page);
     await installMinimapAnalysisStubs(page);
     await stubRecentSatellite(page);
+    // A raw boot misses gotoApp's WFIGS default, and the WA briefing sends
+    // its bounded WFIGS read: answer it from the fixture (found-078, J12).
+    await installDefaultNifcStub(page, 'fixture');
     const islandRequests: string[] = [];
     page.on('request', (req) => {
       if (/island-[^/]*\.js/.test(req.url())) islandRequests.push(req.url());
@@ -504,6 +562,8 @@ test.describe('the Brief-door action at 400px (mobile and embed)', () => {
     await expect(page.locator('#app')).toHaveClass(/\bembed\b/);
     await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
     await expect(page.locator('#impact-panel')).toBeVisible({ timeout: 15_000 });
+    // The briefing's WFIGS read was answered by the fixture (found-078).
+    await expect.poll(() => nifcStubLog(page).length).toBeGreaterThan(0);
 
     const action = page.locator('#tribal-nations-brief-action');
     await expect(action).toBeVisible();

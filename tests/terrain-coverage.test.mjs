@@ -1,0 +1,450 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { registerHooks } from 'node:module';
+import { join } from 'node:path';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * The two terrain sentences and the 3D scene's edge fade, browser-free.
+ *
+ * The flat Terrain Shading reads the bundled archive (zoom 0-8); the 3D
+ * scene reads the deep archive when it resolves (zoom 0-10). Both sentences
+ * opened "Terrain relief uses", so the map key's zoom 8 and the 3D
+ * information's zoom 10 read as one claim contradicting itself. Each now
+ * names its own layer and both come from one formatter.
+ *
+ * Runs under plain `node --test` (Node 24 strips types); the resolve hook
+ * maps the sources' extensionless relative imports to their .ts files.
+ */
+
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      specifier.startsWith('.') &&
+      !/\.[a-z]+$/i.test(specifier) &&
+      typeof context.parentURL === 'string' &&
+      context.parentURL.endsWith('.ts')
+    ) {
+      return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  }
+});
+
+const {
+  FIRE3D_TERRAIN_COVERAGE,
+  HILLSHADE_COVERAGE_SENTENCE,
+  terrainCoverageSentence
+} = await import('../src/config/terrain-coverage.ts');
+const {
+  FIRE3D_COVERAGE_NOTE,
+  TERRAIN_EDGE_BUFFER,
+  TERRAIN_EDGE_PAINT,
+  fire3dCoverageNote,
+  fire3dTerrainCoverageSentence,
+  terrainEdgeLine
+} = await import('../src/config/fire3d-presentation.ts');
+
+test('each sentence carries its own zoom and never the other', () => {
+  const deep = { ...FIRE3D_TERRAIN_COVERAGE, maxZoom: 10 };
+  assert.match(terrainCoverageSentence('X', deep), /detail ends at zoom 10;/);
+  assert.doesNotMatch(terrainCoverageSentence('X', deep), /zoom 8\b/);
+  assert.match(terrainCoverageSentence('X', FIRE3D_TERRAIN_COVERAGE), /detail ends at zoom 8;/);
+  assert.doesNotMatch(terrainCoverageSentence('X', FIRE3D_TERRAIN_COVERAGE), /zoom 10\b/);
+});
+
+test('the flat shading and the 3D scene name different layers, so their zooms cannot read as one claim', () => {
+  assert.ok(HILLSHADE_COVERAGE_SENTENCE.startsWith('Terrain Shading uses '));
+  assert.match(HILLSHADE_COVERAGE_SENTENCE, new RegExp(`zoom ${FIRE3D_TERRAIN_COVERAGE.maxZoom};`));
+  assert.ok(fire3dTerrainCoverageSentence(10).startsWith('3D relief uses '));
+  assert.match(fire3dTerrainCoverageSentence(10), /zoom 10;/);
+  assert.ok(FIRE3D_COVERAGE_NOTE.startsWith('3D relief uses '));
+  for (const s of [HILLSHADE_COVERAGE_SENTENCE, fire3dTerrainCoverageSentence(10)]) {
+    assert.ok(s.includes(FIRE3D_TERRAIN_COVERAGE.issuer));
+    assert.ok(s.includes('125°W to 110.5°W, 41.5°N to 49.5°N'));
+  }
+});
+
+test('the map key carries no terrain coverage note; Technical information holds it', () => {
+  const source = readFileSync(join(ROOT, 'src', 'ui', 'map-key.ts'), 'utf8');
+  assert.ok(!source.includes('HILLSHADE_COVERAGE_SENTENCE'), 'map-key.ts no longer reads the terrain sentence');
+  assert.ok(!source.includes('Pacific Northwest only'), 'map-key.ts prints no terrain label');
+  assert.ok(!/detail ends at zoom \d/.test(source), 'map-key.ts types no zoom figure by hand');
+});
+
+/** A zoom-only `interpolate` expression's value at `zoom` (linear or exponential). */
+function evaluateZoom(expr, zoom) {
+  const [op, [kind, base = 1], input, ...stops] = expr;
+  assert.equal(op, 'interpolate');
+  assert.deepEqual(input, ['zoom']);
+  if (zoom <= stops[0]) return stops[1];
+  for (let i = 2; i < stops.length; i += 2) {
+    const z0 = stops[i - 2], z1 = stops[i], v0 = stops[i - 1], v1 = stops[i + 1];
+    if (zoom > z1) continue;
+    const t = kind === 'linear' || base === 1
+      ? (zoom - z0) / (z1 - z0)
+      : (base ** (zoom - z0) - 1) / (base ** (z1 - z0) - 1);
+    return v0 + t * (v1 - v0);
+  }
+  return stops[stops.length - 1];
+}
+
+const pxPerDegree = (zoom) => (512 * 2 ** zoom) / 360;
+
+test('the edge fade is one blurred line on the archive box: a true gradient, no bands', () => {
+  const box = FIRE3D_TERRAIN_COVERAGE;
+  const line = terrainEdgeLine(box);
+  assert.equal(line.geometry.type, 'LineString');
+  // Closed on the box itself, so the peak sits on the seam.
+  assert.deepEqual(line.geometry.coordinates, [
+    [box.west, box.south], [box.east, box.south], [box.east, box.north],
+    [box.west, box.north], [box.west, box.south]
+  ]);
+  const paint = TERRAIN_EDGE_PAINT;
+  for (const zoom of [3, 4, 5, 6, 7, 8, 9, 11]) {
+    const width = evaluateZoom(paint['line-width'], zoom);
+    // Blur of half the width: alpha falls linearly from the seam to zero at both sides.
+    assert.ok(Math.abs(evaluateZoom(paint['line-blur'], zoom) - width / 2) < 1e-9);
+  }
+  // Half a degree of ground from regional zoom to close in, so the regional
+  // view gets a soft edge rather than a hairline; the seam carries the peak.
+  for (const zoom of [3, 4, 5, 6.5, 9]) {
+    const deg = evaluateZoom(paint['line-width'], zoom) / pxPerDegree(zoom);
+    assert.ok(Math.abs(deg - 0.5) < 0.02, `half a degree at zoom ${zoom}, got ${deg}`);
+  }
+  // Nothing can frame the archive box at regional zoom: transparent at zoom 6
+  // and below, opaque enough to hide the seam by zoom 8.
+  for (const zoom of [3, 5, 6]) assert.equal(evaluateZoom(paint['line-opacity'], zoom), 0);
+  assert.ok(evaluateZoom(paint['line-opacity'], 8) >= 0.9, 'opaque enough at the seam to hide it');
+  // Held in screen space past zoom 9, and the half width stays inside the
+  // GeoJSON tile buffer at every zoom (a tile edge would cut the fade).
+  assert.equal(evaluateZoom(paint['line-width'], 14), evaluateZoom(paint['line-width'], 9));
+  assert.ok(evaluateZoom(paint['line-width'], 9) / 2 <= TERRAIN_EDGE_BUFFER);
+  assert.ok(TERRAIN_EDGE_BUFFER <= 512, 'the style spec caps the buffer at 512');
+});
+
+test('national boxes attach only to a national key with the committed union header, and drive the dormant multi-box reads', async () => {
+  const { NATIONAL_TERRAIN_BOXES, terrainCoverageFor } = await import('../src/config/terrain-coverage.ts');
+  const { classifyTerrainCoverage, isWithinTerrainCoverage } = await import('../src/config/fire3d-presentation.ts');
+  const header = (west, south, east, north, maxZoom = 10) =>
+    ({ tileDataOffset: 1, tileDataLength: 1, minZoom: 0, maxZoom, west, south, east, north });
+  const union = header(-179.3, -14.7, -64.4, 71.5);
+  const national = terrainCoverageFor('us-z10-2026-11-06.pmtiles', union);
+  assert.deepEqual(national.boxes, NATIONAL_TERRAIN_BOXES);
+  assert.equal(terrainCoverageFor('us-z11-2026-11-06.pmtiles', { ...union, maxZoom: 11 }).boxes, NATIONAL_TERRAIN_BOXES);
+  // Fallbacks: the live PNW key, a wrong union, or a stray key keep the header's single box.
+  for (const [key, h] of [
+    ['pnw-z10-2026-09-10.pmtiles', union],
+    ['us-z10-2026-11-06.pmtiles', header(-125, 24, -66.9, 50)],
+    ['us-z10-2026-11-06.pmtiles', header(-125, 41.5, -110.5, 49.5)],
+    ['us-z10-latest.pmtiles', union]
+  ]) {
+    const c = terrainCoverageFor(key, h);
+    assert.equal(c.boxes, undefined, key);
+    assert.deepEqual([c.west, c.south, c.east, c.north], [h.west, h.south, h.east, h.north]);
+  }
+  // Inside one box is full; across a box edge is partial; between Hawaii and CONUS is none.
+  assert.equal(classifyTerrainCoverage({ west: -100, south: 37, east: -96, north: 40 }, national), 'full');
+  assert.equal(classifyTerrainCoverage({ west: -123, south: 49, east: -121, north: 50 }, national), 'partial');
+  assert.equal(classifyTerrainCoverage({ west: -140, south: 25, east: -135, north: 30 }, national), 'none');
+  assert.equal(classifyTerrainCoverage({ west: -156, south: 19, east: -155, north: 20 }, national), 'full');
+  // The same view against the union rectangle alone would claim it full.
+  assert.equal(classifyTerrainCoverage({ west: -140, south: 25, east: -135, north: 30 }, { ...national, boxes: undefined }), 'full');
+  assert.equal(isWithinTerrainCoverage(-140, 25, national), false, 'mid-Pacific inside the union carries no elevation');
+  assert.equal(isWithinTerrainCoverage(-155.47, 19.82, national), true);
+  assert.equal(isWithinTerrainCoverage(-170.7, -14.3, national), true);
+});
+
+test('the edge fade draws every box ring when the archive has boxes, the single box otherwise', async () => {
+  const { NATIONAL_TERRAIN_BOXES } = await import('../src/config/terrain-coverage.ts');
+  const national = { ...FIRE3D_TERRAIN_COVERAGE, west: -179.3, south: -14.7, east: -64.4, north: 71.5, boxes: NATIONAL_TERRAIN_BOXES };
+  const line = terrainEdgeLine(national);
+  assert.equal(line.geometry.type, 'MultiLineString');
+  assert.equal(line.geometry.coordinates.length, 5);
+  const [w, s, e, n] = [-125.0, 24.4, -66.9, 49.5];
+  assert.deepEqual(line.geometry.coordinates[0], [[w, s], [e, s], [e, n], [w, n], [w, s]]);
+  assert.equal(terrainEdgeLine(FIRE3D_TERRAIN_COVERAGE).geometry.type, 'LineString');
+});
+
+test('the perimeter ribbon holds 16 px at the latitude it is drawn, not only at 45 N', async () => {
+  const { perimeterRibbonHeightMeters, buildPerimeterRibbonSlabPaint, PERIMETER_RIBBON_SCREEN_HEIGHT_PX,
+    PERIMETER_RIBBON_SLAB_COUNT } = await import('../src/config/fire3d-presentation.ts');
+  const metersPerPixel = (zoom, lat) => (78271.5169640205 * Math.cos((lat * Math.PI) / 180)) / 2 ** zoom;
+  for (const lat of [25, 45, 64]) {
+    for (const zoom of [5, 9.5, 15]) {
+      const px = perimeterRibbonHeightMeters(zoom, lat) / metersPerPixel(zoom, lat);
+      assert.ok(Math.abs(px - PERIMETER_RIBBON_SCREEN_HEIGHT_PX) < 1e-9, `${lat} N zoom ${zoom}: ${px} px`);
+    }
+  }
+  // The default stays the 45 N tuning, so a caller that passes no latitude draws exactly as before.
+  assert.equal(perimeterRibbonHeightMeters(9), perimeterRibbonHeightMeters(9, 45));
+  assert.deepEqual(buildPerimeterRibbonSlabPaint(2), buildPerimeterRibbonSlabPaint(2, 45));
+  const top = buildPerimeterRibbonSlabPaint(PERIMETER_RIBBON_SLAB_COUNT - 1, 64)['fill-extrusion-height'];
+  assert.ok(Math.abs(top[4] - perimeterRibbonHeightMeters(5, 64)) < 1e-9);
+  // At 64 N the fixed 45 N height drew about 1.6 times too tall.
+  assert.ok(Math.abs(perimeterRibbonHeightMeters(9) / perimeterRibbonHeightMeters(9, 64) - 1.613) < 0.001);
+});
+
+test('the deep archive branch resolves its coverage by key and header; the bundled fallback stays header-only', () => {
+  const source = readFileSync(join(ROOT, 'src', 'map', 'fire3d.ts'), 'utf8');
+  const fn = source.slice(source.indexOf('async function resolveFire3DTerrainUrl'), source.indexOf('function warnComponent'));
+  assert.match(fn, /coverage: terrainCoverageFor\(archiveKey\(URLS\.terrainPmtilesDeep\), header\)/);
+  assert.match(fn, /coverage: terrainCoverageFromHeader\(bundled\.header\)/);
+});
+
+test('the scene adds the veil with that buffer and re-seats the ruled chain after it', () => {
+  const source = readFileSync(join(ROOT, 'src', 'map', 'fire3d.ts'), 'utf8');
+  const block = source.slice(source.indexOf('terrainEdgeLine(resolved.coverage)'));
+  assert.match(block.slice(0, 600), /buffer: TERRAIN_EDGE_BUFFER/);
+  assert.match(block.slice(0, 900), /reassertThematicOrder\(map\);\s*reassertLabelOrder\(map\);/);
+});
+
+test('the Impact Briefing never prints the 3D scene\'s unresolved zoom 8 as a 3D relief claim', async () => {
+  const { renderMapTechnicalInformation, setMapTechnicalNote } =
+    await import('../src/ui/map-technical-information.ts');
+  const briefing = () => /<p id="impact-technical-fire3d">([^<]*)<\/p>/.exec(renderMapTechnicalInformation())[1];
+  const decode = (s) => s.replace(/&#039;/g, "'").replace(/&amp;/g, '&');
+  // Before any scene: the flat Terrain Shading's own sentence, zoom 8, by name.
+  assert.ok(decode(briefing()).startsWith(HILLSHADE_COVERAGE_SENTENCE));
+  assert.doesNotMatch(briefing(), /3D relief uses/);
+  // The control hands over its unresolved bundled form while no scene is active.
+  setMapTechnicalNote('fire3d', FIRE3D_COVERAGE_NOTE);
+  assert.ok(decode(briefing()).startsWith(HILLSHADE_COVERAGE_SENTENCE));
+  assert.doesNotMatch(briefing(), /3D relief uses/);
+  // An active scene on the deep archive: the sidebar's own sentence, verbatim.
+  const deep = fire3dCoverageNote({ ...FIRE3D_TERRAIN_COVERAGE, maxZoom: 10 });
+  setMapTechnicalNote('fire3d', deep, true);
+  assert.equal(decode(briefing()), deep);
+  assert.match(briefing(), /^3D relief uses .*zoom 10;/);
+  // An active scene that fell back to the bundled archive reads its own line, not the idle one.
+  setMapTechnicalNote('fire3d', FIRE3D_COVERAGE_NOTE, true);
+  assert.equal(decode(briefing()), FIRE3D_COVERAGE_NOTE);
+});
+
+test('the notes taken off the key, the storm popup and the smoke legend read in the Impact Briefing instead', async () => {
+  const { renderMapTechnicalInformation } = await import('../src/ui/map-technical-information.ts');
+  const html = renderMapTechnicalInformation().replace(/&#039;/g, "'");
+  for (const note of [
+    'NOAA Hazard Mapping System, analyst-drawn from GOES imagery; current or previous UTC day. Its plume observation window is independent of any satellite basemap frame shown. Density opacity is presentation, not ground-level air quality.',
+    'Surface temperature anomalies are shown for large lakes and inland seas as well as the ocean.',
+    'Basins covered: Atlantic, Eastern North Pacific, Central North Pacific.',
+    "Circles are sized by the issuer's wind classes; the issuer's icons are not reproduced.",
+    'Times are as the issuer states them; DDM does not read them as full dates.',
+    'National Weather Service HeatRisk covers the contiguous United States only.',
+    'Products issued under the former names Excessive Heat Warning and Excessive Heat Watch are drawn in the colours of Extreme Heat Warning and Extreme Heat Watch and share their rows in the key; a product\'s popup gives the name it was issued under.',
+    'National Weather Service products are read about every five minutes; the time beside them in the key is when DDM last read them, not when a product was issued or when it is in effect.'
+  ]) {
+    assert.ok(html.includes(`<p>${note}</p>`), note);
+  }
+  // The three issuer passages, verbatim as read on the issuers' pages 2026-10-13, each with its link.
+  for (const [quote, url] of [
+    ['It is inaccurate to label individual storms or events as a La Niña or El Niño event.', 'https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/ensostuff/ensofaq.shtml'],
+    ['The Sea Surface Temperature Anomalies (L4, MUR) layer is created from the Group for High Resolution Sea Surface Temperature (GHRSST)', 'https://www.earthdata.nasa.gov/news/worldview-image-archive/global-sea-surface-temperature-anomalies'],
+    ['The cone represents the probable track of the center of a tropical cyclone', 'https://www.nhc.noaa.gov/aboutcone.shtml']
+  ]) {
+    assert.ok(html.includes(quote) && html.includes(`href="${url}"`), quote);
+  }
+  const source = (...path) => readFileSync(join(ROOT, 'src', ...path), 'utf8');
+  assert.doesNotMatch(source('ui', 'map-key.ts'), /Basins covered|Circles are sized/);
+  assert.doesNotMatch(source('ui', 'map-key.ts'), /covers the contiguous United States|snapshot as of|join\(' \/ '\)/);
+  assert.doesNotMatch(source('layers', 'hms-smoke.ts'), /HMS_OVERVIEW_QUALIFICATION/);
+});
+
+test('the perimeter note, the currents box and the time horizon reasons read in Technical information, not the legend, key or sidebar', async () => {
+  const { renderMapTechnicalInformation } = await import('../src/ui/map-technical-information.ts');
+  const { NIFC_GENERALIZATION_NOTE } = await import('../src/config/wildfire-presentation.ts');
+  const { clusterHorizonReason } = await import('../src/ui/horizon-reason.ts');
+  const { HAZARD_CLUSTER_KEYS, TEMPORAL_HORIZON_KEYS } = await import('../src/config/clusters.ts');
+  const html = renderMapTechnicalInformation().replace(/&#039;/g, "'");
+  assert.ok(html.includes(`<p>NIFC WFIGS current interagency mapped perimeters. ${NIFC_GENERALIZATION_NOTE} Service cadence does not establish individual perimeter age. Not for evacuation, parcel, or tactical decisions; open NIFC for the source record.</p>`));
+  // Every mode's disabled-chip reasons, enumerated from the cluster table.
+  const reasons = HAZARD_CLUSTER_KEYS.flatMap((cluster) => TEMPORAL_HORIZON_KEYS.map((key) => clusterHorizonReason(cluster, key))).filter((r) => r !== null);
+  assert.ok(reasons.length > 0);
+  for (const reason of reasons) assert.ok(html.includes(reason), reason);
+  const source = (...path) => readFileSync(join(ROOT, 'src', ...path), 'utf8');
+  assert.doesNotMatch(source('layers', 'nifc-fires.ts'), /Service cadence does not establish/);
+  assert.doesNotMatch(source('ui', 'island', 'shell.tsx'), /id="shell-horizon-note"/);
+  assert.doesNotMatch(source('layers', 'enso-flow.ts'), /currentsBoxNote/);
+  assert.doesNotMatch(source('layers', 'enso-flow-data.ts'), /Ocean current lines in this view/);
+});
+
+test('the Fire key carries no perimeter generalization note; Technical information holds it', async () => {
+  const { buildFireKey } = await import('../src/ui/map-key.ts');
+  const { NIFC_GENERALIZATION_NOTE } = await import('../src/config/wildfire-presentation.ts');
+  const { renderMapTechnicalInformation } = await import('../src/ui/map-technical-information.ts');
+  const key = buildFireKey(new Set(['nifc-fires', 'spc-fire-weather']));
+  assert.doesNotMatch(key.itemsHtml, /0\.0005 degree|data-nifc-generalization|tactical/);
+  assert.ok(renderMapTechnicalInformation().replace(/&#039;/g, "'").includes(NIFC_GENERALIZATION_NOTE));
+});
+
+test('the ENSO key keeps every kind\'s credit as its own text item, even when the state line names the product', async () => {
+  const { ensoFlowRow } = await import('../src/ui/map-key.ts');
+  const { FLOW_WORDS, flowLiveLine } = await import('../src/layers/enso-flow-data.ts');
+  const row = (kind, line) => ensoFlowRow({ status: 'live', label: kind, line, notes: [], provenance: FLOW_WORDS.provenance[kind] });
+  const at = Date.UTC(2026, 9, 5, 6);
+  // The "derived from" credit says DDM re-encodes the product; the state line naming the product does not say that.
+  for (const kind of Object.keys(FLOW_WORDS.provenance)) {
+    for (const line of [flowLiveLine('live', kind, at, at), `no data · ${FLOW_WORDS.noOcean}`]) {
+      const { html, ariaLabel } = row(kind, line);
+      assert.ok(html.includes(`<span class="map-key-item" data-enso-flow="provenance">${FLOW_WORDS.provenance[kind]}</span>`), kind);
+      assert.ok(ariaLabel.endsWith(` ${FLOW_WORDS.provenance[kind]}.`), kind);
+    }
+  }
+});
+
+test('the flow explanations taken off the ENSO key read in the Impact Briefing under the name of their control', async () => {
+  const { renderMapTechnicalInformation, FLOW_TECHNICAL_NOTES } = await import('../src/ui/map-technical-information.ts');
+  const { FLOW_WORDS } = await import('../src/layers/enso-flow-data.ts');
+  const html = renderMapTechnicalInformation();
+  const heading = '<h4>Ocean &amp; atmosphere</h4>';
+  assert.ok(html.includes(heading), 'a heading named for the control');
+  const section = html.slice(html.indexOf(heading), html.indexOf('<h4>', html.indexOf(heading) + heading.length));
+  for (const sentence of [
+    'Line pace shows relative speed within this field; it is not real time.',
+    'Lines show the modeled flow at one instant, not the path of anything carried by it.',
+    'Ocean waves are drawn as sets of three curved lines, from NOAA GFS-Wave.',
+    'All sets move at one display speed; wave speed is not shown, and the water does not travel with the marks.',
+    'The spacing and curve of the lines are a drawing convention, not the wavelength or the shape of real wave fronts.',
+    'no sets are drawn where neighbouring directions disagree.',
+    FLOW_WORDS.mask,
+    'Model output, not an observation.',
+    'display bins, not thresholds.',
+    'This is model context, independently timed from the observed SST map.'
+  ]) {
+    assert.ok(section.includes(sentence), sentence);
+  }
+  // The rules tests/flow-wire.spec.ts holds every flow string to still bind the sentences that moved here.
+  const word = (list) => new RegExp(`(^|[^a-z])(${list})([^a-z]|$)`, 'i');
+  for (const note of FLOW_TECHNICAL_NOTES) {
+    assert.doesNotMatch(note, word('now|right now|currently|real-time|latest|today|forecasts?|will|expected'), note);
+    assert.doesNotMatch(note, word('trajectory|trajectories|carries|travels to'), note);
+    assert.doesNotMatch(note, /predict|drift|where the wind goes/i, note);
+  }
+  assert.equal(FLOW_TECHNICAL_NOTES.join(' ').match(/path of/gi).length, 1, 'one "path of", inside its negation');
+  assert.ok(FLOW_TECHNICAL_NOTES.join(' ').includes('not the path of anything carried by it'));
+  // The key keeps what decodes its symbols: one bins sentence per drawn kind, in real units.
+  for (const bins of Object.values(FLOW_WORDS.bins)) {
+    assert.match(bins, /: (?:none )?under [0-9.]+,(?: then)?(?: [0-9.]+ to [0-9.]+,)+ [0-9.]+ or more (?:m|kg m-2)/);
+  }
+  assert.ok(!section.includes('under 5') && !section.includes('under 0.25'), 'the bins stay in the key');
+  // Every kind the control offers is named here by its button's own label, and the two winds by the
+  // names their state lines give them.
+  const panelSource = readFileSync(join(ROOT, 'src', 'layers', 'enso-flow.ts'), 'utf8');
+  const labels = panelSource.slice(panelSource.indexOf('const LABELS'), panelSource.indexOf('const SOURCES'));
+  const kinds = [...labels.matchAll(/([a-z]+): '([^']+)'/g)].filter(([, kind]) => kind !== 'off');
+  assert.deepEqual(kinds.map(([, kind]) => kind).sort(), Object.keys(FLOW_WORDS.source).sort());
+  for (const [, , label] of kinds) assert.ok(section.includes(label), `the briefing never names ${label}`);
+  for (const source of [FLOW_WORDS.source.wind, FLOW_WORDS.source.jet]) assert.ok(section.includes(source), source);
+  // The navigation disclaimer is the briefing's, for the ocean kinds only; the panel carries none.
+  assert.ok(section.includes('The wave marks are unsuitable for coastal navigation.'));
+  assert.doesNotMatch(panelSource, /navigation/i);
+  assert.doesNotMatch(section, /wind[^.]*navigation|navigation[^.]*wind/i);
+  // Precipitable water: the issuer's field name, level words and unit, what the shade is and is not. It is never
+  // named as a weather feature, a rain amount or a movement of moisture, and no definition of it ships without the
+  // issuer's own sentence and link.
+  const water = FLOW_TECHNICAL_NOTES.find((note) => note.startsWith('Precipitable water'));
+  for (const sentence of [
+    'Precipitable water is the NOAA GFS field "PWAT: entire atmosphere (considered as a single layer)", in kg m-2 as the issuer gives it: a column total at one model instant, on a 1.0 degree grid.',
+    'Model output, not an observation.',
+    'The white shade is drawn by DDM from those values and is not a NOAA image.',
+    'Its steps are display bins chosen by DDM, not thresholds and not issuer classes.',
+    'The shade holds still: it does not show rain, and it does not show which way moisture is moving.'
+  ]) {
+    assert.ok(water.includes(sentence), sentence);
+  }
+  assert.ok(section.includes(water.replace(/"/g, '&quot;')), 'the paragraph reads under the control\'s heading');
+  assert.doesNotMatch(water, /atmospheric river|\briver\b|transport|warning|forecast|plume|\bmm\b|millimet|flood|storm/i);
+  assert.doesNotMatch(water, /under 15|15 to 30|45 or more/, 'the bins stay in the key');
+  for (const words of [FLOW_WORDS.bins.pwat, FLOW_WORDS.source.pwat, FLOW_WORDS.provenance.pwat, FLOW_WORDS.unavailable.pwat]) {
+    assert.doesNotMatch(words, /atmospheric river|transport|warning|forecast|\bmm\b/i, words);
+  }
+  // The currents credit, its dated-frame sentence and its disclaimer read here, never in the key; the two boxes
+  // it states are the committed frame's own grids, so a landing that changes a grid fails here.
+  const { gridBoxWords } = await import('../src/layers/enso-flow-data.ts');
+  const frame = JSON.parse(readFileSync(join(ROOT, 'public', 'data', 'rtofs-surface-currents.json'), 'utf8'));
+  assert.equal(frame.grids.length, 2);
+  for (const grid of frame.grids) assert.ok(section.includes(`${grid.dlat} degree from ${gridBoxWords(grid)}`.replace(/^1 /, '1.0 ')), grid.id);
+  for (const sentence of [
+    'Ocean currents are model output: surface currents from the NOAA/NCEP Global RTOFS ocean model, re-encoded by DDM.',
+    'one dated frame',
+    'never joined',
+    'Not for navigation.'
+  ]) {
+    assert.ok(section.includes(sentence), sentence);
+  }
+  const flowWords = () => readFileSync(join(ROOT, 'src', 'layers', 'enso-flow-data.ts'), 'utf8');
+  assert.doesNotMatch(flowWords(), /Not for navigation|never joined/, 'the key keeps only the short credit');
+  assert.doesNotMatch(flowWords(), /Line pace shows|Lines show the modeled flow|Model output, not an observation|Display bins, not thresholds|The marks move in the direction/);
+});
+
+test('the notes, qualifications and credits of the layers on the map read in Technical information, from their own builders', async () => {
+  const { renderMapTechnicalInformation } = await import('../src/ui/map-technical-information.ts');
+  const { LEGEND_ORDER, hideLegend, renderSwatchLegend, showLegend } = await import('../src/ui/legend-registry.ts');
+  const { HMS_VOLUME_QUALIFICATION } = await import('../src/config/wildfire-presentation.ts');
+  const { PERIMETER_RIBBON_QUALIFICATION } = await import('../src/config/fire3d-presentation.ts');
+  // Just enough DOM for the builders: innerHTML and append, as a real element serializes them.
+  const element = (tag) => ({
+    tag, className: '', dataset: {}, textContent: '', innerHTML: '',
+    append(...children) { this.innerHTML += children.map((child) => child.outerHTML).join(''); },
+    get outerHTML() {
+      const data = Object.keys(this.dataset).map((name) => ` data-${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}=""`).join('');
+      return `<${this.tag} class="${this.className}"${data}>${this.textContent.replace(/&/g, '&amp;')}</${this.tag}>`;
+    }
+  });
+  const savedDocument = globalThis.document;
+  globalThis.document = { createElement: element, getElementById: () => null };
+  const keys = ['hms-smoke-volume', 'nifc-perimeter-ribbon', 'power-context', 'telemetry', 'nws-alerts', 'whp-2023'];
+  try {
+    assert.ok(!renderMapTechnicalInformation().includes('Notes for the layers on the map'), 'no layer on the map, no heading');
+    const credit = 'Power plants: Source: U.S. Energy Information Administration (reporting period 2025-06), Forms EIA-860/860M, via the Esri Federal User Community (ArcGIS Living Atlas) copy.';
+    showLegend('hms-smoke-volume', { order: 1, render: (body) => renderSwatchLegend(body, 'Smoke volume (3D view)', [], HMS_VOLUME_QUALIFICATION) });
+    showLegend('nifc-perimeter-ribbon', { order: 2, render: (body) => renderSwatchLegend(body, 'Perimeter ribbon (3D view)', [], PERIMETER_RIBBON_QUALIFICATION) });
+    showLegend('power-context', {
+      order: 3,
+      render: (body) => {
+        renderSwatchLegend(body, 'Power infrastructure', [], 'Not comprehensive or current.');
+        const line = element('p');
+        line.className = 'legend-note legend-credit';
+        line.dataset.powerCredit = '';
+        line.textContent = credit;
+        body.append(line);
+      }
+    });
+    showLegend('telemetry', {
+      order: 4,
+      render: (body) => {
+        renderSwatchLegend(body, 'Monitoring stations', [], 'Featured stations keep their own marker colors.');
+        body.innerHTML += '<p class="legend-note legend-ddm-notice"><span class="ack-notice-label">DDM notice:</span> Public-view station data</p>';
+      }
+    });
+    showLegend('nws-alerts', { order: 5, render: (body) => renderSwatchLegend(body, 'Heat & fire weather alerts', [], 'Active National Weather Service products. As of 9:00 AM.') });
+    const { WHP_3D_SHADE_QUALIFICATION } = await import('../src/config/whp-shade.ts');
+    showLegend('whp-2023', { order: 6, render: (body) => renderSwatchLegend(body, 'Wildfire Hazard Potential', [], WHP_3D_SHADE_QUALIFICATION) });
+    const html = renderMapTechnicalInformation();
+    assert.equal(html.replace(/&#039;/g, "'").split(WHP_3D_SHADE_QUALIFICATION).length - 1, 1, 'the 3D hazard shade sentence is read once');
+    const section = html.slice(html.indexOf('<h4>Notes for the layers on the map</h4>'));
+    assert.ok(section.startsWith('<h4>'), 'one heading');
+    for (const sentence of [HMS_VOLUME_QUALIFICATION, PERIMETER_RIBBON_QUALIFICATION, 'Not comprehensive or current.', 'Featured stations keep their own marker colors.', credit]) {
+      assert.ok(section.replace(/&#039;/g, "'").includes(sentence), sentence);
+    }
+    assert.ok(section.includes('<strong>Power infrastructure.</strong> Not comprehensive or current.'), 'a note names its layer');
+    assert.ok(!section.includes('Public-view station data'), 'the RAWS notice stays in Acknowledgements');
+    assert.ok(!section.includes('Active National Weather Service products'), 'a note the briefing already carries is not read twice');
+    hideLegend('hms-smoke-volume');
+    assert.ok(!renderMapTechnicalInformation().includes(HMS_VOLUME_QUALIFICATION), 'a layer taken off the map takes its note with it');
+    // An open briefing follows the map: the wrapper is rewritten when a legend comes or goes.
+    const wrapper = { innerHTML: '' };
+    globalThis.document.getElementById = (id) => (id === 'impact-technical-layer-notes' ? wrapper : null);
+    showLegend('hms-smoke-volume', { order: 1, render: (body) => renderSwatchLegend(body, 'Smoke volume (3D view)', [], HMS_VOLUME_QUALIFICATION) });
+    assert.ok(wrapper.innerHTML.includes('Smoke volume (3D view)'), 'a layer turned on after render adds its note');
+    hideLegend('hms-smoke-volume');
+    assert.ok(!wrapper.innerHTML.includes('Smoke volume (3D view)'), 'a layer taken off after render drops its note');
+  } finally {
+    for (const key of keys) hideLegend(key);
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
+});

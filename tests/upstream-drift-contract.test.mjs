@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -6,13 +7,18 @@ import { join, relative } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
+import { stripComments } from './pure-lane-inventory.test.mjs';
 import {
   ARCGIS_FIELD_PROBES,
   DRIFT_TIERS,
   EXPECTED_WORKER_REVISION,
   OUT_FIELDS_SENDERS_COVERED_ELSEWHERE,
+  RETIRED_ALERT_PRODUCTS,
   buildFieldProbeEntries,
+  buildProductProbeEntry,
+  check,
   checkFieldSchema,
+  checkProductNames,
   classifyDriftResults,
   extractOutFields,
   extractUrls,
@@ -124,6 +130,27 @@ test('EXPECTED_WORKER_REVISION is truly wired to readWorkerRevision(), not a har
   assert.equal(EXPECTED_WORKER_REVISION, readWorkerRevision(source));
 });
 
+// The Worker source as last revised: sha256 of workers/proxy/src/index.ts
+// with CRLF read as LF. Two behaviour changes once shipped under one
+// revision string, so /healthz could not tell those Workers apart.
+// shortcut: any edit (comments too) needs a re-pin; an editor could re-pin the hash alone, so review that the revision moved with it.
+const WORKER_SOURCE_PIN = {
+  revision: '2026-10-13-query-pin-v7',
+  sha256: '66b6e74f9c9ef19a4f30c697904a01c2565144fcf28d968b3538aaf58f373a52',
+};
+
+test('an edit to the Worker source changes WORKER_REVISION in the same commit', async () => {
+  const source = (await readFile(new URL('../workers/proxy/src/index.ts', import.meta.url), 'utf8')).replaceAll('\r\n', '\n');
+  const current = { revision: readWorkerRevision(source), sha256: createHash('sha256').update(source).digest('hex') };
+  assert.deepEqual(
+    current,
+    WORKER_SOURCE_PIN,
+    current.revision === WORKER_SOURCE_PIN.revision
+      ? 'workers/proxy/src/index.ts changed under the same WORKER_REVISION: give it a new revision, then pin both values here'
+      : 'WORKER_REVISION moved: pin the new revision and the source hash here',
+  );
+});
+
 test('recognizes only complete, bound soil drift inputs', () => {
   const normalize = (value) => value.replaceAll('\\', '/');
   const stateFor = (paths) =>
@@ -197,6 +224,19 @@ test('candidate failures are warnings while runtime and build failures block', (
   assert.deepEqual(classified.skipped.map(({ key }) => key), [
     'landscapeSoilVintage',
   ]);
+});
+
+test('the Wildfire 3D ground\'s NOAA STAR land-cover template, kept out of the catalog chunk, is still extracted and probed at the runtime tier', async () => {
+  const read = (path) => readFile(new URL(path, import.meta.url), 'utf8');
+  const entries = extractUrls(await read('../src/config/dryness-ground.ts'));
+  assert.deepEqual(entries.map(({ key, tier }) => ({ key, tier })),
+    [{ key: 'starLandCoverTileTemplate', tier: DRIFT_TIERS.RUNTIME }]);
+  // The probe substitutes {z}, {x} and {y}; nothing else is templated.
+  assert.equal(entries[0].url,
+    'https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/image_mapTile.php?type=ancillary//IGBPlandtype&Z={z}&X={x}&Y={y}');
+  // The monitor reads that file with the catalog, and the catalog does not carry the key a second time.
+  assert.match(await read('../scripts/check-upstream-drift.mjs'), /readFile\(DRYNESS_GROUND_URLS_PATH, 'utf8'\)/);
+  assert.ok(!extractUrls(await read('../src/config/urls.ts')).some(({ key }) => key === 'starLandCoverTileTemplate'));
 });
 
 test('the current URL registry keeps representative lifecycle tiers distinct', async () => {
@@ -283,6 +323,54 @@ test('checkFieldSchema turns a pjson body into a tripwire miss or a present note
   assert.match(checkFieldSchema(['DM'], '{"name":"x"}').miss, /no fields array/);
 });
 
+test('the WWA product probe checks every product a mode names against the renderer, and a renamed one fails the run', async () => {
+  const urls = await readFile(new URL('../src/config/urls.ts', import.meta.url), 'utf8');
+  const entry = await buildProductProbeEntry(extractUrls(urls));
+  assert.equal(entry.key, 'products:nwsWwaMapServer');
+  assert.match(entry.url, /\/WWA\/watch_warn_adv\/MapServer\/1\?f=json$/);
+  assert.equal(entry.tier, DRIFT_TIERS.RUNTIME);
+  const { HAZARD_CLUSTERS } = await import('../src/config/clusters.ts');
+  const named = new Set(Object.values(HAZARD_CLUSTERS).flatMap((def) => def.alerts?.events ?? []));
+  assert.deepEqual(new Set([...entry.productsExpected, ...RETIRED_ALERT_PRODUCTS]), named);
+  const renderer = (names) => JSON.stringify({ drawingInfo: { renderer: { uniqueValueInfos: names.map((value) => ({ value, label: value })) } } });
+  const all = entry.productsExpected.length;
+  assert.deepEqual(checkProductNames(entry.productsExpected, renderer(entry.productsExpected)), { miss: null, note: `${all}/${all} requested products in the renderer` });
+  assert.match(checkProductNames(['Flood Warning', 'High Wind Watch'], renderer(['Flood Warning'])).miss, /products not in the renderer: High Wind Watch$/);
+  assert.match(checkProductNames(['Flood Warning'], '{"error":{"code":400,"message":"Invalid URL"}}').miss, /ArcGIS error 400/);
+  assert.match(checkProductNames(['Flood Warning'], '<html>').miss, /not JSON/);
+  assert.match(checkProductNames(['Flood Warning'], '{"fields":[]}').miss, /no renderer value list/);
+  await assert.rejects(buildProductProbeEntry([]), /disarmed/);
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(renderer(entry.productsExpected.slice(1)), { status: 200, headers: { 'content-type': 'application/json' } });
+    const result = await check(entry);
+    assert.equal(result.ok, false);
+    assert.match(result.detail, new RegExp(`TRIPWIRE: products not in the renderer: ${entry.productsExpected[0]}`));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('the bounded NLCD coverage probe rejects HTTP 200 OGC exceptions and requires TIFF bytes', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    for (const [body, type, expected] of [
+      ['<ows:ExceptionReport><ows:ExceptionText>Could not understand version:1.0.0</ows:ExceptionText></ows:ExceptionReport>', 'application/xml', false],
+      ['<ows:ExceptionReport/>', 'image/tiff', false],
+      ['II*\0fixture', 'image/tiff; application=geotiff', true],
+      ['MM\0+fixture', 'application/octet-stream', true],
+    ]) {
+      globalThis.fetch = async () => new Response(body, { status: 200, headers: { 'content-type': type } });
+      const result = await check({ key: 'landscapeNlcdPinnedTime', url: 'https://coverage.example.test/wcs' });
+      assert.equal(result.ok, expected, type);
+      assert.equal(result.tier, DRIFT_TIERS.BUILD);
+      if (!expected) assert.match(result.detail, /TRIPWIRE:.*did not return TIFF bytes/);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('every ArcGIS field probe names a runtime URLS key, an existing module, and resolves its field list', async () => {
   const urls = await readFile(new URL('../src/config/urls.ts', import.meta.url), 'utf8');
   const urlEntries = extractUrls(urls);
@@ -335,6 +423,41 @@ test('buildFieldProbeEntries throws on an unresolvable list instead of skipping 
   await rm(root, { recursive: true, force: true });
 });
 
+// Pinned, alphabetically sorted (DDM-P15-T08). An added or removed outFields
+// sender must name itself here, so the walk below fails on the exact file
+// rather than a floor number a coincidental new sender could satisfy
+// quietly. Derived 2026-09-12 by running the stripped walk once: 21 files,
+// the same 21 the raw-text grep found, none of them comment-only.
+const OUT_FIELDS_SENDERS = [
+  'src/config/place-catalog.ts',
+  'src/config/station-registry.ts',
+  'src/config/urls.ts',
+  'src/impact/sources.ts',
+  'src/impact/water-supply.ts',
+  'src/layers/aiannh.ts',
+  'src/layers/bc-drought.ts',
+  'src/layers/bia-reservations.ts',
+  'src/layers/cpc-seasonal-read.ts',
+  'src/layers/drought.ts',
+  'src/layers/heatrisk.ts',
+  'src/layers/hms-smoke.ts',
+  'src/layers/nifc-fires.ts',
+  'src/layers/nws-alerts.ts',
+  'src/layers/power-3d.ts',
+  'src/layers/public-lands.ts',
+  'src/layers/spc-fire-weather.ts',
+  'src/layers/tribal-streets.ts',
+  'src/layers/tropical-read.ts',
+  'src/layers/usdm.ts',
+  'src/map/satellite.ts',
+  'src/state/display-snapshot.ts',
+  'src/state/watershed-geometry.ts',
+  'src/ui/heatrisk-sequence.ts',
+  'src/ui/island/place-studio.tsx',
+  'src/ui/search-controller.ts',
+  'src/util/bcws-perimeter-read.ts',
+];
+
 test('every src file that sends outFields is probed or explicitly accounted for', async () => {
   const root = new URL('../', import.meta.url);
   const probed = new Set(ARCGIS_FIELD_PROBES.map((p) => p.file));
@@ -344,13 +467,21 @@ test('every src file that sends outFields is probed or explicitly accounted for'
     for (const entry of await readdir(dir, { withFileTypes: true })) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) await walk(path);
-      else if (/\.(ts|tsx)$/.test(entry.name) && /\boutFields\b/.test(await readFile(path, 'utf8'))) {
+      else if (
+        /\.(ts|tsx)$/.test(entry.name) &&
+        /\boutFields\b/.test(stripComments(await readFile(path, 'utf8')))
+      ) {
         senders.push(relative(fileURLToPath(root), path).replaceAll('\\', '/'));
       }
     }
   }
   await walk(fileURLToPath(new URL('src/', root)));
-  assert.ok(senders.length >= 15, `expected the runtime's outFields senders, found ${senders.length}`);
+  senders.sort();
+  assert.deepEqual(
+    senders,
+    OUT_FIELDS_SENDERS,
+    'the outFields sender set moved; name the added or removed file in OUT_FIELDS_SENDERS'
+  );
   const missing = senders.filter((file) => !accounted.has(file));
   assert.deepEqual(missing, [], 'outFields senders with neither a probe row nor a recorded reason');
   for (const file of Object.keys(OUT_FIELDS_SENDERS_COVERED_ELSEWHERE)) {

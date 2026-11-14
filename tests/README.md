@@ -24,71 +24,196 @@ on port 4173, the suite fails instead of reusing an unattributed build.
 
 ## The local verification ladder
 
-Three commands a person types, cheapest first. Every duration below was measured
-on 2026-09-01 on the developer laptop (Windows 11, 13th Gen i5-1340P, 32 GB,
-Chromium on ANGLE over SwiftShader, `--workers=1`), except where it says
-inferred. Re-measure these when the suite grows; a stale number here is worse
-than no number.
+Choose verification for the changed behavior. The scripts in `package.json`
+are the executable rosters. The exported `PURE_SPECS` roster in `playwright.config.ts`
+supplies pure-lane membership and the browser matrix exclusions.
+Avoid copying spec counts and runtime estimates into several documents.
 
-| Script | What it runs | Duration |
+| Work being checked | Command | Scope |
 | --- | --- | --- |
-| `npm run verify:quick` | `typecheck`, `scan:emdash`, `check:vocabulary`, `check:coverage` | about 5 s |
-| `npm run verify:pure` | the twelve browser-free spec files under `playwright.pure.config.ts`, no build, no server | seconds |
-| `npm run verify:smoke` | `gate` plus the twelve smoke specs, `--workers=1` | about 5 to 6 min |
-| `npm run test:serial` | all tests, all three projects, one worker | 31.1 min measured 2026-09-03 with the boot-idle seam (894 tests; 23.9 min before the seam, which makes every boot wait for real idle) |
+| A change needing the combined source checks | `npm run verify:quick` | Types, vocabulary, coverage and punctuation; no browser or build |
+| Pure logic | `npm run verify:pure -- tests/layer-order.spec.ts` | Selected source-level cases; omit the selector for the whole pure lane |
+| Source checks without a bundle | `npm run gate:nobuild` | Types and all source checks, including the pure lane |
+| A red that reading the code cannot explain | `npx playwright test --workers=1 -g "case title"` | Fresh production build and the one case, with every diagnostic in the first run |
+| A needed local check of touched browser behavior | `npm run test:touched` | The specs `npm run spec:impact` lists as touched; refuses none, more than 12, or a held port 4173 or 4180 |
+| Cross-cutting build/configuration changes | `npm run gate` | Fresh build, artifact budgets and all source checks |
+| The full suite | `gh workflow run validate.yml --ref <branch>` | GitHub's fourteen shards; `npm run test:serial` is not a local step |
 
-`verify:quick` is the save-and-think loop. No build, no network, no browser.
+The full browser suite normally runs on GitHub, in the Validate workflow, which
+slices it into fourteen shards. When full integration is needed and no matching run
+exists, use an existing PR's run or, without a PR, dispatch
+`gh workflow run validate.yml --ref <branch>`. The normal application landing route
+requires that integration evidence. Proxy-only pull requests run the proxy typecheck,
+audit and client-contract/receipt tests without the application, terrain,
+landscape or browser suites. Docs outside the artifact report Validate without
+application jobs. Named browser dispatches run only those specs. An empty
+dispatch requests full integration. A local `test:serial` takes more than an
+hour and is not a local step: the full suite is GitHub's.
 
-`verify:pure` (DR-052 b) is the same loop for the pure logic under `src/`: the
-spec files that never ask for a page run against the source directly, in
-seconds, because the pure config has no `webServer` and so no build and no
-preview to wait behind. They also run inside `test:serial` under the main
-config, so nothing is proven only here. Membership is enforced by
-`tests/pure-lane-inventory.test.mjs` under `check:all`: a listed file that
-grows a browser case fails the inventory, and leaves the list.
-`check:vocabulary` and `check:coverage` are the two that catch a config-table
-edit drifting from its documentation, which is the most common silent break
-here, and `scan:emdash` enforces hard rule 9 before it reaches a diff.
+`npm test` runs the same three assertion projects with the configured worker
+count. Keep one browser runner at a time. The pure lane starts no browser or
+preview; its execution inside the smoke gate finishes before preview starts.
+Run `npm run verify:pure` without selectors to check all of its source-level cases.
 
-`verify:smoke` is the before-you-hand-it-over loop. Its twelve specs are
-`boot`, `ux1-surfaces`, `url-state`, `cluster-controller-integration`,
-`temporal-axis`, `impact-panel-a11y`, `legend`, `conditions-strip`,
-`mobile-sheet`, `embed-viewport`, `interface-responsive`, and `s4-minimap`:
-about 105 tests covering map lifecycle, role-group order and surface
-exclusivity, URL-as-state, cluster switching, the time controls, the briefing
-modal, the unified legend, the honest off states, the phone sheet, the embed
-viewports, the 720 px boundary, and the minimap framings. One build, one
-preview.
+### Iteration and session closeout
 
-`test:serial` is the integration branch's final pass before a push to main, not
-a routine loop.
+Run affected tests while developing. Pure logic belongs in the pure lane when it
+does not require rendering, navigation or a real browser. Keep browser cases that
+prove the production wiring and user behavior. The pure inventory check rejects
+browser fixtures and boot helpers; the lane's execution catches imported DOM
+dependencies. All these cases remain in the full suite.
 
-When fire or 3D changed, run those two specs directly before you push. They are
-excluded from `verify:smoke` because together they are longer than the rest of
-the smoke set combined (about 20 min inferred; `fire3d-mode` alone measured
-11.1 min):
+The popup PF3 cases partition migrated builders between the generic loop and
+the dedicated M26b rows. Run both groups when checking the complete tier contract;
+each builder keeps its own fresh page and runs each fixture method once. Tests
+that require a live layer or date rail must install positive fixtures explicitly;
+the offline backstop's error response cannot establish those preconditions.
 
+While developing, choose the smallest named checks that cover the change.
+Use `npm run typecheck` for TypeScript changes and the affected browser-free
+tests for logic. Commit and push pieces without repeating a gate per commit.
+GitHub's integration run includes the gate; do not duplicate it locally unless
+a specific diagnosis needs it. The table offers choices, not a required sequence.
+
+A browser run only when nothing simpler can answer the question. A wording,
+configuration, size or pure-logic change never needs one. When one is needed:
+the fewest cases (`-g`), every diagnostic in the first run, at most one
+confirming run when the piece is finished. `verify:smoke`, whole Playwright
+projects, the Fire pair and repeat runs are not local steps: the full suite
+runs on GitHub at a real integration/release boundary or for a specific broad
+regression risk. A block, commit, push or new session is not an automatic suite trigger.
+Explain the scope first. Reuse complete passing evidence when source, dependencies,
+configuration, relevant inputs and main base match. Reuse independent review coverage;
+review material uncovered changes once. Inspect existing runs
+before dispatching: an open PR already triggers Validate on each push, and its
+synthetic merge commit is different from a manually dispatched branch tip.
+Batch fixes before validating a new candidate. An unchanged infrastructure
+failure needs only justified failed jobs retried, subject to the owner's run guard.
+After a code fix, run its focused regression before any necessary new integration.
+An explicitly authorized direct delivery may use a stated narrower check scope,
+subject to repository protection; report its limits without claiming full integration.
+Never call skipped checks passed.
+
+A block's own specs (owner, 2026-10-19). `npm run spec:impact` reads the
+block's commits (`<base>...HEAD`, the base defaulting to the merge base with
+`origin/main`, `--base <ref>` to choose; it reads commits, so commit first).
+It prints every spec line that still names a string, attribute value, class
+token or visible text the block removed from `src/` or `index.html` and that
+HEAD's code no longer has anywhere (a mention left in a comment does not
+count; likely absence checks are listed apart and not counted), then the
+touched specs: specs the block changed, specs with such a mention, and specs
+that import a changed `src/` module or test helper directly (the measurement
+specs are left out). It catches text deleted everywhere, not text the block
+moved or reworded: a spec asserting a label that now reads differently still
+needs the targeted run to find it. It also adds a few fixed specs when the
+block touches shared style or markup (`src/styles/`, `index.html`), a map key,
+legend, dock or minimap component, or the test seam (`tests/helpers.ts`,
+`tests/offline-test.ts`, `playwright.config.ts`), and prints which rule added
+each; the sets (`CROSS_CUTTING` in `scripts/spec-impact.mjs`) come from the
+0.7.7 reds, six specs in all, and are a guess at ownership, not a dependency
+graph. `MODULE_SPECS` beside it maps, by hand, modules the specs reach only
+through the built app (`src/main.ts`, the interaction coordinator, the time
+bar and others) to at most five specs each; a new spec for one of them is
+added there by hand. It exits 1 while a counted mention remains; `--list`
+prints only the touched paths. Choose the needed evidence:
+
+1. For changed browser behavior, choose a local focused check or a targeted
+   GitHub run: after the authorized push, `npm run spec:impact -- --dispatch` (add
+   `--base <ref>` as above). It dispatches Validate on the checked-out branch
+   with the touched list as `specs`, and refuses an empty list (that would be
+   the full run), a detached HEAD, or a HEAD that is not the pushed tip. Every
+   shard runs only its slice of the named files; the run's name says it is not
+   a landing run.
+2. Before a needed full dispatch, run `npm run spec:impact` with no counted
+   mention left. Reuse passing focused evidence; `npm run test:touched` is an
+   option when a local browser check is needed, not a mandatory extra run.
+3. At an application integration or release boundary, use the full Validate
+   run with no `specs`, once. Reuse a matching full green rather than dispatch
+   a duplicate. A targeted browser pass is not full landing evidence.
+
+A session ending is not a new application verification event. Do not start
+`verify:smoke` or `test:serial` solely because the session is ending, or rerun
+an unchanged candidate just to recover context. A report says what ran and what
+happened, including unfinished checks and failures. The detailed record (commit,
+build SHA, run id) is kept for the release candidate only.
+
+For documentation-only work, check the changed text and public-tree policy.
+For verification-tooling work, run the relevant lane/configuration tests, types,
+the gate when build orchestration changes, and a focused execution of the changed
+browser startup path. A tooling check does not establish application readiness.
+
+After shared navigation, map lifecycle or state changes, choose local or remote
+focused browser cases when needed; full integration on GitHub covers the rest
+at the landing boundary.
+
+### 3D diagnosis
+
+The 3D specs run on a software renderer by default (it is what GitHub has),
+and under it the scene freezes the page for 8 to 26 seconds at a time. To
+explain a 3D red locally, use real graphics instead:
+
+```powershell
+$env:DDM_3D_NATIVE_GPU = '1'
+npx playwright test --workers=1 --project=chromium-3d tests/wildfire3d-ground.spec.ts -g "<the case>"
+Remove-Item Env:DDM_3D_NATIVE_GPU
 ```
-npx playwright test --workers=1 tests/fire3d-mode.spec.ts tests/view-contracts.spec.ts
-```
 
-Two underlying checks sit beneath the three commands. `npm run gate` is the
-deterministic backbone, 17 steps in about 40 s, and it is what CI runs.
-`npm run gate:nobuild` is the same backbone minus the three steps that need a
-build: it typechecks (`tsc --noEmit` emits nothing and needs no `dist/`) and
-runs the fourteen steps that read only source and `public/`, skipping `vite
-build`, `check:bundle`, and `check:activation`, the only two steps that read
-`dist/`. Measured at about 19 s. Use it when nothing you changed can move the
-bundle; use `gate` before you hand work over.
+It opens a browser window and uses Direct3D. Measured 2026-10-11 on two cases
+of `wildfire3d-ground.spec.ts`: 12 seconds, against about 2.5 minutes on the
+software renderer. It is for diagnosis only: timing-sensitive behavior can
+differ, so GitHub's software-renderer run remains the evidence. The Fire pair
+(`tests/fire3d-mode.spec.ts` with `tests/view-contracts.spec.ts`) is GitHub's
+to run, not a local step.
 
-Neither step list is written twice. `npm run check:all` holds the fourteen
-shared steps; `gate` is `build && check:bundle && check:activation &&
-check:all` and `gate:nobuild` is `typecheck && check:all`, so the two doors
-cannot drift apart.
+### One build per smoke invocation
 
-`npm run check:links` exists but is wired into no gate and no workflow. It is
-not part of any tier above, and it may reach the network. Treat a green
-`check:links` as an unratified extra, not as coverage.
+`verify:smoke` uses `playwright.smoke.config.ts`. Its owned server command runs
+`npm run gate && npm run preview -- --host 127.0.0.1 --strictPort`: gate builds
+and checks the artifact, then preview serves that same output. A failed gate
+prevents preview startup. The ordinary Playwright config still builds for direct
+targeted runs. Neither path reuses a pre-existing listener or accepts a stale
+`dist/` through a skip-build flag.
+
+`check:all` is the shared source-check list. `gate` adds the production build,
+bundle check and activation check; `gate:nobuild` typechecks instead and does not
+certify an artifact. Do not run `gate` immediately before `verify:smoke`:
+smoke already owns it.
+
+Within `check:all`, adjacent compatible Node tests share a literal
+`node --test --test-concurrency=1` command. Each file retains its default
+subprocess isolation; Node orders files within each group. Non-Node checks
+remain between the same groups, and the NIFC model keeps its separate
+`--experimental-transform-types` invocation. A focused check is
+`node --test tests/<file>.test.mjs`. A failed group stops the `&&` chain before later
+checks or preview startup.
+
+The full serial suite runs on GitHub. If GitHub is unavailable, preserve the
+local gate and focused-test results until the full run can complete there.
+
+A build SHA or dirty marker alone does not establish equivalent inputs. For a
+release candidate, record the commit, build SHA and GitHub run id of the run
+that passed, and attribute the result to the candidate that actually ran it.
+
+`npm run check:links` is outside these gates and can reach the network. It is
+not a substitute for any assigned verification.
+
+
+### tests/ is typechecked too (`npm run typecheck:tests`)
+
+`tsconfig.tests.json` (repository root) typechecks every file under `tests/`
+plus the base, pure and smoke Playwright configs, with the
+Playwright, `node:test`, and Cloudflare Workers types each spec needs; it
+never weakens a strict flag from the production `tsconfig.json`, and that
+file's own `include` (`src/**` only) is untouched. `npm run typecheck:tests`
+runs it and then proves the negative side of the acceptance sentence:
+`tests/types/context-literal-typo.ts`, a hand-built `BoundarySelectionContext`
+literal missing its required `containing` field, must FAIL to compile under
+its own `tests/types/tsconfig.context-literal-typo.json`
+(`tests/types/check-context-literal-typo.mjs` asserts exactly that, the same
+inverted-pass/fail pattern `scripts/check-key-types.mjs` uses for
+`tests/types/key-typos.ts`). Both fixture files are excluded from
+`tsconfig.tests.json`'s own `include` on purpose. `typecheck:tests` is the
+last step in `check:all`.
 
 ### The evidence capture pass (`DDM_CAPTURE_EVIDENCE=1`)
 
@@ -132,25 +257,33 @@ Error: http://127.0.0.1:4173 is already used, make sure that nothing is
 running on the port/url or set reuseExistingServer:true in config.webServer.
 ```
 
-Do not set `reuseExistingServer: true`. Find the orphan and stop it.
+Keep `reuseExistingServer: false`. Before stopping a listener, establish which
+run and workspace own it using process metadata and available run records.
+The port number and `node.exe` name alone do not establish ownership.
 
-```powershell
-# PowerShell 7
-Get-NetTCPConnection -LocalPort 4173 -State Listen |
-  Select-Object -ExpandProperty OwningProcess |
-  ForEach-Object { Get-Process -Id $_ }        # confirm it is node.exe
-Get-NetTCPConnection -LocalPort 4173 -State Listen |
-  ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
-```
+If it belongs to an active or unidentified run, coordinate with its owner.
+Stop only a positively identified orphan from your own ended run, and recheck
+its PID and start time immediately before stopping it. Apply the same ownership
+check to leftover headless browsers; CPU use alone is insufficient.
 
-```bash
-# Git Bash equivalent
-netstat -ano | grep -E 'LISTENING' | grep ':4173'   # last column is the PID
-taskkill //PID <pid> //F
-```
+## The citation manifest
 
-A killed run can also leave a `chrome-headless-shell.exe` behind; it holds no
-port and exits on its own, so stop it only if it is burning CPU.
+`tests/enso-citations.spec.ts` asserts that each Pacific Northwest ENSO tilt
+sentence links the source its own text claims. It checks that against
+`tests/fixtures/citation-manifest.json`, a small tracked copy of the three
+entries the spec needs, rather than against the private references ledger,
+`planning/references/register.yaml`, which is a directory junction into a
+private repository and is absent from the public tree and from CI. That
+keeps the spec's own assertion true in every environment it runs in,
+including CI, where the junction does not exist.
+
+`npm run check:citations` (`scripts/check-citation-manifest.mjs`, part of
+`check:all`) is what still holds the tracked manifest and the private ledger
+in agreement. Where the ledger is present, such as on the maintainer's
+machine through the junction, it compares every manifest entry's URL against
+the ledger's and fails on any disagreement or missing id. Where the ledger
+is absent, it reports that honestly, "private ledger unavailable", and
+exits clean rather than assuming agreement it cannot check.
 
 ## What it asserts, and what it deliberately does not
 
@@ -166,8 +299,6 @@ Two doctrines shape the coverage.
    - `ux1-surfaces.spec.ts` - the four role groups render in order; condition
      surfaces are mutually exclusive; an old multi-surface link resolves to
      the first surface named; a deactivated surface clears its pill.
-   - `ux2-presets.spec.ts` - the five preset chips render in order; a preset
-     replaces the active layer set and holds the one-surface-at-a-time rule.
    - `url-state.spec.ts` - region and layers restore from a deep link; a
      toggle round-trips through the URL and a second toggle-on reuses the
      cached lazy-loaded module; embed mode survives a re-sync; expanding the
@@ -193,13 +324,11 @@ judgment call rather than a red CI run. The telemetry spec here asserts only
 the honest-status contract (terminal, not a specific number), which is what a
 regression would actually break.
 
-Pull requests run the deterministic root gate and Worker typecheck (without
-deploying the optional Worker) beside the browser suite; the Pages workflow
-runs the root gate and build beside the same browser suite, and deploys only
-when both have passed. Run focused affected specs during development and
-`npm run test:serial` when a change affects shared navigation, map lifecycle,
-state, or release readiness. The verification ladder above wraps that advice
-into four named scripts.
+Validate runs the deterministic root gate and Worker checks beside the browser
+suite. Pages builds and gates the publication artifact, publishes it, and then
+runs the live proof; it does not repeat the candidate's browser suite. Use the
+focused and bounded touched-spec checks described above while developing.
+The full GitHub suite covers the frozen candidate once.
 
 ## How CI runs the suite
 
@@ -218,18 +347,19 @@ first attempt locally with no retries, and in Validate runs 33452141530 and
 (1m33s and 2m00s, then 1m48s and 2m29s). The isolation may simply have worked.
 The grouping stays until something is measured that says otherwise, but nobody
 should read it as a standing claim that these specs flake today. `chromium-3d`
-holds `fire3d-mode.spec.ts` and
-`view-contracts.spec.ts`, the two files whose 3D cases build terrain, a sky, a
+holds `fire3d-mode.spec.ts`,
+`view-contracts.spec.ts` and `wildfire3d-ground.spec.ts` (`FIRE3D_SPECS` in the
+config), the files whose 3D cases build terrain, a sky, a
 smoke volume, and context tiles on the software renderer and carry their own
 120 to 180 second budgets (the Node-level cases in `fire3d-mode` and the
 three non-3D contract rows ride along; the split is by file, and all three
-projects use the same browser settings). Locally, `npm test` and `npm run
-test:serial` run all three projects, so coverage is the same in either seat.
+projects use the same browser settings). `npm test` and `npm run test:serial`
+select all three projects, but the full suite runs only on GitHub.
 
-In CI (`.github/workflows/browser-suite.yml`, called by both Validate and the
-Pages deploy) each project is sliced with `--shard=i/n` onto its own runners,
-one worker each: four shards for `chromium`, two for `chromium-interaction`,
-two for `chromium-3d`. Each runner builds and serves its own `dist/`, so no
+In CI (`.github/workflows/browser-suite.yml`, called by Validate and run weekly
+on main) each project is sliced with `--shard=i/n` onto its own runners,
+one worker each: eight shards for `chromium` (four until 2026-10-12), two for `chromium-interaction`,
+four for `chromium-3d` (two until 2026-10-12). Each runner builds and serves its own `dist/`, so no
 shard reads another's state. Each page is its own software-GL MapLibre
 context, so more runners is the lever; more workers per runner is not (see
 the `workers` note in the config, and the `workers`/`retries` experiment
@@ -238,29 +368,31 @@ Public-repo standard runners are 4 vCPU / 16 GB, not the 2-core machine an
 older comment here assumed; that assumption was measured on a developer
 laptop and has never been re-tested on CI.
 
-Counts, re-measured with `npx playwright test --list --project=<p>` on
-`d5aaac1` (2026-09-01): `chromium` **778** tests in 101 files over 4 shards,
-`chromium-interaction` **42** tests in 4 files over 2 shards, `chromium-3d`
-**32** tests in 2 files over 2 shards. Suite total **852 tests in 107 spec
-files**. The earlier figure recorded here and in
-`.github/workflows/browser-suite.yml`, 763 for `chromium` on 56dd46a
-(2026-08-29), is 15 low; the other two projects have not moved. Of the 852,
-about 292 (34 percent) open no browser page at all: 25 spec files are pure
-`fakeMapHarness` suites, plus the first ten cases of `fire3d-mode.spec.ts`.
-Re-fit these when the suite grows.
+Shard layout and counts. The layout is the matrix in
+`.github/workflows/browser-suite.yml`: `chromium` over 8 shards,
+`chromium-interaction` over 2, `chromium-3d` over 4, 14 shard jobs in all. The
+last test counts recorded are in that workflow's re-fit note (2026-10-12):
+`chromium` about 1,630 tests and `chromium-3d` 84 tests; `chromium-interaction`
+was 42 tests on 2026-09-01 and has not been re-measured since. The checkout
+holds 168 spec files under `tests/` (the `*.spec.ts` files), 34 of them in the
+pure lane (`PURE_SPECS` in `playwright.config.ts`). The 2026-09-01 figures
+this paragraph used to carry (778, 42 and 32 tests; 852 in 107 files) are
+superseded. Re-measure with `npx playwright test --list --project=<p>` when
+the suite is next re-fitted, and replace this paragraph with that result.
 
 `chromium-3d` moved from 3 shards to 2 to pay for `chromium-interaction`'s two
-runners without raising the total shard count more than by one. **That reshard
-was not time-neutral, and the note here previously said it was.** Measured
-across Validate runs 33452141530 and 33444784737: the 2-way split runs 4m49s
-against 10m31s, and 4m43s against 12m26s. `chromium-3d 2/2` is now the
+runners without raising the total shard count more than by one, and moved to
+4 shards on 2026-10-12. **The 2-shard split was not time-neutral, and the note
+here previously said it was.** Measured
+across Validate runs 33452141530 and 33444784737: the 2-way split ran 4m49s
+against 10m31s, and 4m43s against 12m26s, so `chromium-3d 2/2` was the
 critical path of the whole browser suite, at roughly double the next slowest
 shard and five to eight times the cheapest. The split is by file order over 32
-tests whose first 10 run in milliseconds, so shard 1 is nearly free by
-construction. Splitting `chromium-3d` three ways again, or moving
-`view-contracts.spec.ts` into its own project so the split is by cost rather
-than by file order, would rebalance it. Not done here: it is a CI-shape change
-and CI is being demoted to a confirmation lane.
+tests whose first 10 run in milliseconds, so shard 1 was nearly free by
+construction. The four-way split replaced it; moving `view-contracts.spec.ts`
+into its own project, so the split is by cost rather than by file order, remains
+an option and a CI-shape change. GitHub's Validate run is where the full
+browser suite runs.
 
 `browser-suite.yml` also takes `workers` and `retries` experiment inputs
 (mirrored as `workflow_dispatch` inputs on `validate.yml`), both defaulted to
@@ -272,6 +404,15 @@ exactly the pressure the flakiest specs are sensitive to, so a wall-clock win
 bought with a new flake is a loss. Take at least 5 runs per setting on one
 unchanged SHA before comparing, and adopt a change only when the repeated
 runs show no new flake names and no rise in the existing rate.
+
+A third input, `specs` (2026-10-19), is the targeted run described under
+"Iteration and session closeout": each shard adds `--pass-with-no-tests` and
+the named files, after checking each is an existing `tests/*.spec.ts` path (a
+blank list fails rather than running everything under the targeted name), and
+a `collect` job lists the named files across the three matrix projects and
+fails the run when that finds no test at all. `workers` and `retries` must be
+small whole numbers (`retries` may be empty). Empty, as on every pull
+request and the weekly schedule, the command is unchanged.
 
 Every shard writes a job summary (passed, failed, flaky, skipped, and the
 `file:line` of each failed or flaky test) from its JSON report through
@@ -345,7 +486,10 @@ alike, so a local green and a CI green mean the same thing; the bodies are
 the hand-authored rectangles with obviously synthetic names in
 `tests/tribal-fixtures.ts`, and no real sovereign-boundary polygon can enter
 a test artifact (the project's hard rule 1; see the NON-REDISTRIBUTION GUARD
-in `src/layers/aiannh.ts`). A spec that needs a different response (an empty
+in `src/layers/aiannh.ts`). These boundaries are public data at T0; the
+synthetic stand-in shapes keep every run repeatable and independent of the
+live services, and the operator slots must stay empty in the repository. A
+spec that needs a different response (an empty
 collection, an abort, a truncated body, an ArcGIS error, a geography-keyed
 answer) registers its own handler through `routeBoundary`, which wins because
 Playwright checks Page routes before context routes.
@@ -405,7 +549,12 @@ and no agency ever sends a body. Where the catalog
 mounts it also asserts both boundary pills reach `live`, which can only come
 from the fixture body. It does not observe the boots that navigate
 themselves: those answer from their own `routeAllTribalFixtures` handlers, so
-their requests never enter the suite-wide stub's log.
+their requests never enter the suite-wide stub's log. The same file also
+proves the NIFC WFIGS default (J12, below): a bare national Wildfire boot and
+a Brief-door Wildfire commit each send WFIGS requests, and every one of them,
+matched request by request as `METHOD url` against `nifcStubLog`, was
+answered by the default stub; a third case proves `nifc: 'live'` passes
+through to a route the spec registered.
 
 `tests/boundary-boot-inventory.test.mjs` covers those STATICALLY, and guards
 the seams. It runs in the gate with the other `node:test` files
@@ -444,7 +593,8 @@ should be read before anything is added to what CI keeps.
 
 **Cannot appear.** Sovereign geometry of any kind: Census AIANNH, BIA
 AIAN-LAR, and the deployer-owned Tribal and Treaty slots. The first two are
-answered from synthetic rectangles on every boot; the last two are asserted
+answered from synthetic rectangles on every boot so runs are repeatable (the
+boundaries themselves are public data at T0); the last two are asserted
 empty by the gate. No rendered pixels, from any source, because trace frames,
 screenshots, and video are all off in CI. No spec source text (`sources:
 false`).
@@ -452,27 +602,49 @@ false`).
 **May appear, and is accepted.** Response bodies from the other public
 agency sources a boot touches: NIFC and WFIGS fire perimeters, drought
 polygons (NADM, USDM, CDM), NOAA weather alerts, HMS smoke, EPA ecoregions,
-watersheds, station telemetry. OpenStreetMap raster tile bodies from the live
-basemap.
+watersheds, station telemetry. (The basemap is DDM's own same-origin archives,
+not a live tile host.)
 
-One of those is not hypothetical, and it is worth naming with its evidence.
-`gotoApp` stubs `NADM-current.geojson` only when the query carries neither
-`layers=` nor `cluster=`, so a boot that names either fetches it live, and the
-minimap fetches it live on the same boots. Inspecting the first real CI trace
-artifacts (Validate run 33250251205) found a **2.5 MB live NADM body from
-`ncei.noaa.gov`** stored in `playwright-traces-chromium-3-of-4`. That is
-public-domain NOAA drought data, not sovereign geometry, so it breaks no hard
-rule and it sits inside the accepted list above. It does mean the sentence
-"no live external geometry reaches a retained trace" is **not** true today,
-only "no live SOVEREIGN geometry" is. Making the NADM stub context-level the
-way the boundary and minimap stubs are would close it, and is deliberately
-left as follow-up rather than folded into the retention change. Request and response headers, cookies, request URLs with their
+One of those is not hypothetical, and it is worth naming with its evidence,
+as history. `gotoApp` used to stub `NADM-current.geojson` only when the
+query carried neither `layers=` nor `cluster=`, so a boot that named either
+fetched it live, and the minimap fetched it live on the same boots.
+Inspecting the first real CI trace artifacts (Validate run 33250251205)
+found a **2.5 MB live NADM body from `ncei.noaa.gov`** stored in
+`playwright-traces-chromium-3-of-4`. That is public-domain NOAA drought
+data, not sovereign geometry, so it broke no hard rule and it sat inside the
+accepted list above. It did mean the sentence "no live external geometry
+reaches a retained trace" was not true then, only "no live SOVEREIGN
+geometry" was. The NADM stub is now a CONTEXT-level backstop (DDM-P1-T09
+step 2 part d), claimed unconditionally on every boot the way the boundary
+and minimap stubs already are; a spec's own page-level `page.route` for the
+same pattern still overrides it (Playwright checks page routes before
+context routes, whatever order the two were registered in), but no boot is
+left to reach the live agency by default the way one used to, so this hole
+is closed. Request and response headers, cookies, request URLs with their
 coordinates and place names, DOM snapshots including any Tribal Nation name
 from the committed `public/data/tribal-roster.json`, and console output.
 Nothing there is sovereign geometry, and nothing there is undisclosed by a
 `git clone` of this public repository, but a licensing and redistribution
 review of the agency and raster content has **not** been done and is open
 work.
+
+The NIFC WFIGS current-perimeters service followed the NADM path for a
+different reason (J12, DDM-P10-T13). Once the national region became the
+default camera, a Wildfire boot with no WFIGS route of its own asked the live
+service for every current perimeter in the contiguous United States, and the
+boot-idle seam waited on that payload. `gotoApp` now installs
+`installDefaultNifcStub` (`tests/wildfire-fixtures.ts`) on the CONTEXT for
+every boot. It is fail-closed: a GET `/query?...f=geojson` (the perimeter
+layer's read and the briefing's area read) gets `NIFC_STUB`, a minimap count
+POST (`returnCountOnly=true`) gets a successful `{ count: 0 }`, and any other
+WFIGS request gets a 400, never the network. A spec's own `page.route` for
+WFIGS still wins, whatever the order; a page route that calls
+`route.fallback()` now reaches this stub rather than the network. The opt-out
+is `gotoApp(page, query, { nifc: 'live' })`, a pass-through; only the
+mode-switch measurement uses it, because its recorded baseline measured the
+live reads. After this change a WFIGS body can reach a trace only from a
+`nifc: 'live'` boot or a boot that navigates itself outside `gotoApp`.
 
 **Deferred, deliberately.** A synthetic or blank basemap for artifact-bearing
 runs, which is the precondition for turning pixels back on: it is what would
@@ -491,8 +663,8 @@ the sidebar never builds.
 
 ## When you change a config table
 
-The canonical strings the specs assert against (preset labels, role-group
+The canonical strings the specs assert against (role-group
 headings, the pill vocabulary, default-on keys) are mirrored in
-`tests/helpers.ts`. If you rename a preset or relabel a role group, update the
+`tests/helpers.ts`. If you relabel a role group, update the
 mirror there; the mismatch will otherwise surface as a failing spec, which is
 the point.

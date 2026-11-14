@@ -26,9 +26,14 @@
  *     a fast-follow, never a per-click service; `county` already allows null.
  *
  * `resolveLocationIdentity` is async only because of the state point-in-polygon
- * fallback's one-time fetch of the bundled boundaries; the rendered-feature
- * queries are synchronous. The fetch honors the caller's abort signal and its
- * result is cached for the session.
+ * fallback's fetch of the bundled boundaries; the rendered-feature queries are
+ * synchronous. The fetch honors the caller's own abort signal (cancelling only
+ * this module's wait, never a fetch another consumer still needs) and its
+ * result is cached for the session. The transport itself is shared page-wide
+ * under `US_STATES_SHARED_KEY` (DDM-P14-T06): this fallback runs only when the
+ * `states` layer is not rendering the clicked point, but whenever it does run
+ * it reuses whatever the layer, the deep link, or the Place studio already
+ * fetched, rather than issuing a second request for the same file.
  *
  * Stewardship: no sovereign polygons are bundled or fetched here beyond the
  * public Census state boundaries; Tribal identity comes only from layers the
@@ -38,7 +43,7 @@
 import type * as maplibregl from 'maplibre-gl';
 import type { FeatureCollection, GeoJsonProperties } from 'geojson';
 
-import { fetchWithBudget } from '../util/fetch';
+import { fetchSharedJsonWithBudget, US_STATES_SHARED_KEY } from '../util/fetch';
 import { pointInPolygonGeometry } from '../util/point-in-polygon';
 
 /** Two-letter postal code plus display name for the containing state. */
@@ -82,6 +87,11 @@ export interface ContainingTribalIdentity {
    * result as a source representation, never jurisdictional truth.
    */
   readonly source: 'tribal' | 'bia-reservation' | 'aiannh';
+  /**
+   * The BIA LARNAME under the same point when a legal Census area wins, so a
+   * consumer can title the place by the Nation name a click on the BIA area gives.
+   */
+  readonly biaLandArea?: string;
 }
 
 /** The composed identity for a point. Every field degrades honestly to null. */
@@ -118,14 +128,6 @@ const STATES_FETCH_TIMEOUT_MS = 10_000;
  */
 const STATES_LOCAL_URL =
   `${import.meta.env?.BASE_URL ?? '/dynamic-drought-module/'}data/us-states.geojson`;
-
-/**
- * Session cache for the bundled state boundaries used by the point-in-polygon
- * fallback. Resolved once, reused for every later click; a failed fetch caches
- * null so the fallback degrades to "state unresolved" without re-hitting a
- * missing file each click.
- */
-let statesCachePromise: Promise<FeatureCollection | null> | null = null;
 
 /** First non-empty string among `keys` in a feature's properties, else null. */
 function firstString(props: GeoJsonProperties, keys: readonly string[]): string | null {
@@ -171,32 +173,39 @@ function stateFromProps(props: GeoJsonProperties): StateIdentity | null {
   return { code: code.toUpperCase(), name: name ?? code.toUpperCase() };
 }
 
-/** Load and cache the bundled state boundaries; null on any failure. */
-function loadBundledStates(signal: AbortSignal): Promise<FeatureCollection | null> {
-  if (statesCachePromise) return statesCachePromise;
-  statesCachePromise = (async () => {
-    try {
-      const response = await fetchWithBudget(STATES_LOCAL_URL, null, signal, STATES_FETCH_TIMEOUT_MS);
-      if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-      return (await response.json()) as FeatureCollection;
-    } catch (err) {
-      // An aborted fetch is a superseded click, not a real failure: do not
-      // poison the cache, so a later click can try again.
-      if (signal.aborted) {
-        statesCachePromise = null;
-        return null;
-      }
-      console.warn('[location-identity] bundled state boundaries fetch failed.', err);
-      return null;
-    }
-  })();
-  return statesCachePromise;
+/**
+ * Load the bundled state boundaries. null only when this caller was superseded
+ * (its signal aborted); a failed read throws, so a caller that must tell a
+ * failed lookup from "no State holds this point" can (search-controller).
+ */
+async function loadBundledStates(signal: AbortSignal): Promise<FeatureCollection | null> {
+  try {
+    // Shared, page-lifetime transport (DDM-P14-T06) is the session cache: a
+    // success is kept and reused by every reader (states layer, deep link,
+    // Place studio), each caller waits with its own signal so a superseded
+    // click cannot cancel a live one, and a failure is evicted so the next
+    // click retries. The collection is only ever read here, never mutated.
+    return (await fetchSharedJsonWithBudget(
+      US_STATES_SHARED_KEY,
+      STATES_LOCAL_URL,
+      null,
+      signal,
+      STATES_FETCH_TIMEOUT_MS
+    )) as FeatureCollection;
+  } catch (err) {
+    // An aborted wait is a superseded click, not a real failure.
+    if (signal.aborted) return null;
+    console.warn('[location-identity] bundled state boundaries fetch failed.', err);
+    throw err;
+  }
 }
 
 /**
  * Resolve the containing state: the rendered `states` layer first (matching
  * what the user sees), then a point-in-polygon test against the bundled Census
- * boundaries so a click resolves even when the state layer is off.
+ * boundaries so a click resolves even when the state layer is off. Resolves null
+ * when no State holds the point or the caller was superseded; rejects when the
+ * bundled read failed.
  */
 async function resolveState(
   map: maplibregl.Map,
@@ -273,15 +282,31 @@ function resolveContainingTribal(
 
   const aiannhFeatures = queryFeatures(map, point, [AIANNH_FILL]);
   const legalAiannh = aiannhIdentity(aiannhFeatures, true);
-  if (legalAiannh) return legalAiannh;
-
   const bia = queryFirstFeature(map, point, [BIA_FILL]);
-  if (bia) {
-    const name = firstString(bia.properties, ['LARNAME', 'LARName', 'NAME', 'name']);
-    if (name) return { name, source: 'bia-reservation' };
-  }
+  const biaName = bia ? firstString(bia.properties, ['LARNAME', 'LARName', 'NAME', 'name']) : null;
+  if (legalAiannh) return biaName ? { ...legalAiannh, biaLandArea: biaName } : legalAiannh;
+  if (biaName) return { name: biaName, source: 'bia-reservation' };
 
   return aiannhIdentity(aiannhFeatures, false);
+}
+
+/**
+ * Resolve only the containing state for a point, without the county,
+ * ecoregion or containing-Tribal identity `resolveLocationIdentity` also
+ * computes. For a consumer that only ever needs the state (the impact panel's
+ * containing-state enrichment, DDM-P2-T08 microtask 2b), this is the narrow
+ * tool: same `resolveState` implementation, same rendered-layer-first then
+ * bundled-boundary-fallback order, same session cache, so there is exactly
+ * one state-resolution codepath rather than two that could drift. A failed
+ * bundled read rejects here (unlike `resolveLocationIdentity`, which degrades).
+ */
+export function resolveContainingState(
+  map: maplibregl.Map,
+  lngLat: { lng: number; lat: number },
+  signal: AbortSignal
+): Promise<StateIdentity | null> {
+  const point = map.project([lngLat.lng, lngLat.lat]);
+  return resolveState(map, point, lngLat, signal);
 }
 
 /**
@@ -297,7 +322,8 @@ export async function resolveLocationIdentity(
   const point = map.project([lngLat.lng, lngLat.lat]);
   const ecoregion = resolveEcoregion(map, point);
   const containingTribal = resolveContainingTribal(map, point);
-  const state = await resolveState(map, point, lngLat, signal);
+  // The identity of a click degrades to "no State" on a failed read (already warned); only the city pick surfaces it.
+  const state = await resolveState(map, point, lngLat, signal).catch(() => null);
   return {
     lngLat: { lng: lngLat.lng, lat: lngLat.lat },
     state,

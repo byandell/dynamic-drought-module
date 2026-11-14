@@ -1,16 +1,34 @@
 import 'maplibre-gl/dist/maplibre-gl.css';
 import './styles/app.css';
+import './styles/hazard-indicators.css';
+import './styles/mobile-panels.css';
+import './styles/edge-column.css';
 
 import type * as maplibregl from 'maplibre-gl';
+import { holdSatellite } from './map/basemap-switcher';
 import { createMap } from './map/init';
+import { loadFire3DController } from './map/fire3d-chunk';
+import { FIRE3D_CHUNK_WIDTH_QUERY, onFire3DPreferenceChange } from './state/fire3d-store';
 import { initInteractionCoordinator } from './map/interaction-coordinator';
 import { setMap } from './state/map-store';
 import { applyDeepLink } from './state/deep-link';
-import { parseSelectParam } from './state/url';
+import { SIDEBAR_DESKTOP_QUERY, parseFire3dParam, parseSelectParam } from './state/url';
 import type { SelectParam } from './state/url';
-import { getStudioRoute, onStudioRouteChange } from './state/studio-route';
+import {
+  getStudioRoute,
+  onStudioRouteChange,
+  studioOwnsScreen
+} from './state/studio-route';
+import {
+  getCommittedSnapshot,
+  onCommittedSnapshotChange
+} from './state/cluster-service';
 import { onTypedPlaceChange } from './state/typed-place';
-import { buildSidebar } from './ui/sidebar';
+import {
+  buildSidebar,
+  buildSidebarShell,
+  setSidebarControlReason
+} from './ui/sidebar';
 import { initHoverInspector } from './ui/hover-inspector';
 import { isGpuInitializationError, webGl2Capability } from './map/gl-capability';
 import {
@@ -23,7 +41,10 @@ import {
   showRendererNotice
 } from './ui/renderer-notice';
 import { initMapInformation } from './ui/map-information';
+import { initEdgeColumn } from './ui/edge-column';
+import { initLocateControl } from './ui/locate-control';
 import { initMobileSheet } from './ui/mobile-sheet';
+import { initFire3DPhone } from './ui/fire3d-phone';
 import { initViewShell } from './ui/view-shell';
 import { initPlaceEmphasis } from './state/place-emphasis';
 import { initLocatedBoundary } from './state/located-boundary';
@@ -52,7 +73,7 @@ import { initLocatedBoundary } from './state/located-boundary';
 function prepareStudioAwareDeepLink(
   map: maplibregl.Map,
   initialSelect: SelectParam
-): () => void {
+): () => Promise<void> {
   interface InFlightCommand {
     readonly select: SelectParam;
     readonly routeGeneration: number;
@@ -74,7 +95,7 @@ function prepareStudioAwareDeepLink(
   };
 
   const runHeld = (): void => {
-    if (!started || disposed || getStudioRoute() !== null || !heldSelect) return;
+    if (!started || disposed || studioOwnsScreen() || !heldSelect) return;
     const command: InFlightCommand = {
       select: heldSelect,
       routeGeneration
@@ -85,11 +106,11 @@ function prepareStudioAwareDeepLink(
       map,
       command.select,
       () =>
-        getStudioRoute() === null &&
+        !studioOwnsScreen() &&
         routeGeneration === command.routeGeneration
     ).finally(() => {
       if (inFlight === command) inFlight = null;
-      if (heldSelect && getStudioRoute() === null) {
+      if (heldSelect && !studioOwnsScreen()) {
         runHeld();
       } else if (!heldSelect && !inFlight) {
         cleanup();
@@ -112,7 +133,7 @@ function prepareStudioAwareDeepLink(
       if (navigationSelect) heldSelect = navigationSelect;
     }
 
-    if (route === null) runHeld();
+    runHeld();
   });
 
   unsubscribeTypedPlace = onTypedPlaceChange((place) => {
@@ -123,13 +144,12 @@ function prepareStudioAwareDeepLink(
     cleanup();
   });
 
-  return () => {
+  return async () => {
     if (started) return;
     started = true;
-    if (getStudioRoute() === null) {
+    if (!studioOwnsScreen()) {
       cleanup();
-      void applyDeepLink(map, initialSelect);
-      return;
+      return applyDeepLink(map, initialSelect);
     }
     runHeld();
   };
@@ -195,8 +215,8 @@ function loadMapKey(): void {
 
 /**
  * The chrome that needs no renderer: the on-map key and the map-information
- * disclosure, which is where the OpenStreetMap and per-source attribution
- * lives. Booted on the degraded paths (DR-035a) so a map that never paints
+ * disclosure, which points to the per-source attribution in the
+ * Acknowledgements. Booted on the degraded paths (DR-035a) so a map that never paints
  * still leaves a reachable, honest interface rather than a complete-looking
  * skeleton. Idempotent.
  */
@@ -204,6 +224,13 @@ let mapFreeChromeBooted = false;
 function bootMapFreeChrome(): void {
   if (mapFreeChromeBooted) return;
   mapFreeChromeBooted = true;
+  // found-084: the column is the only surface a map-free boot has, and its
+  // expand control is withheld until the controls are ready (app.css), which
+  // this boot never reaches. So a closed desktop preference (sidebar=closed,
+  // DR-139, applied by the inline bootstrap in index.html) is not applied
+  // here. Presentation only: the URL keeps the key for a browser that can
+  // render the map, as a phone boot preserves it without applying it.
+  document.getElementById('app')?.classList.remove('sidebar-collapsed');
   loadMapKey();
   initMapInformation();
 }
@@ -216,10 +243,36 @@ async function boot(): Promise<void> {
   // build (the nonce distinguishes two servers on the same commit).
   document.documentElement.dataset.ddmBuildSha = __DDM_BUILD_SHA__;
   document.documentElement.dataset.ddmBuildNonce = __DDM_BUILD_NONCE__;
+  // found-028 / DDM-P0-T14: the footer version is stamped from the same
+  // build-time constant, never a runtime fetch of package.json and never a
+  // hand-maintained literal in index.html.
+  const footerVersionEl = document.getElementById('footer-version');
+  if (footerVersionEl) footerVersionEl.textContent = `v${__DDM_VERSION__}`;
   // The third stamp: `data-ddm-boot` reads `booting` from here and `idle`
   // once the map has loaded, every URL-named layer has left `loading`, and
   // no shared transport is in flight (src/state/boot-idle.ts, DR-052).
   markBooting();
+
+  // The sidebar's generated controls build NOW, from the static registry
+  // tables, before the renderer is even probed (the 2026-09-03 launch
+  // ruling, section 4). They render disabled with a reason a person can
+  // read, and `buildSidebar` enables them when the map-dependent half is
+  // wired. This is the shared root of DR-065 modes 1 and 2, the
+  // no-WebGL-2 shell gap, and the DDM-P14-T02 boot watchdog: every path
+  // below, including the two that never get a map, now leaves a sidebar
+  // that states its condition instead of an empty one that looks broken.
+  buildSidebarShell();
+
+  // The one answer to "this browser cannot render the map", shared by the
+  // capability check, the constructor throw and the `error` event below. The
+  // controls exist, so they have to say why they cannot act (DDM-P14-T02), and
+  // nothing else will load: the boot is idle now, honestly.
+  const failWithoutRenderer = (): void => {
+    showRendererNotice('no-webgl2');
+    bootMapFreeChrome();
+    setSidebarControlReason('no-map');
+    settleBootIdleWithoutMap();
+  };
 
   // DR-025a / DR-035a: MapLibre 6 requires WebGL 2 and has no WebGL 1
   // fallback, so ask first. Without a context the constructor would build a
@@ -231,14 +284,22 @@ async function boot(): Promise<void> {
     console.warn(
       `[boot] no WebGL 2 context: ${capability.reason ?? 'unknown'}`
     );
-    showRendererNotice('no-webgl2');
-    bootMapFreeChrome();
-    // Nothing else will load: the boot is idle now, honestly.
-    settleBootIdleWithoutMap();
+    failWithoutRenderer();
     return;
   }
 
-  const map = createMap('map');
+  // MapLibre 6.7+ THROWS GPUInitializationError from the constructor when the
+  // WebGL 2 context cannot be created (Map._setupPainter); anything else
+  // thrown is not ours to swallow.
+  let map: maplibregl.Map;
+  try {
+    map = createMap('map');
+  } catch (err) {
+    if (!isGpuInitializationError(err)) throw err;
+    console.warn('[boot] map constructor threw GPUInitializationError');
+    failWithoutRenderer();
+    return;
+  }
   // Publish the map so the frozen UI-service facades (the impact panel) can
   // resolve a selection's location identity without a map parameter (F3).
   setMap(map);
@@ -262,18 +323,16 @@ async function boot(): Promise<void> {
     };
   }
 
-  // MapLibre 6 reports a failed GPU context through the map's `error` event
-  // rather than a constructor throw (`Map._setupPainter` fires an ErrorEvent
-  // carrying a GPUInitializationError). Only that error means "this browser
-  // cannot render the map"; routine tile and source errors travel the same
-  // event and must not raise a renderer notice, so the classifier is narrow.
+  // A GPU context that cannot be recreated after a loss still reaches us as
+  // an `error` event carrying a GPUInitializationError (Map's
+  // webglcontextrestored path). Only that error means "this browser cannot
+  // render the map"; routine tile and source errors travel the same event and
+  // must not raise a renderer notice, so the classifier is narrow.
   let gpuInitializationFailed = false;
   map.on('error', (event) => {
     if (!isGpuInitializationError(event.error)) return;
     gpuInitializationFailed = true;
-    showRendererNotice('no-webgl2');
-    bootMapFreeChrome();
-    settleBootIdleWithoutMap();
+    failWithoutRenderer();
   });
 
   const loadedInBound = await waitForMapLoad(map, MAP_LOAD_BOUND_MS);
@@ -291,7 +350,9 @@ async function boot(): Promise<void> {
     hideRendererNotice();
   });
 
-  if (map.isStyleLoaded() === true) {
+  // A GPU failure leaves the style loading with no painter: wiring now would
+  // hide the 'no-webgl2' notice and enable controls over a map that never paints.
+  if (map.isStyleLoaded() === true && !gpuInitializationFailed) {
     // The style is in hand and only the painting is stalled (a hidden or
     // occluded window throttles requestAnimationFrame to nothing, so `load`
     // never fires even though everything loaded). Sources and layers can be
@@ -304,6 +365,16 @@ async function boot(): Promise<void> {
   // The style is not in hand, so adding a source or a layer would throw.
   // Wait on, passively and without a second bound: nothing is blocked on
   // this now, and the interface is already saying what it is showing.
+  //
+  // The watchdog's control surface (DDM-P14-T02, acceptance: a renderer
+  // that never starts produces a stated failure the user can read instead
+  // of a complete-looking inert interface). The map notice above states the
+  // map's condition; this states the controls' condition, beside them, and
+  // stands until a late `load` wires the map-dependent half and enables
+  // them. No second timer: DR-035a's one bound is the whole watchdog.
+  setSidebarControlReason(
+    gpuInitializationFailed ? 'no-map' : 'map-not-started'
+  );
   map.once('load', () => {
     wireMapDependentChrome(map);
   });
@@ -359,26 +430,63 @@ function wireMapDependentChrome(map: maplibregl.Map): void {
   initMapInformation();
 
   // The desktop 3D Fire mode (W3/W4) rides its own lazy chunk behind the
-  // shell's desktop breakpoint, so a mobile boot never fetches it. A boot
-  // below the breakpoint arms a one-shot widen listener instead: the mode's
-  // toggle only renders on desktop widths, and a later resize into them
-  // must find a live controller rather than an inert control.
-  const fire3dViewport = window.matchMedia('(min-width: 721px)');
+  // shell's desktop breakpoint, so a mobile boot never fetches it (DDM-P2-T04
+  // narrowed this further: a DESKTOP Drought boot must not fetch it either,
+  // since nothing on that screen can use it). The chunk is fetched only once
+  // eligibility is real: the committed cluster is 'wildfire' (the same
+  // condition that shows the control, fire3d-control.tsx:199-205), or the
+  // boot URL names the mode directly (only the exact single token `true`
+  // counts, matching src/state/url.ts's parseFire3dParam so a stray or
+  // duplicated parameter never triggers a fetch a bare boot has no use for).
+  // A boot below the breakpoint still arms a widen listener; the
+  // same eligibility rule applies when it fires, so a later resize into
+  // desktop width finds a live controller rather than an inert control.
+  //
+  // Owner direction 2026-11-09 (sprint), DR-pending: a phone may enter the
+  // scene through its own 3D cell (src/ui/fire3d-phone.ts), so the width
+  // above is now the phone floor. The rule below keeps a phone that did not
+  // ask from paying for the chunk: the committed Wildfire view alone loads
+  // it only at the desktop console's width, where the control that needs it
+  // is on screen; everywhere the URL naming the mode loads it, which on a
+  // phone happens only through that cell's press or a shared link. Below the
+  // console's width only the phone shell can present the scene, and an embed
+  // never has one, so a phone-width embed loads nothing (review finding
+  // R2-10); if the person leaves the embed, the 3D cell's chrome loads and
+  // starts the controller itself (src/ui/fire3d-phone-scene.ts).
+  const fire3dViewport = window.matchMedia(FIRE3D_CHUNK_WIDTH_QUERY);
+  const fire3dConsole = window.matchMedia(SIDEBAR_DESKTOP_QUERY);
+  let fire3dLoaded = false;
+  let unsubscribeFire3dEligibility: (() => void) | null = null;
+  let unsubscribeFire3dPreference: (() => void) | null = null;
   const loadFire3D = (): void => {
-    void import('./map/fire3d').then(({ initFire3DController }) => {
+    if (fire3dLoaded) return;
+    fire3dLoaded = true;
+    void loadFire3DController().then(({ initFire3DController }) => {
       initFire3DController(map);
+      unsubscribeFire3dEligibility?.();
+      unsubscribeFire3dPreference?.();
+      fire3dViewport.removeEventListener('change', maybeLoadFire3D);
+      fire3dConsole.removeEventListener('change', maybeLoadFire3D);
+    }).catch((error: unknown) => {
+      fire3dLoaded = false;
+      // No controller will release a boot hold on the imagery (DR-105).
+      holdSatellite(map, false);
+      console.warn('Fire 3D controller could not load:', error);
     });
   };
-  if (fire3dViewport.matches) {
-    loadFire3D();
-  } else {
-    const onWiden = (): void => {
-      if (!fire3dViewport.matches) return;
-      fire3dViewport.removeEventListener('change', onWiden);
-      loadFire3D();
-    };
-    fire3dViewport.addEventListener('change', onWiden);
-  }
+  const fire3dEligible = (): boolean =>
+    parseFire3dParam() ||
+    (fire3dConsole.matches && getCommittedSnapshot().cluster === 'wildfire');
+  const fire3dPresentable = (): boolean =>
+    fire3dConsole.matches || !(document.getElementById('app')?.classList.contains('embed') ?? false);
+  const maybeLoadFire3D = (): void => {
+    if (fire3dViewport.matches && fire3dPresentable() && fire3dEligible()) loadFire3D();
+  };
+  unsubscribeFire3dEligibility = onCommittedSnapshotChange(maybeLoadFire3D);
+  unsubscribeFire3dPreference = onFire3DPreferenceChange(maybeLoadFire3D);
+  fire3dViewport.addEventListener('change', maybeLoadFire3D);
+  fire3dConsole.addEventListener('change', maybeLoadFire3D);
+  maybeLoadFire3D();
 
   // Selected-place emphasis (U3h, headroom A1): the chosen boundary stays lit
   // while its popup or briefing is open. This wires only the close seam (clear
@@ -397,7 +505,19 @@ function wireMapDependentChrome(map: maplibregl.Map): void {
   // at-hand place picker is the ONE shared search (U3), which the sheet
   // mounts lazily on activation, so no deep-link/impact-panel callback is
   // injected here anymore.
+  // The phone shell's right-edge column (owner direction 2026-11-09 (sprint),
+  // DR-pending): built before the shell activates, so the first activation
+  // finds one column that owns every right-edge control's seat.
+  initEdgeColumn();
+  // Locate (owner direction 2026-11-09 (sprint), DR-pending): one cell in the
+  // column's view tools and the launch check; everything else is lazy. A
+  // `select=` boot makes no Locate offer: the shared link is the ask.
+  initLocateControl(map, select !== null);
   initMobileSheet(map, { deepLinkBoot: select !== null });
+  // The phone's 3D cell rides the column's view tools, present only where
+  // pressing it means something (owner direction 2026-11-09 (sprint),
+  // DR-pending). The scene and its chrome stay lazy behind the press.
+  initFire3DPhone(map);
 
   // The two doors (U1, D-ARCH-002): mode chrome and the Brief head, after
   // the sidebar (which seeds the mode from the URL). The U1 answer-first
@@ -414,7 +534,7 @@ function wireMapDependentChrome(map: maplibregl.Map): void {
   // return to the map; that is a later, user-driven activation, not part of
   // the boot, so the seam treats the held link as settled.
   let deepLink: Promise<void> = Promise.resolve();
-  if (startStudioAwareDeepLink) startStudioAwareDeepLink();
+  if (startStudioAwareDeepLink) deepLink = startStudioAwareDeepLink();
   else deepLink = applyDeepLink(map, select);
   armBootIdle(deepLink);
 }

@@ -2,11 +2,14 @@
  * The shared, names-only Tribal land-area roster
  * (`public/data/tribal-roster.json`, built by scripts/build-tribal-roster.mjs
  * from the Federal Register roster and the BIA AIAN-LAR LARNAME audit;
- * D-0.7.0-026). Two consumers: the search index (src/ui/search-controller.ts)
- * and other consumers that need trusted formal names. Extracted
- * with Unit I so the STRUCTURAL provenance gate lives in exactly one place.
+ * D-0.7.0-026). Three consumers share the one gate helper below: the search
+ * index (src/ui/search-controller.ts), the place catalog's Tribal Nations
+ * list (src/config/place-catalog.ts, since DR-094), and other consumers that
+ * need trusted formal names. Extracted with Unit I so the STRUCTURAL
+ * provenance gate lives in exactly one place.
  *
- * Stewardship: the roster carries NAMES ONLY (no geometry). A formal Tribal
+ * Stewardship: the roster carries NAMES ONLY (no geometry), apart from the
+ * headquarters rows' town points (build rule 14). A formal Tribal
  * Nation name may be used ONLY from a row whose provenance is trusted; any
  * other row keeps the BIA land-area label verbatim (hard rules 5 and 6,
  * D-0.7.0-026). Consumers must not soften this gate.
@@ -33,26 +36,112 @@ export const TRUSTED_PROVENANCE: ReadonlySet<string> = new Set([
   'safe-match'
 ]);
 
-const ROSTER_URL = import.meta.env.BASE_URL + 'data/tribal-roster.json';
+/**
+ * The one gate helper (DR-094, DDM-P2-T10): a roster row's displayName is
+ * shown only from trusted provenance; any other row's own BIA land-area name
+ * (`larName`) is the honest fallback, with NO visible marker distinguishing
+ * the two (titles stay uniform per DR-094; any caveat lives in metadata or
+ * the Impact Briefing, never in a title). Both live callers of the gate
+ * (src/ui/search-controller.ts and src/config/place-catalog.ts) call this
+ * one function rather than re-deriving the rule.
+ */
+export function gatedDisplayName(area: TribalRosterArea): string {
+  return TRUSTED_PROVENANCE.has(area.provenance ?? '') ? area.displayName : area.larName;
+}
+
+/**
+ * One Census AIANNH area row (`censusAreas`): a Census area for a Tribe the
+ * AIAN-LAR set cannot locate, keyed by its four-digit AIANNH code. Names only.
+ */
+export interface TribalCensusArea {
+  readonly aiannh: string;
+  readonly name: string;
+  readonly displayName: string;
+  readonly provenance?: string;
+  /** A state-recognized Census area pinned to a Nation no other row finds (build rule 13). */
+  readonly stateArea?: boolean;
+}
+
+/**
+ * A Nation's headquarters town (`headquarters`, build rule 14): for a Nation
+ * no boundary source draws an area for. The point is the Census place's
+ * internal point, a town and never the Nation's land.
+ */
+export interface TribalHeadquarters {
+  readonly displayName: string;
+  readonly provenance?: string;
+  readonly town: string;
+  /** Postal code. */
+  readonly state: string;
+  readonly point: readonly [number, number];
+  readonly source: string;
+}
+
+function isHeadquarters(row: unknown): row is TribalHeadquarters {
+  if (!isObject(row)) return false;
+  const point = row['point'];
+  return (
+    typeof row['displayName'] === 'string' &&
+    typeof row['town'] === 'string' &&
+    typeof row['state'] === 'string' &&
+    typeof row['source'] === 'string' &&
+    Array.isArray(point) &&
+    point.length === 2 &&
+    point.every((n) => typeof n === 'number' && Number.isFinite(n))
+  );
+}
+
+/** The same gate for a Census row: untrusted rows keep the Census name. */
+export function gatedCensusName(area: TribalCensusArea): string {
+  return TRUSTED_PROVENANCE.has(area.provenance ?? '') ? area.displayName : area.name;
+}
+
+// Guarded so a pure Node test can import this module without a Vite-served
+// page (the same idiom as src/config/urls-boot.ts:29, DDM-P2-T12).
+const ROSTER_URL = (import.meta.env?.BASE_URL ?? '/dynamic-drought-module/') + 'data/tribal-roster.json';
 
 /**
  * Deadline for the roster load, milliseconds. The artifact is same-origin and
- * about 52 kB, so ten seconds is generous even on a rural connection, while
+ * about 95 kB, so ten seconds is generous even on a rural connection, while
  * still honoring invariant 7 (non-trivial network work must be cancellable and
  * time-bounded). Previously this was a bare `fetch` with no signal and no
  * timeout (ARCH-05).
  */
 const ROSTER_TIMEOUT_MS = 10_000;
 
-let rosterCache: readonly TribalRosterArea[] | null = null;
-let rosterInFlight: Promise<readonly TribalRosterArea[]> | null = null;
+interface RosterFile {
+  readonly areas: readonly TribalRosterArea[];
+  readonly censusAreas: readonly TribalCensusArea[];
+  /** Census AIANNH code to the Nations' Federal Register names, for the Tribal Lands labels. */
+  readonly labelAreas: ReadonlyMap<string, readonly string[]>;
+  /** Trusted rows only: a Nation's name is never shown from any other. */
+  readonly headquarters: readonly TribalHeadquarters[];
+}
 
-/**
- * Lazy-load the roster's area rows (once, cached). REJECTS on failure
- * (invariant 6: a failed load must surface honestly, never masquerade as an
- * empty roster); a later attempt can retry.
- */
-export function loadTribalRoster(): Promise<readonly TribalRosterArea[]> {
+function labelAreasOf(raw: unknown): ReadonlyMap<string, readonly string[]> {
+  return new Map(
+    Object.entries(isObject(raw) ? raw : {}).filter(
+      (entry): entry is [string, string[]] =>
+        /^\d{4}$/.test(entry[0]) && Array.isArray(entry[1]) && entry[1].every((n) => typeof n === 'string')
+    )
+  );
+}
+
+let rosterCache: RosterFile | null = null;
+let rosterInFlight: Promise<RosterFile> | null = null;
+
+function isCensusArea(row: unknown): row is TribalCensusArea {
+  return (
+    isObject(row) &&
+    typeof row['aiannh'] === 'string' &&
+    /^\d{4}$/.test(row['aiannh']) &&
+    typeof row['name'] === 'string' &&
+    typeof row['displayName'] === 'string'
+  );
+}
+
+/** The one fetch both loaders share. */
+function loadRosterFile(): Promise<RosterFile> {
   if (rosterCache) return Promise.resolve(rosterCache);
   if (rosterInFlight) return rosterInFlight;
   rosterInFlight = (async () => {
@@ -64,7 +153,17 @@ export function loadTribalRoster(): Promise<readonly TribalRosterArea[]> {
         ROSTER_TIMEOUT_MS
       );
       const areas = isObject(json) ? json['areas'] : undefined;
-      rosterCache = Array.isArray(areas) ? (areas as readonly TribalRosterArea[]) : [];
+      // An older roster (and every test fixture) has no censusAreas: none.
+      const census = isObject(json) ? json['censusAreas'] : undefined;
+      const headquarters = isObject(json) ? json['headquarters'] : undefined;
+      rosterCache = {
+        areas: Array.isArray(areas) ? (areas as readonly TribalRosterArea[]) : [],
+        censusAreas: Array.isArray(census) ? census.filter(isCensusArea) : [],
+        labelAreas: labelAreasOf(isObject(json) ? json['labelAreas'] : undefined),
+        headquarters: Array.isArray(headquarters)
+          ? headquarters.filter(isHeadquarters).filter((row) => TRUSTED_PROVENANCE.has(row.provenance ?? ''))
+          : []
+      };
       return rosterCache;
     } catch (err) {
       console.warn('[tribal-roster] roster load failed.', err);
@@ -77,28 +176,74 @@ export function loadTribalRoster(): Promise<readonly TribalRosterArea[]> {
 }
 
 /**
- * The formal Tribal Nation name for a BIA land area, or null when the roster
- * has no TRUSTED row for it (the safe residue: never a guessed name). Pure
- * over the supplied rows so the gate is unit-testable without a fetch.
- *
- * Currently no caller invokes this (ARCH-12). The one live application of the
- * gate open-codes the same rule at `src/ui/search-controller.ts:105`, which
- * imports `TRUSTED_PROVENANCE` directly; `src/config/place-catalog.ts` takes
- * formal names from the crosswalk artifact instead and does not consult
- * provenance at all. Kept, not deleted, because it is the single readable
- * statement of D-0.7.0-026: the next consumer should call this rather than
- * re-derive the rule. Adopting it in `search-controller.ts` is a change in
- * that file's owner's hands.
+ * Lazy-load the roster's area rows (once, cached). REJECTS on failure
+ * (invariant 6: a failed load must surface honestly, never masquerade as an
+ * empty roster); a later attempt can retry.
  */
-export function trustedNameFor(
-  larName: string,
-  areas: readonly TribalRosterArea[]
-): string | null {
-  const target = larName.trim().toLowerCase();
-  if (target === '') return null;
-  for (const area of areas) {
-    if (area.larName.trim().toLowerCase() !== target) continue;
-    return TRUSTED_PROVENANCE.has(area.provenance ?? '') ? area.displayName : null;
-  }
-  return null;
+export function loadTribalRoster(): Promise<readonly TribalRosterArea[]> {
+  return loadRosterFile().then((f) => f.areas);
+}
+
+/** The Census area rows from the same cached load; rejects like loadTribalRoster. */
+export function loadTribalCensusAreas(): Promise<readonly TribalCensusArea[]> {
+  return loadRosterFile().then((f) => f.censusAreas);
+}
+
+/** The headquarters-town rows from the same cached load; rejects like loadTribalRoster. */
+export function loadTribalHeadquarters(): Promise<readonly TribalHeadquarters[]> {
+  return loadRosterFile().then((f) => f.headquarters);
+}
+
+/** The Tribal Lands label map from the same cached load; rejects like loadTribalRoster. */
+export function loadTribalLabelAreas(): Promise<ReadonlyMap<string, readonly string[]>> {
+  return loadRosterFile().then((f) => f.labelAreas);
+}
+
+const LABEL_NAMES_URL = (import.meta.env?.BASE_URL ?? '/dynamic-drought-module/') + 'data/tribal-label-names.json';
+
+/** How the map label names a Nation, each keyed by its Federal Register name. */
+export interface TribalLabelNames {
+  /** Its name in its own language (DR-247), drawn above. */
+  readonly own: ReadonlyMap<string, string>;
+  /** The shorter name it is generally known by (owner, 2026-11-13), drawn in place of a long formal name. */
+  readonly short: ReadonlyMap<string, string>;
+  /**
+   * By Census AIANNH code: the label of one area that its Nation's Federal Register name lists among
+   * several bands, places or communities (owner, 2026-11-13), drawn on that area in place of the Nation's name.
+   */
+  readonly area: ReadonlyMap<string, string>;
+}
+
+let labelNamesLoad: Promise<TribalLabelNames> | null = null;
+
+/** One curated column of public/data/tribal-label-names.json, NFC (MapLibre does no Unicode normalization). */
+function namesOf(json: unknown, list: string, field: string, key = 'nation'): ReadonlyMap<string, string> {
+  const rows = isObject(json) && Array.isArray(json[list]) ? (json[list] as unknown[]) : [];
+  return new Map(
+    rows.flatMap((r) =>
+      isObject(r) && typeof r[key] === 'string' && typeof r[field] === 'string'
+        ? [[r[key] as string, (r[field] as string).normalize('NFC')] as const]
+        : []
+    )
+  );
+}
+
+/**
+ * The curated label names (public/data/tribal-label-names.json): loaded once;
+ * rejects on failure, and a later call retries. The briefing never reads them:
+ * it carries the full Federal Register name.
+ */
+export function loadTribalLabelNames(): Promise<TribalLabelNames> {
+  labelNamesLoad ??= fetchJsonWithBudget(LABEL_NAMES_URL, null, null, ROSTER_TIMEOUT_MS).then(
+    (json) => ({
+      own: namesOf(json, 'ownNames', 'ownName'),
+      short: namesOf(json, 'shortNames', 'shortName'),
+      area: namesOf(json, 'areaNames', 'areaName', 'aiannh')
+    }),
+    (err: unknown) => {
+      labelNamesLoad = null;
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  );
+  return labelNamesLoad;
 }

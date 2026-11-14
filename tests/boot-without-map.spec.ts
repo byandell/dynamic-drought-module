@@ -1,5 +1,5 @@
-import { expect, test } from '@playwright/test';
-import type { Page } from '@playwright/test';
+import { expect, test } from './offline-test';
+import type { Page } from './offline-test';
 
 import { gotoApp, PILL } from './helpers';
 import { routeAllTribalFixtures } from './tribal-fixtures';
@@ -70,6 +70,21 @@ test('without WebGL 2 the chrome still boots and says so', async ({ page }) => {
     'Dynamic Drought Module'
   );
 
+  // DDM-P14-T02, the second surface: the generated controls exist, each is
+  // disabled with the reason beside it, and the stamp says there will be no
+  // map. Removing the early buildSidebarShell() call in main.ts fails these.
+  await expect(page.locator('html')).toHaveAttribute('data-ddm-controls', 'no-map');
+  const regionSelect = page.locator('#region-select');
+  await expect(regionSelect).toBeDisabled();
+  await expect(regionSelect).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.locator('#hazard-rail button[data-preset]')).not.toHaveCount(0);
+  await expect(
+    page.locator('#hazard-rail button[data-preset]:not([aria-disabled="true"])')
+  ).toHaveCount(0);
+  await expect(page.locator('#sidebar-control-note')).toHaveText(
+    'This browser cannot show the map, so these controls have nothing to change.'
+  );
+
   // The build stamps still identify this boot (T1-0 receipt integrity):
   // they are written before the capability probe, so a degraded boot is
   // still attributable to a commit and a run.
@@ -98,4 +113,31 @@ test('a healthy boot never shows the renderer notice', async ({ page }) => {
   // Neither reason's copy is anywhere on a page whose map is painting.
   await expect(page.getByText(NO_WEBGL2_TEXT)).toHaveCount(0);
   await expect(page.getByText(NOT_RENDERING_TEXT)).toHaveCount(0);
+});
+
+test('a sidebar=closed link without WebGL 2 opens the degraded shell and keeps the key (found-084)', async ({
+  page
+}) => {
+  // The inline bootstrap collapses the desktop column before the app loads
+  // (index.html, DR-139), and the expand control is withheld until the
+  // controls are ready (app.css), which a map-free boot never reaches. So
+  // the closed preference is not applied here: the column is the only
+  // surface this boot has. The key stays in the URL for a browser that can
+  // render the map, as a phone boot preserves it without applying it.
+  await page.setViewportSize({ width: 1280, height: 720 });
+  await removeWebGl2(page);
+  await routeAllTribalFixtures(page);
+  await installMinimapAnalysisStubs(page);
+  await page.goto('/?sidebar=closed', { waitUntil: 'domcontentloaded' });
+
+  await expect(page.locator('.renderer-notice')).toHaveText(NO_WEBGL2_TEXT);
+  await expect(page.locator('html')).toHaveAttribute('data-ddm-controls', 'no-map');
+  await expect(page.locator('#app')).not.toHaveClass(/sidebar-collapsed/);
+  await expect(page.locator('#sidebar')).toBeVisible();
+  await expect(page.locator('.brand-text h1')).toHaveText('Dynamic Drought Module');
+  await expect(page.locator('#sidebar-control-note')).toHaveText(
+    'This browser cannot show the map, so these controls have nothing to change.'
+  );
+  const search = await page.evaluate(() => location.search);
+  expect(new URLSearchParams(search).getAll('sidebar')).toEqual(['closed']);
 });

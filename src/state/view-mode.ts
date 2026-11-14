@@ -10,19 +10,15 @@
  * derivation below stands, but a briefing opens ONLY from an explicit
  * place selection or a `select=` deep link, never unsolicited.
  *
- * Boot derivation for URLs that do not carry an explicit `view=` (the
- * legacy-URL rule, D-0.7.0-017):
+ * Boot derivation for URLs that do not carry an explicit `view=`:
  *
  *   1. An explicit `view=` always wins (it IS the mode).
- *   2. A `select=` deep link opens BRIEF: the sharer meant the briefing
- *      (the recommended partner URL carries `layers=states` only to
- *      make the selected boundary visible, so `select` outranks the
- *      layers clause below).
- *   3. A URL naming `layers=`, a `cluster=` or its `ocean=` companion
- *      (S2, D-0.7.0-044: a display link), or a `region` or `framing=`
- *      without `select=`, opens the CONSOLE: the sharer meant the map.
- *   4. A bare URL opens BRIEF (embeds included: embeds default to
- *      brief, D-ARCH-002).
+ *   2. On the full site every URL without `view=console` opens BRIEF
+ *      (owner, 2026-10-19).
+ *   3. An embed naming `layers=`, `region=`, `cluster=`, `ocean=` or
+ *      `framing=` without `select=` keeps the older display-link rule
+ *      (D-0.7.0-017, D-0.7.0-044) and opens the CONSOLE; any other
+ *      embed opens BRIEF (D-ARCH-002).
  *
  * This module is a tiny store in the region-store pattern: the URL
  * parser writes the boot mode, the view shell writes user switches, and
@@ -37,17 +33,16 @@ type ViewModeListener = (mode: ViewMode) => void;
 let currentMode: ViewMode = 'brief';
 const listeners = new Set<ViewModeListener>();
 
-/** Derive the boot mode from the URL parameters (the legacy-URL rule). */
+/** Derive the boot mode from the URL parameters (Brief unless view=console; embeds keep the display-link rule). */
 export function deriveViewMode(params: URLSearchParams): ViewMode {
   const explicit = params.get('view');
   if (explicit === 'brief' || explicit === 'console') return explicit;
-  if (params.get('select')) return 'brief';
+  // Inline embed tokens: importing parseEmbedParam would cycle through url.ts.
+  const embed = params.get('embed');
   if (
-    params.has('layers') ||
-    params.has('region') ||
-    params.has('cluster') ||
-    params.has('ocean') ||
-    params.has('framing')
+    (embed === 'true' || embed === '1') &&
+    !params.get('select') &&
+    ['layers', 'region', 'cluster', 'ocean', 'framing'].some((k) => params.has(k))
   ) {
     return 'console';
   }
@@ -57,35 +52,6 @@ export function deriveViewMode(params: URLSearchParams): ViewMode {
 /** The active view mode. */
 export function getViewMode(): ViewMode {
   return currentMode;
-}
-
-/**
- * The explicit-Brief boot flag (U-UX-FIX-1 DEF-2). True only when the
- * INBOUND URL carried a literal, valid `view=brief` token, recorded by the
- * sidebar's boot URL application from the parser's raw explicitness (the
- * derived Brief mode of a bare URL never sets it). The mobile sheet reads
- * it exactly once, at its boot activation, to raise the Brief surface at
- * the half detent: a shared or reloaded `?view=brief` link reproduces what
- * the sender saw, while a bare boot keeps the ratified map-first closed
- * state (D-0.7.0-041). The sheet clears the flag after its boot evaluation
- * so later shell activations (a viewport crossing, the embed-exit reveal)
- * are never re-raised by the app's own `view=` stamp.
- */
-let explicitBriefBoot = false;
-
-/** Record whether the boot URL explicitly asked for the Brief door. */
-export function setExplicitBriefBoot(flag: boolean): void {
-  explicitBriefBoot = flag;
-}
-
-/** Whether the boot URL explicitly asked for the Brief door (see above). */
-export function isExplicitBriefBoot(): boolean {
-  return explicitBriefBoot;
-}
-
-/** Consume the boot-time ask (called once the boot shell has evaluated). */
-export function clearExplicitBriefBoot(): void {
-  explicitBriefBoot = false;
 }
 
 /**

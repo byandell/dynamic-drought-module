@@ -23,6 +23,8 @@
  */
 
 import type { EvidenceClass, SourcedClaim } from './types';
+import { PRODUCT_KEYS } from '../config/products';
+import { isoDayLocal } from '../util/iso-day';
 
 /**
  * The presentation for one evidence class: visible label, CSS class token,
@@ -57,6 +59,65 @@ export const EVIDENCE_PRESENTATION: Readonly<Record<EvidenceClass, EvidencePrese
   outlook: { label: 'Outlook', cssClass: 'impact-claim-outlook', tone: 'outlook' }
 };
 
+/**
+ * The reader-facing observed/outlook register word (DDM-P8-T03, owner ruling
+ * R3, 2026-09-07): a second, plainer word placed beside a claim's source
+ * line so a reader can tell, without decoding the seven-way badge, whether a
+ * claim describes something already true or something the app expects.
+ *
+ * This is NOT `EvidencePresentation.tone` above. `derived` and `classified`
+ * carry the `outlook`/`observation` TONE the T-P0-2 badge styling needs, but
+ * that tone answers "should this look cautious," not "is this the observed
+ * or the outlook register." Every `derived` claim this app builds is a
+ * present-tense read computed from already-observed inputs (the wildfire
+ * companion inferred from the current USDM category; the ENSO index-state
+ * and Pacific Northwest tendency reads), never a probability, so `derived`
+ * renders `observed` here (the exact case DR-031 raised: the near-term ENSO
+ * claim under a heading that must not imply a forecast the app does not
+ * have). `classified` is not named in the R3 ruling; it renders `observed`
+ * by the same reasoning the badge tone already gives it: an issuer's own
+ * classification of a currently valid state (HeatRisk's 0-4 class), not a
+ * forecast. `modeled` and `modeled-analysis` are unused by any claim as of
+ * this ruling; both render `outlook`, matching their existing tone, because
+ * a model output is exactly the forward-looking case the tag exists to mark.
+ *
+ * A claim whose text would be misdescribed by its class's tag renders none
+ * (R3's escape hatch) rather than take this table's default. The 2026-09-07
+ * inventory of every claim site found none that needed it; DR-070 amended
+ * 2026-09-08 later created the first one: a HeatRisk claim in force is
+ * OUTLOOK register (the issuer's own words, HeatRisk "provides a forecast of
+ * the potential level of risk ... over a 24-hour period", override the
+ * classified -> observed reading for HeatRisk only; every other classified
+ * source keeps observed). `src/impact/sources.ts` sets that one claim's
+ * `register` field; read this table through `claimRegisterTag`, not
+ * directly, so a per-claim override is never missed. `src/ui/claim-render.ts`
+ * renders the result beside the source line; `CELL_ABSENCE` prose in
+ * `src/impact/matrix.ts` never reaches this table (R4: an absence is neither
+ * register).
+ */
+export const CLAIM_REGISTER_TAG: Readonly<Record<EvidenceClass, 'observed' | 'outlook'>> = {
+  observed: 'observed',
+  analyzed: 'observed',
+  classified: 'observed',
+  'modeled-analysis': 'outlook',
+  modeled: 'outlook',
+  derived: 'observed',
+  outlook: 'outlook'
+};
+
+/**
+ * The reader-facing register for one claim: its explicit `register` override
+ * when set (DR-070 amended 2026-09-08), else `CLAIM_REGISTER_TAG`'s
+ * per-evidence-class default. The only sanctioned way to read a claim's
+ * register; callers must not index `CLAIM_REGISTER_TAG` directly, or a
+ * future per-claim override would be silently skipped.
+ */
+export function claimRegisterTag(
+  claim: Pick<SourcedClaim, 'evidence' | 'register'>
+): 'observed' | 'outlook' {
+  return claim.register ?? CLAIM_REGISTER_TAG[claim.evidence];
+}
+
 /** A claim under construction: everything but the derived legacy `kind`. */
 export type SourcedClaimInput = Omit<SourcedClaim, 'kind'>;
 
@@ -66,7 +127,8 @@ const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
  * The typed claim factory: the only sanctioned way to build a `SourcedClaim`,
  * in src/ and in specs alike. Because specs are excluded from typecheck, the
  * contract is enforced HERE at runtime, not only by the input type: text and
- * source must be non-empty, `evidence` must be one of the seven classes, and
+ * source must be non-empty, `evidence` must be one of the seven classes,
+ * `product` must be a `PRODUCT_KEYS` member (DDM-P14-T05 microtask 2), and
  * the claim must carry at least one ISO 8601 (`YYYY-MM-DD`) date (every claim
  * is dated; that is the contract, not a style preference). The legacy `kind`
  * is derived, never set independently. Construction sites sit inside their
@@ -83,6 +145,9 @@ export function makeClaim(input: SourcedClaimInput): SourcedClaim {
   const pres = EVIDENCE_PRESENTATION[input.evidence];
   if (!pres) {
     throw new Error(`makeClaim: unknown evidence class "${String(input.evidence)}"`);
+  }
+  if (!PRODUCT_KEYS.includes(input.product)) {
+    throw new Error(`makeClaim: unknown product key "${String(input.product)}"`);
   }
   const dates = input.dates ?? {};
   const dateValues = [dates.valid, dates.issued, dates.published, dates.retrieved].filter(
@@ -101,23 +166,38 @@ export function makeClaim(input: SourcedClaimInput): SourcedClaim {
 
 /** Today as an ISO 8601 date, for `dates.retrieved` on live fetches. */
 export function todayIso(): string {
-  const d = new Date();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${d.getFullYear()}-${m}-${day}`;
+  return isoDayLocal(new Date());
+}
+
+/** A claim's shown date as data: the word it wears and its ISO day. */
+export interface ClaimClock {
+  readonly word: 'Valid' | 'Issued' | 'Published' | 'Retrieved';
+  /** `YYYY-MM-DD`, as the claim carries it. */
+  readonly date: string;
 }
 
 /**
- * The shown date line for a claim. Precedence: valid, else issued, else
+ * The one date a claim shows, as data. Precedence: valid, else issued, else
  * published, else retrieved (so `retrieved` always shows when nothing more
- * specific exists). Returns null only for a claim with no dates at all.
+ * specific exists). Null only for a claim with no dates at all. A figure
+ * that places a claim in time reads this, so it can never plot another date
+ * than the one the claim's own line states.
  */
-export function claimDateLine(claim: Pick<SourcedClaim, 'dates'>): string | null {
+export function claimClock(claim: Pick<SourcedClaim, 'dates'>): ClaimClock | null {
   const d = claim.dates;
   if (!d) return null;
-  if (d.valid) return `Valid ${d.valid}`;
-  if (d.issued) return `Issued ${d.issued}`;
-  if (d.published) return `Published ${d.published}`;
-  if (d.retrieved) return `Retrieved ${d.retrieved}`;
+  if (d.valid) return { word: 'Valid', date: d.valid };
+  if (d.issued) return { word: 'Issued', date: d.issued };
+  if (d.published) return { word: 'Published', date: d.published };
+  if (d.retrieved) return { word: 'Retrieved', date: d.retrieved };
   return null;
+}
+
+/**
+ * The shown date line for a claim: `claimClock`'s word and date. Returns
+ * null only for a claim with no dates at all.
+ */
+export function claimDateLine(claim: Pick<SourcedClaim, 'dates'>): string | null {
+  const clock = claimClock(claim);
+  return clock ? `${clock.word} ${clock.date}` : null;
 }

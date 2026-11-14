@@ -41,10 +41,8 @@ import { signal } from '@preact/signals';
 import type { ReadonlySignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 
-import {
-  CLUSTER_DISPLAY_NAMES,
-  TEMPORAL_HORIZON_CHIP_LABELS
-} from '../../config/clusters';
+import { CLUSTER_DISPLAY_NAMES } from '../../config/clusters';
+import { HORIZON_CHROME, SHELL_HORIZON_KEY } from '../../impact/horizon-chrome';
 import {
   dismissResponse,
   setResponseSink
@@ -77,9 +75,11 @@ function clusterLine(snap: CommittedShellSnapshot): string {
     snap.cluster === 'custom'
       ? 'Custom layer set'
       : `${CLUSTER_DISPLAY_NAMES[snap.cluster]} view`;
-  // One table for the visible horizon wording (src/config/clusters.ts), so
-  // this line and the shell's chips can never drift apart.
-  return `${view} · ${TEMPORAL_HORIZON_CHIP_LABELS[snap.horizon]}`;
+  // One table for the visible horizon wording (src/impact/horizon-chrome.ts,
+  // DDM-P8-T03 owner ruling R1, 2026-09-07), so this line and the shell's
+  // chips can never drift apart. Title only: this is a compact inline
+  // summary, not the chip row, which also shows the subtitle.
+  return `${view} · ${HORIZON_CHROME[SHELL_HORIZON_KEY[snap.horizon]].title}`;
 }
 
 interface PanelResponseProps {
@@ -148,6 +148,10 @@ export function mountPanelResponse(host: HTMLElement): void {
       return true;
     },
     dismiss() {
+      // Focus in the leaving card goes to the map, as a closing popup's does (the coordinator's returnFocus), never the page.
+      if (host.contains(document.activeElement)) {
+        document.querySelector<HTMLElement>('.maplibregl-canvas')?.focus({ preventScroll: true });
+      }
       current.value = null;
       host.toggleAttribute('data-open', false);
     }

@@ -1,8 +1,10 @@
 /**
  * The desktop 3D Fire view toggle (W3/W4), rendered in the shell island
- * directly under the hazard cluster buttons.
+ * in the view details below the persistent navigation controls.
  *
- * Visibility: only while the committed cluster is 'wildfire' AND the
+ * Visibility: only while the committed cluster is 'wildfire' (Fuel risk
+ * included, an optional layer of Wildfire) or the scene is still up after a
+ * custom demotion (the button is the way out) AND the
  * device can enter the scene at all, which since DR-025a is the same three
  * questions the map-side gate in `src/map/fire3d.ts` asks: the viewport is
  * at least the desktop breakpoint wide, at least `FIRE3D_MIN_HEIGHT_PX`
@@ -14,6 +16,24 @@
  * #shell-panel), so the control is inert in embeds for free while a
  * URL-named fire3d=true still drives the map-side effect through the
  * orchestrator.
+ *
+ * Refusals are SAID, not performed by omission (DDM-P9-T02). Withdrawing
+ * the control was only half of DR-025a: it stopped offering a button the
+ * map would refuse, and left the person who cannot have the scene looking
+ * at an interface indistinguishable from one where the feature was never
+ * built. A device that cannot hold the scene now reads one sentence where
+ * the button would have been, naming what was observed and nothing else
+ * (`fire3dControlOffer` and `FIRE3D_REFUSAL_TEXT` carry both decisions and
+ * both sentences). Of the two, only the short-window sentence is reachable
+ * in a browser today: this island mounts through `wireMapDependentChrome(map)`
+ * in main.ts, which needs a live map, and MapLibre 6 builds no map without
+ * WebGL 2, so a browser without it never reaches the island. That case is
+ * answered earlier, by the boot's renderer notice
+ * (`src/ui/renderer-notice.ts`, DDM-P14-T02); the no-webgl2 sentence stays
+ * as the pure function's deeper refusal, proven in Node, for a mount path
+ * that does not exist yet. It is a control affordance, not a seventh layer
+ * state; the status line below the button keeps the six-state vocabulary
+ * to itself.
  *
  * The button mirrors the PREFERENCE (the user's durable ask, aria-pressed
  * flips with the click); the status line underneath tells the honest truth
@@ -32,28 +52,69 @@
  * main.ts uses, and only while the control is actually visible.
  */
 
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import {
+  FIRE3D_CONSOLE_WIDTH_QUERY,
   FIRE3D_COVERAGE_NOTE,
   FIRE3D_MIN_HEIGHT_QUERY,
-  FIRE3D_MIN_WIDTH_QUERY,
-  FIRE3D_NON_PREDICTION_NOTE
+  FIRE3D_NON_PREDICTION_NOTE,
+  FIRE3D_OUT_OF_COVERAGE_STATUS,
+  FIRE3D_PARTIAL_COVERAGE_STATUS,
+  FIRE3D_REFUSAL_TEXT,
+  fire3dControlOffer,
+  fire3dCoverageNote
 } from '../../config/fire3d-presentation';
+import { WHP_3D_SHADE_QUALIFICATION } from '../../config/whp-shade';
+import type * as maplibregl from 'maplibre-gl';
+import { HAZARD_CLUSTERS } from '../../config/clusters';
 import type { HazardClusterKey } from '../../config/clusters';
 import type { Fire3DStatus } from '../../map/fire3d';
+import { requestBasemapMode } from '../../map/basemap-switcher';
+import { defaultBasemapFor } from '../../state/basemap-store';
+import { loadFire3DController } from '../../map/fire3d-chunk';
 // The shared, once-per-page probe result (already in the entry chunk through
 // main.ts, so reading it here adds no eager weight and no second context).
 import { webGl2Capability } from '../../map/gl-capability';
+import { getCommittedSnapshot, onCommittedSnapshotChange, requestCluster } from '../../state/cluster-service';
+import {
+  getFire3DGroundLayer,
+  onFire3DGroundLayerChange,
+  setFire3DGroundLayer,
+  type Fire3DGroundLayer
+} from '../../state/fire3d-ground-layers';
 import {
   getFire3DPreference,
   onFire3DPreferenceChange,
   setFire3DPreference
 } from '../../state/fire3d-store';
 import { registry } from '../../state/registry';
+import {
+  FLAT_FUEL_RISK_KEY,
+  FUEL_RISK_TITLE,
+  fuelRiskKeepsConsole,
+  fuelRiskSwitch,
+  revealScroll,
+  shouldRevealScroll
+} from '../fire3d-fuel-risk';
+import { requestLayerOn } from '../layer-toggle-command';
+import { setMapTechnicalNote } from '../map-technical-information';
 
 /** The catalog key whose emptiness the 3D control reports. */
 const HMS_SMOKE_LAYER_KEY = 'hms-smoke';
+
+/**
+ * The two ground switches (owner, DR-199), offered only while the scene is
+ * up: each removes or restores its own white layer and nothing else. They
+ * mirror session state (src/state/fire3d-ground-layers.ts), on by default,
+ * and are buttons of the same family and size as the 3D toggle above them.
+ * On the flat map "Fuel risk" turns on the flat white layer instead
+ * (src/ui/fire3d-fuel-risk.ts); in the scene it waits for the drape.
+ */
+const GROUND_SWITCHES: readonly (readonly [Fire3DGroundLayer, string])[] = [
+  ['plantStress', 'Plant stress'],
+  ['fuelRisk', 'Fuel risk']
+];
 
 /**
  * The status line speaks the six honest layer states (AGENTS.md invariant
@@ -74,20 +135,37 @@ const HMS_SMOKE_LAYER_KEY = 'hms-smoke';
  * strings move. `inactive` renders no line at all: the scene is off and
  * claims nothing.
  */
-function statusLine(status: Fire3DStatus | null): string {
+function statusLine(status: Fire3DStatus | null, smokeStatus: string | undefined): string {
   if (status === null) return '';
   switch (status.state) {
     case 'checking':
       return 'Loading terrain availability...';
     case 'active':
-      return status.smokeVolume
-        ? 'Live: terrain relief with the smoke volume.'
+      if (status.smokeVolume) return 'Live: terrain relief with the smoke volume.';
+      // A failed smoke read empties the flat veil too, so there is no veil to point at.
+      return smokeStatus === 'error'
+        ? 'Live (partial): terrain relief; smoke is unavailable.' // DRAFT wording
         : 'Live (partial): terrain relief; smoke stays in the flat veil.';
     case 'unavailable':
       return `Unavailable. ${status.reason ?? ''}`.trim();
     default:
       return '';
   }
+}
+
+/**
+ * The coverage note for the archive the scene actually reads (DR-083 step
+ * 1). While the scene is active, the depth comes from the resolved
+ * archive's own header, so a scene reading the deep archive says zoom 10.
+ * Before activation, and whenever the scene is not active, the bundled
+ * form stands: the bundled archive is what ships, so it is the honest
+ * claim about a scene that has not yet chosen.
+ */
+function coverageNote(status: Fire3DStatus | null): string {
+  if (status?.state === 'active' && status.terrainMaxZoom !== null) {
+    return fire3dCoverageNote(status.terrainExtent ?? status.terrainMaxZoom);
+  }
+  return FIRE3D_COVERAGE_NOTE;
 }
 
 /**
@@ -115,19 +193,57 @@ function emptySmokeLine(status: Fire3DStatus | null, smokeStatus: string | undef
     : '';
 }
 
+/**
+ * The out-of-coverage line (defect 1 of the terrain relief lane, 2026-09-10:
+ * the owner reported "no terrain, it's flat", and part of that report is a
+ * fire outside the Pacific Northwest bake, where the ground is genuinely
+ * flat because MapLibre's terrain sampler has no elevation to return there).
+ *
+ * Same pattern as emptySmokeLine above: a conditional line beside the live
+ * status, not a new member of the six-state vocabulary (the scene is still
+ * `active`; this qualifies what "active" means for the ground under THIS
+ * view). It renders and clears with `status.terrainCoverage`, which the
+ * orchestrator keeps current across a pan, so the sentence tracks the
+ * camera rather than only ever describing where the scene happened to enter.
+ *
+ * THREE readings since 2026-09-10, not two (Codex adversarial review finding
+ * 8). A view that straddles the extent's edge gets its own sentence, because
+ * the wholly-outside one is false about the half of the view that IS
+ * modelled, and saying nothing is false about the half that is not.
+ */
+function outOfCoverageLine(status: Fire3DStatus | null): string {
+  if (status?.state !== 'active') return '';
+  if (status.terrainCoverage === 'none') return FIRE3D_OUT_OF_COVERAGE_STATUS;
+  if (status.terrainCoverage === 'partial') return FIRE3D_PARTIAL_COVERAGE_STATUS;
+  return '';
+}
+
 export function Fire3DControl({
-  cluster
+  cluster,
+  map
 }: {
   readonly cluster: HazardClusterKey | 'custom';
+  readonly map: maplibregl.Map;
 }) {
   // The geometry half of the entry gate (DR-025a): wide enough AND tall
   // enough, watched as two media queries so a phone rotating into landscape
   // withdraws the control and rotating back restores it. The capability
   // half is read once; it cannot change for a page.
-  const [geometryFits, setGeometryFits] = useState<boolean>(
-    () =>
-      window.matchMedia(FIRE3D_MIN_WIDTH_QUERY).matches &&
-      window.matchMedia(FIRE3D_MIN_HEIGHT_QUERY).matches
+  //
+  // The two are held apart rather than as one boolean because they now have
+  // different ANSWERS: a viewport below the desktop breakpoint is the phone
+  // chrome, which offers the scene from its own cell (src/ui/fire3d-phone.ts)
+  // so this console says nothing there, while a wide but short viewport is a
+  // landscape phone that has to be told why the button it saw yesterday is
+  // gone (DDM-P9-T02). The width asked is the CONSOLE's, not the scene's own
+  // floor: since 2026-11-09 the scene's floor admits phones, and reading it
+  // here would mount this control inside the phone sheet and load the 3D
+  // chunk for every phone in Wildfire.
+  const [wideEnough, setWideEnough] = useState<boolean>(
+    () => window.matchMedia(FIRE3D_CONSOLE_WIDTH_QUERY).matches
+  );
+  const [tallEnough, setTallEnough] = useState<boolean>(
+    () => window.matchMedia(FIRE3D_MIN_HEIGHT_QUERY).matches
   );
   const [preference, setPreference] = useState<boolean>(getFire3DPreference);
   const [status, setStatus] = useState<Fire3DStatus | null>(null);
@@ -136,10 +252,11 @@ export function Fire3DControl({
   );
 
   useEffect(() => {
-    const width = window.matchMedia(FIRE3D_MIN_WIDTH_QUERY);
+    const width = window.matchMedia(FIRE3D_CONSOLE_WIDTH_QUERY);
     const height = window.matchMedia(FIRE3D_MIN_HEIGHT_QUERY);
     const onChange = (): void => {
-      setGeometryFits(width.matches && height.matches);
+      setWideEnough(width.matches);
+      setTallEnough(height.matches);
     };
     width.addEventListener('change', onChange);
     height.addEventListener('change', onChange);
@@ -157,6 +274,21 @@ export function Fire3DControl({
     []
   );
 
+  // The ground switches render straight from their store; a change redraws.
+  const [, redrawGroundSwitches] = useState(0);
+  useEffect(() => onFire3DGroundLayerChange(() => redrawGroundSwitches((n) => n + 1)), []);
+  // In the scene Fuel risk acts on the 3D drape only while it is mounted (src/layers/whp-3d.ts says
+  // so), which hides the flat layer meanwhile; on the flat map it acts on the flat layer.
+  const [drapeMounted, setDrapeMounted] = useState(false);
+  useEffect(() => {
+    const onShade = (event: Event): void => {
+      const mounted = (event as CustomEvent<{ mounted?: boolean }>).detail?.mounted;
+      if (mounted !== undefined) setDrapeMounted(mounted);
+    };
+    window.addEventListener('ddm:whp-shade', onShade);
+    return () => window.removeEventListener('ddm:whp-shade', onShade);
+  }, []);
+
   // The smoke layer's own status is the single source for the empty-smoke
   // line, so the 3D control and the catalog pill can never disagree about
   // whether the issuer returned anything.
@@ -169,60 +301,188 @@ export function Fire3DControl({
     []
   );
 
-  const visible =
-    geometryFits && webGl2Capability().webgl2 && cluster === 'wildfire';
+  // Subscribed, not read on render: Fuel risk keeps the Wildfire cluster, so the shell's props do not
+  // change and the signals integration skips this control's re-render on that publish.
+  const [snapshot, setSnapshot] = useState(getCommittedSnapshot);
+  useEffect(() => {
+    setSnapshot(getCommittedSnapshot()); // a publish between the first render and this subscription
+    return onCommittedSnapshotChange(() => setSnapshot(getCommittedSnapshot()));
+  }, []);
+  const flatFuelOn = snapshot.intendedKeys.has(FLAT_FUEL_RISK_KEY);
+  const recipeHasFlat =
+    snapshot.cluster !== 'custom' &&
+    HAZARD_CLUSTERS[snapshot.cluster].recipes[snapshot.horizon].includes(FLAT_FUEL_RISK_KEY);
+  const fuelTarget = fuelRiskSwitch({ sceneActive: status?.state === 'active', drapeMounted, recipeHasFlat });
+  const offer = fire3dControlOffer({
+    wideEnough,
+    tallEnough,
+    webgl2: webGl2Capability().webgl2,
+    // A scene kept up after a custom demotion keeps its button: it is the one direct way out.
+    fireView:
+      fuelRiskKeepsConsole(cluster, snapshot.selectedHazard, flatFuelOn) ||
+      status?.state === 'active' ||
+      status?.state === 'checking'
+  });
+  const visible = offer === 'control';
+  const [chunkUnavailable, setChunkUnavailable] = useState(false);
+  useEffect(() => {
+    setMapTechnicalNote('fire3d', coverageNote(status), status?.state === 'active' && status.terrainMaxZoom !== null);
+  }, [status]);
+
+  // The sidebar scrolls; bring the control up when it appears or gains a row
+  // after load, never on the first run (see shouldRevealScroll).
+  const root = useRef<HTMLDivElement>(null);
+  const lastFuelTarget = useRef<typeof fuelTarget | undefined>(undefined);
+  const lastRecipeHasFlat = useRef(recipeHasFlat);
+  // Set by the button, not read from the URL: a shared 3D link must not scroll at load.
+  const turnedOn3D = useRef(false);
+  useEffect(() => {
+    const firstRun = lastFuelTarget.current === undefined;
+    const fuelRowChanged = !firstRun && lastFuelTarget.current !== fuelTarget;
+    lastFuelTarget.current = fuelTarget;
+    // shortcut: recipeHasFlat is not an effect dependency (adding it would scroll a 3D user on every horizon press), so this ref can lag a horizon change made while the scene is active; upgrade if a 3D horizon press is seen to scroll.
+    const recipeChanged = lastRecipeHasFlat.current !== recipeHasFlat;
+    lastRecipeHasFlat.current = recipeHasFlat;
+    const box = root.current?.closest('.sidebar-scroll');
+    if (!root.current || !box) return;
+    if (!shouldRevealScroll({ firstRun, sceneRequested: turnedOn3D.current && preference, fuelRowChanged, recipeChanged })) return;
+    box.scrollTop += revealScroll(root.current.getBoundingClientRect(), box.getBoundingClientRect());
+  }, [visible, status?.state, fuelTarget]);
 
   useEffect(() => {
-    if (!visible) return;
+    // Hidden, the status stops refreshing; a kept 'active' would hold fireView up in another mode.
+    if (!visible) {
+      setStatus(null);
+      return;
+    }
     let disposed = false;
     let unsubscribe: (() => void) | null = null;
-    void import('../../map/fire3d').then((mod) => {
+    void loadFire3DController().then((mod) => {
       if (disposed) return;
+      setChunkUnavailable(false);
       setStatus(mod.getFire3DStatus());
       unsubscribe = mod.onFire3DStatusChange(() => {
         setStatus(mod.getFire3DStatus());
       });
+    }).catch(() => {
+      if (!disposed) setChunkUnavailable(true);
     });
     return () => {
       disposed = true;
       unsubscribe?.();
     };
-  }, [visible]);
+  }, [visible, preference]);
 
-  if (!visible) return null;
+  // A refusal reads as one sentence in the slot the button would have
+  // occupied, directly after the hazard-view button group, so a person
+  // reading the panel in order (screen reader included) meets the reason
+  // exactly where the missing control would have been. It is a statement,
+  // not a control: there is nothing here to press, and a dead-looking
+  // button would say less than a sentence that names the refusal.
+  //
+  // It borrows `.shell-fire3d-empty`, the treatment this panel already uses
+  // for a sentence that ANSWERS rather than qualifies (one step brighter
+  // than the standing notes), so the refusal reads as the answer to "where
+  // is the 3D view" rather than as fine print. `.shell-fire3d-note` stays
+  // countable: this paragraph is not one of the standing notes.
+  if (offer !== 'control') {
+    if (offer === 'silent') return null;
+    return (
+      <p
+        class="shell-fire3d-empty"
+        id="shell-fire3d-refused"
+        data-fire3d-refused={offer}
+      >
+        {FIRE3D_REFUSAL_TEXT[offer]}
+      </p>
+    );
+  }
 
   return (
-    <div class="shell-fire3d" id="shell-fire3d">
+    <div class="shell-fire3d" id="shell-fire3d" ref={root}>
       <button
         type="button"
         class="shell-fire3d-btn"
         aria-pressed={preference}
         title="Tilt the Fire view over 3D terrain relief with a volumetric smoke read. Presentation only: it changes how the same mapped data is seen, not what any layer claims."
-        onClick={() => setFire3DPreference(!preference)}
+        onClick={() => {
+          // The scene enters only from Wildfire; a flat Fuel risk stays on and steps aside for the drape.
+          if (!preference && cluster !== 'wildfire') {
+            requestCluster('wildfire');
+            // A mode switch applies the mode's basemap default, like the shell's chooser.
+            requestBasemapMode(map, defaultBasemapFor('wildfire'));
+          }
+          turnedOn3D.current = !preference;
+          setFire3DPreference(!preference);
+        }}
       >
         3D Fire view
       </button>
+      {status?.state === 'active'
+        ? GROUND_SWITCHES.filter(([layer]) => layer !== 'fuelRisk' || fuelTarget === 'drape').map(([layer, label]) => (
+            <button
+              key={layer}
+              type="button"
+              class="shell-fire3d-layer"
+              aria-pressed={getFire3DGroundLayer(layer)}
+              onClick={() => setFire3DGroundLayer(layer, !getFire3DGroundLayer(layer))}
+            >
+              {label}
+            </button>
+          ))
+        : null}
+      {fuelTarget === 'flat' ? (
+        <button
+          type="button"
+          class="shell-fire3d-layer"
+          data-fuel-risk="flat"
+          aria-pressed={flatFuelOn}
+          title={FUEL_RISK_TITLE}
+          // Off is the Wildfire recipe again, so the display reads Wildfire, not a custom set.
+          onClick={() => (flatFuelOn ? requestCluster('wildfire') : requestLayerOn(FLAT_FUEL_RISK_KEY))}
+        >
+          Fuel risk
+        </button>
+      ) : null}
+      <details class="shell-fire3d-details">
+        <summary>
+          3D information
+          {/* A state that needs a reader's attention rides the summary; plain "live" does not (D6). */}
+          {chunkUnavailable ? ' · unavailable' : status?.state === 'checking' ? ' · loading' :
+            status?.state === 'active' ? (status.smokeVolume ? '' : ' · live (partial)') :
+              status?.state === 'unavailable' ? ' · unavailable' : ''}
+        </summary>
       {/* Persistently rendered live region (the shell summary pattern):
           only its text swaps, so screen readers announce it reliably. */}
       <p
         class="shell-fire3d-status"
-        data-fire3d-status={status?.state ?? 'inactive'}
+        data-fire3d-status={chunkUnavailable ? 'unavailable' : status?.state ?? 'inactive'}
+        data-fire3d-transport={status?.transport ?? undefined}
         aria-live="polite"
       >
-        {statusLine(status)}
+        {chunkUnavailable ? 'Unavailable.' : statusLine(status, smokeStatus)}
       </p>
       {emptySmokeLine(status, smokeStatus) ? (
         <p class="shell-fire3d-empty" data-fire3d-empty-smoke>
           {emptySmokeLine(status, smokeStatus)}
         </p>
       ) : null}
-      <p class="shell-fire3d-note">{FIRE3D_COVERAGE_NOTE}</p>
-      {/* The non-prediction disclosure renders whenever the control does
-          (never a dismissible tooltip): viewers over-trust fire visuals,
-          so the boundary statement lives in the interface itself. */}
+      {outOfCoverageLine(status) ? (
+        <p class="shell-fire3d-empty" data-fire3d-out-of-coverage>
+          {outOfCoverageLine(status)}
+        </p>
+      ) : null}
+      <p class="shell-fire3d-note">{coverageNote(status)}</p>
+      {/* Source limits remain available beside the control through the
+          technical disclosure requested by the owner. */}
       <p class="shell-fire3d-note" data-fire3d-disclosure>
         {FIRE3D_NON_PREDICTION_NOTE}
       </p>
+      {/* The Fuel risk key's caveat, word for word, while the drape it speaks of is drawn (D6). */}
+      {fuelTarget === 'drape' ? (
+        <p class="shell-fire3d-fuel-note" data-fire3d-fuel-note>{WHP_3D_SHADE_QUALIFICATION}</p>
+      ) : null}
+      </details>
     </div>
   );
 }

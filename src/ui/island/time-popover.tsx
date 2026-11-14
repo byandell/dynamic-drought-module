@@ -1,249 +1,102 @@
 /**
- * The compact WHEN row and the "More time" popover (S4c; the S4 design
- * record section 3: "the compact/detail TimeBarSpec facade + the 'More
- * time' popover").
+ * The compact WHEN row (S4c; the S4 design record section 3).
  *
- * COMPACT: the shell's WHEN row shows only the register stamp headline
- * (the smallest honest date statement, same doctrine as the embed date
- * chip) plus one "More time" door. DETAIL: the popover renders the full
- * temporal controls (rail, mode chips, jumps, play) FROM the exact
- * TimeBarSpec the owning surface installed, driving the SAME callbacks,
- * so the compact and detail surfaces can never disagree with the layer
- * modules about dates or capabilities. The affordance honesty carries
- * over verbatim: a Play control renders only when the spec declares one
- * (continuous fields), never on authored stepped products.
+ * The shell's WHEN row shows only the pressed horizon and the register
+ * stamp headline (the smallest honest date statement, same doctrine as the
+ * embed date chip), FROM the exact TimeBarSpec the owning surface installed.
+ * The full temporal controls (rail, mode chips, jumps, play) live in the
+ * `#time-bar` rail, which Console and mobile keep. The row sits at the very
+ * foot of the column (#shell-time-island, owner 2026-11-13) and is drawn in
+ * Console only; Brief keeps it mounted but hidden.
  *
  * When no surface owns a spec the row says so honestly rather than
  * hiding: "No dated product is displayed."
- *
- * Focus: opening moves focus into the popover (the native popover
- * light-dismiss keeps Escape working); closing restores focus to the
- * "More time" button (the S4c focus-restoration contract).
  */
 
-import { useEffect, useRef } from 'preact/hooks';
 import type { ReadonlySignal } from '@preact/signals';
 
+import type { TemporalHorizonKey } from '../../config/clusters';
+import { HORIZON_CHROME, SHELL_HORIZON_KEY } from '../../impact/horizon-chrome';
+import { dateTok } from '../../util/text-tokens';
 import { getTimeBarSpec } from '../time-bar';
-import type { TimeBarSpec } from '../time-bar';
-import { wireShellPopover } from './popover-discipline';
+import type { TimeBarStamp } from '../time-bar';
 
 export interface TimeCompactProps {
   /** Bumped by the shell on every onTimeBarSpecChange notification. */
   readonly specTick: ReadonlySignal<number>;
+  /**
+   * The shell's committed (pressed) horizon chip, from `shell.tsx`'s own
+   * snapshot (found-014, DDM-P10-T11): the heading names THIS horizon, in
+   * `HORIZON_CHROME`'s words, not the surface's own declared `stamp.horizon`
+   * (a HeatRisk day not yet begun answers Near Term even while Current
+   * Conditions is pressed, by design, `src/layers/heatrisk.ts`). Naming the
+   * pressed chip here keeps chip and card agreeing; the surface's own
+   * outlook day still states itself in the headline detail beside it,
+   * so nothing honest is lost, only which fact is the HEADING.
+   */
+  readonly pressedHorizon: TemporalHorizonKey;
 }
 
 /**
- * The step chevron, drawn exactly as the bar draws it
- * (src/ui/time-bar.ts's rail row): same viewBox, size, stroke, and points.
- * The two renderings of one TimeBarSpec must not look like different
- * controls, so this glyph and the bar's are kept identical by eye and by
- * comment; the text `<` / `>` they replaced were the visible divergence.
+ * The feed-freshness words (found-015): built locally from the stamp's own
+ * `checkedAt` ISO instant with `dateTok` (R5 a, month-name dates) rather
+ * than importing `time-bar.ts`'s `freshnessLabel`/`freshnessDate`, whose
+ * non-month-name format (`time-bar.ts:104-119`) is `#time-bar`'s (the Brief
+ * sidebar bar's) own choice, not owned here.
  */
-function StepChevron({ direction }: { direction: 'prev' | 'next' }) {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="14"
-      height="14"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="2"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <polyline points={direction === 'prev' ? '15 18 9 12 15 6' : '9 18 15 12 9 6'} />
-    </svg>
-  );
+function freshnessText(stamp: TimeBarStamp): string {
+  const freshness = stamp.freshness;
+  if (!freshness) return '';
+  if (freshness.state === 'current') return 'Current feed check';
+  if (freshness.state === 'loading') return 'Checking current conditions';
+  const checkedAt = freshness.checkedAt;
+  const date = checkedAt && Number.isFinite(Date.parse(checkedAt)) ? dateTok(checkedAt) : null;
+  // DRAFT wording: "browser check", as the time bar's dot and the NIFC popup's clock word it.
+  return date ? `Last successful browser check ${date}` : 'Current feed check unavailable';
 }
 
-function DetailControls({ spec }: { spec: TimeBarSpec }) {
-  const rail = spec.rail;
-  return (
-    <div class="shell-time-detail">
-      <div class="shell-time-detail-stamp" data-register={spec.stamp.register}>
-        <span class="shell-time-detail-headline">{spec.stamp.headline}</span>
-        <span class="shell-time-detail-line">{spec.stamp.detail}</span>
-      </div>
-      {rail && (
-        <div class="shell-time-detail-rail">
-          <button
-            type="button"
-            class="time-bar-step"
-            aria-label="Previous date"
-            title="Previous date"
-            disabled={rail.index <= 0}
-            onClick={() => {
-              const r = getTimeBarSpec()?.rail;
-              if (r && r.index > 0) r.onStep(r.index - 1);
-            }}
-          >
-            <StepChevron direction="prev" />
-          </button>
-          <input
-            type="range"
-            class="time-bar-rail"
-            min={0}
-            max={rail.count - 1}
-            step={1}
-            value={rail.index}
-            aria-label="Date"
-            aria-valuetext={rail.valueText(rail.index)}
-            // `input` fires per notch while dragging. Stepping per notch
-            // would spam fetches, so the fetch-triggering step still waits
-            // for `change` (release or arrow key) exactly as the bar does;
-            // only the announced value keeps up, so a screen-reader user
-            // dragging the rail hears real product dates rather than a
-            // value frozen at the stop they started from.
-            onInput={(event) => {
-              const el = event.currentTarget as HTMLInputElement;
-              const v = Number(el.value);
-              const r = getTimeBarSpec()?.rail;
-              if (r && Number.isInteger(v)) {
-                el.setAttribute('aria-valuetext', r.valueText(v));
-              }
-            }}
-            onChange={(event) => {
-              const v = Number((event.currentTarget as HTMLInputElement).value);
-              const r = getTimeBarSpec()?.rail;
-              if (r && Number.isInteger(v)) r.onStep(v);
-            }}
-          />
-          <button
-            type="button"
-            class="time-bar-step"
-            aria-label="Next date"
-            title="Next date"
-            disabled={rail.index >= rail.count - 1}
-            onClick={() => {
-              const r = getTimeBarSpec()?.rail;
-              if (r && r.index < r.count - 1) r.onStep(r.index + 1);
-            }}
-          >
-            <StepChevron direction="next" />
-          </button>
-        </div>
-      )}
-      {spec.modes && (
-        <div class="shell-time-detail-modes" role="group" aria-label="View mode">
-          {spec.modes.options.map((m) => (
-            <button
-              type="button"
-              key={m.key}
-              class={`time-bar-mode${m.key === spec.modes?.activeKey ? ' active' : ''}`}
-              title={m.title}
-              aria-pressed={m.key === spec.modes?.activeKey}
-              disabled={m.disabled === true}
-              onClick={() => {
-                const s = getTimeBarSpec();
-                if (s?.modes && m.key !== s.modes.activeKey) s.modes.onSelect(m.key);
-              }}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
-      )}
-      {spec.jumps && (
-        <div class="shell-time-detail-jumps">
-          {spec.jumps.options.map((j) => (
-            <button
-              type="button"
-              key={j.key}
-              class={`time-bar-jump${j.hatched ? ' hatched' : ''}`}
-              title={j.title}
-              onClick={() => getTimeBarSpec()?.jumps?.onJump(j.key)}
-            >
-              {j.label}
-            </button>
-          ))}
-        </div>
-      )}
-      {spec.play && (
-        <button
-          type="button"
-          class="time-bar-play"
-          disabled={spec.play.disabled}
-          onClick={() => getTimeBarSpec()?.play?.onToggle()}
-        >
-          {spec.play.playing ? 'Pause' : 'Play'}
-        </button>
-      )}
-    </div>
-  );
-}
-
-export function TimeCompact({ specTick }: TimeCompactProps) {
+export function TimeCompact({ specTick, pressedHorizon }: TimeCompactProps) {
   // Reading the signal subscribes this component to spec changes.
   void specTick.value;
   const spec = getTimeBarSpec();
-  const moreRef = useRef<HTMLButtonElement>(null);
-  const popRef = useRef<HTMLDivElement>(null);
+  const pressedChrome = HORIZON_CHROME[SHELL_HORIZON_KEY[pressedHorizon]];
 
-  useEffect(() => {
-    const pop = popRef.current;
-    if (!pop) return;
-    // The shared popover discipline: focus in on open, restore to the
-    // door on close (falling back to the WHEN row itself when the door
-    // unmounted with its spec), and consume the light-dismissing pointer
-    // gesture so it never clicks through to the map.
-    return wireShellPopover(
-      pop,
-      () => moreRef.current,
-      () => document.getElementById('shell-time')
-    );
-  }, []);
-
-  // The owning surface can clear its spec WHILE the popover is open (a
-  // cluster switch deactivates the layer, a terminal failure tears it
-  // down). An open detail card over a spec that no longer exists would
-  // be a blank claim, and the door it would restore focus to is gone;
-  // close it now, so the discipline above restores focus to the row's
-  // honest "No dated product is displayed" state instead of dropping it.
-  useEffect(() => {
-    const pop = popRef.current;
-    if (spec === null && pop?.matches(':popover-open')) {
-      pop.hidePopover();
-    }
-  }, [spec]);
-
-  // tabIndex -1 on the row: a programmatic focus target for the
-  // discipline's fallback when the More time door unmounts with its spec.
   return (
-    <div class="shell-time" id="shell-time" data-has-spec={spec !== null} tabIndex={-1}>
+    <div class="shell-time" id="shell-time" data-has-spec={spec !== null}>
       {spec === null ? (
-        <span class="shell-time-empty">No dated product is displayed.</span>
+        <span class="shell-time-headline shell-time-empty">No dated product is displayed.</span>
       ) : (
-        <>
-          <span class="shell-time-headline" data-register={spec.stamp.register}>
-            {spec.stamp.headline}
-          </span>
-          <button
-            type="button"
-            id="shell-time-more"
-            class="shell-popover-door"
-            ref={moreRef}
-            popovertarget="shell-time-popover"
-            title={spec.stamp.detail}
-            // Derived from the live popover state so a spec-tick re-render
-            // while the card is open cannot clobber the discipline's toggle
-            // reflection (W2-D9).
-            aria-expanded={popRef.current?.matches(':popover-open') ?? false}
-          >
-            More time
-          </button>
-        </>
+        <span
+          class="shell-time-headline"
+          data-register={spec.stamp.register}
+          // The CSS reserves a fixed two-line box and clamps beyond it
+          // only as a defensive backstop (app.css .shell-time-headline);
+          // this title carries the full, untruncated text so that backstop
+          // can never hide the issuer's date behind an ellipsis with no way
+          // to read the rest.
+          title={
+            spec.stamp.freshness
+              ? freshnessText(spec.stamp)
+              : `${pressedChrome.title} · ${spec.stamp.headline}`
+          }
+        >
+          {/* found-014: the heading names the PRESSED horizon chip, in
+              HORIZON_CHROME's own words, in every mode; the surface's own
+              headline/detail (Heat's "Outlook valid ... Day 1 of 7") still
+              states what issuer day it shows, right beside it. */}
+          <span class="shell-time-headline-horizon">{pressedChrome.title}</span>
+          {spec.stamp.freshness ? (
+            <span class="feed-current" aria-label={freshnessText(spec.stamp)}>
+              <span class="feed-freshness-dot" data-freshness={spec.stamp.freshness.state} aria-hidden="true" />
+              {spec.stamp.freshness.state === 'stale' && <span> · {dateTok(spec.stamp.freshness.checkedAt ?? '')}</span>}
+              {spec.stamp.freshness.state === 'unavailable' && <span> · Unavailable</span>}
+              {spec.stamp.freshness.state === 'loading' && <span class="sr-only">Checking</span>}
+            </span>
+          ) : (
+            <span class="shell-time-headline-detail"> · {spec.stamp.headline}</span>
+          )}
+        </span>
       )}
-      <div
-        popover="auto"
-        id="shell-time-popover"
-        class="shell-popover"
-        ref={popRef}
-        aria-label="Temporal controls"
-      >
-        {spec !== null && <DetailControls spec={spec} />}
-      </div>
     </div>
   );
 }

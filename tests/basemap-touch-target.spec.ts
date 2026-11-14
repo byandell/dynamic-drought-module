@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 import { BasemapSwitcherControl } from '../src/map/basemap-switcher';
 import {
   getBasemapMode,
@@ -50,6 +50,7 @@ test.describe('DEG-2 desktop keeps the compact control family', () => {
       className: string;
       removed: boolean;
       setAttribute: (name: string, value: string) => void;
+      toggleAttribute: (name: string, force?: boolean) => boolean;
       addEventListener: () => void;
       appendChild: (child: FakeElement) => FakeElement;
       remove: () => void;
@@ -68,6 +69,12 @@ test.describe('DEG-2 desktop keeps the compact control family', () => {
         removed: false,
         setAttribute(name, value) {
           element.attributes.set(name, value);
+        },
+        toggleAttribute(name, force) {
+          const on = force ?? !element.attributes.has(name);
+          if (on) element.attributes.set(name, '');
+          else element.attributes.delete(name);
+          return on;
         },
         addEventListener: () => {},
         appendChild(child) {
@@ -116,8 +123,7 @@ test.describe('DEG-2 desktop keeps the compact control family', () => {
   test('the desktop switcher stays in the one-family stack, unchanged', async ({
     page
   }) => {
-    // Console keeps Share in the on-map control family. Desktop Brief moves
-    // the same wired button into its ordered shell, where it is full width.
+    // Share sits in slot 4 of the on-map control family in Brief and Console alike.
     await gotoApp(page, '?view=console');
     const btn = page.locator('.basemap-switcher-btn');
     await expect(btn).toBeVisible();

@@ -1,48 +1,39 @@
 /**
- * The conditions strip as a Preact island (ADR 0002, D-0.7.0-021): the
- * view half of the retired vanilla `src/ui/conditions-strip.ts`, whose
- * computation lives in `./strip-metrics`. Markup, strings, and data
- * attributes are contract: tests/conditions-strip.spec.ts asserts the
- * off-state wording, the tile order, the stale flags, and the button
- * semantics (see the conditions-strip-strings knowledge card). Since E1
- * (D-0.7.0-041 part 2, review E1.4) the Alerts and Fires tiles render only
- * while their layers are on; the drought tile and the date line are the
- * strip's permanent content.
+ * Live readings computed from the rendered map by `strip-metrics`.
+ * A live reading of the active mode's own layer (the drought surface, the
+ * Wildfire fires, the Heat alerts) opens the map key without changing the
+ * condition surface, so a readout never acts as an unexpected layer-off
+ * control (owner item 9, 2026-11-13). A failed tile keeps Retry; off tiles
+ * and extras outside the mode keep their explicit layer actions through the
+ * shared toggle command.
  *
- * U1 (D-0.7.0-008, the ratified tile guardrail spec): each tile is a
- * REAL `button` with stable semantics in every state (off, loading,
- * ready, zero, error). A tile is an answer followed by an immediate
- * action: it exposes `aria-pressed` from the layer's on-state, keeps
- * status and action distinct in the accessible name ("14 active
- * fire perimeters. Current Mapped Fire Perimeters (NIFC) layer on. Press to hide."), and
- * routes its action through the shared toggle command, never a naive
- * controller call. The drought tile additionally discloses that showing
- * the US Drought Monitor replaces the current condition surface (USDM
- * is an exclusive surface; a silent replacement is technically correct
- * but not a predictable interaction).
- *
- * The component renders the three tiles into #conditions-metrics; the
- * strip's heading and date span are static index.html chrome OUTSIDE
- * this render root, so the date line and the section's `hidden` flip are
- * applied in an after-render effect, mirroring the vanilla render()
- * exactly.
+ * The strip publishes the mode's own lead reading (conditions-headline.ts),
+ * which the desktop Key chip shows as its title (owner 2026-11-13, one box).
+ * In desktop Brief the strip node is parked unseen in the map's dock so it
+ * keeps computing; Console shows it in the sidebar below the hazard buttons.
+ * Source status, historical-week dates, and stale flags stay authoritative.
  */
 
 import type * as maplibregl from 'maplibre-gl';
-import { useEffect, useRef } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import type { ReadonlySignal } from '@preact/signals';
 
 import { getLayerDef } from '../../config/layers';
 import { timeline } from '../../state/timeline';
-import { requestLayerOff, requestLayerOn } from '../layer-toggle-command';
+import { isFailedCheckedLayer, requestLayerOff, requestLayerOn } from '../layer-toggle-command';
+import { HAZARD_CLUSTERS } from '../../config/clusters';
+import type { HazardClusterKey } from '../../config/clusters';
+import { getSelectedHazard, onCommittedSnapshotChange, requestHorizon } from '../../state/cluster-service';
 import {
   droughtMetric,
   alertsMetric,
   firesMetric,
-  isUsdmStale,
+  isDroughtStale,
   formatMapDate
 } from './strip-metrics';
 import type { Metric } from './strip-metrics';
+import { stripFocusAfterHide } from './strip-focus';
+import { setConditionsHeadline } from '../../state/conditions-headline';
 
 /**
  * The tile-to-layer mapping. `disclose` marks the drought tile's
@@ -55,29 +46,51 @@ const TILE_LAYER: Record<string, { key: string; disclose: boolean }> = {
 };
 
 /**
+ * found-008: whether the active mode's own recipe (enumerated from
+ * HAZARD_CLUSTERS, never a hard-coded mode name, DR-113) names any of the
+ * drought current-conditions family. The recipe table names the shipped
+ * tri-national default (`nadm-drought`) and the CPC outlook (`drought`);
+ * `usdm` is the same tile's interchangeable domestic alternate (the strip
+ * already treats the two as one reading via `lastDroughtLayer`), so it
+ * counts too even though no recipe names it directly.
+ */
+const DROUGHT_FAMILY_KEYS: readonly string[] = ['nadm-drought', 'drought', 'usdm'];
+
+/** Whether any horizon recipe of the mode draws `layerKey` (enumerated from HAZARD_CLUSTERS, DR-113). */
+function clusterOffersLayer(clusterKey: HazardClusterKey, layerKey: string): boolean {
+  return Object.values(HAZARD_CLUSTERS[clusterKey].recipes).some((recipe) =>
+    recipe.some((key) => key === layerKey)
+  );
+}
+
+function clusterOffersDroughtFamily(clusterKey: HazardClusterKey): boolean {
+  return DROUGHT_FAMILY_KEYS.some((key) => clusterOffersLayer(clusterKey, key));
+}
+
+/**
  * The accessible name: the status reading first, then the layer state
  * and the action, as distinct sentences (guardrail spec). The visible
  * tile carries the same status; the action cue is visible in the off
  * state ("Show") and accessible-plus-hover elsewhere, so the strip
  * still reads as a summary first, not a second catalog.
  */
-function tileAriaLabel(name: string, m: Metric, isOn: boolean, disclose: boolean): string {
-  let status: string;
-  if (m.tone === 'data') {
-    status = `${m.value} ${m.sublabel}.`;
-  } else if (m.tone === 'none') {
-    status = `${m.value}, ${m.sublabel}.`;
-  } else if (m.tone === 'loading') {
-    status = `${name} loading.`;
-  } else if (m.value === 'Layer off') {
-    status = `${name} layer off.`;
-  } else {
-    // The pending tile: an honest canonical status word ("unavailable",
-    // "no data", "zoom in to load", "live (partial)").
-    status = `${name} ${m.sublabel}.`;
-  }
+function tileStatus(name: string, m: Metric): string {
+  // A count reads as one phrase ("0 mapped wildfire perimeters in view"); only
+  // a word value ("No polygon, no NADM category polygon...") takes the comma.
+  if (m.tone === 'data' || /^\d+$/.test(m.value)) return `${m.value} ${m.sublabel}.`;
+  if (m.tone === 'none') return `${m.value}, ${m.sublabel}.`;
+  if (m.tone === 'loading') return `${name} loading.`;
+  if (m.value === 'Layer off') return `${name} layer off.`;
+  // The pending tile: an honest canonical status word ("unavailable",
+  // "no data", "zoom in to load", "live (partial)").
+  return `${name} ${m.sublabel}.`;
+}
+
+function tileAriaLabel(name: string, m: Metric, isOn: boolean, disclose: boolean, retries: boolean): string {
+  const status = tileStatus(name, m);
   const stale = m.stale ? ' Reading is stale.' : '';
-  const action = isOn
+  // DRAFT wording (DR-177): "Press to retry." names the failed checked tile's action.
+  const action = retries ? ' Press to retry.' : isOn
     ? ` ${name} layer on. Press to hide.`
     : ` Press to show.${
         disclose ? ` Showing ${name} replaces the current condition surface.` : ''
@@ -89,19 +102,44 @@ function MetricTile({
   id,
   m,
   isOn,
-  tile
+  tile,
+  inMode
 }: {
   id: string;
   m: Metric;
   isOn: boolean;
   tile: { key: string; disclose: boolean };
+  /** The active mode's own recipe draws this layer, so its live tile opens the key. */
+  inMode: boolean;
 }) {
   const name = getLayerDef(tile.key)?.name ?? tile.key;
+  const retries = !(id === 'drought' && isOn) && isFailedCheckedLayer(tile.key);
+  const showsDetails = isOn && !retries && (id === 'drought' || inMode);
+  const keyNoun = id === 'drought' ? 'drought' : name;
+  // DRAFT wording (DR-177): failed checked tile action "Retry" and title "Retry {layer name}".
+  const action = retries ? 'Retry' : 'Hide';
+  // A tile mounted while the Key is already open (a layer just turned on) reads it.
+  const [detailsOpen, setDetailsOpen] = useState(() => document.getElementById('map-key')?.dataset['keyDetailsOpen'] === 'true');
+  useEffect(() => {
+    const update = (event: Event): void => {
+      setDetailsOpen(Boolean((event as CustomEvent<{ open: boolean }>).detail?.open));
+    };
+    window.addEventListener('ddm:map-key-details-change', update);
+    return () => window.removeEventListener('ddm:map-key-details-change', update);
+  }, []);
 
-  const onClick = (): void => {
-    if (isOn) {
+  const onClick = (event: MouseEvent): void => {
+    if (showsDetails) {
+      window.dispatchEvent(new Event('ddm:toggle-map-key-details'));
+    } else if (isOn && !isFailedCheckedLayer(tile.key)) {
+      // Hide unmounts this tile; hand on focus a person left here first.
+      const btn = event.currentTarget as HTMLElement;
+      if (document.activeElement === btn) stripFocusAfterHide(btn)?.focus({ preventScroll: true });
       requestLayerOff(tile.key);
     } else {
+      // The observed drought surface commits the Current horizon first, as
+      // drought.ts switchToObserved does, so no outlook chip stays pressed over it.
+      if (id === 'drought') requestHorizon('current');
       requestLayerOn(tile.key);
     }
   };
@@ -112,19 +150,33 @@ function MetricTile({
       class={m.tone === 'loading' ? 'conditions-metric skeleton-shimmer' : 'conditions-metric'}
       data-metric={id}
       data-tone={m.tone}
+      data-layer-on={String(isOn)}
       {...(m.stale ? { 'data-stale': 'true' } : {})}
-      aria-pressed={isOn}
-      aria-label={tileAriaLabel(name, m, isOn, tile.disclose)}
+      aria-pressed={showsDetails ? undefined : isOn}
+      aria-expanded={showsDetails ? detailsOpen : undefined}
+      aria-controls={showsDetails ? 'map-key-content' : undefined}
+      aria-label={showsDetails
+        ? `${tileStatus(name, m)}${m.stale ? ' Reading is stale.' : ''} ${detailsOpen ? 'Close' : 'Open'} ${keyNoun} details and key.`
+        : tileAriaLabel(name, m, isOn, tile.disclose, retries)}
       title={
-        isOn
-          ? `Hide ${name}`
+        showsDetails
+          ? `${id === 'drought' ? 'Drought' : name} details and key`
+          : isOn
+          ? `${action} ${name}`
           : tile.disclose
             ? `Show ${name} (replaces the current condition surface)`
             : `Show ${name}`
       }
       onClick={onClick}
     >
-      <span class="conditions-value" style={m.color ? `color:${m.color}` : undefined}>
+      <span class="conditions-value">
+        {m.color ? (
+          <span
+            class="conditions-swatch"
+            aria-hidden="true"
+            style={`background:${m.color}`}
+          />
+        ) : null}
         {m.value}
       </span>
       <span class="conditions-sublabel">
@@ -135,6 +187,11 @@ function MetricTile({
         {m.stale ? <span class="conditions-stale-tag">stale</span> : null}
       </span>
       {!isOn && m.tone === 'off' ? <span class="conditions-action">Show</span> : null}
+      {/* Name the action visibly: a live in-mode reading opens the key; other
+          tiles retry failed activation or hide their active layer. */}
+      {isOn && m.tone !== 'loading' ? (
+        <span class="conditions-action conditions-action-hide">{showsDetails ? 'Key' : action}</span>
+      ) : null}
     </button>
   );
 }
@@ -151,6 +208,14 @@ export function ConditionsStrip({ map, tick, checked }: StripProps) {
   // Subscribe to the tick: every bump recomputes the metrics from what
   // the map is actually rendering (the reflect-the-map contract).
   void tick.value;
+
+  // found-008: the active mode, kept live so a cluster switch that leaves
+  // the checked set unchanged (rare, but possible via a reference-role
+  // extra surviving the switch) still re-evaluates which surfaces this
+  // mode actually offers.
+  // The person's hazard, not the store, which reads Drought for every custom set.
+  const [cluster, setCluster] = useState<HazardClusterKey>(getSelectedHazard);
+  useEffect(() => onCommittedSnapshotChange(() => setCluster(getSelectedHazard())), []);
 
   const lastDroughtLayer = useRef<'usdm' | 'nadm-drought'>('nadm-drought');
   if (checked.value.get('usdm')) lastDroughtLayer.current = 'usdm';
@@ -180,14 +245,13 @@ export function ConditionsStrip({ map, tick, checked }: StripProps) {
   // its own honest "viewing week of" date register instead.
   const viewingHistory = timeline.usdmWeek !== null;
 
-  // Degrade a frozen or drifted USDM surface to an explicit stale read
+  // Degrade a frozen or drifted USDM or NADM surface to an explicit stale read
   // (critical-review #6): the category still shows, but the tile and the date
-  // line both say so, rather than presenting an old week as current.
+  // line both say so, rather than presenting an old week or month as current.
   const droughtStale =
-    droughtLayer.key === 'usdm' &&
     !viewingHistory &&
     drought.metric.tone === 'data' &&
-    isUsdmStale(drought.dateMs);
+    isDroughtStale(droughtLayer.key, drought.dateMs);
   const droughtTile: Metric = droughtStale ? { ...drought.metric, stale: true } : drought.metric;
 
   useEffect(() => {
@@ -200,13 +264,13 @@ export function ConditionsStrip({ map, tick, checked }: StripProps) {
       dateEl.textContent = '';
       delete dateEl.dataset['stale'];
     } else if (droughtStale) {
-      dateEl.textContent = `stale, data as of ${formatMapDate(drought.dateMs)}`;
+      dateEl.textContent = `stale, data as of ${drought.dateLabel ?? formatMapDate(drought.dateMs)}`;
       dateEl.dataset['stale'] = 'true';
     } else if (viewingHistory) {
       dateEl.textContent = `viewing week of ${formatMapDate(drought.dateMs)}`;
       delete dateEl.dataset['stale'];
     } else {
-      dateEl.textContent = `as of ${formatMapDate(drought.dateMs)}`;
+      dateEl.textContent = `as of ${drought.dateLabel ?? formatMapDate(drought.dateMs)}`;
       delete dateEl.dataset['stale'];
     }
   });
@@ -217,7 +281,7 @@ export function ConditionsStrip({ map, tick, checked }: StripProps) {
   // off state; the drought tile is the strip's identity), but the two event
   // tiles render only while their layers are ON; turning a layer on (the
   // catalog today, the cluster buttons at S4) brings its tile back as the
-  // live reading plus the hide action.
+  // live reading plus its action.
   const alertsOn = isOn('alerts');
   const firesOn = isOn('fires');
   // W2-D10: in a non-drought view the strip leads with the ACTIVE hazard's
@@ -226,15 +290,48 @@ export function ConditionsStrip({ map, tick, checked }: StripProps) {
   // LAST rather than fronting another hazard's read. The drought view
   // itself is unchanged: with its layer on, the drought tile still leads.
   const droughtOn = isOn('drought');
-  const droughtTileNode = (
-    <MetricTile id="drought" m={droughtTile} isOn={droughtOn} tile={droughtLayer} />
+  // found-008: an OFF drought anchor is an invitation ("Layer off. Press to
+  // show.") to activate a SURFACE this mode does not offer; in a mode whose
+  // own recipe never names the drought family, that invitation both names
+  // the wrong mode's layer and, once pressed, silently replaces the mode's
+  // own surface (surface exclusivity). An ON drought reading still renders
+  // regardless of mode: the strip reflects the map honestly either way, and
+  // never hides a layer that is actually drawing.
+  const droughtInMode = droughtOn || clusterOffersDroughtFamily(cluster);
+  const droughtTileNode = droughtInMode ? (
+    <MetricTile key="drought" id="drought" m={droughtTile} isOn={droughtOn} tile={droughtLayer} inMode />
+  ) : null;
+  const eventTile = (id: 'alerts' | 'fires', m: Metric) => (
+    <MetricTile key={id} id={id} m={m} isOn tile={TILE_LAYER[id]!} inMode={clusterOffersLayer(cluster, TILE_LAYER[id]!.key)} />
   );
+  // The mode's OWN readings lead and any other live layer follows, so the Key chip's title (the first, when it is
+  // the mode's own) never names another mode's reading: a Wildfire view with Alerts added leads with its fires.
+  const live = [
+    droughtOn ? { own: clusterOffersDroughtFamily(cluster), node: droughtTileNode, m: droughtTile, key: droughtLayer.key } : null,
+    alertsOn ? { own: clusterOffersLayer(cluster, TILE_LAYER.alerts!.key), node: eventTile('alerts', alerts), m: alerts, key: TILE_LAYER.alerts!.key } : null,
+    firesOn ? { own: clusterOffersLayer(cluster, TILE_LAYER.fires!.key), node: eventTile('fires', fires), m: fires, key: TILE_LAYER.fires!.key } : null
+  ].filter((tile): tile is NonNullable<typeof tile> => tile !== null);
+  const ordered = [...live.filter((tile) => tile.own), ...live.filter((tile) => !tile.own)];
+  const first = ordered[0];
+  const lead = first?.own && (first.m.tone === 'data' || first.m.tone === 'none') ? first : null;
+  // Every render; the store drops an unchanged reading.
+  useEffect(() => setConditionsHeadline(lead ? {
+    value: lead.m.value,
+    sublabel: lead.m.sublabel,
+    ...(lead.m.color ? { color: lead.m.color } : {}),
+    stale: Boolean(lead.m.stale),
+    tone: lead.m.tone as 'data' | 'none',
+    aria: tileStatus(getLayerDef(lead.key)?.name ?? lead.key, lead.m) + (lead.m.stale ? ' Reading is stale.' : '')
+  } : null));
+  useEffect(() => () => setConditionsHeadline(null), []);
   return (
     <>
-      {droughtOn ? droughtTileNode : null}
-      {alertsOn ? <MetricTile id="alerts" m={alerts} isOn={alertsOn} tile={TILE_LAYER.alerts!} /> : null}
-      {firesOn ? <MetricTile id="fires" m={fires} isOn={firesOn} tile={TILE_LAYER.fires!} /> : null}
+      {ordered.map((tile) => tile.node)}
       {!droughtOn ? droughtTileNode : null}
+      {/* Last, so the stylesheet shows it only while no tile is shown (an ENSO
+          view in Console). */}
+      {/* DRAFT wording (DR-177) */}
+      <p class="conditions-empty">No readings for this view</p>
     </>
   );
 }

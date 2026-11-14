@@ -1,6 +1,7 @@
 /**
  * The one search (U3c, 0.7.0): a single input that searches across
- * Places, Tribal land areas, and Layers, rendering grouped results.
+ * Tribal land areas, States, Cities, and Layers, rendering grouped results
+ * in that order (Tribes first, the owner's 0.7.7 review).
  * Ports the ratified U3 note verbatim (the 2026-07-10 design-lens
  * ruling): "one search box and one set of grouped
  * results," reachable identically from wherever a caller mounts it, with
@@ -10,8 +11,8 @@
  * PURE VIEW. This file imports only from 'preact', '@preact/signals'
  * (types only), 'preact/hooks', and the pure dependency-free text fold
  * in src/util/search-fold.ts (shared so query and haystack can never
- * diverge; wave A finding 1). All data (the synchronous Places and
- * Layers items, the lazy Tribal loader) and all behavior (onSelect)
+ * diverge; wave A finding 1). All data (the synchronous States and
+ * Layers items, the lazy Tribal and city loader) and all behavior (onSelect)
  * arrive as props; this component has no knowledge of the map, the URL,
  * the layer registry, or any config table. The caller owns wiring
  * `SearchItem[]` from `LAYER_DEFS`, the region table, and the BIA Tribal
@@ -20,13 +21,25 @@
  * Matching: every whitespace-separated token of the normalized query
  * must appear in an item's `haystack` (AND, substring, case-insensitive,
  * diacritic-insensitive on the query side; the caller is trusted to have
- * normalized `haystack` the same way). No ranking, no visible confidence
- * score. The main-shell instances keep the complete grouped vocabulary;
- * a specialized host may supply only the result kinds it can act on.
+ * normalized `haystack` the same way; a Census area row may skip a generic word
+ * such as "Nation", see matchesTokens). The one rank: within a group,
+ * labels that start with the query come first (prefixFirst), and Enter
+ * with no highlight opens only an unambiguous shown match (enterChoice: an
+ * exact state or city, a unique exact label, or the only prefix row of its
+ * kind), or else highlights the first row; no visible confidence score. The
+ * main-shell instances keep the complete grouped vocabulary; a specialized
+ * host may supply only the result kinds it can act on.
+ *
+ * Loading: the Tribal and city lists load when a search begins (focus on an
+ * empty box, or the first keystroke into one), and a failed list reloads
+ * only then. While either list loads, the results show one loading line and
+ * no rows, so while the query is unchanged no late list ever lands in rows
+ * already on screen and Enter or a click opens only a row the person sees.
+ * The group order (Tribal, States, Cities, Layers) is presentation only.
  *
  * Stewardship: this component holds no Tribal, Treaty, or
  * sovereign-jurisdiction data itself. `SearchItem` for `kind: 'tribal'`
- * carries only a LARNAME-keyed label and id that the caller supplies
+ * carries only a LARNAME- or Census-code-keyed label and id that the caller supplies
  * (see the BIA Land Area Representation source, ddm-tribal-boundary-
  * mapping); this file performs plain substring matching over whatever
  * text arrives and never fetches or redistributes boundary data.
@@ -40,13 +53,13 @@
  */
 
 import type * as preact from 'preact';
-import { useId, useRef, useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 
-import { foldSearchText } from '../../util/search-fold';
+import { enterChoice, foldSearchText, matchesTokens, prefixFirst } from '../../util/search-fold';
 
 export interface SearchItem {
-  kind: 'place' | 'tribal' | 'layer';
-  id: string; // state code | LARNAME | layer key
+  kind: 'place' | 'tribal' | 'city' | 'layer';
+  id: string; // state code | LARNAME, census:<AIANNH code> or hq:<Nation name> | city name | layer key
   label: string; // primary display text
   sublabel?: string; // secondary line (layer source, or a land-area label)
   haystack: string; // pre-normalized lowercase search string (already includes label+sublabel tokens)
@@ -55,11 +68,13 @@ export interface SearchItem {
 export interface SearchProps {
   /** Items available synchronously (Places + Layers). */
   items: SearchItem[];
-  /** Optional lazy loader for Tribal land areas, called once on first focus or first keystroke. */
+  /** Optional lazy loader for Tribal land areas, called when a search begins; after a failure, again when the next one begins. */
   loadTribal?: () => Promise<SearchItem[]>;
+  /** Optional lazy loader for cities, loaded and failing independently of the Tribal list. */
+  loadCities?: () => Promise<SearchItem[]>;
   /** Called when the user chooses a result (click or Enter). */
   onSelect: (item: SearchItem) => void;
-  /** Input placeholder + accessible label, e.g. "Search places, Tribal land areas, and layers". */
+  /** Input placeholder + accessible label, e.g. "Search Tribes, states, cities, and layers". */
   placeholder: string;
 }
 
@@ -68,27 +83,23 @@ const GROUP_CAP = 8;
 
 /** Fixed group order and headings (never reordered, never per-surface). */
 const GROUP_TITLES: Record<SearchItem['kind'], string> = {
-  place: 'Places',
   tribal: 'Tribal land areas',
+  place: 'States',
+  city: 'Cities',
   layer: 'Layers'
 };
-const GROUP_ORDER: readonly SearchItem['kind'][] = ['place', 'tribal', 'layer'];
+const GROUP_ORDER: readonly SearchItem['kind'][] = ['tribal', 'place', 'city', 'layer'];
 
-/**
- * The ONE search folding, shared with every other surface (wave A finding
- * 1): query and haystack normalize identically or punctuation and
- * diacritics silently break matching. See src/util/search-fold.ts.
- */
-function normalizeQuery(raw: string): string {
-  return foldSearchText(raw);
-}
+/** Whether the row press under way is touch or pen (set on pointerdown, read on its mousedown). */
+let touchPress = false;
 
 function tokenize(normalized: string): string[] {
   return normalized.length === 0 ? [] : normalized.split(' ').filter((t) => t.length > 0);
 }
 
 function matchesAllTokens(item: SearchItem, tokens: string[]): boolean {
-  return tokens.every((t) => item.haystack.includes(t));
+  // Only Census rows relax: a land-area row skipping "Oklahoma" would match another state's Nation.
+  return matchesTokens(item.haystack, tokens, item.kind === 'tribal' && item.id.startsWith('census:'));
 }
 
 interface GroupResult {
@@ -113,92 +124,131 @@ interface FlatRow {
   kind: SearchItem['kind'];
 }
 
+interface LazyItems {
+  items: SearchItem[];
+  pending: boolean;
+  failed: boolean;
+  start: () => void;
+}
+
+/**
+ * One lazy item source, started when a search begins (the ref guard makes a
+ * second start a no-op). The loader REJECTS on failure (invariant 6): the
+ * failure renders as an honest "unavailable" line, never as a fake empty
+ * result, and the guard resets so the next search retries.
+ */
+function useLazyItems(load: (() => Promise<SearchItem[]>) | undefined): LazyItems {
+  const [items, setItems] = useState<SearchItem[]>([]);
+  const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const started = useRef(false);
+  const start = (): void => {
+    if (!load || started.current) return;
+    started.current = true;
+    setPending(true);
+    load()
+      .then((loaded) => {
+        setItems(loaded);
+        setFailed(false);
+      })
+      .catch(() => {
+        setFailed(true);
+        started.current = false;
+      })
+      .finally(() => setPending(false));
+  };
+  return { items, pending, failed, start };
+}
+
+/**
+ * One number per mounted search, counted across the whole page.
+ *
+ * Preact's `useId()` numbers a component within ITS render root, and every
+ * mount of this search is a root of its own, so each of them answered
+ * "P0-0": three listboxes on one page shared one id, and `aria-controls`
+ * on two of the three inputs named a listbox that was not theirs (found by
+ * the sprint's scan of the built page, owner direction 2026-11-09 (sprint),
+ * DR-pending). A module counter is one sequence for every root.
+ */
+let searchSequence = 0;
+
 export function Search(props: SearchProps): preact.JSX.Element {
   const [query, setQuery] = useState('');
   // The keyboard highlight is keyed by the ITEM (kind + id), never by list
-  // position: the Tribal group resolves asynchronously and inserts ABOVE the
-  // Layers group, so a position-keyed highlight would silently slide onto an
-  // unrelated row when the roster lands (the U3 stage-5 minor 8 fix). If the
-  // highlighted item leaves the list, the highlight collapses to none.
+  // position, so a changed row order never moves it onto an unrelated row (the
+  // U3 stage-5 minor 8 fix). If the highlighted item leaves the list, the
+  // highlight collapses to none.
   const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
-  const [tribalItems, setTribalItems] = useState<SearchItem[]>([]);
-  const [tribalPending, setTribalPending] = useState(false);
-  const [tribalFailed, setTribalFailed] = useState(false);
-  const tribalStarted = useRef(false);
+  const tribal = useLazyItems(props.loadTribal);
+  const cities = useLazyItems(props.loadCities);
   // A per-instance id prefix so multiple mounts (the console catalog, the Brief
-  // head, the mobile sheet) never collide on element ids (invalid HTML that
-  // would break the aria-controls / aria-activedescendant references).
-  const uid = useId();
-  const tribalEnabled = props.loadTribal !== undefined;
-
-  // Called once on first focus OR first keystroke, whichever comes first
-  // (the ref guard makes the second caller a no-op). loadTribal REJECTS on
-  // failure (invariant 6): the failure renders as an honest "unavailable"
-  // line, never as a fake empty result, and the guard resets so a later
-  // keystroke retries.
-  const startTribalLoad = (): void => {
-    const loadTribal = props.loadTribal;
-    if (!loadTribal || tribalStarted.current) return;
-    tribalStarted.current = true;
-    setTribalPending(true);
-    setTribalFailed(false);
-    loadTribal()
-      .then((loaded) => {
-        setTribalItems(loaded);
-        setTribalPending(false);
-      })
-      .catch(() => {
-        setTribalItems([]);
-        setTribalPending(false);
-        setTribalFailed(true);
-        tribalStarted.current = false;
-      });
-  };
+  // head, the mobile sheet, the studios) never collide on element ids (invalid
+  // HTML that would break the aria-controls / aria-activedescendant
+  // references). Counted across the page, not by `useId()`: see
+  // `searchSequence`.
+  const uidRef = useRef('');
+  if (uidRef.current === '') {
+    searchSequence += 1;
+    uidRef.current = `ddm-search-${searchSequence}`;
+  }
+  const uid = uidRef.current;
 
   const rawTrimmed = query.trim();
-  const tokens = tokenize(normalizeQuery(query));
+  // The ONE search folding, shared with every other surface (wave A finding
+  // 1): query and haystack normalize identically or punctuation and
+  // diacritics silently break matching. See src/util/search-fold.ts.
+  const tokens = tokenize(foldSearchText(query));
   const isEmptyQuery = rawTrimmed.length === 0 || tokens.length === 0;
+  // A search begins from an empty box; only then do lists (re)load, so no load lands in a list on screen.
+  const startSearch = (): void => {
+    if (isEmptyQuery) {
+      tribal.start();
+      cities.start();
+    }
+  };
 
-  const placeMatches = isEmptyQuery
-    ? []
-    : props.items.filter((i) => i.kind === 'place' && matchesAllTokens(i, tokens));
-  const layerMatches = isEmptyQuery
-    ? []
-    : props.items.filter((i) => i.kind === 'layer' && matchesAllTokens(i, tokens));
-  const tribalMatches = isEmptyQuery
-    ? []
-    : tribalItems.filter((i) => matchesAllTokens(i, tokens));
+  const foldedQuery = tokens.join(' ');
+  // Matches of one kind, labels that start with the query first.
+  const matchesOf = (kind: SearchItem['kind'], from: SearchItem[]): SearchItem[] =>
+    isEmptyQuery
+      ? []
+      : prefixFirst(
+          from.filter((i) => i.kind === kind && matchesAllTokens(i, tokens)),
+          foldedQuery
+        );
+  const placeMatches = matchesOf('place', props.items);
+  const layerMatches = matchesOf('layer', props.items);
+  const tribalMatches = matchesOf('tribal', tribal.items);
+  const cityMatches = matchesOf('city', cities.items);
 
-  const placeGroup = buildGroup('place', placeMatches);
-  const tribalGroup = buildGroup('tribal', tribalMatches);
-  const layerGroup = buildGroup('layer', layerMatches);
+  const groups: Record<SearchItem['kind'], GroupResult> = {
+    tribal: buildGroup('tribal', tribalMatches),
+    place: buildGroup('place', placeMatches),
+    city: buildGroup('city', cityMatches),
+    layer: buildGroup('layer', layerMatches)
+  };
 
-  // The Tribal group appears while its load is pending (showing only the
-  // loading line) even before any items resolve; once settled, it only
-  // appears if it actually has matches (an empty resolve never shows a
-  // heading with nothing under it) OR if the load FAILED (the honest
-  // unavailable line; a service failure is never dressed up as no results).
-  const showTribalGroup =
-    tribalEnabled &&
-    !isEmptyQuery &&
-    (tribalPending || tribalFailed || tribalGroup.visible.length > 0);
-  const groupsForRender = GROUP_ORDER.map((kind) => {
-    if (kind === 'place') return placeGroup;
-    if (kind === 'layer') return layerGroup;
-    return tribalGroup;
-  }).filter((g) => (g.kind === 'tribal' ? showTribalGroup : g.visible.length > 0));
+  // The one gate: while either lazy list loads, no group shows, so no row is on
+  // screen for a late list to push aside. A group shows when it has matches (an
+  // empty resolve never shows a heading with nothing under it) or, for a lazy
+  // list, when its load FAILED (the honest unavailable line; a service failure
+  // is never dressed up as no results).
+  const loading = tribal.pending || cities.pending;
+  const showGroup = (kind: SearchItem['kind']): boolean =>
+    groups[kind].visible.length > 0 ||
+    (kind === 'tribal' && tribal.failed) ||
+    (kind === 'city' && cities.failed);
+  const shownKinds = isEmptyQuery || loading ? [] : GROUP_ORDER.filter(showGroup);
+  const groupsForRender = shownKinds.map((kind) => groups[kind]);
 
   // Flat, ordered, ID-stamped list for keyboard nav and aria-activedescendant.
   // The DOM ids are position-based within a render (they only name the
   // currently highlighted DOM option for aria-activedescendant); the
-  // HIGHLIGHT itself is keyed by the stable item key so async list changes
-  // never move it to an unrelated row.
+  // HIGHLIGHT itself is keyed by the stable item key.
   let flatIdx = 0;
   const flatRows: FlatRow[] = [];
-  for (const kind of GROUP_ORDER) {
-    const group = kind === 'place' ? placeGroup : kind === 'layer' ? layerGroup : tribalGroup;
-    if (kind === 'tribal' && !showTribalGroup) continue;
-    for (const item of group.visible) {
+  for (const kind of shownKinds) {
+    for (const item of groups[kind].visible) {
       flatRows.push({ item, id: `${uid}-opt-${flatIdx}`, kind });
       flatIdx += 1;
     }
@@ -213,28 +263,31 @@ export function Search(props: SearchProps): preact.JSX.Element {
     highlightedKey === null ? -1 : flatRows.findIndex((r) => rowKey(r) === highlightedKey);
   const activeRow = activeIndex >= 0 ? flatRows[activeIndex] : undefined;
 
-  const totalMatches = placeMatches.length + tribalMatches.length + layerMatches.length;
-  const noGroupsShown = groupsForRender.length === 0;
-  // The zero-match line only appears once the Tribal load has settled
+  // Counts only shown groups.
+  const totalMatches = groupsForRender.reduce((n, g) => n + g.visible.length + g.overflow, 0);
+  // The zero-match line only appears once the lists have loaded
   // (design-lens: written before ship, plain-language, never blaming the
   // user, since Tribal Nation names often will not match agency spellings).
-  const showZeroMatch = !isEmptyQuery && noGroupsShown && !tribalPending;
+  const showZeroMatch = !isEmptyQuery && !loading && shownKinds.length === 0;
 
   const liveText = isEmptyQuery
     ? ''
-    : tribalPending && totalMatches === 0
-      ? 'Loading Tribal land areas.'
-      : tribalFailed && totalMatches === 0
+    : loading
+      ? 'Loading search results.'
+      : tribal.failed && totalMatches === 0
         ? 'Tribal land area search is unavailable right now.'
-        : totalMatches === 0
-          ? `No matches for "${rawTrimmed}".`
-          : `${totalMatches} result${totalMatches === 1 ? '' : 's'}.`;
+        : cities.failed && totalMatches === 0
+          ? 'City search is unavailable right now.'
+          : totalMatches === 0
+            ? `No matches for "${rawTrimmed}".`
+            : `${totalMatches} result${totalMatches === 1 ? '' : 's'}.`;
 
   const selectItem = (item: SearchItem): void => {
     props.onSelect(item);
     // Clearing the query is what closes the results (an empty query
     // renders the guidance line, not a list); the caller navigates away,
-    // so the input keeps focus rather than being blurred.
+    // so the input keeps focus rather than being blurred (a mouse row
+    // press holds it, below).
     setQuery('');
     setHighlightedKey(null);
   };
@@ -243,11 +296,11 @@ export function Search(props: SearchProps): preact.JSX.Element {
     const value = (event.currentTarget as HTMLInputElement).value;
     setQuery(value);
     setHighlightedKey(null);
-    startTribalLoad();
+    startSearch(); // isEmptyQuery is still the box before this input
   };
 
   const onFocus = (): void => {
-    startTribalLoad();
+    startSearch();
   };
 
   // Arrow keys clamp at the list boundaries; they do not wrap. From "no
@@ -273,9 +326,20 @@ export function Search(props: SearchProps): preact.JSX.Element {
     } else if (event.key === 'Enter') {
       if (flatRows.length === 0) return;
       event.preventDefault();
-      const chosen = activeRow ?? flatRows[0];
-      if (chosen) selectItem(chosen.item);
-    } else if (event.key === 'Escape') {
+      // With the Tribal group first, a typed state or city name still wins
+      // Enter over a Tribe whose name merely starts with it. With no exact or
+      // prefix row, Enter highlights the first row instead of opening it: it
+      // may be another Nation's area, and a second Enter opens what is seen.
+      const chosen =
+        activeRow?.item ??
+        enterChoice(
+          flatRows.map((r) => r.item),
+          foldedQuery
+        );
+      if (chosen) selectItem(chosen);
+      else setHighlightedKey(rowKey(flatRows[0]));
+    } else if (event.key === 'Escape' && query) {
+      // An empty box leaves Escape unhandled so the sheet and studio close on it.
       event.preventDefault();
       setQuery('');
       setHighlightedKey(null);
@@ -289,13 +353,13 @@ export function Search(props: SearchProps): preact.JSX.Element {
         <div class="ddm-search-group-title" id={headingId}>
           {group.title}
         </div>
-        {group.kind === 'tribal' && tribalPending ? (
-          <p class="ddm-search-loading">Loading Tribal land areas...</p>
-        ) : null}
-        {group.kind === 'tribal' && tribalFailed && !tribalPending ? (
+        {group.kind === 'tribal' && tribal.failed ? (
           <p class="ddm-search-unavailable">
-            Tribal land area search is unavailable right now. Places and layers still work.
+            Tribal land area search is unavailable right now. States and layers still work.
           </p>
+        ) : null}
+        {group.kind === 'city' && cities.failed ? (
+          <p class="ddm-search-unavailable">City search is unavailable right now.</p>
         ) : null}
         {rows.map((row) => {
           const isActive = activeRow?.id === row.id;
@@ -308,6 +372,14 @@ export function Search(props: SearchProps): preact.JSX.Element {
               class={isActive ? 'ddm-search-result is-active' : 'ddm-search-result'}
               data-search-kind={row.kind}
               data-search-id={row.item.id}
+              // A mouse press would blur the box to the page body; a touch
+              // press may, so the phone keyboard closes after a pick.
+              onPointerDown={(event) => {
+                touchPress = event.pointerType !== 'mouse';
+              }}
+              onMouseDown={(event) => {
+                if (!touchPress) event.preventDefault();
+              }}
               onClick={() => selectItem(row.item)}
             >
               <span class="ddm-search-result-label">{row.item.label}</span>
@@ -353,10 +425,13 @@ export function Search(props: SearchProps): preact.JSX.Element {
           the input; the input already carries the same words as both its
           placeholder and its aria-label, so assistive tech loses nothing.
           The honest zero-match line below (inside the results) stays. */}
-      <div class="ddm-search-results" role="listbox" id={`${uid}-listbox`}>
-        {!isEmptyQuery
-          ? groupsForRender.map((group) => renderGroup(group, rowsByKind(group.kind)))
-          : null}
+      <div
+        class="ddm-search-results"
+        role="listbox"
+        id={`${uid}-listbox`}
+      >
+        {!isEmptyQuery && loading ? <p class="ddm-search-loading">Loading search results...</p> : null}
+        {groupsForRender.map((group) => renderGroup(group, rowsByKind(group.kind)))}
         {showZeroMatch ? (
           <p class="ddm-search-empty">No matches for "{rawTrimmed}".</p>
         ) : null}

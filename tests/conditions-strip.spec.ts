@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 import {
   gotoApp,
   layerCheckbox,
@@ -7,6 +7,11 @@ import {
   waitForLayerSettled,
   PILL
 } from './helpers';
+import { stubRecentSatellite } from './satellite-fixture';
+import { isNifcRequestUrl } from './wildfire-fixtures';
+import { SATELLITE_PROBE_BBOX } from '../src/map/satellite';
+import { HAZARD_CLUSTERS, HAZARD_CLUSTER_KEYS } from '../src/config/clusters';
+import { composeClusterIntent } from '../src/state/cluster-service';
 
 /**
  * UX-3 conditions strip: a dated at-a-glance summary of the rendered map.
@@ -20,13 +25,79 @@ import {
  * ddm-ui-verifier lane, not this gate.
  */
 test.describe('UX-3 conditions strip', () => {
+  test('the drought indicator updates after its polygons render while unrelated satellite tiles remain pending', async ({ page }) => {
+    // Satellite is installed after the base map loads. Hold its rendered
+    // tiles, but let its probe succeed, so map controls work while global
+    // idle cannot fire. The independently held NADM source resolves later.
+    await stubRecentSatellite(page);
+    let releaseSatellite!: () => void;
+    let releaseDrought!: () => void;
+    const satelliteGate = new Promise<void>((resolve) => { releaseSatellite = resolve; });
+    const droughtGate = new Promise<void>((resolve) => { releaseDrought = resolve; });
+    let heldSatelliteTiles = 0;
+    let droughtRequested = false;
+    await page.route('**/MERGEDGC_Last_24hr/ImageServer/exportImage?**', async (route) => {
+      if (new URL(route.request().url()).searchParams.get('bbox') !== SATELLITE_PROBE_BBOX) {
+        heldSatelliteTiles += 1;
+        await satelliteGate;
+      }
+      await route.fallback();
+    });
+    await page.route('**/NADM-current.geojson', async (route) => {
+      droughtRequested = true;
+      await droughtGate;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            properties: { DROUGHTCAT: 'd3', YEAR_MONTH: '202607' },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[[-140, 20], [-50, 20], [-50, 75], [-140, 75], [-140, 20]]]
+            }
+          }]
+        })
+      });
+    });
+
+    try {
+      await gotoApp(page, '?view=brief&layers=nadm-drought&basemap=satellite', { bootIdle: false });
+      await expect.poll(() => droughtRequested).toBe(true);
+      await expect.poll(() => heldSatelliteTiles).toBeGreaterThan(0);
+      // Desktop Brief parks the strip unseen; the Key chip carries its lead reading (owner 2026-11-13, one box).
+      const drought = page.locator('#conditions-strip-dock .conditions-metric[data-metric="drought"]');
+      const chipLabel = page.locator('#map-key .map-key-chip-label');
+      // The real held source, not a manufactured status class.
+      await expect(drought).toHaveAttribute('data-tone', 'loading');
+      await expect(chipLabel.locator('.map-key-chip-value')).toHaveCount(0);
+      releaseDrought();
+      await expect(drought).toHaveAttribute('data-tone', 'data');
+      await expect(chipLabel.locator('.map-key-chip-value')).toHaveText('D3');
+      await expect(chipLabel.locator('.map-key-chip-value')).toHaveCSS('font-variant-numeric', /^(?:lining-nums tabular-nums|tabular-nums lining-nums)$/);
+      // The issuer's own words, in its own case.
+      await expect(chipLabel.locator('.map-key-chip-text')).toHaveText('Extreme drought');
+      await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-label', /^D3 Extreme drought in view\. (Reading is stale\. )?Open /);
+      // No satellite response has been released: this read must follow the
+      // drought source's render, rather than depend on whole-map idle.
+      await expect(chipLabel).not.toContainText('No polygon');
+    } finally {
+      releaseDrought();
+      releaseSatellite();
+    }
+  });
+
   test('renders the drought tile at the top; off-state event tiles retire (E1 deliverable 6)', async ({
     page
   }) => {
     await gotoApp(page);
 
     const strip = page.locator('#conditions-strip');
-    await expect(strip).toBeVisible();
+    // Desktop Brief parks the strip unseen; it still computes the Key chip's reading.
+    await expect(strip).toBeAttached();
+    await expect(strip).toBeHidden();
 
     // The two event layers are off by default, so only the drought tile
     // renders; the retired "Layer off / Show" cards never appear.
@@ -34,28 +105,45 @@ test.describe('UX-3 conditions strip', () => {
     await expect(tiles).toHaveCount(1);
     await expect(tiles.nth(0)).toHaveAttribute('data-metric', 'drought');
 
-    // Desktop Brief moves the original strip into the frozen sidebar foot.
-    // Its old visual title stands down, while the valid-date slot and the one
-    // metric root stay on the same node.
-    await expect(page.locator('#conditions-strip-dock > #conditions-strip')).toHaveCount(1);
-    await expect(page.locator('#shell-conditions-heading')).toHaveText('Conditions in view');
+    // Desktop Brief parks the original strip in the floating window's dock,
+    // unseen (owner 2026-11-13, one box): the Key chip carries its lead reading.
+    // The valid-date slot and the one metric root stay on the same node.
+    await expect(page.locator('#map-condition-indicator #conditions-strip-dock > #conditions-strip')).toHaveCount(1);
+    await expect(page.locator('#map-key-overlay-host + #conditions-strip-dock')).toHaveCount(1);
+    // One region carries the name: the shell summary names the display instead.
+    await expect(page.locator('#shell-conditions-heading')).toHaveText('Display summary');
+    // The strip is parked under a display:none dock, so no role query can see it: uniqueness is structural,
+    // and the visible Key's accessible name is asserted on its own.
+    await expect(page.locator('[aria-label="Conditions in view"]')).toHaveCount(1);
+    await expect(page.locator('#conditions-strip')).toHaveAttribute('aria-label', 'Conditions in view');
+    await expect(page.getByRole('button', { name: /^(D\d|No polygon)[^.]* in view\. (Reading is stale\. )?(Open|Close) / })).toHaveCount(1);
     await expect(strip.locator('.conditions-title')).toBeHidden();
     await expect(strip.locator('#conditions-date')).toBeAttached();
+    // The bottom Layer legends is gone (owner 2026-11-13, item 13); the Key carries the legend.
+    await expect(page.locator('#legend-panel')).toBeHidden();
 
     await waitForLayerSettled(page, 'nadm-drought');
     const drought = tiles.nth(0);
     await expect(drought).toHaveAttribute('data-tone', 'data');
-    const oneLine = await drought.evaluate((tile) => {
-      const value = tile.querySelector<HTMLElement>('.conditions-value');
-      const label = tile.querySelector<HTMLElement>('.conditions-sublabel');
-      if (!value || !label) return false;
+    // One box: the chip's title is the reading, on one line, and nothing sits under it.
+    const chipLabel = page.locator('#map-key .map-key-chip-label');
+    await expect(chipLabel.locator('.map-key-chip-value')).toHaveText(/^D\d$/);
+    const oneLine = await chipLabel.evaluate((label) => {
+      const value = label.querySelector<HTMLElement>('.map-key-chip-value');
+      const text = label.querySelector<HTMLElement>('.map-key-chip-text');
+      if (!value || !text) return false;
       const valueRect = value.getBoundingClientRect();
-      const labelRect = label.getBoundingClientRect();
-      return valueRect.bottom >= labelRect.top && labelRect.bottom >= valueRect.top;
+      const textRect = text.getBoundingClientRect();
+      return valueRect.bottom >= textRect.top && textRect.bottom >= valueRect.top;
     });
     expect(oneLine).toBe(true);
-    await expect(drought.locator('.conditions-sublabel')).not.toContainText('in view');
-    await expect(drought).toHaveAttribute('aria-label', /in view/i);
+    await expect(chipLabel.locator('.map-key-chip-text')).not.toContainText('in view');
+    await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-label', /^D\d [^.]+ in view\. (Reading is stale\. )?Open /);
+    await expect(page.locator('#conditions-strip-dock')).toBeHidden();
+    const chip = await page.locator('#map-key').boundingBox();
+    expect(chip).not.toBeNull();
+    expect(chip!.width).toBeCloseTo(288, 0);
+    expect([40, 44]).toContain(Math.round(chip!.height));
 
     await page.locator('.view-switch [data-view="console"]').click();
     await expect(page.locator('#conditions-strip-home + #conditions-strip')).toHaveCount(1);
@@ -87,16 +175,28 @@ test.describe('UX-3 conditions strip', () => {
       .not.toBe('US Drought Monitor');
   });
 
-  test('desktop Brief keeps the full categorical legend behind the frozen receipt Key', async ({
-    page
-  }) => {
-    await gotoApp(page);
-    await waitForLayerSettled(page, 'nadm-drought');
-    const key = page.locator('.sidebar-key-disclosure > summary');
-    await expect(key).toBeVisible();
-    await expect(page.locator('#sidebar-key-host > #legend-panel')).toBeHidden();
-    await key.click();
-    await expect(page.locator('#sidebar-key-host > #legend-panel')).toBeVisible();
+  // Owner item 9 (2026-11-13): "clicking 'Conditions in View' in Wildfire mode
+  // makes information disappear". The mode's own Fires reading used to be a
+  // Hide button that switched the mode's main layer off. In desktop Brief the
+  // reading is now the Key chip's title (one box), and a press only opens the Key.
+  test('the Fires reading in Wildfire opens the Key and never switches its layer off', async ({ page }) => {
+    await gotoApp(page, '?cluster=wildfire&view=brief');
+    await waitForLayerSettled(page, 'nifc-fires');
+    const toggle = page.locator('#map-key-details-toggle');
+    await expect(toggle.locator('.map-key-chip-text')).toContainText('mapped wildfire perimeter');
+    await expect(toggle.locator('.map-key-chip-value')).toHaveText(/^\d+$/);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(toggle).toHaveAttribute('aria-label', /^\d+ mapped wildfire perimeters? in view\. Open .+ details and key$/);
+    const beforeUrl = page.url();
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('#map-key-content')).toBeVisible();
+    expect(page.url()).toBe(beforeUrl);
+    await expect(toggle.locator('.map-key-chip-text')).toContainText('mapped wildfire perimeter');
+    await expect(page.locator('.conditions-metric[data-metric="fires"]')).toHaveAttribute('data-layer-on', 'true');
+    await expect(layerPill(page, 'nifc-fires')).toHaveText(PILL.live);
+    await expect(page.locator('.shell-cluster-btn[data-cluster="wildfire"]')).toHaveAttribute('aria-pressed', 'true');
   });
 
   test('the fires tile appears and reflects the wildfire layer once it is on', async ({
@@ -110,16 +210,12 @@ test.describe('UX-3 conditions strip', () => {
     // E1 deliverable 6: no off-state card before the layer goes on.
     await expect(fires).toHaveCount(0);
 
-    // Turn the NIFC perimeter layer on and let its activation settle. The
-    // reflect-the-map contract is asserted only when the layer actually
-    // renders; on an upstream outage the honest outcome is an "unavailable"
-    // pill with the checkbox self-corrected off and the tile still absent,
-    // which is correct behavior, not a regression, so the spec skips rather
-    // than fails (the deterministic backbone never reds on a blipping agency).
+    // Turn the NIFC perimeter layer on and let its activation settle. gotoApp
+    // answers NIFC from the fixture (installDefaultNifcStub), so no agency
+    // outage reaches this case: a pill short of live is a bug, and it fails.
     await layerCheckbox(page, 'nifc-fires').check();
     await waitForLayerSettled(page, 'nifc-fires');
-    const pill = (await layerPill(page, 'nifc-fires').textContent())?.trim();
-    test.skip(pill !== PILL.live, 'NIFC upstream unavailable; nothing rendered to reflect');
+    await expect(layerPill(page, 'nifc-fires')).toHaveText(PILL.live);
 
     // The layer is live: the tile appears and reflects the count (a real
     // zero keeps full contrast; it is an answer, not an absence).
@@ -127,6 +223,28 @@ test.describe('UX-3 conditions strip', () => {
     await expect
       .poll(async () => fires.locator('.conditions-sublabel').textContent())
       .not.toBe('wildfires');
+  });
+
+  test('a zero perimeter count reads as one phrase, with no stray comma (P3-24)', async ({ page }) => {
+    // The look of 2026-11-05: "0, mapped wildfire perimeters in view."
+    await page.route(
+      (url) => isNifcRequestUrl(url.href),
+      (route) =>
+        route.request().method() === 'GET'
+          ? route.fulfill({
+              status: 200,
+              contentType: 'application/geo+json',
+              body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+            })
+          : route.fallback()
+    );
+    await gotoApp(page, '?cluster=wildfire&view=console');
+    const fires = page.locator('.conditions-metric[data-metric="fires"]');
+    await expect(fires).toHaveAttribute('data-tone', 'none');
+    await expect(fires).toHaveAttribute(
+      'aria-label',
+      /^0 mapped wildfire perimeters in view\. Open Current Mapped Fire Perimeters/
+    );
   });
 
   test('a frozen USDM feed degrades to an explicit stale read, not a confident current one', async ({
@@ -216,17 +334,17 @@ test.describe('UX-3 conditions strip', () => {
     // so the pressed/off wording contract is asserted on the drought tile
     // (its off state is exercised by the release-blocker spec below).
     await expect(drought).toHaveJSProperty('tagName', 'BUTTON');
-    await expect(drought).toHaveAttribute('aria-pressed', 'true');
+    await expect(drought).toHaveAttribute('aria-expanded', 'false');
     await expect(alerts).toHaveCount(0);
     await expect(fires).toHaveCount(0);
 
     // Status and action stay distinct in the accessible name.
     const droughtLabel = (await drought.getAttribute('aria-label')) ?? '';
-    expect(droughtLabel).toContain('layer on');
-    expect(droughtLabel).toContain('Press to hide');
+    expect(droughtLabel).toContain('drought details and key');
+    expect(droughtLabel).not.toContain('Press to hide');
   });
 
-  test('RELEASE BLOCKER (D-0.7.0-008): the drought tile label, announcement, and catalog sync move together', async ({
+  test('clicking the drought reading opens its key without removing the polygon or changing URL state', async ({
     page
   }) => {
     await gotoApp(page, '?region=washington_state');
@@ -241,35 +359,26 @@ test.describe('UX-3 conditions strip', () => {
     }
 
     const tile = page.locator('.conditions-metric[data-metric="drought"]');
-    const live = page.locator('#layer-status-live');
-
-    // ON: pressed, and the accessible name pairs the reading with the action.
-    await expect(tile).toHaveAttribute('aria-pressed', 'true');
-    expect(await tile.getAttribute('aria-label')).toContain('layer on. Press to hide.');
-
-    // Press to hide: the layer leaves the URL, the catalog checkbox
-    // unchecks, the live region announces the off transition, and the tile
-    // relabels to the off wording WITH the surface-replacement disclosure
-    // (the guardrail spec's named risk: USDM replaces the active surface).
+    const beforeUrl = page.url();
+    // The layers settle before the strip reads them: wait for the reading itself, or a late
+    // reading ("-" then "D2") is taken for a change made by the click (1 in 30 on 2026-10-04).
+    await expect(tile).not.toHaveAttribute('data-tone', 'loading');
+    await expect(tile.locator('.conditions-value')).not.toHaveText('-');
+    const beforeReading = await tile.locator('.conditions-value').textContent();
+    await expect(tile).toHaveAttribute('aria-expanded', 'false');
     await tile.click();
-    await expect.poll(async () => !(await urlLayers(page)).has('nadm-drought')).toBe(true);
-    await expect(layerCheckbox(page, 'nadm-drought')).not.toBeChecked();
-    await expect(live).toHaveText('North American Drought Monitor: off');
-    await expect(tile).toHaveAttribute('aria-pressed', 'false');
-    await expect(tile.locator('.conditions-value')).toHaveText('Layer off');
-    const offLabel = (await tile.getAttribute('aria-label')) ?? '';
-    expect(offLabel).toContain('North American Drought Monitor layer off');
-    expect(offLabel).toContain('replaces the current condition surface');
-
-    // Press to show: the surface returns through the shared toggle command,
-    // so the URL, the checkbox, the pill, and the announcement move as one.
-    await tile.click();
-    await expect.poll(async () => (await urlLayers(page)).has('nadm-drought')).toBe(true);
+    await expect(tile).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.locator('#map-key-content')).toBeVisible();
+    await expect(page.locator('#map-key-content')).toContainText('D3');
+    expect(page.url()).toBe(beforeUrl);
+    expect((await urlLayers(page)).has('nadm-drought')).toBe(true);
     await expect(layerCheckbox(page, 'nadm-drought')).toBeChecked();
-    await waitForLayerSettled(page, 'nadm-drought');
+    await expect(tile.locator('.conditions-value')).toHaveText(beforeReading ?? '');
+    await tile.click();
+    await expect(tile).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('#map-key-content')).toBeHidden();
+    await expect(layerCheckbox(page, 'nadm-drought')).toBeChecked();
     await expect(layerPill(page, 'nadm-drought')).toHaveText(PILL.live);
-    await expect(live).toHaveText('North American Drought Monitor: live');
-    await expect(tile).toHaveAttribute('aria-pressed', 'true');
   });
 
   test('a non-drought view leads with its own tiles; the off drought anchor renders last (W2-D10)', async ({
@@ -312,8 +421,9 @@ test.describe('UX-3 conditions strip', () => {
         body: JSON.stringify(alertFixture)
       })
     );
-    // Deterministic NADM for the show-again leg (gotoApp skips its default
-    // stub when the query names layers).
+    // A different deterministic NADM body for the show-again leg. Page-level
+    // routes are checked before gotoApp's own context-level NADM backstop, so
+    // this one wins regardless of when either was registered.
     await page.route('**/NADM-current.geojson', (route) =>
       route.fulfill({
         status: 200,
@@ -352,24 +462,141 @@ test.describe('UX-3 conditions strip', () => {
     await droughtTile.click();
     await waitForLayerSettled(page, 'nadm-drought');
     await expect(tiles.nth(0)).toHaveAttribute('data-metric', 'drought');
-    await expect(tiles.nth(0)).toHaveAttribute('aria-pressed', 'true');
+    await expect(tiles.nth(0)).toHaveAttribute('aria-expanded', 'false');
   });
 
-  test('the full app relies on the sidebar drought key', async ({ page }) => {
+  test('Console retains a compact on-map drought disclosure alongside the layer legend', async ({ page }) => {
     // Console boot: the uncheck below drives the catalog checkbox, and E1
     // deliverable 1 hides the Brief-mode catalog behind the console door.
     await gotoApp(page, '?view=console');
 
-    // The default NADM surface is explained in the sidebar and the redundant
-    // full-app map key stays hidden. Embed mode retains the compact key.
+    // The default NADM surface keeps a compact trigger while its full key
+    // stays behind the disclosure.
     const key = page.locator('#map-key');
-    await expect(key).toBeHidden();
+    await expect(key).toBeVisible();
+    await expect(key.locator('#map-key-content')).toBeHidden();
     await expect(page.locator('#legend-panel [data-legend="nadm-drought"]')).toBeVisible();
 
-    // Turning the USDM surface off hides the key: it never claims a surface
-    // that is not on the map.
+    // Turning the USDM surface off no longer hides the key (value-only
+    // migration, S30D D1 M10; interface-chrome-popups-text.md section 2.4,
+    // "the chip never hides"): it falls back to the committed mode's own
+    // word instead of claiming a surface that is not on the map, and the
+    // seat stays present. Before this change the key went `hidden`.
     await waitForLayerSettled(page, 'nadm-drought');
     await layerCheckbox(page, 'nadm-drought').uncheck();
-    await expect(key).toBeHidden();
+    await expect(key).toBeVisible();
+    await expect(key.locator('.map-key-chip-label')).toHaveText('Drought');
   });
+});
+
+/**
+ * S30D D1 M10 (register owner-1h; design record interface-chrome-popups-
+ * text.md, "Swatches and value text"): the class colour leaves the
+ * conditions-strip drought tile's text and becomes a 10px keylined swatch
+ * beside the value instead (the old inline `color:${m.color}` on
+ * `.conditions-value`, `conditions-strip.tsx:126` at D0).
+ *
+ * Predicted red on the pre-M10 tree: `.conditions-swatch` does not exist,
+ * and `.conditions-value`'s own computed `color` (not
+ * `background-color`) carries the category colour.
+ */
+test.describe('the drought tile swatch (D1 M10)', () => {
+  test('a live drought reading shows a keylined swatch beside the value, and the value text itself is not classed', async ({
+    page
+  }) => {
+    // `region=` and `layers=` alone derive CONSOLE (src/state/view-mode.ts,
+    // the legacy-URL rule); `view=brief` is explicit so the desktop Key chip
+    // that carries the lead reading in Brief (owner 2026-11-13, one box) is
+    // what gets measured.
+    await page.route('**/USDM_current/**', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify({
+          type: 'FeatureCollection',
+          features: [{
+            type: 'Feature',
+            properties: { DM: 3, MapDate: Date.now() },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[[-125, 42], [-116, 42], [-116, 49], [-125, 49], [-125, 42]]]
+            }
+          }]
+        })
+      })
+    );
+    await gotoApp(page, '?region=washington_state&layers=usdm&view=brief');
+    await expect(layerPill(page, 'usdm')).toHaveText(PILL.live);
+    await expect(layerCheckbox(page, 'usdm')).toBeChecked();
+    await expect.poll(async () => (await urlLayers(page)).has('usdm')).toBe(true);
+    const chipLabel = page.locator('#map-key .map-key-chip-label');
+    await expect(chipLabel.locator('.map-key-chip-value')).toHaveText('D3');
+    const swatch = chipLabel.locator('.map-key-chip-swatch');
+    await expect(swatch).toBeVisible();
+    const box = await swatch.boundingBox();
+    expect(box && Math.round(box.width)).toBe(10);
+    const bg = await swatch.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(bg, 'the swatch carries the class colour as a fill').not.toBe('rgba(0, 0, 0, 0)');
+    const valueColor = await chipLabel
+      .locator('.map-key-chip-value')
+      .evaluate((el) => getComputedStyle(el).color);
+    expect(valueColor, 'the value text itself is no longer classed').not.toBe(bg);
+  });
+});
+
+// Audit round 5 (R5-5): the off drought tile is an observed surface, so
+// pressing it at Near Term commits Current rather than leaving that chip
+// pressed (and every other chip disabled) over the NADM month.
+test('pressing the off drought tile at Near Term commits the Current horizon', async ({ page }) => {
+  await gotoApp(page, '?view=console');
+  const weeksAhead = page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]');
+  await weeksAhead.click();
+  await expect(weeksAhead).toHaveAttribute('aria-pressed', 'true');
+  await waitForLayerSettled(page, 'drought');
+  const tile = page.locator('.conditions-metric[data-metric="drought"][data-layer-on="false"]');
+  await tile.click();
+  const current = page.locator('.shell-horizon-btn[data-horizon="current"]');
+  await expect(current).toHaveAttribute('aria-pressed', 'true');
+  expect(await current.getAttribute('aria-disabled')).toBeNull();
+  await expect(weeksAhead).toHaveAttribute('aria-pressed', 'false');
+  await expect.poll(() => new URL(page.url()).searchParams.get('horizon')).toBeNull();
+  await expect(page.locator('.conditions-metric[data-metric="drought"]')).toHaveAttribute('data-layer-on', 'true');
+});
+
+/**
+ * found-008 (D1 M14): "Conditions in view" offers only the current mode's
+ * surfaces, enumerated from HAZARD_CLUSTER_KEYS (DR-113) rather than a
+ * literal Heat/ENSO/Wildfire list. Before the fix, the drought anchor tile
+ * (a "North American Drought Monitor layer off. Press to show." chip in
+ * every non-drought mode) rendered unconditionally regardless of mode.
+ */
+test.describe('found-008: Conditions in view offers only the current mode\'s surfaces', () => {
+  for (const key of HAZARD_CLUSTER_KEYS) {
+    if (key === 'drought') continue;
+    const token = HAZARD_CLUSTERS[key].urlToken;
+
+    test(`Conditions in view offers no other mode's layer chip in ${key}`, async ({ page }) => {
+      await gotoApp(page, `?cluster=${token}`);
+
+      // The drought family (nadm-drought / usdm / the CPC drought outlook)
+      // is not this mode's own recipe: no "Layer off. Press to show." drought
+      // chip is offered here.
+      await expect(page.locator('.conditions-metric[data-metric="drought"]')).toHaveCount(0);
+      // The strip has rendered, so the count above tests something. In Brief the
+      // strip is parked unseen (the Key chip carries its reading), so presence, not visibility.
+      await expect.poll(() => page.locator('#conditions-metrics > :is(.conditions-metric, .conditions-empty)').count()).toBeGreaterThan(0);
+    });
+
+    // Audit round 3: a custom set reads the person's hazard, never the store's Drought.
+    test(`a custom set made in ${key} keeps its hazard in the link and offers no drought chip`, async ({ page }) => {
+      // The mode's own layers plus a reference layer: a custom set, whose store claim reads Drought.
+      const layers = [...composeClusterIntent(key, 'current'), 'places'].join(',');
+      await gotoApp(page, `?layers=${layers}&hazard=${token}&view=console`);
+      await expect.poll(() => new URL(page.url()).searchParams.get('hazard')).toBe(token);
+      expect(new URL(page.url()).searchParams.get('cluster')).toBeNull();
+      // The strip has rendered, so the count below tests something.
+      await expect.poll(() => page.locator('#conditions-metrics > :is(.conditions-metric, .conditions-empty):visible').count()).toBeGreaterThan(0);
+      await expect(page.locator('.conditions-metric[data-metric="drought"]')).toHaveCount(0);
+    });
+  }
 });

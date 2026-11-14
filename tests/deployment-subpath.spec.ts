@@ -1,6 +1,7 @@
-import { expect, test } from '@playwright/test';
+import { isExternalHttp } from './offline-test';
+import { expect, test } from './offline-test';
 
-import { ROLE_GROUPS } from './helpers';
+import { awaitQuiescence, ROLE_GROUPS } from './helpers';
 import { stubRecentSatellite } from './satellite-fixture';
 import { routeAllTribalFixtures } from './tribal-fixtures';
 import { installMinimapAnalysisStubs } from './minimap-fixtures';
@@ -20,6 +21,7 @@ test('the production artifact boots from the GitHub Pages subpath', async ({
       `${mountedPath}${requested.search}`,
       requested.origin,
     );
+    if (isExternalHttp(new URL(route.request().url()))) return route.fallback();
     const response = await route.fetch({ url: previewUrl.href });
     await route.fulfill({ response });
   });
@@ -62,7 +64,16 @@ test('the production artifact boots from the GitHub Pages subpath', async ({
     { waitUntil: 'domcontentloaded' },
   );
 
-  await page.waitForTimeout(1_000);
+  // No gotoApp here (the subpath mount is set up by hand above), but the
+  // app still installs `window.__ddm` on boot: wait for the seam to prove
+  // every pending layer and shared transport has settled instead of a
+  // blind fixed wait. The wait starts only after `buildSidebar` has seeded
+  // the URL's layer intents (controls ready), so the seam has the boot's work
+  // to wait on and the collectors below read after the boot's requests: the
+  // J7 receipt (I:/claude-temp/ddm-s30d/gates/j7.log, at 7a2b48d) read phase
+  // `booting` with nothing pending from the bare wait.
+  await expect(page.locator('html')).toHaveAttribute('data-ddm-controls', 'ready');
+  await awaitQuiescence(page);
   expect(sameOriginFailures, 'subpath resource failures').toEqual([]);
   expect(runtimeErrors, 'subpath boot errors').toEqual([]);
   await expect(page.locator('#layer-toggles .layer-group')).toHaveCount(

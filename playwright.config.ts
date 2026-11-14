@@ -40,6 +40,45 @@ const BASE_URL = `${PREVIEW_ORIGIN}${BASE_PATH}`;
 
 const isCI = !!process.env['CI'];
 
+/** Browser-free spec files run once by the gate's pure project, alphabetical. */
+export const PURE_SPECS = [
+  'tests/acknowledgements.spec.ts',
+  'tests/antimeridian.spec.ts',
+  'tests/camera-region-fallbacks.spec.ts',
+  'tests/capability-matrix.spec.ts',
+  'tests/cluster-service.spec.ts',
+  'tests/config-key-authority.spec.ts',
+  'tests/display-summary.spec.ts',
+  'tests/drought-semantics.spec.ts',
+  'tests/enso-flow-data.spec.ts',
+  'tests/fetch.spec.ts',
+  'tests/gl-capability.spec.ts',
+  'tests/heat-h0-cancellation.spec.ts',
+  'tests/heat-h2-cancellation.spec.ts',
+  'tests/landscape-loader.spec.ts',
+  'tests/layer-order.spec.ts',
+  'tests/location-identity.spec.ts',
+  'tests/minimap-drought.spec.ts',
+  'tests/minimap-wildfire.spec.ts',
+  'tests/nadm-shared-payload.spec.ts',
+  'tests/overlap-engine.spec.ts',
+  'tests/place-ref.spec.ts',
+  'tests/pmtiles-probe.spec.ts',
+  'tests/point-in-polygon.spec.ts',
+  'tests/polygon-overlap.spec.ts',
+  'tests/power-layer.spec.ts',
+  'tests/product-catalog.spec.ts',
+  'tests/s1-substrate.spec.ts',
+  'tests/satellite-source.spec.ts',
+  'tests/umbrella-config.spec.ts',
+  'tests/usfs-whp.spec.ts',
+  'tests/verification-config.spec.ts',
+  'tests/wildfire-basemap-policy.spec.ts',
+  'tests/wildfire-source-semantics.spec.ts',
+  'tests/worker-proxy-policy.spec.ts'
+] as const;
+const PURE_SPEC_PATTERNS = PURE_SPECS.map((file) => `**/${file.replace(/^tests\//, '')}`);
+
 // The 3D Fire specs build terrain, a sky, a smoke volume, and context tiles
 // on the software renderer, and carry their own 120 to 180 second budgets
 // (`test.setTimeout` in fire3d-mode.spec.ts, `timeout_ms` rows in
@@ -48,7 +87,7 @@ const isCI = !!process.env['CI'];
 // timing on these specs, not product behavior) instead of inflating the
 // global budget, and so a general shard never waits behind a scene build.
 // Locally `npm test` and `npm run test:serial` still run both projects.
-const FIRE3D_SPECS = ['**/fire3d-mode.spec.ts', '**/view-contracts.spec.ts'];
+const FIRE3D_SPECS = ['**/fire3d-mode.spec.ts', '**/view-contracts.spec.ts', '**/wildfire3d-ground.spec.ts'];
 
 // The interaction cluster (R1/R3, 2026-08-29): these four files carry about
 // 35 of the 53 named flake events tallied in the per-test table (section 3)
@@ -77,6 +116,22 @@ const INTERACTION_SPECS = [
   '**/s4-shell.spec.ts'
 ];
 
+// DDM-P14-T08: the mode-switch cost spec is a measurement, not an
+// assertion suite, and it writes committed files (docs/mode-switch-cost.json,
+// docs/MODE_SWITCH_COST.md) when run with DDM_MEASURE_LABEL set. It gets its
+// own project, run only by `npm run measure:mode-switch`, so it never joins
+// the `chromium` project's testIgnore-excluded default run and never joins
+// CI: browser-suite.yml:220 fans the workflow out over a fixed three-project
+// matrix (chromium, chromium-interaction, chromium-3d) that never names
+// `chromium-measure`, so a CI checkout is never dirtied by this spec.
+//
+// ENSO-FLOW-PLAN E2-2: the flowing paths' measure spec (frame rate, CPU,
+// bytes and wall time in a browser, fixtures only) joins it, so it is never
+// collected by `chromium` (MEASURE_SPECS is that project's testIgnore) or by
+// CI, and is run by `npm run measure:flow` alone. Without this line the spec
+// would be collected by no project.
+const MEASURE_SPECS = ['**/mode-switch-cost.spec.ts', '**/flow-measure.spec.ts'];
+
 // MapLibre GL needs a WebGL2 context. Headless Chromium has no GPU, so force
 // ANGLE over SwiftShader (a pure-software GL implementation) and allow it
 // explicitly (recent Chromium gates the SwiftShader WebGL fallback behind
@@ -94,6 +149,27 @@ const CHROMIUM_USE = {
   }
 };
 
+// Explicit owner measurement only. Flags request a native renderer; the flow
+// measure spec checks the actual map renderer before accepting GPU evidence.
+// Unset, 0, and every value except the exact token 1 retain the software path.
+const MEASURE_USE = process.env['DDM_MEASURE_NATIVE_GPU'] === '1' ? {
+  browserName: 'chromium' as const,
+  headless: false,
+  launchOptions: {
+    args: ['--use-gl=angle', '--use-angle=d3d11', '--disable-frame-rate-limit']
+  }
+} : CHROMIUM_USE;
+
+// Local diagnosis only (owner, 2026-10-11): real graphics for the 3D project,
+// so a 3D red can be explained without the software renderer's multi-second
+// page freezes. Never evidence: GitHub runs the software path. Only the exact
+// token 1 selects it.
+const DIAGNOSE_3D_USE = process.env['DDM_3D_NATIVE_GPU'] === '1' ? {
+  browserName: 'chromium' as const,
+  headless: false,
+  launchOptions: { args: ['--use-gl=angle', '--use-angle=d3d11'] }
+} : CHROMIUM_USE;
+
 export default defineConfig({
   testDir: './tests',
 
@@ -106,14 +182,9 @@ export default defineConfig({
   // `--workers=1` per runner and fans out across runners instead
   // (browser-suite.yml).
   //
-  // The serial baseline recorded here was "about 31 minutes, 2026-08-28".
-  // That is stale and low. Re-measured 2026-09-01 on `d5aaac1`: about 3.8 s
-  // per browser test in `chromium`, about 4.1 s in `chromium-interaction`,
-  // and 11.1 minutes for `fire3d-mode.spec.ts` alone, over 852 tests in 107
-  // files, which puts `npm run test:serial` at roughly 50 to 55 minutes.
-  // Treat it as the integration branch's final pass, not a routine loop; the
-  // cheaper tiers are `npm run verify:quick`, `verify:smoke`, and
-  // `verify:fire` (tests/README.md).
+  // Keep full serial verification for the assembled integration/release
+  // candidate. Use the scoped ladder in tests/README.md while editing;
+  // historical runtime estimates are not verification requirements.
   fullyParallel: true,
   workers: 2,
 
@@ -154,6 +225,7 @@ export default defineConfig({
 
   use: {
     baseURL: BASE_URL,
+    serviceWorkers: 'block',
     // Locally, traces and screenshots are captured only when something goes
     // wrong, so the tree stays clean on a green run (they land in gitignored
     // `test-results/`). CI is DELIBERATELY NOT the same (2026-08-29,
@@ -173,7 +245,7 @@ export default defineConfig({
     // tests/boundary-boot-inventory.test.mjs keep it answered.
     //
     // The PIXEL objection is not answered, so pixels stay out. The basemap is
-    // live OpenStreetMap raster (src/map/style.ts), and a rendered frame of
+    // DDM's own map of real places (src/map/style.ts), and a rendered frame of
     // synthetic rectangles labelled as Tribal geography can be mistaken for
     // real boundaries once it is detached from its test. So in CI:
     // `screenshots: false` drops the trace's own timeline frames, `screenshot`
@@ -212,7 +284,7 @@ export default defineConfig({
 
   projects: [
     {
-      // Everything except the 3D Fire specs and the interaction cluster. CI
+      // Browser specs except the 3D Fire specs and the interaction cluster. CI
       // shards this project across a runner matrix with `--shard=i/n`
       // (contiguous equal-count slices of the file-ordered test list), one
       // worker per runner.
@@ -222,7 +294,14 @@ export default defineConfig({
       // collection and every worker, where they register zero Playwright
       // tests but do execute, so a module-scope throw in one would red a
       // shard as a collection error rather than fail its own runner.
-      testIgnore: [...FIRE3D_SPECS, ...INTERACTION_SPECS, '**/*.test.mjs'],
+      // Pure files already run in the gate; keep the browser matrix disjoint.
+      testIgnore: [
+        ...FIRE3D_SPECS,
+        ...INTERACTION_SPECS,
+        ...MEASURE_SPECS,
+        ...PURE_SPEC_PATTERNS,
+        '**/*.test.mjs'
+      ],
       use: CHROMIUM_USE
     },
     {
@@ -239,7 +318,15 @@ export default defineConfig({
       name: 'chromium-3d',
       testMatch: FIRE3D_SPECS,
       testIgnore: ['**/*.test.mjs'],
-      use: CHROMIUM_USE
+      use: DIAGNOSE_3D_USE
+    },
+    {
+      // The mode-switch cost measurement, alone: see MEASURE_SPECS above
+      // for why it is never part of the default run or the CI matrix.
+      name: 'chromium-measure',
+      testMatch: MEASURE_SPECS,
+      testIgnore: ['**/*.test.mjs'],
+      use: MEASURE_USE
     }
   ],
 

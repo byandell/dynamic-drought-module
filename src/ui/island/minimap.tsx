@@ -3,30 +3,39 @@
  * four-round region-selector spike, D-0.7.0-039/041/051/054).
  *
  * A schematic chooser over the nine editorial camera framings
- * (src/config/framings.ts) plus the ALL reset. The eight mainland
+ * (src/config/framings.ts); the region select holds the All reset. The eight mainland
  * framings keep the verified, edge-matched masks promoted from the S4 shell
  * kit, clipped to bundled Natural Earth 1:50m physical coastline linework;
  * Hawaii is the enlarged inset whose whole frame is its hit target. The
- * drawing itself uses only quiet ocean affordance labels for pointer users
- * (D-0.7.0-054); names, provenance framing, and coverage cautions ride
- * the accessible name and the selected-framing caption below. Pointer
- * hover is deliberately visual-only: a soft glow marks the target
- * without covering the map with a description popup.
+ * frame is not drawn and carries no caption (owner direction 2026-11-09
+ * (sprint), DR-pending): the islands fill the target, and the fact that
+ * they are drawn enlarged and apart from the mainland rides the accessible
+ * name (`HAWAII_INSET_NOTE`). The
+ * drawing itself carries no visible labels (D-0.7.0-054; the ocean labels
+ * moved to the framing dropdown 2026-10-13); names and provenance framing ride the accessible name
+ * and the selected-framing caption below. Pointer hover is deliberately
+ * visual-only: a soft glow marks the target without covering the map
+ * with a description popup.
  *
  * A framing is CAMERA-ONLY (D-0.7.0-039): choosing one fits the
  * viewport and writes `framing=` through the shared store; it never
  * selects a briefing place, never changes the hazard cluster, and never
- * claims data coverage. Coverage honesty is the caption's job here and
- * the display summary's job in prose: both render the SAME user-facing
- * slice of the framing's coverageNote via userFacingCoverageClause.
+ * claims data coverage. Coverage honesty (a framing's `coverage` clauses)
+ * no longer renders in this module's own post-click caption (2026-09-10,
+ * owner: that read as an unwanted popup and duplicated the display
+ * summary's caveat); its one visible home is now the on-map key
+ * (`src/ui/map-key.ts`), which gates each clause on its own conditions of
+ * truth. The per-option accessible name below still carries the two clauses
+ * that describe THIS control: that is inherent control labeling read before
+ * a commit, not a rendered popup, so it was left in place.
  *
- * The three ocean zones are schematic controls, not geographic boundaries.
- * Each enters the shipped ENSO display and fits its configured ocean camera
- * in one explicit gesture. They retain normal Tab stops outside the framing
- * radiogroup because they change both display and camera, while the land
- * framings remain camera-only deferred-commit radios.
+ * The ocean zones are schematic shapes, not geographic boundaries. The
+ * Pacific and Atlantic are clickable here: each enters ENSO and fits its
+ * ocean camera, with its own Tab stop outside the framing radiogroup
+ * because it changes display and camera. The Arctic is reached from the
+ * framing dropdown (src/ui/sidebar.ts).
  *
- * Keyboard model: one radiogroup (ALL plus the nine framings) with the
+ * Keyboard model: one radiogroup (the nine framings) with the
  * repository's roving-tabindex idiom (the region radiogroup pattern),
  * but with COMMIT DEFERRED to Enter/Space: a framing commit is
  * expensive and stateful (a camera flight, an ocean-claim clear, a URL
@@ -40,28 +49,37 @@
 
 import type * as maplibregl from 'maplibre-gl';
 import type { ReadonlySignal } from '@preact/signals';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 
 import {
-  ALL_FRAMING_BOUNDS,
   FRAMINGS,
   FRAMING_KEYS,
-  framingFitBounds,
+  framingMayContainNunavut,
 } from '../../config/framings';
 import type { FramingKey, FramingSelection } from '../../config/framings';
-import type { HazardClusterKey } from '../../config/clusters';
-import { OCEANS, OCEAN_KEYS } from '../../config/oceans';
-import type { OceanKey } from '../../config/oceans';
+import type { HazardClusterKey, TemporalHorizonKey } from '../../config/clusters';
+import {
+  minimapIndexLabel,
+  minimapProductName,
+  minimapProvenanceAt,
+  minimapReading,
+  outlookFramingWords,
+  outlookScaleText,
+} from '../../config/minimap-readings';
+import { OCEANS, MINIMAP_OCEAN_KEYS } from '../../config/oceans';
+import type { MinimapOceanKey, OceanKey } from '../../config/oceans';
 import {
   FRAMING_SHAPES,
   FRAMING_SUPPLEMENTAL_SHAPES,
   HAWAII_ISLAND_SHAPES,
+  MINIMAP_VIEW_NORTH,
 } from '../../config/framing-shapes';
 import type { LonLat, MainlandFramingKey } from '../../config/framing-shapes';
 import {
   MINIMAP_LAKE_PATHS,
   MINIMAP_LAND_PATH,
 } from '../../config/minimap-geometry';
+import { MINIMAP_WHP } from '../../config/minimap-whp';
 import {
   MINIMAP_DROUGHT_COLORS,
   MINIMAP_WILDFIRE_COLORS,
@@ -73,8 +91,7 @@ import {
   getOceanFraming,
   onHazardClusterChange,
 } from '../../state/cluster-store';
-import { requestOcean } from '../../state/cluster-service';
-import { userFacingCoverageClause } from '../../state/display-summary';
+import { getViewMode, onViewModeChange } from '../../state/view-mode';
 import {
   getMinimapDroughtSnapshot,
   retainMinimapDrought,
@@ -84,18 +101,34 @@ import type {
   MinimapDroughtSnapshot,
 } from '../../state/minimap-drought';
 import {
+  MINIMAP_WILDFIRE_COUNT_TIERS,
   getMinimapWildfireSnapshot,
+  mappedWildfireFillOpacity,
   retainMinimapWildfire,
 } from '../../state/minimap-wildfire';
 import type {
   MinimapWildfireSnapshot,
   MinimapWildfireSummary,
 } from '../../state/minimap-wildfire';
+import {
+  IDLE_OUTLOOK,
+  outlookColors,
+  outlookLabels,
+  watchMinimapOutlook,
+} from '../../state/minimap-outlook';
+import type { MinimapOutlookSnapshot } from '../../state/minimap-outlook';
 import type { EnsoPhaseLabel } from '../../impact/enso';
-import { prefersReducedMotion } from '../../util/motion';
+import { fitFraming, fitOcean } from '../../map/camera-fit';
+import { requestBasemapMode } from '../../map/basemap-switcher';
+import { defaultBasemapFor } from '../../state/basemap-store';
+import { requestOcean } from '../../state/cluster-service';
+import { setMapTechnicalNote } from '../map-technical-information';
+import { dateTok } from '../../util/text-tokens';
 
 /** The kit's ratified equirectangular drawing plane. The final 8 units
- * leave the small lower gutter carried by the production-candidate SVG. */
+ * leave the small lower gutter carried by the production-candidate SVG.
+ * The card shows it cropped at MINIMAP_VIEW_NORTH and stretched to fit
+ * (VIEW_BOX below). */
 const LON_MIN = -188;
 const LON_MAX = -52;
 const LAT_MIN = 14;
@@ -104,15 +137,17 @@ const DRAWING_WIDTH = 660;
 const DRAWING_SCALE = DRAWING_WIDTH / (LON_MAX - LON_MIN);
 const DRAWING_MAP_HEIGHT = Math.round((LAT_MAX - LAT_MIN) * DRAWING_SCALE);
 const DRAWING_HEIGHT = DRAWING_MAP_HEIGHT + 8;
+/** Crop the unframed Arctic band and stretch the rest to the card: the SVGs
+ * use preserveAspectRatio="none", and every stroke is non-scaling. */
+const VIEW_TOP = Math.round((LAT_MAX - MINIMAP_VIEW_NORTH) * DRAWING_SCALE);
+const VIEW_BOX = `0 ${VIEW_TOP} ${DRAWING_WIDTH} ${DRAWING_HEIGHT - VIEW_TOP}`;
 
 /** Schematic water affordances. Land controls render above these paths, so
  * the zones own only visible water. They are navigation hit areas, never
  * ocean-boundary geometry. */
-const OCEAN_ZONE_PATHS: Readonly<Record<OceanKey, string>> = {
+const OCEAN_ZONE_PATHS: Readonly<Record<MinimapOceanKey, string>> = {
   pacific:
     'M0,54C92,62 174,88 244,128C282,181 316,262 350,348H0Z',
-  arctic:
-    'M0,0H660V78C572,66 502,78 430,70C344,61 266,70 194,66C126,62 62,70 0,58Z',
   atlantic:
     'M660,54C573,63 511,91 462,136C424,190 389,271 350,348H660Z',
 };
@@ -183,44 +218,38 @@ const HAWAII_PATHS: readonly string[] = HAWAII_ISLAND_SHAPES.map((shape) =>
   shapePath(shape, projectHawaii),
 );
 
-/** Fit the camera to a framing, mirroring the boot path's fit. */
-function fitFraming(map: maplibregl.Map, key: FramingKey): void {
-  const def = FRAMINGS[key];
-  map.fitBounds(
-    framingFitBounds(def),
-    { padding: 20, animate: !prefersReducedMotion() },
-  );
-}
-
-/** Fit ALL to the full North American minimap extent. */
-function fitAll(map: maplibregl.Map): void {
-  map.fitBounds(
-    framingFitBounds({ bounds: ALL_FRAMING_BOUNDS, padding: 0 }),
-    { padding: 20, animate: !prefersReducedMotion() },
-  );
-}
-
-function fitOcean(map: maplibregl.Map, key: OceanKey): void {
-  map.fitBounds(
-    framingFitBounds(OCEANS[key]),
-    { padding: 20, animate: !prefersReducedMotion() },
-  );
-}
-
-/** The roving order follows the drawing: nine framings, then ALL. */
-const ROVING_ORDER: ReadonlyArray<FramingKey | null> = [...FRAMING_KEYS, null];
+/** The roving order follows the drawing. All of North America is the region select's first option, not a tile here. */
+const ROVING_ORDER: ReadonlyArray<FramingKey> = FRAMING_KEYS;
 
 const CAMERA_ONLY_NOTE = 'Click fits the camera. Camera-only; selects nothing.';
 
-export type MinimapMetricContext = HazardClusterKey | 'custom';
+/** What the removed caption said, kept where assistive technology reads it. */
+const HAWAII_INSET_NOTE = 'Drawn enlarged and apart from the mainland.';
 
-const NEUTRAL_METRIC_NOTES: Readonly<
-  Record<Exclude<MinimapMetricContext, 'drought' | 'wildfire'>, string>
-> = {
-  heat: 'No verified Extreme Heat framing metric applied.',
-  enso: 'No verified ENSO framing metric applied.',
-  custom: 'No verified custom-display framing metric applied.'
-};
+/**
+ * The window onto the Hawaii islands inside their hit target, in the inset's
+ * own units. The islands span x 13.7 to 76.1 and y 248.4 to 290.7 (measured
+ * from the rendered paths); this window is centred on them and about a third
+ * tighter than the one that left room for a caption, so the group reads a
+ * little larger without moving its target.
+ */
+const HAWAII_VIEW_BOX = '-4 231 97.8 77';
+
+/**
+ * DR-040 c: a mode and horizon with no reading in the table
+ * (src/config/minimap-readings.ts) shade no framing (DDM-UI-004); the minimap
+ * never invents a product for them. A custom set reads the person's hazard
+ * (the shell passes `selectedHazard`). These say what the minimap shows; the
+ * clause true at that horizon (`minimapProvenanceAt`) says why, or nothing
+ * when no clause is true there.
+ */
+const UNSHADED_NOTE = 'Framings are unshaded in this display.';
+const UNSHADED_SCALE_TEXT = 'Unshaded · see main map';
+
+function unshadedNote(metricContext: HazardClusterKey, horizon: TemporalHorizonKey): string {
+  const why = minimapProvenanceAt(null, metricContext, horizon);
+  return why === undefined ? UNSHADED_NOTE : `${UNSHADED_NOTE} ${why}`;
+}
 
 /**
  * The minimap only exists at the desktop shell breakpoint: below 721px
@@ -242,6 +271,32 @@ function useDesktopMinimap(): boolean {
     const sync = (): void => setMatches(query.matches);
     // Re-read once on mount: the viewport can change between the lazy
     // island chunk's first render and this effect.
+    sync();
+    query.addEventListener('change', sync);
+    return () => query.removeEventListener('change', sync);
+  }, []);
+  return matches;
+}
+
+/**
+ * The compact height band (src/styles/app.css: `@media (min-width: 721px)
+ * and (max-height: 699px)`) is where `.shell-minimap-map` (the inline
+ * instance) yields to `.shell-minimap-popover-wrap` (the popover instance,
+ * behind the "Map areas" door). Duplicated here for the same reason
+ * `DESKTOP_MINIMAP_QUERY` is: a JS-side gate on whether an instance's
+ * geometry has any chance of being seen (EF-2 in spirit, DDM-P11-T01 in
+ * fact) has to match the CSS breakpoint that actually hides it, or the
+ * gate lies in one direction or the other.
+ */
+const COMPACT_HEIGHT_BAND_QUERY = '(min-width: 721px) and (max-height: 699px)';
+
+function useCompactHeightBand(): boolean {
+  const [matches, setMatches] = useState(
+    () => window.matchMedia(COMPACT_HEIGHT_BAND_QUERY).matches,
+  );
+  useEffect(() => {
+    const query = window.matchMedia(COMPACT_HEIGHT_BAND_QUERY);
+    const sync = (): void => setMatches(query.matches);
     sync();
     query.addEventListener('change', sync);
     return () => query.removeEventListener('change', sync);
@@ -278,10 +333,27 @@ function droughtImpactStrokeWidth(
   return 1.6 + Math.sqrt(summary.droughtPercent / 100) * 5.4;
 }
 
+/** The partial-coverage sentence: the mask share, or the mask-did-not-load truth (0% would mislead). */
+export function droughtMaskSentence(
+  notAnalyzedPercent: number,
+  analysisMaskMissing: boolean | undefined,
+  key: FramingKey,
+): string {
+  if (analysisMaskMissing) {
+    // A framing that cannot contain Nunavut has nothing to say about the mask.
+    return framingMayContainNunavut(key)
+      ? "The Nunavut analysis mask did not load, so Nunavut is counted in this framing's land."
+      : '';
+  }
+  return `The Nunavut analysis-mask proxy excludes approximately ${notAnalyzedPercent}% of this framing's land.`;
+}
+
 function droughtDescription(
   status: MinimapDroughtSnapshot['status'],
   summary: FramingDroughtSummary | undefined,
   month: string | null,
+  key: FramingKey,
+  analysisMaskMissing?: boolean,
 ): string {
   if (status === 'loading' || status === 'idle') {
     return 'North American drought summary loading.';
@@ -291,8 +363,7 @@ function droughtDescription(
   }
   const partial =
     summary.coverage === 'live-partial'
-      ? ` Coverage is partial. The Nunavut analysis-mask proxy excludes ` +
-        `approximately ${summary.notAnalyzedPercent}% of this framing's land.`
+      ? ` Coverage is partial. ${droughtMaskSentence(summary.notAnalyzedPercent, analysisMaskMissing, key)}`.trimEnd()
       : '';
   return (
     `Approximate area-weighted mean category index: ${droughtClassLabel(summary.averageClass)}, ` +
@@ -306,13 +377,8 @@ function droughtDescription(
 
 function checkedTimeLabel(checkedAtUtc: string | null): string {
   if (checkedAtUtc === null) return 'at an unavailable check time';
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZoneName: 'short',
-  }).format(new Date(checkedAtUtc));
+  // The house date token, as the Wildfire time statement writes the same browser check.
+  return dateTok(checkedAtUtc);
 }
 
 function whpScope(summary: MinimapWildfireSummary): string {
@@ -382,6 +448,39 @@ function wildfireDescription(
   );
 }
 
+/**
+ * DR-041 b's fallback caption, named for the science verifier: the
+ * organization and product name are fixed strings authored here, the
+ * edition is read straight off the generated artifact
+ * (src/config/minimap-whp.ts, `source.edition`), never hand-typed.
+ */
+const WHP_EDITION_CAPTION = `USFS Wildfire Hazard Potential, ${MINIMAP_WHP.source.edition}`;
+const WHP_EDITION_YEAR_MATCH = MINIMAP_WHP.source.edition.match(/^\d{4}/);
+/**
+ * The edition YEAR (e.g. "2023"), not the trailing "updated YYYY-MM-DD"
+ * date in the same field: per the issuer's own metadata (USFS
+ * RDS-2015-0047-4, ddm-science-verifier check 2026-09-09), that later
+ * date is when the Forest Service patched a Nodata classification bug in
+ * the already-published 2023 raster, a technical correction, not a
+ * refresh of the underlying hazard assessment. The surface itself
+ * reflects landscape conditions as of the end of 2020 and is published
+ * as the 2023, 4th edition; using the patch date as `data-metric-time`
+ * would overstate how current the static fallback is.
+ */
+const WHP_EDITION_YEAR: string | undefined = WHP_EDITION_YEAR_MATCH?.[0];
+
+/** The count tiers in words ("1, 2 to 9, ..."), read off the same table the
+ * fill uses so the note cannot drift from the drawing. */
+const COUNT_TIER_TEXT = MINIMAP_WILDFIRE_COUNT_TIERS.map((tier, index) => {
+  const next = MINIMAP_WILDFIRE_COUNT_TIERS[index + 1];
+  if (next === undefined) return `${tier.min} or more`;
+  return next.min - 1 === tier.min ? `${tier.min}` : `${tier.min} to ${next.min - 1}`;
+}).join(', ');
+
+/** The count-depth rule, one sentence: the briefing note and the card's own
+ * label tooltip both read this constant so they cannot disagree. */
+const COUNT_DEPTH_NOTE = `Orange-red marks current mapped wildfire perimeters, deeper for more: ${COUNT_TIER_TEXT} per framing; a zero count does not establish no active wildfire.`;
+
 function wildfireMetricNote(snapshot: MinimapWildfireSnapshot): string {
   if (snapshot.status === 'loading' || snapshot.status === 'idle') {
     return (
@@ -397,10 +496,11 @@ function wildfireMetricNote(snapshot: MinimapWildfireSnapshot): string {
   }
   return (
     `NIFC browser check: ${checkedTimeLabel(snapshot.checkedAtUtc)}. ` +
-    'Red marks a current mapped wildfire perimeter; a zero count does not establish no active wildfire. ' +
+    `${COUNT_DEPTH_NOTE} ` +
     'Otherwise, WHP 2023 fills are orange above 50% High or Very High, yellow above 30% Moderate or higher, light below both thresholds, and dark for no data or an unavailable current check. ' +
     // vocab-allow: honesty disclaimer denying that static WHP is a forecast
-    'Percentages are approximate shares of classified WHP land in the covered United States portion. WHP is static strategic context, not a forecast; hatching marks partial coverage.'
+    'Percentages are approximate shares of classified WHP land in the covered United States portion. WHP is static strategic context, not a forecast; hatching marks partial coverage. ' +
+    `A zero current-fire count with WHP data renders stippled: ${WHP_EDITION_CAPTION}, a static potential overview, not a current wildfire condition.`
   );
 }
 
@@ -420,31 +520,18 @@ function droughtMetricNote(snapshot: MinimapDroughtSnapshot): string {
   return (
     `North American Drought Monitor monthly consensus, ${monthLabel(snapshot.month)}. ` +
     'Fill is an approximate area-weighted mean category index over assessed land, and outline width is the D1 through D4 share. ' +
-    'This navigation overview is inferred from NADM polygons, not an NADM-issued regional category; hatching marks partial coverage.'
+    'This navigation overview is inferred from NADM polygons, not an NADM-issued regional category; hatching marks partial coverage.' +
+    (snapshot.analysisMaskMissing
+      ? ' The Nunavut analysis mask did not load, so Nunavut is counted in land.'
+      : '')
   );
 }
 
-/**
- * The visible metric note for whichever metric context is showing (EF-3).
- * It used to render on Wildfire alone, so Drought's live NADM encoding was
- * explained only to a screen reader and Heat, ENSO, and custom displays said
- * nothing at all about their flat fills. Neutral contexts keep the neutral
- * sentence verbatim: naming the absence of a framing metric is the honest
- * statement (design record DDM-UI-004), not a defect to paper over.
- */
-function metricNote(
-  context: MinimapMetricContext,
-  drought: MinimapDroughtSnapshot,
-  wildfire: MinimapWildfireSnapshot,
-): string {
-  if (context === 'drought') return droughtMetricNote(drought);
-  if (context === 'wildfire') return wildfireMetricNote(wildfire);
-  return NEUTRAL_METRIC_NOTES[context];
-}
 
 function metricFill(
   droughtSummary: FramingDroughtSummary | undefined,
   wildfireSummary: MinimapWildfireSummary | undefined,
+  outlookFill?: readonly string[],
 ): string | undefined {
   if (droughtSummary) {
     return MINIMAP_DROUGHT_COLORS[droughtSummary.averageClass];
@@ -452,7 +539,22 @@ function metricFill(
   if (wildfireSummary) {
     return MINIMAP_WILDFIRE_COLORS[wildfireSummary.condition];
   }
-  return undefined;
+  return outlookFill?.[0];
+}
+
+/**
+ * DRAFT (classes-drawn rows): several drawn classes as equal stripes of their
+ * issuer colours in legend order, so no class is ranked, merged or blended.
+ */
+function ClassStripes({ id, colors }: { readonly id: string; readonly colors: readonly string[] }) {
+  const size = 4 * colors.length;
+  return (
+    <pattern id={id} width={size} height={size} patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      {colors.map((color, index) => (
+        <rect key={index} x={4 * index} width="4" height={size} fill={color} />
+      ))}
+    </pattern>
+  );
 }
 
 function metricIsPartial(
@@ -466,46 +568,132 @@ function metricIsPartial(
   );
 }
 
+/**
+ * DR-041 b: the fallback case. `condition` reaches one of these three only
+ * when the current-perimeter read SUCCEEDED at zero and WHP 2023 answered
+ * for the gap (src/state/minimap-wildfire.ts:190-220,
+ * `deriveMinimapWildfireSummary`); `unavailable` (the read failed) and
+ * `no-data` (WHP has no coverage either) are excluded on purpose, so this
+ * never marks a state that has nothing to fall back to. Wildfire's
+ * `live-partial` status is unreachable except through one of these three
+ * (`mapped-wildfire` is always `status: 'live'`), so this fully subsumes
+ * the wildfire share of `metricIsPartial`.
+ */
+function isWildfireWhpFallback(
+  wildfireSummary: MinimapWildfireSummary | undefined,
+): boolean {
+  return (
+    wildfireSummary !== undefined &&
+    wildfireSummary.condition !== 'mapped-wildfire' &&
+    wildfireSummary.condition !== 'no-data' &&
+    wildfireSummary.condition !== 'unavailable'
+  );
+}
+
+type MinimapFillTreatment =
+  | { readonly kind: 'solid'; readonly color: string; readonly opacity?: number }
+  | { readonly kind: 'pattern'; readonly patternId: string };
+
+/** The inline style for one framing shape's fill decision. */
+function fillStyle(
+  treatment: MinimapFillTreatment | undefined,
+): Record<string, string> | undefined {
+  if (!treatment) return undefined;
+  if (treatment.kind === 'pattern') return { fill: `url(#${treatment.patternId})` };
+  return treatment.opacity === undefined
+    ? { fill: treatment.color }
+    : { fill: treatment.color, fillOpacity: String(treatment.opacity) };
+}
+
+/**
+ * One fill decision per framing shape, used identically for the mainland
+ * paths and the Hawaii islands. `whp-fallback` (DR-138 R5, issuer color +
+ * stippled) takes precedence over the older partial-coverage crosshatch
+ * for wildfire, since every wildfire `live-partial` state IS a WHP
+ * fallback state (see `isWildfireWhpFallback`); drought's crosshatch is
+ * unaffected, wildfire summaries never reach it.
+ */
+function fillTreatment(
+  idPrefix: string,
+  key: string,
+  droughtSummary: FramingDroughtSummary | undefined,
+  wildfireSummary: MinimapWildfireSummary | undefined,
+  outlookFill?: readonly string[],
+): MinimapFillTreatment | undefined {
+  const fill = metricFill(droughtSummary, wildfireSummary, outlookFill);
+  if (fill === undefined) return undefined;
+  if (outlookFill !== undefined && outlookFill.length > 1) {
+    return { kind: 'pattern', patternId: `${idPrefix}-classes-${key}` };
+  }
+  if (isWildfireWhpFallback(wildfireSummary)) {
+    return { kind: 'pattern', patternId: `${idPrefix}-whp-${key}` };
+  }
+  if (metricIsPartial(droughtSummary, wildfireSummary)) {
+    return { kind: 'pattern', patternId: `${idPrefix}-partial-${key}` };
+  }
+  if (wildfireSummary?.condition === 'mapped-wildfire') {
+    return {
+      kind: 'solid',
+      color: fill,
+      opacity: mappedWildfireFillOpacity(
+        wildfireSummary.mappedWildfirePerimeterCount ?? 1,
+      ),
+    };
+  }
+  return { kind: 'solid', color: fill };
+}
+
 /** Commit a minimap choice: store write plus camera fit, one gesture. */
-function choose(map: maplibregl.Map, key: FramingKey | null): void {
+function choose(map: maplibregl.Map, key: FramingKey): void {
   // A framing choice is an explicit camera gesture: it drops any ocean
   // camera claim so the URL never asserts two cameras at once
   // (D-0.7.0-053; the selectRegion precedent in src/ui/sidebar.ts).
   clearOceanFraming();
-  setFraming(key ?? 'all');
-  if (key === null) fitAll(map);
-  else fitFraming(map, key);
+  setFraming(key);
+  fitFraming(map, key);
 }
 
-/** One explicit ocean gesture enters ENSO and moves the camera. The framing
- * store is intentionally untouched; `ocean=` has camera precedence while it
- * is present and the prior authored framing remains available when cleared. */
+/** One ocean gesture enters ENSO and fits that ocean, the same three calls
+ * as the framing dropdown's ocean group (src/ui/sidebar.ts). */
 function chooseOcean(map: maplibregl.Map, key: OceanKey): void {
   requestOcean(key);
+  requestBasemapMode(map, defaultBasemapFor('enso'));
   fitOcean(map, key);
 }
 
 function oceanAccessibleName(key: OceanKey): string {
   const ocean = OCEANS[key];
-  return (
-    `${ocean.label}. Switch to the El Nino / Southern Oscillation sea-surface-temperature anomaly display and fit this ocean camera. ` +
-    ocean.provenance
-  );
+  return `${ocean.label}. Switch to the El Nino / Southern Oscillation sea-surface-temperature anomaly display and fit this ocean camera. ${ocean.provenance}`;
 }
 
 function accessibleName(
   key: FramingKey,
   drought: MinimapDroughtSnapshot,
   wildfire: MinimapWildfireSnapshot,
-  metricContext: MinimapMetricContext,
+  outlook: MinimapOutlookSnapshot,
+  metricContext: HazardClusterKey,
+  horizon: TemporalHorizonKey,
 ): string {
   const def = FRAMINGS[key];
-  const coverage =
-    def.coverageNote !== undefined
-      ? userFacingCoverageClause(def.coverageNote)
-      : '';
-  const base =
-    coverage.length > 0 ? `${def.label}. ${coverage}.` : `${def.label}.`;
+  const reading = minimapReading(metricContext, horizon);
+  // The accessible name of a MINIMAP control, so it carries the clauses that
+  // describe this widget and the ground it draws: what the display reaches
+  // and what informs this minimap at the current mode and horizon, never
+  // another mode's or horizon's source (`minimapProvenanceAt`). The briefing-scope
+  // clause is deliberately not here; it describes place selection, which this
+  // control does not perform, and the on-map key already carries it
+  // (src/config/framings.ts FramingCoverage; Codex review finding 5).
+  //
+  // Unlike the on-map key, these are NOT gated on the active layer set: an
+  // accessible name is read on demand for a control the user is inspecting,
+  // not published as a live claim about the current display, and a name that
+  // changed its words as layers toggled would be worse for a screen-reader
+  // user than one that is stable and slightly broader.
+  const minimapClause = minimapProvenanceAt(key, metricContext, horizon);
+  const clauses = [def.coverage?.displayScope, minimapClause]
+    .filter((clause): clause is string => clause !== undefined && clause.length > 0)
+    .join(' ');
+  const base = clauses.length > 0 ? `${def.label}. ${clauses}` : `${def.label}.`;
   // The required provenance qualification travels with the name
   // (FramingDef.provenance is required, never empty, D-0.7.0-051; DG-080
   // review blocker 2): these rectangles visually resemble selectable
@@ -513,20 +701,29 @@ function accessibleName(
   // sovereignty-adjacent honesty requirement, not decoration. Coverage
   // copy does not substitute for geometry provenance.
   const metric =
-    metricContext === 'drought'
+    reading?.rule === 'nadm-framing-summary'
       ? droughtDescription(
           drought.status,
           drought.summaries[key],
           drought.month,
+          key,
+          drought.analysisMaskMissing,
         )
-      : metricContext === 'wildfire'
+      : reading?.rule === 'nifc-perimeter-count'
         ? wildfireDescription(
             wildfire.status,
             wildfire.summaries[key],
             wildfire.checkedAtUtc,
           )
-        : NEUTRAL_METRIC_NOTES[metricContext];
-  return `${base} ${metric} ${CAMERA_ONLY_NOTE} ${def.provenance}`;
+        : reading?.rule === 'classes-drawn'
+          ? outlookFramingWords(
+              minimapProductName(reading.product),
+              outlook.status,
+              outlookLabels(reading.outlook, outlook, key),
+            )
+          : UNSHADED_NOTE;
+  const inset = key === 'hawaii' ? ` ${HAWAII_INSET_NOTE}` : '';
+  return `${base}${inset} ${metric} ${CAMERA_ONLY_NOTE} ${def.provenance}`;
 }
 
 export interface MinimapProps {
@@ -536,57 +733,141 @@ export interface MinimapProps {
   /** Distinguishes the inline instance from the popover instance so ids
    * stay unique when both are mounted. */
   readonly idPrefix: string;
-  /** Drought and Wildfire have source-qualified framing metrics. */
-  readonly metricContext: MinimapMetricContext;
+  /** The mode whose reading the table names (src/config/minimap-readings.ts). */
+  readonly metricContext: HazardClusterKey;
+  /** The committed horizon: with the mode, it picks the table's cell. */
+  readonly horizon: TemporalHorizonKey;
+  /** Receives the inline instance's framing or ocean note when another
+   * shell surface owns its presentation. */
+  readonly onNoteChange?: (note: string) => void;
 }
 
 export function Minimap({
   map,
   framing,
   idPrefix,
-  metricContext
+  metricContext,
+  horizon,
+  onNoteChange
 }: MinimapProps) {
   const active = framing.value === 'all' ? null : framing.value;
   const [oceanFraming, setOceanFramingState] = useState(getOceanFraming);
   const activeOcean = metricContext === 'enso' ? oceanFraming : null;
   const landSelectionIsCurrent = activeOcean === null;
-  const showDroughtMetric = metricContext === 'drought';
-  const showWildfireMetric = metricContext === 'wildfire';
+  // What this minimap reads comes from the one table, at this mode AND
+  // horizon: a horizon reads only a product it loads.
+  const reading = minimapReading(metricContext, horizon);
+  const showDroughtMetric = reading?.rule === 'nadm-framing-summary';
+  const showWildfireMetric = reading?.rule === 'nifc-perimeter-count';
+  const outlookReading = reading?.rule === 'classes-drawn' ? reading : null;
+  const showIndexLabel = minimapIndexLabel(metricContext, horizon) === 'roni';
   // The roving-focus position, independent of the committed selection
   // (deferred commit; see the header note). `undefined` means "no
   // browsing in progress": the tab stop sits on the committed option.
-  const [focused, setFocused] = useState<FramingKey | null | undefined>(
-    undefined,
-  );
+  const [focused, setFocused] = useState<FramingKey | undefined>(undefined);
   const [drought, setDrought] = useState<MinimapDroughtSnapshot>(
     getMinimapDroughtSnapshot,
   );
   const [wildfire, setWildfire] = useState<MinimapWildfireSnapshot>(
     getMinimapWildfireSnapshot,
   );
+  const [outlook, setOutlook] = useState<MinimapOutlookSnapshot>(IDLE_OUTLOOK);
   const [ensoPhase, setEnsoPhase] = useState<EnsoPhaseLabel | null>(null);
   const desktopMinimap = useDesktopMinimap();
-  const roving = focused === undefined ? active : focused;
+  const compactHeightBand = useCompactHeightBand();
+  // Console does not need the minimap (owner, 2026-09-10): the stylesheet
+  // hides it (`#app.view-console .shell-minimap-map`), and this state
+  // stops the retained drought/wildfire summary fetches and the ENSO
+  // phase read below from running behind that hidden widget. Read via the
+  // shared store (src/state/view-mode.ts) rather than a prop so this
+  // component needs no change from shell.tsx, which is reserved.
+  const [viewMode, setViewMode] = useState(getViewMode);
+  useEffect(() => onViewModeChange(setViewMode), []);
+  // With nothing committed (All) the first framing holds the one Tab stop.
+  const roving: FramingKey = focused ?? active ?? ROVING_ORDER[0];
+
+  // DDM-P11-T01 clause 3: this is the ONE shell.tsx mounts the popover
+  // instance under (idPrefix "shell-minimap-pop", shell.tsx:309); the
+  // inline instance never matches. Derived from the frozen prefix contract
+  // shell.tsx documents (":394-406"), not from DOM traversal, so it is
+  // known synchronously on the first render with no visibility flash.
+  const isPopoverInstance = idPrefix.endsWith('-pop');
+  const rootRef = useRef<HTMLDivElement>(null);
+  // Closed is the only correct default: a popover starts closed on every
+  // boot, and nothing here can open one before this component paints.
+  const [popoverOpen, setPopoverOpen] = useState(false);
+  useEffect(() => {
+    if (!isPopoverInstance) return;
+    const host = rootRef.current?.closest('[popover]');
+    if (!(host instanceof HTMLElement)) return;
+    const sync = (): void => setPopoverOpen(host.matches(':popover-open'));
+    sync();
+    host.addEventListener('toggle', sync);
+    return () => host.removeEventListener('toggle', sync);
+  }, [isPopoverInstance]);
+  // The inline instance is hidden below 721px (#shell-panel, the whole
+  // shell) and again in the compact height band (.shell-minimap-map
+  // yields to the popover door there); the popover instance is visible
+  // ONLY inside that same band, and only once opened. Either way, this is
+  // the single signal that gates every <svg>/<path> below (clause 3): a
+  // hidden instance renders none.
+  const geometryVisible = isPopoverInstance
+    ? compactHeightBand && popoverOpen
+    : desktopMinimap && !compactHeightBand;
+
+  // Camera seam only: the main map's bounds as data-bounds on the canvas
+  // (the s4-shell refit cases read it); nothing is drawn (owner, 2026-10-19).
+  const [viewportBounds, setViewportBounds] = useState<maplibregl.LngLatBounds | null>(
+    () => map.getBounds(),
+  );
+  useEffect(() => {
+    const sync = (): void => setViewportBounds(map.getBounds());
+    sync();
+    map.on('moveend', sync);
+    return () => {
+      map.off('moveend', sync);
+    };
+  }, [map]);
 
   useEffect(() => {
-    if (!showDroughtMetric || !desktopMinimap) return;
+    if (!showDroughtMetric || !desktopMinimap || viewMode === 'console') return;
     return retainMinimapDrought(setDrought);
-  }, [showDroughtMetric, desktopMinimap]);
+  }, [showDroughtMetric, desktopMinimap, viewMode]);
 
   useEffect(() => {
-    if (!showWildfireMetric || !desktopMinimap) return;
+    if (!showWildfireMetric || !desktopMinimap || viewMode === 'console') return;
     return retainMinimapWildfire(setWildfire);
-  }, [showWildfireMetric, desktopMinimap]);
+  }, [showWildfireMetric, desktopMinimap, viewMode]);
+
+  // A classes-drawn row reads what its layer drew; stopping it forgets the
+  // last reading, so the next row never shows another product's classes.
+  useEffect(() => {
+    if (outlookReading === null || !desktopMinimap || viewMode === 'console') return;
+    const stop = watchMinimapOutlook(map, outlookReading.product, outlookReading.outlook, setOutlook);
+    return () => {
+      stop();
+      setOutlook(IDLE_OUTLOOK);
+    };
+  }, [map, outlookReading, desktopMinimap, viewMode]);
+
+  useEffect(() => {
+    if (showDroughtMetric && drought.status !== 'idle') {
+      setMapTechnicalNote('drought', droughtMetricNote(drought));
+    }
+    if (showWildfireMetric && wildfire.status !== 'idle') {
+      setMapTechnicalNote('wildfire', wildfireMetricNote(wildfire));
+    }
+  }, [showDroughtMetric, showWildfireMetric, drought, wildfire]);
 
   // EF-6: name the current ENSO phase in the scale slot instead of the bare
-  // "Navigation only". Label only, from the SAME bundled snapshot and the
+  // unshaded label. Label only, from the SAME bundled snapshot and the
   // SAME operational-RONI phase the briefing reads, through one lazy import
   // so the ENSO screen does not pull the impact cluster into the shell
   // chunk. It adds no framing metric: the fills stay neutral, and the
   // accessible name still says so. An unavailable read leaves the existing
   // label untouched rather than asserting a phase.
   useEffect(() => {
-    if (metricContext !== 'enso' || !desktopMinimap) return;
+    if (!showIndexLabel || !desktopMinimap || viewMode === 'console') return;
     const controller = new AbortController();
     let live = true;
     void (async () => {
@@ -595,14 +876,14 @@ export function Minimap({
         const label = await readEnsoPhaseLabel(controller.signal);
         if (live) setEnsoPhase(label);
       } catch {
-        // A failed chunk or read keeps the neutral navigation label.
+        // A failed chunk or read keeps the unshaded label.
       }
     })();
     return () => {
       live = false;
       controller.abort();
     };
-  }, [metricContext, desktopMinimap]);
+  }, [showIndexLabel, desktopMinimap, viewMode]);
 
   useEffect(
     () =>
@@ -616,12 +897,6 @@ export function Minimap({
     if (event.key !== 'Enter' && event.key !== ' ') return;
     event.preventDefault();
     choose(map, key);
-  };
-
-  const onOceanKeyDown = (event: KeyboardEvent, key: OceanKey): void => {
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    event.preventDefault();
-    chooseOcean(map, key);
   };
 
   const onKeyDown = (event: KeyboardEvent): void => {
@@ -650,7 +925,7 @@ export function Minimap({
     if (target === undefined) return;
     // Move focus only; the commit waits for Enter/Space or a click.
     setFocused(target);
-    const el = document.getElementById(`${idPrefix}-${target ?? 'all'}`);
+    const el = document.getElementById(`${idPrefix}-${target}`);
     el?.focus();
   };
 
@@ -671,24 +946,28 @@ export function Minimap({
     showWildfireMetric && active !== null
       ? wildfire.summaries[active]
       : undefined;
-  const coverage =
-    activeDef?.coverageNote !== undefined
-      ? userFacingCoverageClause(activeDef.coverageNote)
-      : '';
+  // A framing's coverageNote no longer renders here (2026-09-10, owner:
+  // the popped-up caption was noise); it renders once, in the on-map key
+  // (src/ui/map-key.ts), independent of this component's mount state.
   // EF-6: the ENSO scale slot names the current operational RONI CONDITIONS
-  // (the CPC onset rule on the newest season) and the season they are read
+  // (the CPC threshold on the newest season) and the season they are read
   // from, never the historical five-season episode classification, which
   // lags an event by months. It replaces a label, not a metric: the framings
   // stay neutral (DDM-UI-004), and the accessible name keeps saying so
   // before it names the basin-wide state.
+  // Past the hard staleness cutoff the slot is dated with the briefing's own
+  // stale phrase and drops the present-tense "emerging" tendency.
+  const ensoStaleAsOf = ensoPhase?.staleAsOf ?? null;
   const ensoScaleText =
-    metricContext === 'enso' && ensoPhase !== null
-      ? `RONI ${ensoPhase.conditionsName}${ensoPhase.emerging ? ' emerging' : ''} · ${ensoPhase.season} ${ensoPhase.year}`
+    showIndexLabel && ensoPhase !== null
+      ? ensoStaleAsOf !== null
+        ? `As of the CPC snapshot dated ${ensoStaleAsOf}: RONI ${ensoPhase.conditionsName} · ${ensoPhase.season} ${ensoPhase.year}`
+        : `RONI ${ensoPhase.conditionsName}${ensoPhase.emerging ? ' emerging' : ''} · ${ensoPhase.season} ${ensoPhase.year}`
       : null;
   const ensoScaleAccessibleText =
-    metricContext === 'enso' && ensoPhase !== null
-      ? `${NEUTRAL_METRIC_NOTES.enso} The operational Relative Oceanic Nino Index reads ${ensoPhase.conditionsName} conditions for the ${ensoPhase.season} ${ensoPhase.year} season` +
-        (ensoPhase.emerging
+    showIndexLabel && ensoPhase !== null
+      ? `${UNSHADED_NOTE} ${ensoStaleAsOf !== null ? `As of the CPC snapshot dated ${ensoStaleAsOf}, the` : 'The'} operational Relative Oceanic Nino Index ${ensoStaleAsOf !== null ? 'read' : 'reads'} ${ensoPhase.conditionsName} conditions for the ${ensoPhase.season} ${ensoPhase.year} season` +
+        (ensoPhase.emerging && ensoStaleAsOf === null
           ? `, with the historical five-season episode classification still reading ${ensoPhase.phaseName}`
           : '') +
         '. It is a basin-wide index label rather than a condition in any framing.'
@@ -705,7 +984,9 @@ export function Minimap({
         : wildfire.status === 'unavailable'
           ? 'Wildfire unavailable'
           : 'NIFC / WHP 2023'
-      : ensoScaleText ?? 'Navigation only';
+      : outlookReading !== null
+        ? outlookScaleText(minimapProductName(outlookReading.product), outlook.status)
+        : ensoScaleText ?? UNSHADED_SCALE_TEXT;
   const scaleAccessibleText = showDroughtMetric
     ? drought.status === 'live' && drought.month !== null
       ? `North American Drought Monitor monthly consensus, ${monthLabel(drought.month)}. Fill is an approximate area-weighted mean category index; outline width is the D1 through D4 share.`
@@ -716,10 +997,12 @@ export function Minimap({
         : wildfire.status === 'unavailable'
           ? 'Current mapped NIFC wildfire perimeter summary unavailable. Static WHP is not substituted.'
           : 'Current mapped NIFC wildfire perimeters with static United States Forest Service Wildfire Hazard Potential 2023 fallback.'
-      : ensoScaleAccessibleText ?? NEUTRAL_METRIC_NOTES[metricContext];
+      : outlookReading !== null
+        ? scaleText
+        : ensoScaleAccessibleText ?? unshadedNote(metricContext, horizon);
   const activePartialNote =
     activeDrought?.coverage === 'live-partial'
-      ? ` The Nunavut analysis-mask proxy excludes approximately ${activeDrought.notAnalyzedPercent}% of this framing's land.`
+      ? ` ${droughtMaskSentence(activeDrought.notAnalyzedPercent, drought.analysisMaskMissing, active!)}`.trimEnd()
       : '';
   const activeWildfireNote =
     activeWildfire?.status === 'live-partial'
@@ -727,24 +1010,39 @@ export function Minimap({
       : activeWildfire?.status === 'no-data'
         ? ' WHP 2023 does not cover this framing.'
         : '';
+  const framingNote =
+    activeDef !== null
+      ? activeOcean !== null
+        ? `Ocean view: ${OCEANS[activeOcean].label}. ${OCEANS[activeOcean].provenance} Preserved land framing: ${activeDef.label}.`
+        : `Framing: ${activeDef.label}.${activePartialNote}${activeWildfireNote}`
+      : activeOcean !== null
+        ? `Ocean view: ${OCEANS[activeOcean].label}. ${OCEANS[activeOcean].provenance}`
+        : '';
+  useEffect(() => {
+    onNoteChange?.(framingNote);
+  }, [framingNote, onNoteChange]);
 
   return (
-    <div class="shell-minimap">
+    <div class="shell-minimap" ref={rootRef}>
       <div class="shell-minimap-heading">
         <h2 id={`${idPrefix}-heading`} class="panel-title shell-minimap-title">
           Jump to region
         </h2>
         <span
           id={`${idPrefix}-scale`}
-          class="shell-minimap-scale"
+          class="shell-minimap-scale sr-only"
           aria-label={scaleAccessibleText}
           title={
             showDroughtMetric
-              ? 'North American Drought Monitor monthly consensus; approximate area-weighted mean category index; Nunavut analysis exclusion adapted from Statistics Canada 2021 Digital Boundary Files'
+              ? `North American Drought Monitor monthly consensus; approximate area-weighted mean category index; ${
+                  drought.analysisMaskMissing
+                    ? 'the Nunavut analysis exclusion (adapted from Statistics Canada 2021 Digital Boundary Files) did not load'
+                    : 'Nunavut analysis exclusion adapted from Statistics Canada 2021 Digital Boundary Files'
+                }`
               : showWildfireMetric
                 ? wildfire.checkedAtUtc === null
                   ? scaleAccessibleText
-                  : `${scaleAccessibleText} ${checkedTimeLabel(wildfire.checkedAtUtc)} is the browser check time, not a source observation time.`
+                  : `${COUNT_DEPTH_NOTE} ${scaleAccessibleText} ${checkedTimeLabel(wildfire.checkedAtUtc)} is the browser check time, not a source observation time.`
               : scaleAccessibleText
           }
         >
@@ -756,49 +1054,71 @@ export function Minimap({
         data-drought-status={showDroughtMetric ? drought.status : 'neutral'}
         data-wildfire-status={showWildfireMetric ? wildfire.status : 'neutral'}
         data-minimap-status={
+          // Six-state vocabulary only (src/ui/island/pill-text.ts:18-25):
+          // Heat/ENSO carry no status word at all rather than the
+          // former novel 'neutral' sentinel.
           showDroughtMetric
             ? drought.status
             : showWildfireMetric
               ? wildfire.status
-              : 'neutral'
+              : outlookReading !== null
+                ? outlook.status
+                : undefined
         }
         data-metric-context={metricContext}
+        // The source's valid month, never a retrieval timestamp; wildfire
+        // has no single canvas-wide valid time to put here honestly (its
+        // live share is dateless-current, its WHP share is dated per
+        // framing below), so it is left absent at this level on purpose.
+        data-metric-time={
+          showDroughtMetric && drought.status === 'live'
+            ? (drought.month ?? undefined)
+            : undefined
+        }
+        data-bounds={viewportBounds
+          ? [
+              viewportBounds.getWest(),
+              viewportBounds.getSouth(),
+              viewportBounds.getEast(),
+              viewportBounds.getNorth(),
+            ]
+              .map((value) => value.toFixed(4))
+              .join(',')
+          : undefined}
       >
-        <svg
-          class="shell-minimap-oceans"
-          viewBox={`0 0 ${DRAWING_WIDTH} ${DRAWING_HEIGHT}`}
-          preserveAspectRatio="xMidYMid meet"
-          aria-hidden="true"
-          focusable="false"
-        >
-          {OCEAN_KEYS.map((key) => {
-            return (
+        {geometryVisible && (
+          <svg
+            class="shell-minimap-oceans"
+            viewBox={VIEW_BOX}
+            preserveAspectRatio="none"
+            role="group"
+            aria-label="Ocean views"
+            focusable="false"
+          >
+            {MINIMAP_OCEAN_KEYS.map((key) => (
               <path
                 key={key}
+                id={`${idPrefix}-ocean-${key}`}
                 class={`shell-minimap-ocean${activeOcean === key ? ' active' : ''}`}
                 d={OCEAN_ZONE_PATHS[key]}
                 vectorEffect="non-scaling-stroke"
+                data-ocean={key}
+                role="button"
+                // Lowercase on purpose: Preact writes SVG props as attributes
+                // verbatim, and only `tabindex` makes a listener-free path focusable.
+                tabindex={0}
+                aria-pressed={activeOcean === key}
+                aria-label={oceanAccessibleName(key)}
+                onClick={() => chooseOcean(map, key)}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return;
+                  event.preventDefault();
+                  chooseOcean(map, key);
+                }}
               />
-            );
-          })}
-        </svg>
-
-        <div class="shell-minimap-ocean-doors" role="group" aria-label="Ocean views">
-          {OCEAN_KEYS.map((key) => (
-            <button
-              type="button"
-              id={`${idPrefix}-ocean-${key}`}
-              class={`shell-minimap-ocean-door shell-minimap-ocean-door-${key}`}
-              aria-pressed={activeOcean === key}
-              aria-label={oceanAccessibleName(key)}
-              data-ocean={key}
-              onClick={() => chooseOcean(map, key)}
-              onKeyDown={(event) => onOceanKeyDown(event, key)}
-            >
-              {OCEANS[key].label}
-            </button>
-          ))}
-        </div>
+            ))}
+          </svg>
+        )}
 
         <div
           class="shell-minimap-region-group"
@@ -807,11 +1127,12 @@ export function Minimap({
           onKeyDown={onKeyDown}
           onFocusOut={onFocusOut}
         >
+          {geometryVisible && (
           <svg
             class="shell-minimap-drawing"
-            viewBox={`0 0 ${DRAWING_WIDTH} ${DRAWING_HEIGHT}`}
-            preserveAspectRatio="xMidYMid meet"
-          data-geographic-extent={`${LON_MIN},${LAT_MIN},${LON_MAX},${LAT_MAX}`}
+            viewBox={VIEW_BOX}
+            preserveAspectRatio="none"
+          data-geographic-extent={`${LON_MIN},${LAT_MIN},${LON_MAX},${MINIMAP_VIEW_NORTH}`}
           >
           <defs>
             <clipPath
@@ -835,12 +1156,29 @@ export function Minimap({
               const wildfireSummary = showWildfireMetric
                 ? wildfire.summaries[key]
                 : undefined;
-              if (!metricIsPartial(droughtSummary, wildfireSummary)) return null;
+              const outlookFill = outlookReading
+                ? outlookColors(outlookReading.outlook, outlook, key)
+                : undefined;
+              const treatment = fillTreatment(
+                idPrefix,
+                key,
+                droughtSummary,
+                wildfireSummary,
+                outlookFill,
+              );
+              if (!treatment || treatment.kind !== 'pattern') return null;
+              if (outlookFill !== undefined) {
+                return <ClassStripes key={key} id={treatment.patternId} colors={outlookFill} />;
+              }
               const fill = metricFill(droughtSummary, wildfireSummary);
               if (fill === undefined) return null;
+              // DR-138 R5: the WHP fallback pattern is issuer color plus
+              // a stipple dot, deliberately distinct from the older
+              // diagonal-hatch partial-coverage pattern below it.
+              const whpFallback = isWildfireWhpFallback(wildfireSummary);
               return (
                 <pattern
-                  id={`${idPrefix}-partial-${key}`}
+                  id={treatment.patternId}
                   key={key}
                   width="8"
                   height="8"
@@ -851,7 +1189,11 @@ export function Minimap({
                     height="8"
                     fill={fill}
                   />
-                  <path d="M-2,2L2,-2M0,8L8,0M6,10L10,6" />
+                  {whpFallback ? (
+                    <circle cx="2" cy="2" r="0.9" fill="#0F172A" fill-opacity="0.4" />
+                  ) : (
+                    <path d="M-2,2L2,-2M0,8L8,0M6,10L10,6" />
+                  )}
                 </pattern>
               );
             })}
@@ -882,7 +1224,14 @@ export function Minimap({
             const wildfireSummary = showWildfireMetric
               ? wildfire.summaries[key]
               : undefined;
-            const fill = metricFill(droughtSummary, wildfireSummary);
+            const treatment = fillTreatment(
+              idPrefix,
+              key,
+              droughtSummary,
+              wildfireSummary,
+              outlookReading ? outlookColors(outlookReading.outlook, outlook, key) : undefined,
+            );
+            const whpFallback = isWildfireWhpFallback(wildfireSummary);
             return (
               <path
                 key={key}
@@ -891,21 +1240,14 @@ export function Minimap({
                 d={MAINLAND_PATHS[key]}
                 role="radio"
                 aria-checked={isActive}
-                aria-label={accessibleName(key, drought, wildfire, metricContext)}
-                tabIndex={roving === key ? 0 : -1}
+                aria-label={accessibleName(key, drought, wildfire, outlook, metricContext, horizon)}
+                // Lowercase on purpose: on an SVG path Preact writes `tabIndex`
+                // as an attribute of that exact name, which no browser reads.
+                tabindex={roving === key ? 0 : -1}
                 focusable="true"
                 vectorEffect="non-scaling-stroke"
                 clip-path={`url(#${idPrefix}-physical-land)`}
-                style={
-                  fill !== undefined
-                    ? {
-                        fill:
-                          metricIsPartial(droughtSummary, wildfireSummary)
-                            ? `url(#${idPrefix}-partial-${key})`
-                            : fill,
-                      }
-                    : undefined
-                }
+                style={fillStyle(treatment)}
                 data-framing={key}
                 data-drought-class={
                   showDroughtMetric
@@ -950,6 +1292,14 @@ export function Minimap({
                     ? wildfireSummary?.moderateOrHigherPercent
                     : undefined
                 }
+                // DR-041 b: the source's valid time (the WHP edition
+                // year, never the trailing correction date in the same
+                // field), present only on framings actually showing that
+                // static fallback fill; a live mapped-fire framing has no
+                // discrete date to claim, so it is absent.
+                data-metric-time={
+                  showWildfireMetric && whpFallback ? WHP_EDITION_YEAR : undefined
+                }
                 onClick={() => choose(map, key)}
                 onKeyDown={(event) => onRegionKeyDown(event, key)}
                 onFocus={() => setFocused(key)}
@@ -974,6 +1324,7 @@ export function Minimap({
             />
           ))}
           </svg>
+          )}
 
         <button
           type="button"
@@ -981,7 +1332,7 @@ export function Minimap({
           class={`shell-minimap-region shell-minimap-hawaii${landSelectionIsCurrent && active === 'hawaii' ? ' active' : ''}`}
           role="radio"
           aria-checked={landSelectionIsCurrent && active === 'hawaii'}
-          aria-label={accessibleName('hawaii', drought, wildfire, metricContext)}
+          aria-label={accessibleName('hawaii', drought, wildfire, outlook, metricContext, horizon)}
           tabIndex={roving === 'hawaii' ? 0 : -1}
           data-framing="hawaii"
           data-drought-class={
@@ -1027,133 +1378,94 @@ export function Minimap({
               ? wildfire.summaries.hawaii?.moderateOrHigherPercent
               : undefined
           }
+          data-metric-time={
+            showWildfireMetric &&
+            isWildfireWhpFallback(wildfire.summaries.hawaii)
+              ? WHP_EDITION_YEAR
+              : undefined
+          }
           onClick={() => choose(map, 'hawaii')}
           onFocus={() => setFocused('hawaii')}
         >
-          <span class="shell-minimap-hawaii-label">Hawaii (enlarged)</span>
-          <svg
-            class="shell-minimap-hawaii-islands"
-            viewBox="4 205 132 104"
-            aria-hidden="true"
-            focusable="false"
-          >
-            {metricIsPartial(
-              showDroughtMetric ? drought.summaries.hawaii : undefined,
-              showWildfireMetric ? wildfire.summaries.hawaii : undefined,
-            ) ? (
-              <defs>
-                <pattern
-                  id={`${idPrefix}-partial-hawaii`}
-                  width="8"
-                  height="8"
-                  patternUnits="userSpaceOnUse"
-                >
-                  <rect
-                    width="8"
-                    height="8"
-                    fill={
-                      metricFill(
-                        showDroughtMetric
-                          ? drought.summaries.hawaii
-                          : undefined,
-                        showWildfireMetric
-                          ? wildfire.summaries.hawaii
-                          : undefined,
-                      ) ?? MINIMAP_WILDFIRE_COLORS['no-data']
-                    }
+          {geometryVisible && (() => {
+            const hawaiiDrought = showDroughtMetric
+              ? drought.summaries.hawaii
+              : undefined;
+            const hawaiiWildfire = showWildfireMetric
+              ? wildfire.summaries.hawaii
+              : undefined;
+            const hawaiiOutlook = outlookReading
+              ? outlookColors(outlookReading.outlook, outlook, 'hawaii')
+              : undefined;
+            const hawaiiTreatment = fillTreatment(
+              idPrefix,
+              'hawaii',
+              hawaiiDrought,
+              hawaiiWildfire,
+              hawaiiOutlook,
+            );
+            const hawaiiWhpFallback = isWildfireWhpFallback(hawaiiWildfire);
+            const hawaiiFill = metricFill(hawaiiDrought, hawaiiWildfire);
+            return (
+              <svg
+                class="shell-minimap-hawaii-islands"
+                viewBox={HAWAII_VIEW_BOX}
+                aria-hidden="true"
+                focusable="false"
+              >
+                {hawaiiTreatment && hawaiiTreatment.kind === 'pattern' ? (
+                  <defs>
+                    {hawaiiOutlook !== undefined ? (
+                      <ClassStripes id={hawaiiTreatment.patternId} colors={hawaiiOutlook} />
+                    ) : (
+                    <pattern
+                      id={hawaiiTreatment.patternId}
+                      width="8"
+                      height="8"
+                      patternUnits="userSpaceOnUse"
+                    >
+                      <rect
+                        width="8"
+                        height="8"
+                        fill={
+                          hawaiiFill ?? MINIMAP_WILDFIRE_COLORS['no-data']
+                        }
+                      />
+                      {hawaiiWhpFallback ? (
+                        <circle cx="2" cy="2" r="0.9" fill="#0F172A" fill-opacity="0.4" />
+                      ) : (
+                        <path d="M-2,2L2,-2M0,8L8,0M6,10L10,6" />
+                      )}
+                    </pattern>
+                    )}
+                  </defs>
+                ) : null}
+                {HAWAII_PATHS.map((path, index) => (
+                  <path
+                    key={`impact-${index}`}
+                    class="shell-minimap-impact"
+                    d={path}
+                    vector-effect="non-scaling-stroke"
+                    stroke-width={droughtImpactStrokeWidth(hawaiiDrought)}
+                    data-impact-framing="hawaii"
                   />
-                  <path d="M-2,2L2,-2M0,8L8,0M6,10L10,6" />
-                </pattern>
-              </defs>
-            ) : null}
-            {HAWAII_PATHS.map((path, index) => (
-              <path
-                key={`impact-${index}`}
-                class="shell-minimap-impact"
-                d={path}
-                vector-effect="non-scaling-stroke"
-                stroke-width={droughtImpactStrokeWidth(
-                  showDroughtMetric ? drought.summaries.hawaii : undefined,
-                )}
-                data-impact-framing="hawaii"
-              />
-            ))}
-            {HAWAII_PATHS.map((path, index) => (
-              <path
-                key={index}
-                class="shell-minimap-island"
-                d={path}
-                vectorEffect="non-scaling-stroke"
-                style={
-                  metricFill(
-                    showDroughtMetric ? drought.summaries.hawaii : undefined,
-                    showWildfireMetric ? wildfire.summaries.hawaii : undefined,
-                  ) !== undefined
-                    ? {
-                        fill: metricIsPartial(
-                          showDroughtMetric
-                            ? drought.summaries.hawaii
-                            : undefined,
-                          showWildfireMetric
-                            ? wildfire.summaries.hawaii
-                            : undefined,
-                        )
-                          ? `url(#${idPrefix}-partial-hawaii)`
-                          : metricFill(
-                              showDroughtMetric
-                                ? drought.summaries.hawaii
-                                : undefined,
-                              showWildfireMetric
-                                ? wildfire.summaries.hawaii
-                                : undefined,
-                            ),
-                      }
-                    : undefined
-                }
-              />
-            ))}
-          </svg>
+                ))}
+                {HAWAII_PATHS.map((path, index) => (
+                  <path
+                    key={index}
+                    class="shell-minimap-island"
+                    d={path}
+                    vectorEffect="non-scaling-stroke"
+                    style={fillStyle(hawaiiTreatment)}
+                  />
+                ))}
+              </svg>
+            );
+          })()}
         </button>
 
-        <button
-          type="button"
-          id={`${idPrefix}-all`}
-          class="shell-minimap-all"
-          role="radio"
-          aria-checked={landSelectionIsCurrent && active === null}
-          aria-label="All: fit North America"
-          tabIndex={roving === null ? 0 : -1}
-          onClick={() => choose(map, null)}
-          onFocus={() => setFocused(null)}
-        >
-          All
-        </button>
         </div>
       </div>
-      <hr class="shell-minimap-divider" />
-      {/* A committed framing keeps its visible coverage caution. ALL uses
-          the divider alone so the default state does not repeat itself. */}
-      {activeDef !== null ? (
-        <p class="shell-minimap-note" aria-live="polite">
-          {activeOcean !== null
-            ? `Ocean view: ${OCEANS[activeOcean].label}. ${OCEANS[activeOcean].provenance} Preserved land framing: ${activeDef.label}.`
-            : coverage.length > 0
-              ? `Framing: ${activeDef.label}. ${coverage}.${activePartialNote}${activeWildfireNote}`
-              : `Framing: ${activeDef.label}.${activePartialNote}${activeWildfireNote}`}
-        </p>
-      ) : activeOcean !== null ? (
-        <p class="shell-minimap-note" aria-live="polite">
-          Ocean view: {OCEANS[activeOcean].label}. {OCEANS[activeOcean].provenance}
-        </p>
-      ) : null}
-      <p
-        class="shell-minimap-metric-note"
-        role="status"
-        aria-live="polite"
-        aria-atomic="true"
-      >
-        {metricNote(metricContext, drought, wildfire)}
-      </p>
     </div>
   );
 }

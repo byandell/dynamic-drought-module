@@ -1,14 +1,8 @@
 /**
- * Compact on-map key (0.3.0 design pass; hazard-aware since the 2026-07-14
- * mobile shell, from the ratified 2026-07-11 mockup).
- *
- * The design critique's first-five-seconds finding: the opening view is a
- * striking drought surface with no visible statement of what the colors
- * mean; the full legend lives in the sidebar below the fold, and in embed
- * mode there is no sidebar at all. This strip answers that on the map
- * itself; on desktop and embed it sits in the bottom-left dock, and the
- * mobile shell lifts it to the top of the map (the mockup's "the reference
- * is always above the map").
+ * Compact on-map condition indicator. Its one disclosure opens the details
+ * and categorical key in a bounded, keyboard-scrollable glass card. The
+ * desktop Brief drought metric opens the same card; other surfaces use
+ * the key's own indicator button.
  *
  * Hazard-aware, reflect-the-map: visibility and content key off the
  * registry. The active condition surface picks the key (US Drought Monitor,
@@ -17,32 +11,81 @@
  * the fire fallback when only the event layer is on. Nothing is fetched.
  * Vector swatches come from the map-fill palettes. HeatRisk uses the one
  * issuer-owned mirror table while its raster remains colorized upstream.
+ *
+ * Also, since 2026-09-10, the ONE render site for the S4 minimap's framing
+ * coverage caution (`frameCoverageNote`/`withFrameCoverage` below): a
+ * coverage-noted framing (Mexico, the prairie provinces, and the rest) with
+ * a US-scoped display layer active earns a coverage line here regardless of
+ * which hazard key (or no key at all) is otherwise showing, so it never
+ * goes silent just because the surface is not North America Drought. This
+ * relocated a sentence that used to pop up on the minimap itself on every
+ * framing click and, at the same time, repeat verbatim in the conditions
+ * summary caveat; both were retired in its favor (owner ask; see
+ * src/config/framings.ts and src/state/display-summary.ts).
  */
 
 import { registry } from '../state/registry';
+import { isSpcNoArea } from '../state/spc-no-area';
+import { sstAnomalyScaleHtml } from './sst-anomaly-legend';
+import { timeline } from '../state/timeline';
+import { usdmChangeLegendItems } from '../config/usdm-change';
 import {
   BC_DROUGHT_LEVELS,
   BC_DROUGHT_NO_UPDATE,
+  CDM_CATEGORIES,
+  CPC_EXTENDED_COLORS,
+  CPC_SEASONAL_COLORS,
+  GRIDDED_INDEX_RAMP,
   HEATRISK_CATEGORIES,
   NADM_CATEGORIES,
-  NWS_ALERT_COLORS,
-  SST_ANOMALY_SCALE,
+  NWS_ALERT_LEGEND,
+  OUTLOOK_LEGEND,
+  SST_ANOMALY_LABELS,
+  TRIBAL_FAMILY_COLOR,
   USDM_CATEGORIES,
   USDM_NONE_SWATCH,
   SPC_FIREWX_CATEGORIES
 } from '../config/palette';
-import { getDroughtSurfacePresentation } from '../config/layers';
-import {
-  NIFC_INCIDENT_PRESENTATION,
-  USFS_WHP_PRESENTATION,
-  NIFC_KEY_GENERALIZATION_NOTE
-} from '../config/wildfire-presentation';
+import { LAYER_DEFS, getDroughtSurfacePresentation } from '../config/layers';
+import { TRIBAL_NATIONS_GROUP } from '../config/layer-groups';
+import { HAZARD_CLUSTERS, HEAT_FIRE_ALERTS } from '../config/clusters';
+import { DETAIL_SECTIONS } from '../config/detail-sections';
+import { ensureDetailSectionHosts } from './detail-section-hosts';
+import { NIFC_INCIDENT_PRESENTATION, USFS_WHP_PRESENTATION } from '../config/wildfire-presentation';
+import { FRAMINGS } from '../config/framings';
+import { minimapProvenanceAt } from '../config/minimap-readings';
+import { getFraming, onFramingChange } from '../state/framing-store';
+import { getHazardCluster, getOceanFraming, onHazardClusterChange } from '../state/cluster-store';
+import { getCommittedSnapshot, getSelectedHazard, onCommittedSnapshotChange } from '../state/cluster-service';
+import { getViewMode, onViewModeChange } from '../state/view-mode';
+import { isUsScopeCautionLayer } from '../state/display-summary';
 import { escapeHtml } from '../util/escape';
+import { formatSnapshotTime } from '../util/snapshot-time';
+import { KEY_ELIGIBLE_LABELS, chipFallbackLabel } from '../config/chip-labels';
+import { CHIP_STATE_WORDS, chipStateFromStatuses, type ChipState } from '../config/chip-state';
+import { onConditionsHeadline, type ConditionsHeadline } from '../state/conditions-headline';
 import {
   createHeatRiskSequenceLoader,
   type HeatRiskFrameEventDetail
 } from './heatrisk-sequence-loader';
+import { openTechnicalInformation } from './impact-panel';
 import { watchDesktopMapSeat } from './map-control-seat';
+import { getTimeBarSpec, onTimeBarSpecChange } from './time-bar';
+import { getActiveLegends, onLegendChange, type LegendSpec } from './legend-registry';
+import { MAP_GROUND_COLOR } from '../config/interface-tokens';
+import { WHP_3D_SHADE_CATEGORIES, WHP_SHADE_CATEGORIES, WHP_SHADE_QUALIFICATION, WHP_SURFACE_OPACITY } from '../config/whp-shade';
+import { FUEL_RISK_TITLE, fireKeySections, noSurfaceKeyAria } from './fire3d-fuel-risk';
+import {
+  TROPICAL_CONE,
+  TROPICAL_EMPTY_TEXT,
+  TROPICAL_ISSUERS,
+  TROPICAL_POINT_CLASSES,
+  TROPICAL_POINT_PAPER,
+  TROPICAL_PART_NAMES,
+  TROPICAL_TRACK,
+  TROPICAL_WW_CLASSES,
+  tropicalBasinName
+} from '../config/tropical-presentation';
 
 export interface KeySpec {
   readonly label: string;
@@ -68,6 +111,8 @@ interface NwsSnapshotEventDetail {
     | 'inactive';
   readonly asOf: number | null;
   readonly truncated: boolean;
+  /** The products the layer's current read holds, in its set's order (src/layers/nws-alerts.ts keyEvents). */
+  readonly events?: readonly string[];
 }
 
 interface CdmSnapshotEventDetail {
@@ -93,14 +138,60 @@ interface SstSnapshotEventDetail {
   readonly date: string | null;
 }
 
+/**
+ * The SST map's direction arrows (src/layers/enso-flow.ts), found-115 and
+ * DR-188: their own status, model valid time and qualifications, in the
+ * words their panel shows, for a drawer row under the SST key. The arrows'
+ * module answers ENSO_FLOW_SNAPSHOT_REQUEST_EVENT with its current state,
+ * because this lazy chunk can start after the arrows have loaded.
+ */
+interface EnsoFlowSnapshotEventDetail {
+  readonly status: 'inactive' | 'off' | 'loading' | 'live' | 'live (partial)' | 'no data' | 'unavailable';
+  readonly label: string;
+  readonly line: string;
+  readonly notes: readonly string[];
+  /**
+   * E1-4 (ENSO-FLOW-PLAN.md; C-fit.md 1.6): the flowing paths' motion state
+   * (src/layers/flow/motion-loop.ts `MotionState`). Present only where the
+   * paths can move; it alone decides whether the Pause button is offered.
+   */
+  readonly motion?: 'moving' | 'paused' | 'reduced' | 'held' | 'none';
+  /** E1-4: the issuer credit, in the publisher's words, shown as its own item. */
+  readonly provenance?: string;
+}
+
+/** The tropical cyclones layer's snapshot (src/layers/tropical-cyclones.ts TropicalSnapshot). */
+interface TropicalSnapshotEventDetail {
+  readonly status: 'inactive' | 'loading' | 'live' | 'live (partial)' | 'unavailable' | 'no data';
+  readonly storms: readonly {
+    readonly bin: string;
+    readonly name: string;
+    readonly basin: string;
+    readonly advisory: string;
+    readonly issued: string;
+  }[];
+}
+
+const TROPICAL_KEY = 'tropical-cyclones';
+const TROPICAL_SNAPSHOT_EVENT = 'ddm:tropical-snapshot';
+const TROPICAL_SNAPSHOT_REQUEST_EVENT = 'ddm:tropical-snapshot-request';
+let tropicalSnapshot: TropicalSnapshotEventDetail | null = null;
+
 const HEATRISK_FRAMES_EVENT = 'ddm:heatrisk-frames';
 const HEATRISK_DAY_SELECT_EVENT = 'ddm:heatrisk-day-select';
 const CDM_SNAPSHOT_EVENT = 'ddm:cdm-snapshot';
 const NADM_SNAPSHOT_EVENT = 'ddm:nadm-snapshot';
 const NWS_SNAPSHOT_EVENT = 'ddm:nws-products-snapshot';
 const SST_SNAPSHOT_EVENT = 'ddm:sst-snapshot';
+const ENSO_FLOW_SNAPSHOT_EVENT = 'ddm:enso-flow-snapshot';
+const ENSO_FLOW_SNAPSHOT_REQUEST_EVENT = 'ddm:enso-flow-snapshot-request';
+/** A key button that opens a map feature's popup (the layer that draws it answers). */
+const FEATURE_DOOR_EVENT = 'ddm:feature-door';
+/** The Pause button's request; src/layers/flow/motion-loop.ts MOTION_REQUEST_EVENT. */
+const ENSO_FLOW_MOTION_REQUEST_EVENT = 'ddm:enso-flow-motion-request';
 const MOBILE_MAP_KEY_QUERY = '(max-width: 720px)';
 const MOBILE_MAP_KEY_HEIGHT_PROPERTY = '--mobile-map-key-height';
+const DESKTOP_LOADING_TOP_PROPERTY = '--desktop-loading-top';
 
 let heatRiskFrames: readonly HeatRiskFrame[] = [];
 let heatRiskSelectedDay: number | null = null;
@@ -110,13 +201,47 @@ let cdmClasses: CdmSnapshotEventDetail['classes'] = [];
 let cdmLicense: CdmSnapshotEventDetail['license'] = null;
 let nadmMonth: string | null = null;
 let sstObservedDate: string | null = null;
+let ensoFlowSnapshot: EnsoFlowSnapshotEventDetail | null = null;
 let heatRiskHasCoverage: boolean | null = null;
 let nwsSnapshotStatus: NwsSnapshotEventDetail['status'] = 'inactive';
 let nwsSnapshotAsOf: number | null = null;
 let nwsSnapshotTruncated = false;
-let disposeMapKeyLayout: (() => void) | null = null;
-let disposeMapKeyOverflow: (() => void) | null = null;
-let disposeMapKeySeat: (() => void) | null = null;
+let nwsSnapshotEvents: readonly string[] = [];
+/** initMapKey has run: the degraded boot calls it twice (src/main.ts), and the first run's DOM and listeners stand. */
+let mapKeyBooted = false;
+let whpShadeActive = false;
+/** The Wildfire 3D drape is mounted, so the flat Fuel risk layer is hidden (src/layers/whp-3d.ts). */
+let whpDrapeMounted = false;
+/** The Wildfire 3D dryness ground (DDM-P9-T13); mirrored literals of src/layers/wildfire-dryness.ts. */
+const DRYNESS_GROUND_EVENT = 'ddm:dryness-ground';
+const DRYNESS_GROUND_REQUEST_EVENT = 'ddm:dryness-ground-request';
+let drynessGround: import('../layers/wildfire-dryness').DrynessGroundDetail | null = null;
+
+/** Third in the key after fires and fuel risk; `data-product-key` is the product mounted on the map. */
+function drynessKeyHtml(): string {
+  const ground = drynessGround;
+  if (!ground) return '';
+  return `<span class="map-key-scale" data-dryness-key data-dryness-state="${escapeHtml(ground.state)}" data-product-key="${ground.productKey}">` +
+    `<strong>${escapeHtml(ground.title ?? 'Plant stress')}</strong> <span class="map-key-qualification">${escapeHtml(ground.state)}</span>` +
+    ground.rows.map((row) => swatchItem(whiteShade(row.alpha), row.label)).join('') +
+    ground.lines.map((line) => `<span class="map-key-qualification">${escapeHtml(line)}</span>`).join('') +
+    '</span>';
+}
+
+/**
+ * Last in every mode's key while a Tribal Nations layer is on (visual uniformity D9): the outline and
+ * semi-transparent fill as the map paints them and the group's own name, no caveat. Not a `.map-key-item`: those rows are an issuer's classes.
+ * Not gated on status: every pan re-read reports `loading` while the outlines stay drawn, so the row would blink.
+ */
+function tribalNationsKeyHtml(): string {
+  const active = registry.getActiveKeys();
+  if (!TRIBAL_NATIONS_GROUP.members.some((key) => active.has(key))) return '';
+  // The map's own pair: an outline over a semi-transparent family fill (about what a reservation shows where AIANNH and BIA overlap).
+  return '<span class="map-key-scale" data-tribal-nations-key>' +
+    '<svg width="14" height="11" viewBox="0 0 14 11" style="flex:none" aria-hidden="true" focusable="false">' +
+    `<rect x="2" y="2" width="10" height="7" fill="${TRIBAL_FAMILY_COLOR}" fill-opacity="0.28" stroke="${TRIBAL_FAMILY_COLOR}" stroke-width="1.1" stroke-opacity="0.9"/></svg>` +
+    `<span>${escapeHtml(TRIBAL_NATIONS_GROUP.label)}</span></span>`;
+}
 
 /**
  * Seat the on-map key beside the map controls on the desktop shell, and
@@ -125,12 +250,12 @@ let disposeMapKeySeat: (() => void) | null = null;
  * alone in the bottom-left corner). Phones and embeds keep the dock seat
  * their layouts were designed around; see src/ui/map-control-seat.ts.
  */
-function watchMapKeySeat(node: HTMLElement): () => void {
+function watchMapKeySeat(node: HTMLElement): void {
   const marker = document.getElementById('map-key-home');
   const overlayHost = document.getElementById('map-key-overlay-host');
   const dock = marker?.parentElement ?? null;
-  if (!marker || !overlayHost || !dock) return () => {};
-  return watchDesktopMapSeat({
+  if (!marker || !overlayHost || !dock) return;
+  watchDesktopMapSeat({
     node,
     host: overlayHost,
     home: dock,
@@ -147,11 +272,10 @@ function watchMapKeySeat(node: HTMLElement): () => void {
 
 interface MapKeyLayoutWatch {
   readonly schedule: () => void;
-  readonly dispose: () => void;
 }
 
 /**
- * Keep the mobile loading chrome below the one live key.
+ * Keep loading chrome clear of the live key and desktop condition indicator.
  * Key content is status-derived and can wrap after a registry update, a font
  * swap, text scaling, or a viewport change, so a fixed pixel offset cannot be
  * honest. The measured height is presentation state only and never enters the
@@ -160,16 +284,64 @@ interface MapKeyLayoutWatch {
 function watchMapKeyLayout(host: HTMLElement): MapKeyLayoutWatch {
   const app = document.getElementById('app');
   if (!app) {
-    return { schedule: () => {}, dispose: () => {} };
+    return { schedule: () => {} };
   }
 
   const widthQuery = window.matchMedia(MOBILE_MAP_KEY_QUERY);
+  const indicator = document.getElementById('map-condition-indicator');
+  const loading = document.getElementById('loading-indicator');
+  const controls = document.querySelector<HTMLElement>('.map-overlay-controls');
+  const bottomDock = document.getElementById('map-bottom-dock');
   let frame: number | null = null;
-  let disposed = false;
 
   const measure = (): void => {
     frame = null;
-    if (disposed) return;
+    const content = host.querySelector<HTMLElement>('#map-key-content');
+    const mapBox = document.getElementById('map-container')?.getBoundingClientRect();
+    if (content && !content.hidden && mapBox) {
+      const contentBox = content.getBoundingClientRect();
+      // S30D D1 M11 repair round: the Key drawer never intersects the
+      // scale bars, but that invariant is already the CSS hard ceiling
+      // at hazard-indicators.css:243 (`max-height: min(55vh, 420px,
+      // var(--map-key-available-height, 55vh))`), not this JS bound. A
+      // scale-bar-aware clamp on `bottomLimit` was tried here and proven
+      // unreachable: with the indicator's content starting about 12px
+      // (indicator top) below the map plus the closed chip's own ~40px,
+      // `available` computed from the plain viewport/dock bottom alone
+      // never drops under the 420px (396px at a 720px-tall viewport)
+      // ceiling at any width and height this app supports, so the
+      // scale bar's own top edge was never the smaller operand and the
+      // clamp never changed what rendered. Dead code is not shipped; the
+      // CSS ceiling alone carries the guarantee, proven by
+      // tests/map-chrome-seats.spec.ts's own "never intersects ... the
+      // scale bars" case.
+      const bottomLimit = Math.min(window.innerHeight, mapBox.bottom);
+      let available = bottomLimit - contentBox.top - 16;
+      if (app.classList.contains('embed')) {
+        // Embeds keep the key in a bottom-anchored dock. Growing content
+        // raises its header and any preceding date stamp or notices, so
+        // reserve the whole dock prefix below the upper controls.
+        const keyBox = host.getBoundingClientRect();
+        const dockTop = bottomDock?.getBoundingClientRect().top ?? keyBox.top;
+        const controlsBox = controls?.getBoundingClientRect();
+        const overlapsControls = controlsBox && keyBox.left < controlsBox.right && keyBox.right > controlsBox.left;
+        const top = overlapsControls ? Math.max(mapBox.top, controlsBox.bottom) + 8 : mapBox.top + 8;
+        available = keyBox.bottom - top - (contentBox.top - dockTop);
+      }
+      host.style.setProperty('--map-key-available-height', `${Math.max(0, Math.floor(available))}px`);
+    } else host.style.removeProperty('--map-key-available-height');
+    // Compare horizontal ranges only: reading the top we set here would
+    // otherwise alternate between "overlap" and "clear" on every measure.
+    if (!widthQuery.matches && !app.classList.contains('embed') && indicator && loading && !loading.hidden) {
+      const indicatorBox = indicator.getBoundingClientRect();
+      const loadingBox = loading.getBoundingClientRect();
+      const containerBox = loading.offsetParent?.getBoundingClientRect();
+      const overlaps = indicatorBox.height > 0 && loadingBox.width > 0 &&
+        loadingBox.left < indicatorBox.right + 8 && loadingBox.right > indicatorBox.left - 8;
+      if (overlaps && containerBox) {
+        app.style.setProperty(DESKTOP_LOADING_TOP_PROPERTY, `${Math.ceil(indicatorBox.bottom - containerBox.top + 8)}px`);
+      } else app.style.removeProperty(DESKTOP_LOADING_TOP_PROPERTY);
+    } else app.style.removeProperty(DESKTOP_LOADING_TOP_PROPERTY);
     if (!widthQuery.matches || host.hidden || !host.isConnected) {
       app.style.removeProperty(MOBILE_MAP_KEY_HEIGHT_PROPERTY);
       return;
@@ -183,31 +355,25 @@ function watchMapKeyLayout(host: HTMLElement): MapKeyLayoutWatch {
   };
 
   const schedule = (): void => {
-    if (disposed || frame !== null) return;
+    if (frame !== null) return;
     frame = window.requestAnimationFrame(measure);
   };
 
   const observer =
     typeof ResizeObserver === 'function' ? new ResizeObserver(schedule) : null;
   observer?.observe(host);
+  if (indicator) observer?.observe(indicator);
+  if (loading) observer?.observe(loading);
+  if (controls) observer?.observe(controls);
+  if (bottomDock) observer?.observe(bottomDock);
+  const loadingVisibility = new MutationObserver(schedule);
+  if (loading) loadingVisibility.observe(loading, { attributes: true, attributeFilter: ['hidden'] });
   widthQuery.addEventListener('change', schedule);
   window.addEventListener('resize', schedule);
   void document.fonts?.ready.then(schedule);
   schedule();
 
-  return {
-    schedule,
-    dispose() {
-      if (disposed) return;
-      disposed = true;
-      observer?.disconnect();
-      widthQuery.removeEventListener('change', schedule);
-      window.removeEventListener('resize', schedule);
-      if (frame !== null) window.cancelAnimationFrame(frame);
-      frame = null;
-      app.style.removeProperty(MOBILE_MAP_KEY_HEIGHT_PROPERTY);
-    }
-  };
+  return { schedule };
 }
 
 /** Presentation-only family for semantic CSS hooks and disclosure behavior. */
@@ -217,11 +383,13 @@ export function resolveMapKeyFamily(
   // Keep this precedence identical to activeKey(): the family describes the
   // key that is actually rendered when a custom URL activates mixed layers.
   if (active.has('heatrisk')) return 'heat';
-  if (active.has('spc-fire-weather') || active.has('usfs-whp')) return 'fire';
+  if (active.has('spc-fire-weather') || active.has('usfs-whp') || active.has('usfs-whp-classes')) return 'fire';
   if (
     active.has('usdm') ||
     active.has('nadm-drought') ||
-    active.has('cdm-drought')
+    active.has('cdm-drought') ||
+    active.has('drought') ||
+    active.has('gridded-index')
   ) {
     return 'drought';
   }
@@ -241,8 +409,32 @@ function swatchItem(color: string, code: string): string {
   )}"></span>${escapeHtml(code)}</span>`;
 }
 
+/**
+ * A Wildfire 3D white shade (fuel risk, plant stress) as it reads on the map:
+ * white at `alpha` over the map's dark ground. Nothing drawn is a transparent swatch.
+ */
+function whiteShade(alpha: number): string {
+  if (alpha === 0) return 'transparent';
+  const white = `rgba(255,255,255,${alpha})`;
+  return `linear-gradient(${white},${white}),${MAP_GROUND_COLOR}`;
+}
+
 function droughtKey(): KeySpec {
+  if (getDroughtSurfacePresentation().edition === 'usdm' && timeline.usdmMode !== 'absolute') {
+    const span = timeline.usdmMode === 'chg4' ? '4-week' : '1-week';
+    const title = `Drought change key (${span})`;
+    return {
+      label: title,
+      ariaLabel: title,
+      itemsHtml: usdmChangeLegendItems().map(item => swatchItem(item.color, item.label)).join('')
+    };
+  }
   const presentation = getDroughtSurfacePresentation();
+  // DR-160 (2026-09-28): while BC_BASIN_EDITION_HELD is true in
+  // src/config/layers.ts, no writer ever sets edition 'bc-basin'
+  // (src/layers/usdm.ts editionForRegion, src/ui/sidebar.ts selectRegion),
+  // so this branch is unreachable; it stays dormant, not deleted, for the
+  // hold's eventual release.
   if (presentation.edition === 'bc-basin') {
     const date = presentation.sourceDate ?? 'unavailable';
     return {
@@ -279,9 +471,8 @@ function formatSstDate(iso: string): string {
 
 /**
  * The ENSO ocean-surface key (W2-D1): the one quick view that previously
- * had no on-map scale. Swatches and wording come from the shared
- * SST_ANOMALY_SCALE table (src/config/palette.ts), the same table the
- * sidebar legend renders, so the two surfaces cannot drift. The observed
+ * had no on-map scale. Full source colors and existing qualitative words
+ * come from the same helper as the sidebar legend. The observed
  * date mirrors the frame the ddm:sst-snapshot event announced (the same
  * date the temporal stamp shows); the scale stays qualitative because the
  * GIBS metadata states no climatology baseline.
@@ -290,14 +481,18 @@ function sstKey(): KeySpec {
   const observed = sstObservedDate
     ? ` Observed ${formatSstDate(sstObservedDate)}.`
     : '';
-  const first = SST_ANOMALY_SCALE[0]!;
-  const last = SST_ANOMALY_SCALE.at(-1)!;
+  const first = SST_ANOMALY_LABELS[0];
+  const last = SST_ANOMALY_LABELS[2];
+  const flow = ensoFlowRow();
+  const outlooks = cpcOutlookRows();
   return {
     label: 'Ocean temperature',
     ariaLabel:
-      `Ocean temperature anomaly key, ${first.label.toLowerCase()} through ${last.label.toLowerCase()}, a qualitative scale.` +
+      `Ocean temperature anomaly key, ${first.toLowerCase()} through ${last.toLowerCase()}, a qualitative scale.` +
       observed +
-      ' NASA GIBS GHRSST MUR SST anomaly.',
+      ' NASA GIBS GHRSST MUR SST anomaly.' +
+      flow.ariaLabel +
+      outlooks.ariaLabel,
     itemsHtml:
       (sstObservedDate
         ? `<span class="map-key-item" data-sst-observed>Observed ${escapeHtml(
@@ -305,10 +500,144 @@ function sstKey(): KeySpec {
           )}</span>`
         : '') +
       '<span class="map-key-scale" data-sst-anomaly-key>' +
-      SST_ANOMALY_SCALE.map((entry) => swatchItem(entry.color, entry.label)).join('') +
+      sstAnomalyScaleHtml() +
       '</span>' +
-      '<span class="map-key-item" data-sst-attribution>NASA GIBS GHRSST MUR</span>'
+      '<span class="map-key-item" data-sst-attribution>NASA GIBS GHRSST MUR</span>' +
+      // A keyboard door to the box's popup (the box's own title; src/layers/sst-anomaly.ts answers it).
+      '<button type="button" class="map-key-item map-key-door" data-feature-door="nino34">Nino 3.4 (the ENSO index region)</button>' +
+      flow.html +
+      outlooks.html
   };
+}
+
+type CpcClass = { readonly label: string; readonly color: readonly number[] };
+/** The CPC outlooks ENSO draws over the SST, in their legend order (src/layers/cpc-seasonal-outlook.ts KEY_ORDER). */
+const CPC_OUTLOOK_CLASSES: readonly (readonly [string, readonly CpcClass[]])[] = [
+  ['cpc-seasonal-precip', CPC_SEASONAL_COLORS.precipitation],
+  ['cpc-seasonal-temp', CPC_SEASONAL_COLORS.temperature],
+  ['cpc-610-precip', CPC_EXTENDED_COLORS.precipitation],
+  ['cpc-610-temp', CPC_EXTENDED_COLORS.temperature],
+  ['cpc-814-precip', CPC_EXTENDED_COLORS.precipitation],
+  ['cpc-814-temp', CPC_EXTENDED_COLORS.temperature]
+];
+
+/**
+ * One row per CPC outlook on the map, as outlookKey keys the drought outlook:
+ * the layer's catalog name, then its renderer's classes and labels. Equal
+ * Chances is drawn clear, so it has no swatch. The valid season and issue
+ * date stay in the layer's legend and popup.
+ */
+export function cpcOutlookRows(
+  drawn: (key: string) => boolean = (key) =>
+    registry.getActiveKeys().has(key) && ['ready', 'degraded'].includes(registry.getStatus(key) ?? '')
+): { readonly html: string; readonly ariaLabel: string } {
+  let html = '';
+  let ariaLabel = '';
+  for (const [key, rows] of CPC_OUTLOOK_CLASSES) {
+    if (!drawn(key)) continue;
+    const name = LAYER_DEFS.find((def) => def.key === key)?.name ?? key;
+    const classes = rows.filter((row) => (row.color[3] ?? 255) > 0);
+    // DRAFT wording (DR-177): the catalog name, the renderer's labels, the popup's issuer and outlookKey's odds sentence.
+    html +=
+      `<span class="map-key-scale" data-cpc-key="${escapeHtml(key)}"><strong class="map-key-scale-label">${escapeHtml(name)}</strong>` +
+      classes.map(({ label, color: [r, g, b] }) => swatchItem(`rgb(${r},${g},${b})`, label)).join('') +
+      '<span class="map-key-item">NOAA Climate Prediction Center</span></span>';
+    ariaLabel += ` NOAA Climate Prediction Center ${name} key, ${classes.map((row) => row.label).join(', ')}. An outlook is a shift in odds, not an observed condition.`;
+  }
+  return { html, ariaLabel };
+}
+
+/**
+ * The direction arrows' own row, after the SST attribution and apart from
+ * the SST "Observed" row: two products, two clocks (docs/design/README.md,
+ * DDM-UI-007). Every word is the arrows' module's own; this only joins them.
+ * For the NODD kinds the notes are the bins and any live-state sentence; what
+ * the lines and marks mean reads in the Impact Briefing
+ * (src/ui/map-technical-information.ts). No row while the arrows are off or
+ * their layer is inactive.
+ */
+export function ensoFlowRow(
+  flow: EnsoFlowSnapshotEventDetail | null = ensoFlowSnapshot
+): { readonly html: string; readonly ariaLabel: string } {
+  if (!flow || flow.status === 'inactive' || flow.status === 'off') return { html: '', ariaLabel: '' };
+  // DRAFT wording (DR-177): pending owner read (DRAFT-W1, the
+  // composition "<label> · <status line>" then the qualification sentences).
+  const status = `${flow.label} · ${flow.line}`;
+  const notes = flow.notes.join(' ');
+  // E1-4: the credit is its own text item, as data-sst-attribution is for
+  // the SST; the words are the publisher's, never typed here. It stays when the
+  // state line names the product: only the credit says DDM re-encodes it.
+  const provenance = flow.provenance ?? '';
+  return {
+    html:
+      `<span class="map-key-item" data-enso-flow="status">${escapeHtml(status)}</span>` +
+      (provenance ? `<span class="map-key-item" data-enso-flow="provenance">${escapeHtml(provenance)}</span>` : '') +
+      (notes ? `<span class="map-key-qualification" data-enso-flow="notes">${escapeHtml(notes)}</span>` : ''),
+    ariaLabel: ` ${status}.` + (provenance ? ` ${provenance}.` : '')
+  };
+}
+
+/**
+ * The flowing paths' Pause toggle (E1-4). Built once by initMapKey and only
+ * shown, hidden and renamed here, never re-created. The icon and the
+ * accessible name swap together and say what a press does (two bars and
+ * "Pause motion" while the lines move, a play triangle and "Play motion"
+ * while they hold still), so the button carries no aria-pressed (APG button
+ * pattern: a name that changes, or a pressed state, never both). The names
+ * stay apart from the time bar's own "Pause" and "Play" for the SST days.
+ */
+function buildFlowPauseButton(): HTMLButtonElement {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.id = 'map-key-flow-pause';
+  button.className = 'map-key-flow-pause';
+  // DRAFT (DR-draft, block E1 E1-4): pending owner read
+  // DRAFT wording (DR-177): "Pause motion", the flowing paths' toggle name,
+  // on ENSO-FLOW-PLAN.md question 6's read-back list.
+  button.setAttribute('aria-label', 'Pause motion');
+  button.dataset.paused = 'false';
+  button.hidden = true;
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 16 16');
+  svg.setAttribute('width', '14');
+  svg.setAttribute('height', '14');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  const bars = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  bars.setAttribute('class', 'map-key-flow-pause-bars');
+  bars.setAttribute('d', 'M4 3h3v10H4zM9 3h3v10H9z');
+  const play = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  play.setAttribute('class', 'map-key-flow-pause-play');
+  play.setAttribute('d', 'M4.5 2.5 13 8l-8.5 5.5z');
+  svg.append(bars, play);
+  button.append(svg);
+  return button;
+}
+
+/**
+ * Show the toggle only while the paths' snapshot reports motion, and offer
+ * Play while they are paused or still under reduced motion. `held` (the SST
+ * days playing, a hidden tab) is no one's pause, so it still offers Pause.
+ */
+function syncFlowPause(
+  host: HTMLElement,
+  button: HTMLButtonElement,
+  flow: EnsoFlowSnapshotEventDetail | null
+): void {
+  const motion =
+    flow && flow.status !== 'inactive' && flow.status !== 'off' && flow.motion && flow.motion !== 'none'
+      ? flow.motion
+      : null;
+  button.hidden = motion === null;
+  if (motion === null) {
+    delete host.dataset.flowMotion;
+    return;
+  }
+  host.dataset.flowMotion = motion;
+  const paused = motion === 'paused' || motion === 'reduced';
+  button.dataset.paused = String(paused);
+  // DRAFT wording (DR-177): "Play motion", the same toggle's name while the lines hold still.
+  button.setAttribute('aria-label', paused ? 'Play motion' : 'Pause motion');
 }
 
 function formatHeatRiskDate(validTime: number): string {
@@ -346,15 +675,14 @@ function heatDateControl(): string {
 }
 
 function heatKey(): KeySpec {
-  const coverageCopy =
-    'National Weather Service HeatRisk covers the contiguous United States only.';
+  // The coverage caveat lives in Technical information, not the key.
   if (heatRiskHasCoverage === false) {
     return {
       label: 'HeatRisk',
-      ariaLabel: `No data. ${coverageCopy}`,
+      ariaLabel: 'No HeatRisk data at the map center.',
       itemsHtml:
         '<span class="map-key-qualification" data-heatrisk-coverage>' +
-        `<strong>no data</strong> ${escapeHtml(coverageCopy)}</span>`
+        '<strong>no data</strong> at the map center</span>'
     };
   }
 
@@ -366,32 +694,46 @@ function heatKey(): KeySpec {
     : '';
   const firstCategory = HEATRISK_CATEGORIES[0]!;
   const lastCategory = HEATRISK_CATEGORIES.at(-1)!;
+  // A DAY CHANGE IS A FETCH (DDM-P8-T05). The selected frame's source is
+  // replaced whenever the day changes, so between the teardown and the
+  // first tile the key would otherwise present the full scale under the
+  // NEW valid date with nothing painted under it. `loading` is the honest
+  // qualification for that window, in the same W2-D6 form an activation
+  // placeholder uses; the frame watcher replaces it with the terminal
+  // verdict, so it cannot outlive the fetch.
+  const frameLoading = heatRiskFrameStatus === 'loading';
   return {
     label: 'HeatRisk',
     ariaLabel:
       `NWS HeatRisk key, value ${firstCategory.value} ${firstCategory.label} through value ${lastCategory.value} ${lastCategory.label} expected heat impact (experimental product).` +
       validDate +
-      (heatRiskFrameStatus === 'degraded'
-        ? ' Live (partial): selected frame has missing tiles.'
-        : heatRiskFrameStatus === 'error'
-          ? ' Unavailable: no selected-frame tiles loaded.'
-          : ''),
+      (frameLoading
+        ? ' Loading: the selected frame has not painted yet.'
+        : heatRiskFrameStatus === 'degraded'
+          ? ' Live (partial): selected frame has missing tiles.'
+          : heatRiskFrameStatus === 'error'
+            ? ' Unavailable: no selected-frame tiles loaded.'
+            : ''),
     itemsHtml:
       heatDateControl() +
       '<span class="map-key-scale" data-heatrisk-scale>' +
       '<strong class="map-key-scale-label">Surface</strong>' +
       HEATRISK_CATEGORIES.map((category) =>
         swatchItem(
-          category.color,
+          // class 0 is not shaded on the map (exportImage noData=0)
+          category.value === 0 ? 'transparent' : category.color,
           `${category.value} ${category.label}`
         )
       ).join('') +
       '</span>' +
-      (heatRiskFrameStatus === 'degraded'
-        ? '<span class="map-key-qualification" data-heatrisk-tile-status><strong>live (partial)</strong> Selected frame has missing tiles.</span>'
-        : heatRiskFrameStatus === 'error'
-          ? '<span class="map-key-qualification" data-heatrisk-tile-status><strong>unavailable</strong> No selected-frame tiles loaded.</span>'
-          : '')
+      (frameLoading
+        ? '<span class="map-key-qualification map-key-loading" data-key-loading="heatrisk">' +
+          '<strong>loading</strong> The selected frame has not painted yet.</span>'
+        : heatRiskFrameStatus === 'degraded'
+          ? '<span class="map-key-qualification" data-heatrisk-tile-status><strong>live (partial)</strong> Selected frame has missing tiles.</span>'
+          : heatRiskFrameStatus === 'error'
+            ? '<span class="map-key-qualification" data-heatrisk-tile-status><strong>unavailable</strong> No selected-frame tiles loaded.</span>'
+            : '')
   };
 }
 
@@ -399,34 +741,21 @@ function nwsProductKey(): {
   readonly html: string;
   readonly ariaLabel: string;
 } {
-  const labelsByColor = new Map<string, string[]>();
-  for (const [label, color] of Object.entries(NWS_ALERT_COLORS)) {
-    const labels = labelsByColor.get(color) ?? [];
-    labels.push(label);
-    labelsByColor.set(color, labels);
-  }
-  const labels = [...labelsByColor.values()].flat();
+  // Key order (NWS_ALERT_LEGEND): every heat and fire weather product the mode
+  // asks for (HazardClusterDef.alerts), or, for any other set, those the
+  // layer's current read holds, carried by its snapshot event.
+  const set = HAZARD_CLUSTERS[getSelectedHazard()].alerts;
+  const events = set === HEAT_FIRE_ALERTS ? set.events : nwsSnapshotEvents;
+  const rows = NWS_ALERT_LEGEND.filter(({ label }) => events.includes(label));
   return {
     html:
       '<span class="map-key-scale map-key-nws-products" data-nws-products-key>' +
       '<strong class="map-key-scale-label">NWS products</strong>' +
-      [...labelsByColor].map(([color, names]) =>
-        swatchItem(color, names.join(' / '))
-      ).join('') +
+      rows.map(({ color, label }) => swatchItem(color, label)).join('') +
       '</span>',
     ariaLabel:
-      `National Weather Service event products: ${labels.join(', ')}.`
+      rows.length === 0 ? '' : `National Weather Service event products: ${rows.map(({ label }) => label).join(', ')}.`
   };
-}
-
-function formatSnapshotTime(time: number): string {
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    timeZoneName: 'short'
-  }).format(new Date(time));
 }
 
 function nwsSnapshotQualification(): {
@@ -434,18 +763,18 @@ function nwsSnapshotQualification(): {
   readonly ariaLabel: string;
 } {
   if (nwsSnapshotAsOf === null) {
-    const state =
-      nwsSnapshotStatus === 'error'
-        ? 'National Weather Service snapshot unavailable.'
-        : 'National Weather Service snapshot loading.';
+    const unavailable = nwsSnapshotStatus === 'error';
     return {
-      html: `<span class="map-key-qualification" data-nws-snapshot>${escapeHtml(state)}</span>`,
-      ariaLabel: state
+      html: `<span class="map-key-qualification" data-nws-snapshot>${
+        unavailable ? 'Unavailable' : 'Loading'
+      }</span>`,
+      ariaLabel: unavailable
+        ? 'National Weather Service products unavailable.'
+        : 'National Weather Service products loading.'
     };
   }
-  const asOf = `National Weather Service snapshot as of ${formatSnapshotTime(
-    nwsSnapshotAsOf
-  )}.`;
+  // "As of", not "Valid": the time is DDM's read, not an NWS validity time.
+  const stamp = formatSnapshotTime(nwsSnapshotAsOf);
   const partial =
     nwsSnapshotTruncated || nwsSnapshotStatus === 'degraded'
       ? ' live (partial): transfer limit reached.'
@@ -453,12 +782,12 @@ function nwsSnapshotQualification(): {
   return {
     html:
       '<span class="map-key-qualification" data-nws-snapshot>' +
-      `${escapeHtml(asOf)}${
+      `As of ${escapeHtml(stamp)}${
         partial
           ? ' <strong>live (partial)</strong>: transfer limit reached.'
           : ''
       }</span>`,
-    ariaLabel: asOf + partial
+    ariaLabel: `National Weather Service products as of ${stamp}.${partial}`
   };
 }
 
@@ -482,7 +811,7 @@ function cdmKey(): KeySpec {
       `Canadian Drought Monitor key for ${month}. Agriculture and Agri-Food Canada. Areas without a polygon are not assigned class zero.`,
     itemsHtml:
       `<span class="map-key-item">${escapeHtml(month)}</span>` +
-      USDM_CATEGORIES.map((entry) =>
+      CDM_CATEGORIES.map((entry) =>
         swatchItem(
           entry.color,
           stateByClass.get(entry.code) === 'absent-no-occupied-area'
@@ -510,6 +839,24 @@ function nadmKey(): KeySpec {
   };
 }
 
+/** The CPC outlook classes, from the same table the sidebar legend draws. */
+function outlookKey(): KeySpec {
+  return {
+    label: KEY_ELIGIBLE_LABELS['drought']!,
+    ariaLabel: 'NOAA Climate Prediction Center drought outlook key. An outlook is a shift in odds, not an observed condition.',
+    itemsHtml: OUTLOOK_LEGEND.map((entry) => swatchItem(entry.color, entry.label)).join('')
+  };
+}
+
+/** The gridded index ramp, drier to wetter; the unlabeled white slot is left out. */
+function griddedKey(): KeySpec {
+  return {
+    label: KEY_ELIGIBLE_LABELS['gridded-index']!,
+    ariaLabel: 'Gridded Standardized Precipitation Index key, drier to wetter. NOAA NIDIS.',
+    itemsHtml: GRIDDED_INDEX_RAMP.flatMap((entry) => (entry.code ? [swatchItem(entry.color, entry.code)] : [])).join('')
+  };
+}
+
 /** A placeholder row for a still-loading key section (W2-D6): the section
  * is named rather than omitted, so live activation never silently drops a
  * source from the reference. 'unavailable' keeps its absence semantics. */
@@ -531,13 +878,20 @@ export function buildFireKey(
   if (!includeSpcOutlook && !includeNifcPerimeters && !spcLoading && !nifcLoading) {
     throw new Error('A fire key requires at least one active fire product.');
   }
+  // The issuer's no-area answer draws nothing, so the key says so instead of listing three classes that are not on the map.
+  // Only SPC's own answer counts: an empty collection or an expired issuance is no-data too, and says no such thing.
+  const spcNoArea = includeSpcOutlook && registry.getStatus('spc-fire-weather') === 'no-data' && isSpcNoArea();
+  // vocab-allow: verbatim SPC term for this state, from its Day 1 Fire Weather Outlook product page (2026-09-27, found-079)
+  const SPC_NO_AREA_WORDS = 'No Risk Areas Forecast today';
   const outlook =
     includeSpcOutlook || spcLoading
       ? '<span class="map-key-scale" data-spc-fire-weather-key>' +
         '<strong class="map-key-scale-label">SPC Day 1 outlook</strong>' +
         (spcLoading
           ? loadingSectionRow('spc-fire-weather')
-          : SPC_FIREWX_CATEGORIES.map((c) => swatchItem(c.color, c.label)).join('')) +
+          : spcNoArea
+            ? `<span class="map-key-item" data-spc-no-area>${SPC_NO_AREA_WORDS}</span>`
+            : SPC_FIREWX_CATEGORIES.map((c) => swatchItem(c.color, c.label)).join('')) +
         '</span>'
       : '';
   const perimeters =
@@ -557,14 +911,13 @@ export function buildFireKey(
             swatchItem(
               NIFC_INCIDENT_PRESENTATION.other.lineColor,
               NIFC_INCIDENT_PRESENTATION.other.legendLabel
-            ) +
-            '<span class="map-key-qualification" data-nifc-generalization>' +
-            escapeHtml(NIFC_KEY_GENERALIZATION_NOTE) +
-            '</span>') +
+            )) +
         '</span>'
       : '';
   const ariaParts: string[] = [];
-  if (includeSpcOutlook) {
+  if (spcNoArea) {
+    ariaParts.push(`Storm Prediction Center (SPC) Day 1 fire-weather outlook: ${SPC_NO_AREA_WORDS}.`);
+  } else if (includeSpcOutlook) {
     ariaParts.push(
       'Storm Prediction Center (SPC) Day 1 fire-weather outlook categories.'
     );
@@ -589,36 +942,30 @@ export function buildFireKey(
   };
 }
 
-export function buildWhpKey(): KeySpec {
+export function buildWhpKey(scaleLabel = 'USFS Wildfire Hazard Potential', shaded = false): KeySpec {
+  const categories = shaded
+    ? WHP_SHADE_CATEGORIES.map((category) => ({ ...category, color: `rgba(255,255,255,${category.opacity * WHP_SURFACE_OPACITY})` }))
+    : USFS_WHP_PRESENTATION.categories;
+  const qualification = shaded ? WHP_SHADE_QUALIFICATION : USFS_WHP_PRESENTATION.qualification;
   return {
     label: 'Wildfire potential',
-    ariaLabel: USFS_WHP_PRESENTATION.qualification,
+    ariaLabel: qualification,
     itemsHtml:
       '<span class="map-key-scale" data-usfs-whp-key>' +
-      '<strong class="map-key-scale-label">USFS Wildfire Hazard Potential</strong>' +
-      USFS_WHP_PRESENTATION.categories
+      `<strong class="map-key-scale-label">${escapeHtml(scaleLabel)}</strong>` +
+      categories
         .map((category) => swatchItem(category.color, category.label))
         .join('') +
       '</span>' +
       `<span class="map-key-qualification">${escapeHtml(
-        USFS_WHP_PRESENTATION.qualification
+        qualification
       )}</span>`
   };
 }
 
-/** The layer keys that can earn (or contribute to) the on-map key, with
- * the label a whole-key loading placeholder renders under (W2-D6). */
-const KEY_ELIGIBLE_LABELS: Readonly<Record<string, string>> = {
-  heatrisk: 'HeatRisk',
-  'spc-fire-weather': 'Fire',
-  'usfs-whp': 'Wildfire potential',
-  'cdm-drought': 'Canada drought',
-  'nadm-drought': 'North America drought',
-  usdm: 'Drought',
-  'sst-anomaly': 'Ocean temperature',
-  'nifc-fires': 'Fire',
-  'nws-alerts': 'Products'
-};
+// KEY_ELIGIBLE_LABELS moved to src/config/chip-labels.ts (S30D D1 M10): the
+// same table now serves the runtime and tests/chrome-n-modes.test.mjs's
+// plain-Node N-mode contract, so the two can never drift.
 
 interface KeyEligibility {
   /** Registered-active keys (the registry's post-activation truth). */
@@ -654,100 +1001,332 @@ function loadingKeySpec(key: string): KeySpec {
 }
 
 /**
- * Coverage qualification for the default-on `hillshade` layer (FIRE-09).
+ * Whether the land framing's coverage clauses apply to the CURRENT CAMERA.
  *
- * Terrain Shading ships `defaultOn: true` (src/config/layers.ts) over a
- * Pacific Northwest-only raster-dem archive, so in the United States,
- * Alaska, Hawaii, and British Columbia framings it reports `live` and draws
- * nothing. The 3D mode discloses its own bake (`FIRE3D_COVERAGE_NOTE`); the
- * flat hillshade that is on for every user at every viewport did not.
- *
- * THE VISIBLE FORM IS DELIBERATELY SHORT AND WIDTH-GATED. Both are measured,
- * not hypothetical (2026-09-01):
- *
- *   - A sentence-long span pushed the phone Fire card past the 224px
- *     `--mobile-map-key-collapsed-height` at 390x844, so `#map-key-expand`
- *     stopped being hidden and every phone key gained a standing collapse
- *     control (`tests/interface-responsive.spec.ts:303` and `:371` red).
- *   - Shortening it to these three words did NOT fix that. Under the phone
- *     clamp `.map-key-content` is `flex-direction: column`, so ANY new child
- *     costs a whole row plus the 9px gap (about 23px), and the Fire key,
- *     alone among the four, has less headroom than that: it is the only key
- *     with two stacked sections plus their qualifications.
- *
- * So the visible entry renders above the clamp only. The full sentence rides
- * the key's accessible name on EVERY surface (a `title` carries it for
- * pointer users), which costs no layout, so a phone user on assistive
- * technology still hears the qualification. Making it visible on a phone
- * needs `--mobile-map-key-collapsed-height` to grow, which is an
- * owner-visible presentation decision and a stylesheet this module does not
- * own. FIRE-09's other half, the `hillshade` catalog row in
- * `src/config/layers.ts`, has no such constraint and is the better
- * phone-visible home for the disclosure.
+ * An ocean framing takes camera precedence while deliberately preserving the
+ * land framing underneath it (D-0.7.0-042/053: an ocean click is an entry
+ * into ENSO, display plus camera, and it does not clear `framing=`). Reading
+ * only the land framing therefore put Mexico-specific copy on a Pacific
+ * ocean scene (Codex adversarial review 2026-09-10, finding 5). The land
+ * framing's sentences describe land the camera is no longer looking at, so
+ * none of them applies until the ocean camera is released.
  */
-const HILLSHADE_COVERAGE_LABEL = 'Terrain: Pacific Northwest only';
+function landFramingGovernsCamera(): boolean {
+  return getOceanFraming() === null;
+}
 
 /**
- * The terrain sentence of `FIRE3D_COVERAGE_NOTE` verbatim. That constant is
- * not imported whole because its second sentence describes the 3D view's
- * bundled structure bake (the central Oregon pilot area), which says nothing
- * about the flat hillshade and would broaden the claim made here.
+ * Whether a minimap actually exists in this scene, which is what makes a
+ * sentence about "this minimap" mean anything.
+ *
+ * Console hides the widget and stops its retained drought and wildfire reads
+ * (src/ui/island/minimap.tsx), so its provenance sentence has no referent
+ * there and used to render anyway (finding 5's second case). The view mode is
+ * the deterministic half of the answer and the DOM presence check is the
+ * honest half: the minimap also stands down on narrow viewports and in the
+ * compact height band, and duplicating those media queries here would be a
+ * second copy of a rule that is already hard to keep in step. A key that
+ * renders before the widget mounts simply omits the clause, which
+ * under-claims rather than over-claims and corrects itself on the next
+ * render.
  */
-const HILLSHADE_COVERAGE_NOTE =
-  'Terrain relief covers the Pacific Northwest data bake; outside it the ground renders flat.';
+function minimapInScene(): boolean {
+  if (getViewMode() === 'console') return false;
+  if (typeof document === 'undefined') return false;
+  const el = document.querySelector('.shell-minimap-map');
+  return el instanceof HTMLElement && el.getClientRects().length > 0;
+}
 
 /**
- * Append the terrain coverage entry when Terrain Shading is on. It rides an
- * existing key rather than earning one: the hillshade is reference relief,
- * not a condition surface, so it must never materialize a key strip on a map
- * that has otherwise earned none.
+ * The active framing's coverage cautions (D-0.7.0-051; the S4 handoff), the
+ * ONE render site since 2026-09-10 (owner: the sentence used to pop up on
+ * the minimap itself on every click AND repeat, word for word, in the
+ * conditions summary caveat; both were retired here, src/config/framings.ts
+ * and src/state/display-summary.ts).
+ *
+ * Independent of `hazardKey()` (see `withFrameCoverage` below) so it never
+ * vanishes just because the active surface is not North America Drought.
+ *
+ * Each clause carries its own gate, because they do not share conditions of
+ * truth (Codex adversarial review 2026-09-10, finding 5; the reasoning is in
+ * `FramingCoverage` in src/config/framings.ts). This function's predecessor
+ * rendered all of them together and ungated, which is how a tri-national
+ * surface came to be told it did not cover Mexico, and how Console came to
+ * carry a sentence about a minimap it does not show.
  */
-function withTerrainCoverage(
-  spec: KeySpec | null,
-  active: ReadonlySet<string>
-): KeySpec | null {
-  if (spec === null || !active.has('hillshade')) return spec;
-  const clamped = window.matchMedia(MOBILE_MAP_KEY_QUERY).matches;
+function frameCoverageNote(): string {
+  const selection = getFraming();
+  const framing = selection === null || selection === 'all' ? null : selection;
+  const def = framing !== null ? FRAMINGS[framing] : undefined;
+  const coverage = def?.coverage;
+  if (!landFramingGovernsCamera()) return '';
+  // Per mode and horizon (the minimap's own reading table), and before the
+  // coverage early return: arid-west and southeast-gulf have no coverage
+  // block but still earn the Wildfire, Heat and ENSO clauses.
+  // With no framing selected the key stays as quiet as it always was.
+  const minimapProvenance = framing !== null && minimapInScene()
+    ? minimapProvenanceAt(framing, getSelectedHazard(), timeline.horizon)
+    : undefined;
+  if (coverage === undefined) return minimapProvenance?.replace(/\.\s*$/, '') ?? '';
+
+  const clauses: string[] = [];
+
+  if (coverage.displayScope !== undefined) {
+    // What is actually on the map right now, by the same rule
+    // display-summary.ts applies (`isUsScopeCautionLayer`): a non-reference
+    // layer that is not one of the two that already reach past the US.
+    const activeDisplay = LAYER_DEFS.filter(
+      (d) => registry.getActiveKeys().has(d.key) && d.role !== 'reference'
+    );
+    const usScoped = activeDisplay.filter((d) => isUsScopeCautionLayer(d));
+    // A clause phrased about the WHOLE display is false the moment one
+    // active layer reaches further, so it needs every layer to be US-scoped.
+    // A clause phrased about the US-scoped layers among them needs only one.
+    const earned = coverage.claimsWholeDisplay === true
+      ? activeDisplay.length > 0 && usScoped.length === activeDisplay.length
+      : usScoped.length > 0;
+    if (earned) clauses.push(coverage.displayScope);
+  }
+
+  if (minimapProvenance !== undefined) clauses.push(minimapProvenance);
+
+  // Ungated: the place catalog ends where it ends, whatever is displayed.
+  if (coverage.briefingScope !== undefined) clauses.push(coverage.briefingScope);
+
+  // Trailing periods are re-added by the caller, which appends exactly one.
+  return clauses.join(' ').replace(/\.\s*$/, '');
+}
+
+/**
+ * Fold the framing coverage caution into whatever key the active layer set
+ * already earned, OR stand up a minimal key of its own when nothing else
+ * would render one (the stations-only or no-active-hazard case): a coverage
+ * caution that only showed up when some OTHER key happened to be visible
+ * would silently vanish exactly when the display is otherwise quiet, which
+ * is the case that most needs the honesty.
+ */
+function withFrameCoverage(spec: KeySpec | null, coverage: string): KeySpec | null {
+  if (coverage.length === 0) return spec;
+  const html =
+    '<span class="map-key-qualification" data-frame-coverage>' +
+    `${escapeHtml(coverage)}.</span>`;
+  if (spec === null) {
+    return { label: 'Map coverage', ariaLabel: `${coverage}.`, itemsHtml: html };
+  }
   return {
     ...spec,
-    ariaLabel: `${spec.ariaLabel} ${HILLSHADE_COVERAGE_NOTE}`,
-    itemsHtml: clamped
-      ? spec.itemsHtml
-      : spec.itemsHtml +
-        '<span class="map-key-qualification" data-hillshade-coverage title="' +
-        `${escapeHtml(HILLSHADE_COVERAGE_NOTE)}">` +
-        `${escapeHtml(HILLSHADE_COVERAGE_LABEL)}</span>`
+    ariaLabel: `${spec.ariaLabel} ${coverage}.`,
+    itemsHtml: spec.itemsHtml + html
   };
 }
 
+/**
+ * A KeySpec together with the registry key(s) its chip glyph state is
+ * read from (repair round on M10: `chipStateFromStatuses` in
+ * src/config/chip-state.ts reads `registry.getStatus` for exactly these
+ * keys, never the spec's own rendered text). Empty when the spec was
+ * synthesized with no backing product (the frame-coverage-only "Map
+ * coverage" spec `withFrameCoverage` builds from nothing) -- see `update`,
+ * which also treats the committed mode's own no-key fallback as empty.
+ */
+interface HazardKeyResult {
+  readonly spec: KeySpec;
+  readonly productKeys: readonly string[];
+}
+
 /** The key the active layer set earns, or null to hide the strip. */
-function activeKey(): KeySpec | null {
-  return withTerrainCoverage(hazardKey(), registry.getActiveKeys());
+function activeKey(): HazardKeyResult | null {
+  const hazard = hazardKey();
+  const spec = withFrameCoverage(hazard?.spec ?? null, frameCoverageNote());
+  if (!spec) return null;
+  return { spec, productKeys: hazard?.productKeys ?? [] };
+}
+
+/** The two fire-family product keys, filtered to the ones actually eligible
+ * right now (buildFireKey itself reads `active` and `loading` the same
+ * way): a solo NIFC fallback names only 'nifc-fires', never a
+ * spc-fire-weather status that is not part of what is drawn. */
+function fireProductKeys(eligible: ReadonlySet<string>): readonly string[] {
+  return (['spc-fire-weather', 'nifc-fires'] as const).filter((key) => eligible.has(key));
+}
+
+/**
+ * A neutral circle at a renderer class's size (the issuer's points are icons, not colours).
+ * The map draws dark ink over a bright raster; the key panel is dark, so here the circle is
+ * paper alone: a solid paper disc for a filled point, a paper ring with a clear centre for a
+ * hollow one and for the size examples.
+ */
+function tropicalCircle(radius: number, label: string, filled = false): string {
+  const size = Math.round(radius * 2);
+  return (
+    '<span class="map-key-item"><span class="map-key-swatch" style="' +
+    `background:${filled ? TROPICAL_POINT_PAPER : 'transparent'};border:1.5px solid ${TROPICAL_POINT_PAPER};box-shadow:none;border-radius:50%;width:${size}px;height:${size}px` +
+    `"></span>${escapeHtml(label)}</span>`
+  );
+}
+
+/** One stacked key group: a heading on its own line, then one row per line (CSS .map-key-tropical-group). */
+function tropicalGroup(rows: readonly string[], heading?: string): string {
+  const head = heading ? `<strong class="map-key-scale-label" data-tropical-points="${escapeHtml(heading)}">${escapeHtml(heading)}</strong>` : '';
+  return `<span class="map-key-tropical-group">${head}${rows.join('')}</span>`;
+}
+
+/**
+ * The tropical cyclones row (ENSO block B3), an event overlay appended to
+ * whichever key the surface earned, like the NWS products row. Its state is
+ * the registry's (a refresh that fails reads unavailable; an empty season
+ * reads the owner's words, "No active tropical cyclones"); its storms and
+ * classes are the layer snapshot's and the issuer renderer's labels, verbatim.
+ * The basins and circle-sizing notes read in the Impact Briefing
+ * (src/ui/map-technical-information.ts), not here.
+ */
+function tropicalRow(): { readonly html: string; readonly ariaLabel: string } | null {
+  const status = registry.getStatus(TROPICAL_KEY);
+  const on = registry.getActiveKeys().has(TROPICAL_KEY);
+  // A failed first read leaves the key inactive with 'error' kept for the
+  // committed mode's summary; say unavailable only while that mode shows it.
+  const committed = Object.values(HAZARD_CLUSTERS[getHazardCluster()].recipes).some((r) => r.includes(TROPICAL_KEY));
+  if (!on && status !== 'loading' && !(status === 'error' && committed)) return null;
+  const issuer = TROPICAL_ISSUERS.both.name;
+  const parts: string[] = ['<strong class="map-key-scale-label">Tropical cyclones</strong>'];
+  let aria = 'Tropical cyclones:';
+  let state: string;
+  if (status === 'loading' || status === undefined) {
+    state = 'loading';
+    parts.push(`<span class="map-key-qualification map-key-loading" data-key-loading="${TROPICAL_KEY}"><strong>loading</strong></span>`);
+    aria += ' loading.';
+  } else if (status === 'error') {
+    state = 'unavailable';
+    parts.push('<span class="map-key-qualification" data-tropical-status><strong>unavailable</strong> The NHC and CPHC advisories could not be read.</span>');
+    aria += ' unavailable. The NHC and CPHC advisories could not be read.';
+  } else if (status === 'no-data') {
+    state = 'no data';
+    parts.push(`<span class="map-key-item" data-tropical-empty>${escapeHtml(TROPICAL_EMPTY_TEXT)}</span>`);
+    aria += ` ${TROPICAL_EMPTY_TEXT}.`;
+  } else {
+    state = status === 'degraded' ? 'live (partial)' : 'live';
+    for (const storm of tropicalSnapshot?.storms ?? []) {
+      const basin = tropicalBasinName(storm.basin) ?? `basin ${storm.basin || 'not given'} (not recognised)`;
+      const line = `${storm.name}, ${basin}, advisory ${storm.advisory}, issued ${storm.issued}`;
+      // A keyboard door to the storm's popup (src/layers/tropical-cyclones.ts answers it).
+      parts.push(
+        `<button type="button" class="map-key-item map-key-door" data-tropical-storm="${escapeHtml(storm.bin)}" data-feature-door="storm:${escapeHtml(storm.bin)}">${escapeHtml(line)}</button>`
+      );
+      aria += ` ${line}.`;
+    }
+    if (status === 'degraded') {
+      parts.push('<span class="map-key-qualification" data-tropical-status><strong>live (partial)</strong> Some storm layers could not be read or name another advisory; those are not drawn.</span>');
+      aria += ' live (partial).';
+    }
+    for (const src of ['Tropical Cyclone', 'Post-Tropical Cyclone'] as const) {
+      parts.push(
+        tropicalGroup(
+          TROPICAL_POINT_CLASSES.filter((c) => c.key.endsWith(`,${src}`)).map((c) => tropicalCircle(c.radius, c.label)),
+          src
+        )
+      );
+    }
+    parts.push(
+      tropicalGroup([
+        tropicalCircle(7.5, 'Advisory position', true),
+        tropicalCircle(7.5, 'Later positions'),
+        // The track is black on the map; a paper ring keeps it visible on the dark panel.
+        swatchItem(TROPICAL_TRACK.color, TROPICAL_PART_NAMES.track).replace('style="', `style="box-shadow:0 0 0 1px ${TROPICAL_POINT_PAPER};`),
+        swatchItem(TROPICAL_CONE.fill, TROPICAL_PART_NAMES.cone),
+        ...TROPICAL_WW_CLASSES.map((c) => swatchItem(c.color, c.label))
+      ])
+    );
+    aria += ` ${TROPICAL_POINT_CLASSES.map((c) => c.label).join(', ')}; ${TROPICAL_WW_CLASSES.map((c) => c.label).join(', ')}.`;
+  }
+  parts.push(`<span class="map-key-item" data-tropical-issuer>${escapeHtml(issuer)}</span>`);
+  return {
+    html: `<span class="map-key-scale" data-tropical-key data-tropical-state="${state}">${parts.join('')}</span>`,
+    ariaLabel: `${aria} ${issuer}.`
+  };
+}
+
+/** The surface key with the tropical cyclones row appended when that layer is on. */
+function hazardKey(): HazardKeyResult | null {
+  const base = surfaceKey();
+  const row = tropicalRow();
+  if (!row) return base;
+  if (base) {
+    return {
+      spec: { ...base.spec, ariaLabel: `${base.spec.ariaLabel} ${row.ariaLabel}`, itemsHtml: base.spec.itemsHtml + row.html },
+      productKeys: base.productKeys
+    };
+  }
+  return { spec: { label: KEY_ELIGIBLE_LABELS[TROPICAL_KEY]!, ariaLabel: row.ariaLabel, itemsHtml: row.html }, productKeys: [] };
 }
 
 /** The condition-surface key, before shared reference qualifications. */
-function hazardKey(): KeySpec | null {
+function surfaceKey(): HazardKeyResult | null {
   const { active, loading, eligible } = keyEligibility();
   let spec: KeySpec | null = null;
+  let productKeys: readonly string[] = [];
+  const fireSections = fireKeySections(eligible, whpDrapeMounted);
+  // Fuel risk ('usfs-whp') is white-shaded; the Layer studio's classes row keeps issuer colours.
+  const whpKey = eligible.has('usfs-whp-classes') ? 'usfs-whp-classes' : 'usfs-whp';
+  const whpShaded = whpKey === 'usfs-whp';
   if (eligible.has('heatrisk')) {
     spec = active.has('heatrisk') ? heatKey() : loadingKeySpec('heatrisk');
-  } else if (eligible.has('spc-fire-weather')) {
-    spec = buildFireKey(active, loading);
-  } else if (eligible.has('usfs-whp')) {
-    spec = active.has('usfs-whp') ? buildWhpKey() : loadingKeySpec('usfs-whp');
+    productKeys = ['heatrisk'];
+  } else if (fireSections && !fireSections.fire) {
+    spec = active.has(whpKey) ? buildWhpKey(undefined, whpShaded) : loadingKeySpec(whpKey);
+    productKeys = [whpKey];
+  } else if (fireSections) {
+    // Fuel risk over Wildfire: the Fire key keeps every section and gains the potential one.
+    const fire = buildFireKey(active, loading);
+    spec = fire;
+    productKeys = fireProductKeys(eligible);
+    if (fireSections.whp) {
+      const whpTitle = whpShaded ? FUEL_RISK_TITLE : 'USFS Wildfire Hazard Potential';
+      const whp = active.has(whpKey)
+        ? buildWhpKey(whpTitle, whpShaded)
+        : {
+            ariaLabel: 'loading.',
+            itemsHtml:
+              '<span class="map-key-scale" data-usfs-whp-key>' +
+              `<strong class="map-key-scale-label">${escapeHtml(whpTitle)}</strong>` +
+              `${loadingSectionRow(whpKey)}</span>`
+          };
+      spec = {
+        ...fire,
+        ariaLabel: `${fire.ariaLabel} ${whpTitle}, ${whp.ariaLabel}`,
+        itemsHtml: fire.itemsHtml + whp.itemsHtml
+      };
+      productKeys = [...productKeys, whpKey];
+    }
   } else if (eligible.has('cdm-drought')) {
     spec = active.has('cdm-drought') ? cdmKey() : loadingKeySpec('cdm-drought');
+    productKeys = ['cdm-drought'];
   } else if (eligible.has('nadm-drought')) {
     spec = active.has('nadm-drought') ? nadmKey() : loadingKeySpec('nadm-drought');
+    productKeys = ['nadm-drought'];
   } else if (eligible.has('usdm')) {
     spec = active.has('usdm') ? droughtKey() : loadingKeySpec('usdm');
+    productKeys = ['usdm'];
+  } else if (eligible.has('drought')) {
+    spec = active.has('drought') ? outlookKey() : loadingKeySpec('drought');
+    productKeys = ['drought'];
+  } else if (eligible.has('gridded-index')) {
+    spec = active.has('gridded-index') ? griddedKey() : loadingKeySpec('gridded-index');
+    productKeys = ['gridded-index'];
   } else if (eligible.has('sst-anomaly')) {
     spec = active.has('sst-anomaly') ? sstKey() : loadingKeySpec('sst-anomaly');
+    productKeys = ['sst-anomaly'];
   } else if (eligible.has('nifc-fires')) {
     spec = buildFireKey(active, loading);
+    productKeys = fireProductKeys(eligible);
   }
 
-  if (!eligible.has('nws-alerts')) return spec;
+  // NWS alerts is an EVENT layer stacked over whichever surface above (or
+  // none), a qualification appended to the spec's text. It never joins
+  // productKeys: the chip glyph states the SURFACE's status, and an event
+  // overlay's own loading/ready state has no six-state glyph slot of its
+  // own here (map-key.ts:1180's no-key fallback already covers "no
+  // surface, nothing to grade").
+  if (!eligible.has('nws-alerts')) return spec ? { spec, productKeys } : null;
   if (loading.has('nws-alerts')) {
     // Activation in flight: a named placeholder row (W2-D6), not the full
     // product scale, which would claim a surface not yet on the map.
@@ -757,44 +1336,252 @@ function hazardKey(): KeySpec | null {
     const loadingAria = 'National Weather Service event products loading.';
     if (spec) {
       return {
-        ...spec,
-        ariaLabel: `${spec.ariaLabel} ${loadingAria}`,
-        itemsHtml: spec.itemsHtml + loadingHtml
+        spec: {
+          ...spec,
+          ariaLabel: `${spec.ariaLabel} ${loadingAria}`,
+          itemsHtml: spec.itemsHtml + loadingHtml
+        },
+        productKeys
       };
     }
     return {
-      label: 'Products',
-      ariaLabel: loadingAria,
-      itemsHtml: loadingHtml
+      spec: {
+        label: KEY_ELIGIBLE_LABELS['nws-alerts']!,
+        ariaLabel: loadingAria,
+        itemsHtml: loadingHtml
+      },
+      productKeys: []
     };
   }
   const snapshot = nwsSnapshotQualification();
   const products = nwsProductKey();
   if (spec) {
     return {
-      ...spec,
-      ariaLabel:
-        `${spec.ariaLabel} ${products.ariaLabel} ${snapshot.ariaLabel}`,
-      itemsHtml: spec.itemsHtml + products.html + snapshot.html
+      spec: {
+        ...spec,
+        // A read that lists no product leaves its sentence out.
+        ariaLabel: [spec.ariaLabel, products.ariaLabel, snapshot.ariaLabel].filter(Boolean).join(' '),
+        itemsHtml: spec.itemsHtml + products.html + snapshot.html
+      },
+      productKeys
     };
   }
   return {
-    label: 'Products',
-    ariaLabel: `${products.ariaLabel} ${snapshot.ariaLabel}`,
-    itemsHtml: products.html + snapshot.html
+    spec: {
+      label: KEY_ELIGIBLE_LABELS['nws-alerts']!,
+      ariaLabel: [products.ariaLabel, snapshot.ariaLabel].filter(Boolean).join(' '),
+      itemsHtml: products.html + snapshot.html
+    },
+    productKeys: []
   };
+}
+
+/**
+ * Legend sections the builders above already draw, by legend-registry key, so
+ * 'Also on the map' below never repeats one: the keyed products, the NWS
+ * products row, the CPC rows under the SST key, and the 3D shade row
+ * (src/layers/whp-3d.ts shows its section as 'whp-2023').
+ */
+function keyedLegendKeys(productKeys: readonly string[]): ReadonlySet<string> {
+  const keyed = new Set(productKeys);
+  if (keyEligibility().eligible.has('nws-alerts')) keyed.add('nws-alerts');
+  if (keyed.has('sst-anomaly')) for (const [key] of CPC_OUTLOOK_CLASSES) keyed.add(key);
+  if (whpShadeActive) keyed.add('whp-2023');
+  return keyed;
+}
+
+const alsoSectionCache = new WeakMap<LegendSpec, string | null>();
+
+/**
+ * Whether a reader can use the Legend panel (#legend-panel) right now: it has a box, and neither it nor
+ * any ancestor is display none, visibility hidden, or a clipped box with no width or height (desktop and
+ * tablet Brief, a collapsed sidebar, an embed's zero-width sidebar, the phone sheet). The ONE test for
+ * the Key's 'Also on the map' and the briefing's Legend link, so the two never disagree about where a
+ * legend is read. The registry's own empty-state `hidden` is not the shell's doing (Console shows the
+ * panel again with its first section), so it is lifted for the reading.
+ */
+export function legendPanelUsable(panel: HTMLElement | null = document.getElementById('legend-panel')): boolean {
+  if (!panel) return false;
+  const emptyHidden = panel.hidden;
+  if (emptyHidden) panel.hidden = false;
+  try {
+    for (let node: HTMLElement | null = panel; node; node = node.parentElement) {
+      const style = getComputedStyle(node);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      const clipped = style.overflowX !== 'visible' || style.overflowY !== 'visible';
+      if (node === panel || clipped) {
+        const box = node.getBoundingClientRect();
+        if (box.width === 0 || box.height === 0) return false;
+      }
+    }
+    return panel.getClientRects().length > 0;
+  } finally {
+    if (emptyHidden) panel.hidden = true;
+  }
+}
+
+/**
+ * One section's rows from its own `render` (a spec is rendered once; a layer
+ * that changes its legend shows it again with a new spec). Notes (caveats,
+ * credits, notices) stay in the Legend panel and the Impact Briefing, never on
+ * the map (DR-106; uncluttered rule). A section with a control or an element
+ * id (the ecoregion level selector, the gridded index product) cannot be copied
+ * without breaking it, so it is carried live instead: null (see
+ * `adoptLiveLegendSections`).
+ */
+function alsoSectionHtml(spec: LegendSpec): string | null {
+  let html = alsoSectionCache.get(spec);
+  if (html === undefined) {
+    const body = document.createElement('div');
+    spec.render(body);
+    body.querySelectorAll('.legend-note').forEach((note) => note.remove());
+    html = body.querySelector('[id], button, select, input, textarea') ? null : body.innerHTML.trim();
+    alsoSectionCache.set(spec, html);
+  }
+  return html;
+}
+
+function legendSectionIn(root: ParentNode, key: string): HTMLElement | null {
+  return root.querySelector<HTMLElement>(`.legend-section[data-legend="${CSS.escape(key)}"]`);
+}
+
+/**
+ * A section with a control is MOVED from the Legend panel into its slot in the Key, with its handlers and
+ * ids intact, so the level selector still works and the layer's own refresh still finds its list by id.
+ * Run after every update: a section the registry rebuilt lands in the panel's container and replaces the
+ * stale one here.
+ */
+function adoptLiveLegendSections(strip: HTMLElement): void {
+  const container = document.getElementById('legend-sections');
+  if (!container) return;
+  strip.querySelectorAll<HTMLElement>('[data-legend-live]').forEach((slot) => {
+    const fresh = legendSectionIn(container, slot.dataset['legendAlso'] ?? '');
+    if (fresh) slot.replaceChildren(fresh);
+  });
+}
+
+/**
+ * The reverse, run before the strip is rewritten (and so whenever the panel is usable again): a section
+ * whose layer is still shown goes back to the panel in its place; one whose layer went off is dropped.
+ */
+function releaseLiveLegendSections(strip: HTMLElement): void {
+  const container = document.getElementById('legend-sections');
+  const shownKeys = new Set(getActiveLegends().map(({ key }) => key));
+  strip.querySelectorAll<HTMLElement>('[data-legend-live] > .legend-section').forEach((section) => {
+    const key = section.dataset['legend'] ?? '';
+    if (!container || !shownKeys.has(key) || legendSectionIn(container, key)) {
+      section.remove();
+      return;
+    }
+    const order = Number(section.dataset['order'] ?? '0');
+    const after = Array.from(container.children).find((el) => Number((el as HTMLElement).dataset['order'] ?? '0') > order);
+    container.insertBefore(section, after ?? null);
+    const panel = document.getElementById('legend-panel');
+    if (panel) panel.hidden = false;
+  });
+}
+
+/**
+ * 'Also on the map' (owner 2026-11-13, item 13 follow-through): every shown
+ * legend section the Key does not already carry, ONLY where the Legend panel
+ * cannot be used (`legendPanelUsable`: desktop and tablet Brief, a collapsed
+ * sidebar, an embed, every phone sheet detent; Console's column shows it), so a
+ * future layer's legend is reachable with no code here. Absent when empty.
+ */
+function alsoOnMapHtml(productKeys: readonly string[]): string {
+  const keyed = keyedLegendKeys(productKeys);
+  const rows = getActiveLegends().filter(({ key }) => !keyed.has(key));
+  if (rows.length === 0) return '';
+  if (legendPanelUsable()) return '';
+  const sections = rows
+    .map(({ key, spec }) => ({ key, html: alsoSectionHtml(spec) }))
+    .filter(({ html }) => html !== '')
+    .map(({ key, html }) =>
+      html === null
+        ? `<div class="map-key-also-live" data-legend-also="${escapeHtml(key)}" data-legend-live></div>`
+        : `<div class="legend-section" data-legend-also="${escapeHtml(key)}">${html}</div>`
+    )
+    .join('');
+  // DRAFT wording (DR-177)
+  return sections
+    ? `<div class="map-key-also" data-map-key-also><strong class="map-key-scale-label">Also on the map</strong>${sections}</div>`
+    : '';
+}
+
+/**
+ * The chip's six-state glyph, read from the layer REGISTRY's own recorded
+ * status for the product key(s) `productKeys` names, never from a spec's
+ * rendered text (repair round on M10: the old `chipStateFromSpec`
+ * substring-matched `ariaLabel`/`itemsHtml`, which the hillshade coverage
+ * note and a partially-loading multi-layer key could both falsify). An
+ * empty `productKeys` (no key backs the spec) returns undefined: see
+ * `aggregateChipState` in src/config/chip-state.ts for the six-state
+ * doctrine this defers to, and the caller below for what "no glyph state"
+ * renders as.
+ */
+function chipStateFromKeys(productKeys: readonly string[]): ChipState | undefined {
+  return chipStateFromStatuses(productKeys.map((key) => registry.getStatus(key)));
+}
+
+/**
+ * A legend glyph (three swatches, three lines) that tells a reader the title opens the key (owner 2026-11-13,
+ * item 4). Decorative: aria-hidden, no title or text, so the chip's name and text stay the mode word.
+ */
+const KEY_GLYPH =
+  '<svg class="map-key-chip-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">' +
+  '<rect x="3" y="3" width="4" height="4" rx="1"/><path d="M11 5h10"/>' +
+  '<rect x="3" y="10" width="4" height="4" rx="1"/><path d="M11 12h10"/>' +
+  '<rect x="3" y="17" width="4" height="4" rx="1"/><path d="M11 19h10"/></svg>';
+
+/**
+ * The chip's grammar slots (interface-chrome-popups-text.md section
+ * 2.4): a decorative key glyph, one label line, the six-state glyph, and an SVG chevron disclosure
+ * (turned when the key is open) replacing the CSS `::after` character so
+ * its centring can be measured (D1.md M10 Notes). On the desktop chip the
+ * label carries the mode's own lead Conditions-in-view reading, with its
+ * class swatch, when one is live (owner 2026-11-13, one box); otherwise the
+ * keyed product. No empty swatch is ever drawn: it read as an unticked layer.
+ */
+function buildChipGrammar(button: HTMLButtonElement): {
+  readonly label: HTMLSpanElement;
+  readonly state: HTMLSpanElement;
+} {
+  const label = document.createElement('span');
+  label.className = 'map-key-chip-label';
+
+  const state = document.createElement('span');
+  state.className = 'map-key-chip-state';
+  state.setAttribute('aria-hidden', 'true');
+
+  const disclosure = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  disclosure.setAttribute('class', 'map-key-chip-disclosure');
+  disclosure.setAttribute('viewBox', '0 0 16 16');
+  disclosure.setAttribute('width', '16');
+  disclosure.setAttribute('height', '16');
+  disclosure.setAttribute('aria-hidden', 'true');
+  disclosure.setAttribute('focusable', 'false');
+  const chevron = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  chevron.setAttribute('d', 'M4 6l4 4 4-4');
+  chevron.setAttribute('fill', 'none');
+  chevron.setAttribute('stroke', 'currentColor');
+  chevron.setAttribute('stroke-width', '2');
+  chevron.setAttribute('stroke-linecap', 'round');
+  chevron.setAttribute('stroke-linejoin', 'round');
+  disclosure.append(chevron);
+
+  button.replaceChildren(label, state, disclosure);
+  button.insertAdjacentHTML('afterbegin', KEY_GLYPH);
+  return { label, state };
 }
 
 /** Build the swatch strip once and keep it synced to the registry. */
 export function initMapKey(): void {
+  if (mapKeyBooted) return;
+  mapKeyBooted = true;
   const host = document.getElementById('map-key');
   if (!host) return;
-  disposeMapKeyLayout?.();
-  disposeMapKeyOverflow?.();
-  disposeMapKeySeat?.();
   const layout = watchMapKeyLayout(host);
-  disposeMapKeyLayout = layout.dispose;
-  disposeMapKeySeat = watchMapKeySeat(host);
+  watchMapKeySeat(host);
   const heatRiskSequenceLoader = createHeatRiskSequenceLoader(
     () => import('./heatrisk-sequence'),
     (err) => {
@@ -805,143 +1592,361 @@ export function initMapKey(): void {
   const content = document.createElement('div');
   content.id = 'map-key-content';
   content.className = 'map-key-content';
+  content.hidden = true;
+  content.tabIndex = 0;
+  content.setAttribute('role', 'region');
+  content.setAttribute('aria-label', 'Map details and key');
 
-  const expandButton = document.createElement('button');
-  expandButton.id = 'map-key-expand';
-  expandButton.className = 'map-key-expand';
-  expandButton.type = 'button';
-  expandButton.hidden = true;
-  expandButton.setAttribute('aria-label', 'Expand Fire map key');
-  expandButton.setAttribute('aria-controls', content.id);
-  expandButton.setAttribute('aria-expanded', 'false');
-  expandButton.innerHTML =
-    '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="6 9 12 15 18 9"/></svg>';
+  // S30D D1 M11 (the Key drawer): update() below writes the rendered
+  // KeySpec HTML into THIS wrapper, never into `content` itself, so the
+  // drawer's static per-cluster section hosts (index.html, moved in
+  // next) survive every legend re-render instead of being wiped by it.
+  // `display: contents` (app.css) keeps it invisible to layout, so the
+  // legend's own items read exactly as `content`'s direct flex children
+  // did before this split.
+  const legend = document.createElement('div');
+  legend.id = 'map-key-legend';
+  legend.className = 'map-key-legend';
+  content.append(legend);
 
-  host.replaceChildren(content, expandButton);
+  // The drawer's section hosts (src/config/detail-sections.ts, built by
+  // src/ui/detail-section-hosts.ts's ensureDetailSectionHosts(): S30D D1
+  // M11 repair round 3, DR-158): built once, only relocated (never
+  // rewritten) here.
+  const drawerSections = ensureDetailSectionHosts();
+  drawerSections.hidden = false;
+  content.append(drawerSections);
+
+  // The owner's call 1: one quiet link to the briefing's Technical information, built once (outside the rewritten legend) so it keeps focus.
+  const technicalLink = document.createElement('button');
+  technicalLink.type = 'button';
+  technicalLink.className = 'map-info-ack-link';
+  technicalLink.dataset['openTechnicalInformation'] = '';
+  // DRAFT wording (DR-177)
+  technicalLink.textContent = 'Technical information';
+  technicalLink.addEventListener('click', () => openTechnicalInformation(technicalLink));
+  content.append(technicalLink);
+
+  const detailsButton = document.createElement('button');
+  detailsButton.id = 'map-key-details-toggle';
+  detailsButton.className = 'map-key-details-toggle';
+  detailsButton.type = 'button';
+  detailsButton.setAttribute('aria-controls', content.id);
+  detailsButton.setAttribute('aria-expanded', 'false');
+  const chipGrammar = buildChipGrammar(detailsButton);
+
+  // E1-4 (ENSO-FLOW-PLAN.md; C-fit.md 1.8; WCAG 2.2.2): the flowing paths'
+  // Pause, one native toggle in the collapsed header right after the chip,
+  // outside #map-key-legend (rewritten on every update) so it is built once
+  // and keeps focus across key updates. Its name says what a press does,
+  // from the paths' own snapshot and nothing else. Hidden until
+  // a snapshot reports motion (nothing does before E2-1 wires the paths).
+  const pauseButton = buildFlowPauseButton();
+
+  host.replaceChildren(detailsButton, pauseButton, content);
+  host.dataset.keyDetailsOpen = 'false';
 
   const widthQuery = window.matchMedia(MOBILE_MAP_KEY_QUERY);
   let rendered = '';
   let family: MapKeyFamily = 'other';
   let keyLabel = '';
-  let baseInteractive = false;
-  let canExpand = false;
-  let expanded = false;
-  let overflowFrame: number | null = null;
+  let detailsOpen = false;
+  let headline: ConditionsHeadline | null = null;
+  /** The headline the chip shows: desktop chip only (phone and embed keep their title). */
+  let shown: ConditionsHeadline | null = null;
+  let labelSig = '';
+  let announced = '';
+  let announcedMode = '';
+  // The reading first (the visible label's words), then what a press does (WCAG 2.5.3).
+  const chipName = (): string =>
+    `${shown ? shown.aria + ' ' : ''}${detailsOpen ? 'Close' : 'Open'} ${keyLabel || 'map'} details and key`;
+
+  /**
+   * The desktop chip's title: [swatch] [bold value] text [muted tag]. The lead
+   * reading when one is shown; else the keyed product and, for a failed or
+   * empty source, its canonical status word; else the mode word. Text only,
+   * and the nodes are replaced only when the parts change.
+   */
+  const fillChipLabel = (productLabel: string, keyed: boolean, chipState: ChipState | undefined): void => {
+    const parts: Array<{ cls: string; text: string; color?: string }> = [];
+    if (shown) {
+      if (shown.color) parts.push({ cls: 'map-key-chip-swatch', text: '', color: shown.color });
+      if (shown.tone === 'data' || /^\d+$/.test(shown.value)) {
+        parts.push({ cls: 'map-key-chip-value', text: shown.value });
+        parts.push({ cls: 'map-key-chip-text', text: shown.sublabel.replace(/ in view$/i, '') });
+      } else {
+        parts.push({ cls: 'map-key-chip-text', text: shown.value });
+      }
+      if (shown.stale) parts.push({ cls: 'map-key-chip-tag', text: 'stale' });
+    } else {
+      parts.push({ cls: 'map-key-chip-text', text: keyed ? productLabel : chipFallbackLabel(getSelectedHazard()) });
+      if (keyed && (chipState === 'unavailable' || chipState === 'no-data' || chipState === 'zoom-in')) {
+        parts.push({ cls: 'map-key-chip-tag', text: CHIP_STATE_WORDS[chipState] });
+      }
+    }
+    const sig = JSON.stringify(parts);
+    if (sig === labelSig) return;
+    labelSig = sig;
+    chipGrammar.label.replaceChildren(...parts.map(({ cls, text, color }) => {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.textContent = text;
+      if (color) {
+        span.setAttribute('aria-hidden', 'true');
+        span.style.background = color;
+      }
+      return span;
+    }));
+  };
+
+  const setDetailsOpen = (next: boolean): void => {
+    detailsOpen = next;
+    host.dataset.keyDetailsOpen = String(next);
+    content.hidden = !next;
+    detailsButton.setAttribute('aria-expanded', String(next));
+    detailsButton.setAttribute('aria-label', chipName());
+    window.dispatchEvent(new CustomEvent('ddm:map-key-details-change', { detail: { open: next } }));
+    layout.schedule();
+  };
 
   const reflectInteraction = (): void => {
-    const interactive = baseInteractive || canExpand;
-    host.setAttribute('role', interactive ? 'group' : 'img');
-    host.style.pointerEvents = interactive ? 'auto' : '';
+    host.setAttribute('role', 'group');
+    host.style.pointerEvents = 'auto';
   };
 
-  const setExpanded = (next: boolean): void => {
-    expanded = canExpand && next;
-    host.dataset.keyExpanded = String(expanded);
-    expandButton.setAttribute('aria-expanded', String(expanded));
-    const name = keyLabel ? `${keyLabel} map key` : 'map key';
-    expandButton.setAttribute(
-      'aria-label',
-      expanded ? `Collapse ${name}` : `Expand ${name}`
-    );
-    layout.schedule();
-  };
-
-  const checkOverflow = (): void => {
-    overflowFrame = null;
-    // W2-D4: the measured-overflow disclosure is no longer Fire-only. Any
-    // key that genuinely overflows its collapsed capacity on a narrow
-    // viewport (the phone shell or a narrow embed) earns the chevron.
-    const eligible = widthQuery.matches && !host.hidden && host.isConnected;
-    let nextCanExpand = false;
-    if (eligible) {
-      const collapsedHeight = Number.parseFloat(
-        getComputedStyle(content).getPropertyValue(
-          '--mobile-map-key-collapsed-height'
-        )
-      );
-      const limit = Number.isFinite(collapsedHeight)
-        ? collapsedHeight
-        : content.clientHeight;
-      nextCanExpand = content.scrollHeight > limit + 1;
-    }
-
-    canExpand = nextCanExpand;
-    expandButton.hidden = !canExpand;
-    if (canExpand) host.dataset.keyOverflow = 'true';
-    else delete host.dataset.keyOverflow;
-    if (!canExpand) setExpanded(false);
-    reflectInteraction();
-    layout.schedule();
-  };
-
-  const scheduleOverflow = (): void => {
-    if (overflowFrame !== null) return;
-    overflowFrame = window.requestAnimationFrame(checkOverflow);
-  };
-
-  const overflowObserver =
-    typeof ResizeObserver === 'function'
-      ? new ResizeObserver(scheduleOverflow)
-      : null;
-  overflowObserver?.observe(content);
-  const mutationObserver = new MutationObserver(scheduleOverflow);
-  mutationObserver.observe(content, { childList: true, subtree: true });
-  // The terrain coverage entry is width-gated (see withTerrainCoverage), so
-  // crossing the breakpoint has to RE-RENDER the strip, not only re-measure
-  // it. `update` diffs against the last rendered html, so this is cheap.
+  const appPresentationObserver = new MutationObserver(() => update());
+  const app = document.getElementById('app');
+  // The sheet detent decides, with the class, whether the Legend panel has a box ('Also on the map').
+  if (app) appPresentationObserver.observe(app, { attributes: true, attributeFilter: ['class', 'data-sheet-detent'] });
+  // Crossing the phone breakpoint re-renders the strip as well as
+  // re-measuring it. `update` diffs against the last rendered html, so this
+  // is cheap.
   const onWidthChange = (): void => {
     update();
-    scheduleOverflow();
+    layout.schedule();
   };
   widthQuery.addEventListener('change', onWidthChange);
-  window.addEventListener('resize', scheduleOverflow);
-  void document.fonts?.ready.then(scheduleOverflow);
-  expandButton.addEventListener('click', () => setExpanded(!expanded));
-
-  disposeMapKeyOverflow = () => {
-    overflowObserver?.disconnect();
-    mutationObserver.disconnect();
-    widthQuery.removeEventListener('change', onWidthChange);
-    window.removeEventListener('resize', scheduleOverflow);
-    if (overflowFrame !== null) window.cancelAnimationFrame(overflowFrame);
-    overflowFrame = null;
+  const toggleDetails = (): void => setDetailsOpen(!detailsOpen);
+  /** The visible chip: the key toggle. */
+  const chip = (): HTMLElement | null => detailsButton;
+  const closeDetailsOnEscape = (event: KeyboardEvent): void => {
+    if (event.key !== 'Escape' || !detailsOpen) return;
+    setDetailsOpen(false);
+    chip()?.focus();
   };
+  detailsButton.addEventListener('click', toggleDetails);
+  pauseButton.addEventListener('click', () => {
+    window.dispatchEvent(new CustomEvent(ENSO_FLOW_MOTION_REQUEST_EVENT, {
+      detail: { paused: pauseButton.dataset.paused !== 'true' }
+    }));
+  });
+  window.addEventListener('ddm:toggle-map-key-details', toggleDetails);
+  host.addEventListener('keydown', closeDetailsOnEscape);
+
+  // S30D D1 M28 (interface-chrome-popups-text.md 2.7, the focus table).
+  // Two hand-offs, each acting only while focus was on a node that has now
+  // gone (removed, or hidden under it) and has moved nowhere else; focus a
+  // person moves themselves (a pointer press on a mode button, a click on
+  // the page) is never taken back.
+  // - A focused drawer control that disappears (a re-render, or its section
+  //   hidden on a mode change, such as a HeatRisk day cell on leaving Heat)
+  //   hands focus to the drawer heading (`tabindex="-1"`) while the drawer
+  //   is open, otherwise to the chip (P2).
+  // - A focused chip control that disappears hands focus to the key toggle.
+  // Each runs from a focusout with no next target (a removal) and again
+  // after every update, which is where a node is hidden.
+  const handOff = (lost: HTMLElement | null, next: () => HTMLElement | null): HTMLElement | null => {
+    const active = document.activeElement;
+    if (!lost || (active !== lost && active !== document.body && active !== null)) return lost;
+    if (lost.isConnected && lost.getClientRects().length > 0) return active === lost ? lost : null;
+    const target = next();
+    if (target && target !== lost && target.getClientRects().length > 0) {
+      target.focus({ preventScroll: true });
+      return target;
+    }
+    return lost;
+  };
+  let drawerFocus: HTMLElement | null = null;
+  let chipFocus: HTMLElement | null = null;
+  const drawerHeading = (): HTMLElement | null => {
+    const heading = detailsOpen ? legend.querySelector<HTMLElement>('.map-key-label') : null;
+    if (heading) heading.tabIndex = -1;
+    return heading ?? chip();
+  };
+  const handOffLostFocus = (): void => {
+    drawerFocus = handOff(drawerFocus, drawerHeading);
+    chipFocus = handOff(chipFocus, chip);
+  };
+  const onFocusIn = (event: FocusEvent): void => {
+    const target = event.target as HTMLElement;
+    drawerFocus = content.contains(target) ? target : null;
+    chipFocus = target === detailsButton || target === pauseButton ? target : null;
+  };
+  const onFocusOut = (event: FocusEvent): void => {
+    if (!event.relatedTarget && (event.target === drawerFocus || event.target === chipFocus)) {
+      queueMicrotask(handOffLostFocus);
+    }
+  };
+  document.addEventListener('focusin', onFocusIn);
+  document.addEventListener('focusout', onFocusOut);
 
   const update = (): void => {
-    const spec = activeKey();
-    if (!spec) {
+    const active = activeKey();
+    // THE CHIP NEVER HIDES, but only where it IS the chip: the desktop
+    // TL-1 seat, outside an embed (interface-chrome-popups-text.md
+    // sections 2.4 and 2.8). Phones and embeds keep today's seats exactly
+    // (D1.md M10 scope), which includes hiding when nothing is eligible;
+    // only there does the pre-M10 `host.hidden = true` path survive.
+    const isDesktopChip = !widthQuery.matches && !app?.classList.contains('embed');
+    // A shown 3D drape is drawn even when no surface is keyed (Wildfire 3D at season-ahead).
+    if (!active && !isDesktopChip && !whpShadeActive) {
       host.hidden = true;
+      setDetailsOpen(false);
       delete host.dataset.keyFamily;
-      delete host.dataset.keyOverflow;
-      canExpand = false;
-      baseInteractive = false;
-      expandButton.hidden = true;
-      setExpanded(false);
+      delete host.dataset.register;
       reflectInteraction();
       layout.schedule();
       return;
     }
-    keyLabel = spec.label;
+    const spec: KeySpec = active?.spec ?? {
+      label: chipFallbackLabel(getSelectedHazard()),
+      ariaLabel: noSurfaceKeyAria(chipFallbackLabel(getSelectedHazard()), whpShadeActive),
+      itemsHtml: ''
+    };
+    // The committed mode's no-key fallback above names no product (its
+    // drawer already says "the view draws no classed layer"), so it earns
+    // no productKeys either: `chipStateFromKeys` below returns undefined
+    // for it, same as `active`'s own coverage-only synthetic spec.
+    const productKeys: readonly string[] = active?.productKeys ?? [];
+    // The title names the mode with the word on its button (visual uniformity D8); the product keeps the drawer's
+    // own title line. An embed has no mode button and keeps the product. The toggle's accessible name carries
+    // both, the visible word first (WCAG 2.5.3).
+    const chipTitle = app?.classList.contains('embed') ? spec.label : chipFallbackLabel(getSelectedHazard());
+    keyLabel = chipTitle === spec.label ? spec.label : `${chipTitle}, ${spec.label}`;
+    const shadeKey = whpShadeActive
+      ? '<span class="map-key-scale" data-whp-shade-key><strong>3D wildfire potential</strong>' +
+        WHP_3D_SHADE_CATEGORIES.map((category) => swatchItem(
+          whiteShade(category.opacity), category.label
+        )).join('') + '</span>'
+      : '';
     const html =
-      `<span class="map-key-label">${escapeHtml(spec.label)}</span>` + spec.itemsHtml;
+      `<span class="map-key-label">${escapeHtml(spec.label)}</span>` + spec.itemsHtml + shadeKey + drynessKeyHtml() +
+      tribalNationsKeyHtml() + alsoOnMapHtml(productKeys);
     if (html !== rendered) {
+      // A re-render replaces every node in the strip, so anything the
+      // person was operating loses focus. The HeatRisk valid-date select
+      // is the only focusable control in here, and since DDM-P8-T05 a day
+      // change re-renders TWICE: once to say the new frame is loading, and
+      // again when its tiles settle. Without this, a keyboard day change
+      // dropped focus the moment the tiles landed and the next arrow key
+      // went nowhere. Captured before the rewrite, restored after it. The
+      // feature doors (a storm, the Nino 3.4 box) keep focus the same way
+      // across the storm refresh and the SST and flow snapshots.
+      const active = document.activeElement;
+      const door = active instanceof HTMLElement ? active.dataset.featureDoor : undefined;
+      const refocus =
+        active instanceof HTMLElement && legend.contains(active)
+          ? active.matches('[data-heatrisk-day]')
+            ? '[data-heatrisk-day]'
+            : door !== undefined
+              ? `[data-feature-door="${CSS.escape(door)}"]`
+              : active.id && active.closest('[data-legend-live]')
+                ? `#${CSS.escape(active.id)}`
+                : null
+          : null;
       rendered = html;
-      content.innerHTML = html;
+      releaseLiveLegendSections(legend);
+      legend.innerHTML = html;
+      adoptLiveLegendSections(legend);
       host.setAttribute('aria-label', spec.ariaLabel);
-      setExpanded(false);
+      if (refocus) {
+        const restored = legend.querySelector(refocus);
+        if (restored instanceof HTMLElement) restored.focus();
+      }
     }
+    adoptLiveLegendSections(legend);
     // The family follows what the strip acknowledges (active plus loading
     // placeholders), so a loading key seats under the same CSS its ready
     // form will use.
-    const { active, eligible } = keyEligibility();
-    family = resolveMapKeyFamily(eligible);
+    const { eligible } = keyEligibility();
+    const nextFamily = resolveMapKeyFamily(eligible);
+    // S30D D1 M11 (design record section 2.6, "Persistence"): the Key
+    // drawer stays open across a hazard, horizon, loading or selection
+    // change and re-renders for the new state. The automatic close this
+    // used to run on every family change is removed; only the toggle
+    // (detailsButton) and Escape (closeDetailsOnEscape) close it now.
+    family = nextFamily;
     host.dataset.keyFamily = family;
-    baseInteractive =
-      active.has('heatrisk') || (active.has('cdm-drought') && cdmLicense !== null);
+    // The drawer's per-cluster sections (DR-113; src/config/detail-
+    // sections.ts): the SELECTED hazard decides which static section
+    // host is revealed, never the momentarily-eligible family, so a
+    // section never flashes for a layer that is merely loading under a
+    // different mode. Not the store's cluster: a reference layer added to
+    // a mode demotes the set to custom and the store to 'drought', while
+    // the shell keeps its hazard (view-shell.ts selectedHazardTitle).
+    const activeCluster = getCommittedSnapshot().selectedHazard;
+    const activeSections = HAZARD_CLUSTERS[activeCluster].detailSections ?? [];
+    for (const def of Object.values(DETAIL_SECTIONS)) {
+      const sectionEl = document.getElementById(def.homeId);
+      if (sectionEl) sectionEl.hidden = !activeSections.includes(def.key);
+    }
+    // The chip grammar slots (section 2.4): the key glyph, the title, and the
+    // six-state glyph. On the desktop chip the title is the mode's own lead
+    // reading (with its class swatch) when one is live, else the keyed
+    // product with a failed or empty source's canonical status word, else the
+    // mode word; no text-transform, so issuer words stay verbatim (owner
+    // 2026-11-13, one box). Phones and embeds keep the title computed above,
+    // read from the mode table (DR-113 forbids a cluster literal).
+    const chipState = chipStateFromKeys(productKeys);
+    shown = isDesktopChip ? headline : null;
+    if (isDesktopChip) {
+      fillChipLabel(spec.label, productKeys.length > 0, chipState);
+    } else {
+      labelSig = '';
+      chipGrammar.label.textContent = chipTitle;
+    }
+    if (chipState) {
+      chipGrammar.state.dataset.chipState = chipState;
+      chipGrammar.state.title = CHIP_STATE_WORDS[chipState];
+    } else {
+      // No product key backs this spec (the no-key fallback, or a
+      // coverage-only synthetic spec): no glyph state, never an invented
+      // seventh state (interface-chrome-popups-text.md section 7).
+      delete chipGrammar.state.dataset.chipState;
+      chipGrammar.state.title = '';
+    }
+    detailsButton.setAttribute('aria-label', chipName());
+    // A reading cut off by the ellipsis stays readable on hover.
+    detailsButton.title = shown ? shown.aria : '';
+    // In Brief the strip (and its own aria-live) is parked unseen, so the chip
+    // announces a changed reading; with the strip shown (Console) it stays silent.
+    // The first reading after boot or a mode switch is the switch's own result, not news: it is not announced.
+    const sentence = shown ? shown.aria : '';
+    const strip = document.getElementById('conditions-strip');
+    if (sentence && sentence !== announced) {
+      const mode = getSelectedHazard();
+      if (mode === announcedMode && !(strip && strip.getClientRects().length > 0)) {
+        const status = document.getElementById('map-key-reading-status');
+        if (status) status.textContent = sentence;
+      }
+      announcedMode = mode;
+    }
+    announced = sentence;
+    syncFlowPause(host, pauseButton, ensoFlowSnapshot);
+    // A MIRROR of the owning layer's own declared register (never
+    // computed from the pressed horizon chip, never invented for a
+    // layer, such as WHP, that declares none): src/ui/time-bar.ts is
+    // the single source, so the key and the time bar can never disagree.
+    const timeBarSpec = getTimeBarSpec();
+    if (timeBarSpec) {
+      host.dataset.register = timeBarSpec.stamp.register;
+    } else {
+      delete host.dataset.register;
+    }
     reflectInteraction();
     host.hidden = false;
-    scheduleOverflow();
     layout.schedule();
+    handOffLostFocus();
   };
 
   host.addEventListener('change', (event) => {
@@ -958,6 +1963,24 @@ export function initMapKey(): void {
       new CustomEvent(HEATRISK_DAY_SELECT_EVENT, { detail: { day } })
     );
   });
+  // A feature door asks the owning layer, by event, so the key imports no layer module.
+  host.addEventListener('click', (event) => {
+    const door = event.target instanceof Element ? event.target.closest<HTMLElement>('[data-feature-door]') : null;
+    if (door) window.dispatchEvent(new CustomEvent(FEATURE_DOOR_EVENT, { detail: door.dataset.featureDoor }));
+  });
+
+  const onWhpShade = (event: Event): void => {
+    const detail = (event as CustomEvent<{ active: boolean; mounted?: boolean }>).detail;
+    whpShadeActive = Boolean(detail?.active);
+    whpDrapeMounted = Boolean(detail?.mounted);
+    update();
+  };
+  window.addEventListener('ddm:whp-shade', onWhpShade);
+  const onDrynessGround = (event: Event): void => {
+    drynessGround = (event as CustomEvent<typeof drynessGround>).detail ?? null;
+    update();
+  };
+  window.addEventListener(DRYNESS_GROUND_EVENT, onDrynessGround);
 
   window.addEventListener(HEATRISK_FRAMES_EVENT, (event) => {
     const detail = (event as CustomEvent<HeatRiskFrameEventDetail>).detail;
@@ -976,6 +1999,7 @@ export function initMapKey(): void {
     nwsSnapshotStatus = detail.status;
     nwsSnapshotAsOf = detail.asOf;
     nwsSnapshotTruncated = detail.truncated;
+    nwsSnapshotEvents = detail.events ?? [];
     update();
   });
   window.addEventListener(CDM_SNAPSHOT_EVENT, (event) => {
@@ -998,13 +2022,59 @@ export function initMapKey(): void {
     sstObservedDate = detail.status === 'ready' ? detail.date : null;
     update();
   });
+  const onEnsoFlowSnapshot = (event: Event): void => {
+    const detail = (event as CustomEvent<EnsoFlowSnapshotEventDetail>).detail;
+    if (!detail) return;
+    ensoFlowSnapshot = detail;
+    update();
+  };
+  window.addEventListener(ENSO_FLOW_SNAPSHOT_EVENT, onEnsoFlowSnapshot);
+  window.addEventListener(TROPICAL_SNAPSHOT_EVENT, (event) => {
+    const detail = (event as CustomEvent<TropicalSnapshotEventDetail>).detail;
+    if (!detail) return;
+    tropicalSnapshot = detail;
+    update();
+  });
+  onTimeBarSpecChange(update);
+  // A framing click never fires a registry event (D-0.7.0-039: camera-only,
+  // no layer write), so without this the coverage caution above would only
+  // refresh on the NEXT unrelated key change.
+  onFramingChange(update);
+  // Nor does a Brief/Console flip, and it decides whether the minimap
+  // provenance clause has a referent at all (finding 5). Without this the
+  // sentence would linger into Console until some unrelated key change.
+  onViewModeChange(update);
+  // The chip never hides (section 2.4): with no key eligible it falls back
+  // to the committed mode's own word, so a mode switch with no layer
+  // change (an empty season-ahead recipe, D-0.7.0-043) still has to
+  // re-render the fallback label.
+  onHazardClusterChange(update);
+  // The drawer sections follow the selected hazard, which a requestCluster
+  // publishes only after its store write (cluster-service.ts publish).
+  onCommittedSnapshotChange(update);
+  // The strip's lead reading titles the desktop chip (owner 2026-11-13, one box).
+  onConditionsHeadline((next) => {
+    headline = next;
+    update();
+  });
 
   registry.on('change', update);
+  // A layer shows its legend after its registry change, so 'Also on the map' follows the legend registry itself.
+  onLegendChange(update);
   // Every status transition can change the strip now that a loading key
   // renders a placeholder (W2-D6); the render diffs, so a status that does
   // not change the HTML is a cheap no-op.
   registry.on('status-change', () => {
     update();
   });
+  timeline.onChange(update);
+  // The arrows may have loaded before this chunk did (a boot with `flow=`
+  // in the URL): ask once for their state; nothing answers while inactive.
+  ensoFlowSnapshot = null;
+  window.dispatchEvent(new Event(ENSO_FLOW_SNAPSHOT_REQUEST_EVENT));
+  drynessGround = null;
+  window.dispatchEvent(new Event(DRYNESS_GROUND_REQUEST_EVENT));
+  tropicalSnapshot = null;
+  window.dispatchEvent(new Event(TROPICAL_SNAPSHOT_REQUEST_EVENT));
   update();
 }

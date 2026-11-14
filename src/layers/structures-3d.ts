@@ -1,23 +1,20 @@
 /**
- * Building structures context for the desktop 3D Fire mode: Overture Maps
- * Foundation footprints extruded over the terrain. A presentation
- * companion owned by the fire3d context orchestrator
- * (src/map/fire3d-context.ts); not a LAYER_DEFS entry.
+ * Buildings for the desktop 3D Fire mode: USA Structures footprints (Oak
+ * Ridge National Laboratory for the FEMA Geospatial Response Office) extruded
+ * over the terrain. A presentation companion owned by the fire3d context
+ * orchestrator (src/map/fire3d-context.ts); not a LAYER_DEFS entry.
  *
- * Coverage honesty: the bundled archive covers the central_oregon region
- * framing ONLY (the full PNW box holds 9.16 million footprints, far past
- * same-origin hosting; scripts/extract-overture-buildings.py --bbox is
- * the deployer path for other regions). The 3D Fire control's coverage
- * note and this layer's legend both state the pilot scope, and the
- * archive stores z13-14 only, so buildings appear when zoomed in.
+ * Coverage: the bundled archive covers the central_oregon region framing
+ * only (a whole state is far past same-origin hosting) and stores z13-14
+ * only, so buildings appear when zoomed in.
  *
- * Height honesty: two fill-extrusion layers split the read. Footprints
- * with an issuer-published height extrude to it in the measured tone;
- * the rest draw in a visibly dimmer tone at a disclosed placeholder
- * height (three meters per published floor, otherwise four meters),
- * never implying a precision the source does not carry. The placeholder
- * rule is a presentation constant stated in the legend, not an estimate
- * dressed as data.
+ * Height: the source publishes none for any footprint in that box, so one
+ * layer draws every building at one low stated height in one quiet tone
+ * (STRUCTURES_PRESENTATION), never implying a measurement.
+ *
+ * Nothing but the word: the map and its key carry no credit, source line or
+ * caveat for this layer (owner, 2026-11-12). The credit is the
+ * Acknowledgements row.
  *
  * Failure posture: the caller treats a false return as a NON-fatal
  * partial degrade (the scene keeps everything else).
@@ -27,40 +24,70 @@ import type * as maplibregl from 'maplibre-gl';
 
 import {
   STRUCTURES_PRESENTATION,
-  STRUCTURES_QUALIFICATION,
-  buildStructuresMeasuredPaint,
-  buildStructuresPlaceholderPaint
+  buildStructuresPaint
 } from '../config/wildfire-presentation';
 import { URLS } from '../config/urls';
 import { reassertLabelOrder, reassertThematicOrder } from '../map/layer-order';
-import {
-  LEGEND_ORDER,
-  hideLegend,
-  renderSwatchLegend,
-  showLegend
-} from '../ui/legend-registry';
+import { LEGEND_ORDER, getLegendSection, hideLegend, showLegend } from '../ui/legend-registry';
 import { probeArchiveHeader } from '../util/pmtiles-probe';
+import type { PmtilesHeader } from '../util/pmtiles-probe';
 
 const SOURCE_ID = 'structures-3d';
 const SOURCE_LAYER = 'structures';
-const MEASURED_LAYER_ID = 'structures-3d';
-const PLACEHOLDER_LAYER_ID = 'structures-3d-est';
+const LAYER_ID = 'structures-3d';
 const LEGEND_KEY = 'structures-3d';
 
+/** Stops the key following the view; set while the layer is on the map. */
+let stopKeyTracking: (() => void) | null = null;
+
 /**
- * Probe the bundled archive, then add the vector source, both extrusion
- * layers, and the legend. Idempotent. Returns false (nothing added) when
- * the archive is unreachable or invalid.
+ * The key lists "Buildings" only while one can draw: at or above the
+ * archive's own zoom floor with the view touching its box (both read from
+ * the probed header, so no second copy of either exists). Nothing on the
+ * map explains an absent building, so the key must not promise one.
+ */
+function trackKey(map: maplibregl.Map, archive: PmtilesHeader): void {
+  stopKeyTracking?.();
+  const sync = (): void => {
+    const view = map.getBounds();
+    const canDraw =
+      map.getZoom() >= archive.minZoom &&
+      view.getWest() < archive.east && view.getEast() > archive.west &&
+      view.getSouth() < archive.north && view.getNorth() > archive.south;
+    if (!canDraw) {
+      hideLegend(LEGEND_KEY);
+    } else if (!getLegendSection(LEGEND_KEY)) {
+      showLegend(LEGEND_KEY, {
+        // After the stations slot: the event band is full (smoke volume at
+        // +3, power at +4) and event+5 would collide with LEGEND_ORDER.stations.
+        order: LEGEND_ORDER.stations + 1,
+        // One swatch and the one word; both values are this module's own constants.
+        render: (body) => {
+          body.innerHTML = `<ul class="legend"><li><span class="swatch" style="background:${STRUCTURES_PRESENTATION.color}"></span>Buildings</li></ul>`;
+        }
+      });
+    }
+  };
+  map.on('moveend', sync);
+  stopKeyTracking = () => map.off('moveend', sync);
+  sync();
+}
+
+/**
+ * Probe the bundled archive, then add the vector source, the extrusion
+ * layer, and the key (shown only where a building can draw). Idempotent. Returns false (nothing added) when the
+ * archive is unreachable or invalid, or the scene left during the probe.
  */
 export async function activateStructures(
   map: maplibregl.Map,
   signal: AbortSignal
 ): Promise<boolean> {
+  let archive: PmtilesHeader;
   try {
-    await probeArchiveHeader(URLS.structuresPmtilesLocal, signal);
+    archive = await probeArchiveHeader(URLS.structuresPmtilesLocal, signal);
   } catch (err) {
     if (!signal.aborted) {
-      console.warn('[structures-3d] the structures archive is unreachable or invalid.', err);
+      console.warn('[structures-3d] invalid or unavailable archive.', err);
     }
     return false;
   }
@@ -73,69 +100,35 @@ export async function activateStructures(
         url: 'pmtiles://' + URLS.structuresPmtilesLocal
       });
     }
-    if (!map.getLayer(MEASURED_LAYER_ID)) {
+    if (!map.getLayer(LAYER_ID)) {
       map.addLayer({
-        id: MEASURED_LAYER_ID,
+        id: LAYER_ID,
         type: 'fill-extrusion',
         source: SOURCE_ID,
         'source-layer': SOURCE_LAYER,
-        filter: ['has', 'h'],
-        paint: buildStructuresMeasuredPaint()
-      });
-    }
-    if (!map.getLayer(PLACEHOLDER_LAYER_ID)) {
-      map.addLayer({
-        id: PLACEHOLDER_LAYER_ID,
-        type: 'fill-extrusion',
-        source: SOURCE_ID,
-        'source-layer': SOURCE_LAYER,
-        filter: ['!', ['has', 'h']],
-        paint: buildStructuresPlaceholderPaint()
+        paint: buildStructuresPaint()
       });
       // Added outside the layer controller (the hms-smoke-volume
-      // discipline): re-assert the ruled chain so structures seat with
+      // discipline): re-assert the ruled chain so the buildings seat with
       // the context overlays, under every event overlay.
       reassertThematicOrder(map);
       reassertLabelOrder(map);
     }
   } catch (err) {
     console.warn('[structures-3d] setup failed.', err);
-    for (const layerId of [MEASURED_LAYER_ID, PLACEHOLDER_LAYER_ID]) {
-      if (map.getLayer(layerId)) map.removeLayer(layerId);
-    }
-    if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
+    deactivateStructures(map);
     return false;
   }
 
-  showLegend(LEGEND_KEY, {
-    // After the stations slot: the event band is full (smoke volume at
-    // +3, power at +4) and event+5 would collide with LEGEND_ORDER.stations.
-    order: LEGEND_ORDER.stations + 1,
-    render: (body) =>
-      renderSwatchLegend(
-        body,
-        'Structures (3D view)',
-        [
-          {
-            color: STRUCTURES_PRESENTATION.measuredColor,
-            label: 'Building (issuer-published height)'
-          },
-          {
-            color: STRUCTURES_PRESENTATION.placeholderColor,
-            label: 'Building (no published height; disclosed placeholder height)'
-          }
-        ],
-        STRUCTURES_QUALIFICATION
-      )
-  });
+  trackKey(map, archive);
   return true;
 }
 
-/** Remove both extrusion layers, the source, and the legend. Defensive. */
+/** Remove the extrusion layer, the source, and the key. Defensive. */
 export function deactivateStructures(map: maplibregl.Map): void {
-  for (const layerId of [MEASURED_LAYER_ID, PLACEHOLDER_LAYER_ID]) {
-    if (map.getLayer(layerId)) map.removeLayer(layerId);
-  }
+  stopKeyTracking?.();
+  stopKeyTracking = null;
+  if (map.getLayer(LAYER_ID)) map.removeLayer(LAYER_ID);
   if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
   hideLegend(LEGEND_KEY);
 }

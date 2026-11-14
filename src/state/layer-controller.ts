@@ -40,8 +40,9 @@ import {
   loadLayerModule,
   getLoadedLayerModule
 } from '../config/layers';
-import type { LayerDef, LayerModule } from '../config/layers';
+import type { LayerActivation, LayerDef, LayerModule } from '../config/layers';
 import type { ViewPreset } from '../config/presets';
+import { isCommittedCompositionKey } from './cluster-service';
 import { registry } from './registry';
 import { reassertLabelOrder, reassertThematicOrder } from '../map/layer-order';
 import { fadeInLayers, fadeOutLayers } from '../util/layer-fade';
@@ -74,16 +75,26 @@ export interface LayerControllerView {
  *     for surface-role layers.
  *   - `deactivate` turns a layer off.
  *   - `applyPreset` makes the active set equal a preset's layer list.
- *   - `applyLayerSet` activates a set of keys (the URL/default boot path).
- *   - `ensureActive` is fire-and-forget activation (void, not awaited).
+ *   - `applyLayerSet` activates a set of keys: the URL/default boot path,
+ *     boot-only and called once. It skips every key any command has ever
+ *     set (`desiredOn` is only ever added to), so a later caller would
+ *     silently skip every layer a person has touched.
  */
 export interface LayerController {
   activate(key: string, cascade?: boolean): Promise<void>;
   deactivate(key: string): void;
   applyPreset(preset: ViewPreset): void;
+  /** Boot-only, call once (a second call rejects): skips every key a command has already set. */
   applyLayerSet(keys: Iterable<string>): Promise<void>;
-  ensureActive(key: string): void;
 }
+
+/**
+ * Layers re-requested once, this many ms after an unavailable first read.
+ * Tropical cyclones: all 15 presence reads can end together at the 10 s
+ * sweep deadline, and the failure teardown below would otherwise leave the
+ * layer off until the reader presses the mode again.
+ */
+const RETRY_ONCE_MS: Readonly<Record<string, number>> = { 'tropical-cyclones': 30_000 };
 
 /**
  * Build the layer controller for a map, driving DOM through `view`. One
@@ -105,6 +116,8 @@ export function createLayerController(
    * turned-off layer into the registry and the URL.
    */
   const desiredOn = new Map<string, boolean>();
+  /** Whether the one boot `applyLayerSet` call has been taken. */
+  let layerSetApplied = false;
 
   /**
    * Monotonic intent generation per key, bumped on EVERY intent flip (on or
@@ -118,8 +131,17 @@ export function createLayerController(
    */
   const intentGen = new Map<string, number>();
 
+  /**
+   * The one delayed retry after an unavailable first read, for the layers
+   * listed in RETRY_ONCE_MS. Any later intent flip (off, a re-press, the
+   * retry itself) clears it, so a retry never outlives the intent it served.
+   */
+  const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
   /** Record an intent flip: bump the key's generation, set the boolean. */
   function bumpIntent(key: string, on: boolean): number {
+    clearTimeout(retryTimers.get(key));
+    retryTimers.delete(key);
     const gen = (intentGen.get(key) ?? 0) + 1;
     intentGen.set(key, gen);
     desiredOn.set(key, on);
@@ -137,6 +159,112 @@ export function createLayerController(
 
   /** Layers whose bindPopups has already run (once, on first activation). */
   const popupsBound = new Set<string>();
+
+  /**
+   * The controller-owned cancellation seam (DDM-P1-T02, 2026-09-08): the
+   * live activation attempt per key. Exactly one exists per key at a time;
+   * it is created inside the activation op, handed to the module as
+   * `LayerActivation`, and aborted by `abortAttempt` the moment off intent
+   * is recorded (synchronously, ahead of the serialized teardown), when a
+   * newer activate of the same key supersedes it, and when the attempt stands
+   * down or fails. The modules' own `cancelActivation` seam stays beside it
+   * for the modules that keep private controllers; this signal is what lets a
+   * module without one abort just as promptly.
+   */
+  const attempts = new Map<string, AbortController>();
+
+  /** Abort and forget the key's live attempt, if any. Safe to call twice. */
+  function abortAttempt(key: string): void {
+    const attempt = attempts.get(key);
+    if (!attempt) return;
+    attempts.delete(key);
+    attempt.abort();
+  }
+
+  /** Supersede any prior attempt for the key and open a new one. */
+  function beginAttempt(key: string, generation: number): LayerActivation {
+    abortAttempt(key);
+    const attempt = new AbortController();
+    attempts.set(key, attempt);
+    return { signal: attempt.signal, generation };
+  }
+
+  /**
+   * Close one attempt that stood down or failed, but only if it is still the
+   * key's live attempt: a deactivate that already aborted it, or a newer
+   * activate that already superseded it, owns the map entry by then.
+   */
+  function endAttempt(key: string, activation: LayerActivation): void {
+    const attempt = attempts.get(key);
+    if (!attempt || attempt.signal !== activation.signal) return;
+    attempts.delete(key);
+    attempt.abort();
+  }
+
+  /**
+   * The shared tail of a failed activation, thrown or not (DDM-P1-T03,
+   * 2026-09-08; corrected same day after the verifier found a double
+   * announcement): uncheck the box and clear the on-intent BEFORE
+   * `registry.deactivate`, because the sidebar's URL sync reads the checkbox
+   * DOM snapshot synchronously off the registry's `change` event
+   * (`checkedLayerKeys` in src/ui/sidebar.ts), not the registry's active set;
+   * a share URL booted from a failed key must self-correct on this same
+   * tick. Since D1 M5 (2026-09-27) the uncheck is scoped: a member of the
+   * committed cluster's composition, recipe or persistent reference
+   * (`isCommittedCompositionKey`; widened for found-073) stays checked and in
+   * the share URL, so its failure never demotes the committed view; the
+   * registry steps below run for every failure.
+   *
+   * Then read `registry.getStatus(key)` BEFORE deactivating, to tell the two
+   * failure shapes apart:
+   *
+   *   - A module that follows the self-reporting contract already called
+   *     `registry.setStatus(key, 'error')` itself (for example
+   *     usdm.ts:794 `reportStatus('error'); return`) before this ever runs.
+   *     Its status-change already announced "unavailable" once. Calling
+   *     `registry.deactivate(key)` plain would wipe that stored status
+   *     (registry.ts's documented clear-on-deactivate), and re-asserting it
+   *     with a second `setStatus` would emit and announce it a second time
+   *     for the same failure. So here we call
+   *     `registry.deactivate(key, { keepStatus: true })` and do NOT call
+   *     `setStatus` again: one status-change, one announcement.
+   *   - Otherwise (a thrown chunk import, or any other path that never
+   *     reported a status) there is nothing recorded yet, so
+   *     `registry.deactivate(key)` (default: clears status, which is a
+   *     no-op here) followed by `registry.setStatus(key, 'error')` is the
+   *     ONE status-change for this failure.
+   *
+   * Either branch produces exactly one `registry.setStatus` call carrying
+   * 'error' per failure, so `getStatus()` reads 'error' afterward and
+   * `#layer-status-live` announces "unavailable" once, not twice.
+   */
+  function failActivation(key: string): void {
+    // Scope of the uncheck (D1 M5, 2026-09-27; found-002 and found-003,
+    // the director's Tier 1 scope; found-073 widened it from the recipe to
+    // the whole composition, so hillshade and the boundaries count too): a
+    // member of the committed composition keeps its checkbox and its
+    // on-intent. Unchecking it made the
+    // checked set diverge from the committed composition, so the cluster
+    // service demoted the view to a custom set: no hazard pressed,
+    // `cluster=` gone from the URL, and the horizon chips locked. Kept
+    // checked, the key stays in the share URL (the one-word `cluster=`
+    // token, or Drought's `layers=` list), reads unavailable from its
+    // 'error' status, and a press of the committed hazard re-requests it
+    // (cluster-service.ts applyCluster). Every other failure (a custom
+    // `layers=` set) self-corrects out of the URL exactly as before. The
+    // predicate is read BEFORE anything changes, while the checked set
+    // still describes the display.
+    if (!isCommittedCompositionKey(key)) {
+      view.setCheckbox(key, false);
+      desiredOn.set(key, false);
+    }
+    if (registry.getStatus(key) === 'error') {
+      registry.deactivate(key, { keepStatus: true });
+    } else {
+      registry.deactivate(key);
+      registry.setStatus(key, 'error');
+    }
+  }
 
   function enqueueLayerOp(key: string, op: () => Promise<void> | void): Promise<void> {
     const prev = layerOpChain.get(key) ?? Promise.resolve();
@@ -163,7 +291,9 @@ export function createLayerController(
 
   /**
    * Activate a layer with a loading-indicator token around the call. Updates
-   * the registry on success; unchecks the checkbox on failure.
+   * the registry on success; on failure runs `failActivation`, which
+   * unchecks the checkbox unless the key is a member of the committed
+   * cluster's composition (D1 M5, found-073).
    *
    * The registry is set to `loading` before the activation so the status pill
    * updates immediately; the layer module is responsible for setting its own
@@ -175,7 +305,7 @@ export function createLayerController(
    * deactivation (there is always one; only `deactivate` flips the intent off)
    * then clears the pill and announces the off state.
    */
-  function activateWithIndicator(def: LayerDef): Promise<void> {
+  function activateWithIndicator(def: LayerDef, isRetry = false): Promise<void> {
     const gen = bumpIntent(def.key, true);
     // This activation owns the outcome only while BOTH hold: the latest
     // intent is on AND no newer flip has occurred since this op was born.
@@ -185,22 +315,29 @@ export function createLayerController(
       desiredOn.get(def.key) === true && intentGen.get(def.key) === gen;
     return enqueueLayerOp(def.key, async () => {
       // The user reversed or superseded this toggle while it waited in the
-      // queue, or the layer is already fully active (an off/on flip whose
-      // off was skipped as stale); either way there is nothing to do.
+      // queue, or the layer is already fully active.
       if (!ownsIntent()) return;
       if (registry.getActiveKeys().has(def.key)) return;
 
       const token = showLoading(`Loading ${def.name}...`);
       registry.setStatus(def.key, 'loading');
+      let mod: LayerModule | undefined;
       try {
-        const mod = await loadLayerModule(def);
+        mod = await loadLayerModule(def);
         if (!ownsIntent()) return;
         ensurePopupsBound(def.key, mod);
-        await mod.activate(map);
+        // The attempt opens here, after the chunk import, so a module never
+        // sees a signal older than its own code; it is aborted by
+        // deactivateInternal the instant off intent is recorded, so a held
+        // fetch inside mod.activate aborts promptly rather than running out
+        // its network budget behind this op (DDM-P1-T02).
+        const activation = beginAttempt(def.key, gen);
+        await mod.activate(map, activation);
         if (!ownsIntent()) {
           // Turned off (or superseded by a newer flip) during activation:
           // undo before anything registers. A queued deactivation clears the
           // pill and announces; a queued newer activation starts clean.
+          endAttempt(def.key, activation);
           try {
             mod.deactivate(map);
           } catch (err) {
@@ -215,22 +352,35 @@ export function createLayerController(
         // status as a failed activation and mirror the thrown-error cleanup:
         // never registry.activate on anything but a genuine on state (ready,
         // no-data, or zoom-in). This protects the URL-as-state invariant
-        // (critical-review finding #2, 2026-07-07).
+        // (critical-review finding #2, 2026-07-07). Scope since D1 M5
+        // (2026-09-27): the key never registers active either way, but a
+        // member of the committed composition keeps its checkbox and its
+        // place in the share URL, because the URL then claims the committed
+        // view the user chose, whose summary names the layer unavailable;
+        // only a custom set's failure leaves the URL (found-073).
         if (registry.getStatus(def.key) === 'error') {
-          view.setCheckbox(def.key, false);
-          desiredOn.set(def.key, false);
+          endAttempt(def.key, activation);
           try {
             mod.deactivate(map);
           } catch (err) {
             console.error(`Layer "${def.key}" failed to deactivate cleanly:`, err);
           }
-          // Emit a `change` so the URL re-syncs from the active set without this
-          // key (a boot from ?layers=<failed> must self-correct); registry.
-          // deactivate also clears the stored status.
-          registry.deactivate(def.key);
-          // Re-assert the terminal 'error' after that clear so the pill and any
-          // getStatus() reader see "unavailable", not "off".
-          registry.setStatus(def.key, 'error');
+          // Shared failure tail (DDM-P1-T03): the module already
+          // self-reported 'error', so failActivation keeps that status
+          // instead of re-asserting it. See failActivation above.
+          failActivation(def.key);
+          // One retry, and only while the checkbox stays on (a committed
+          // member); a failed retry is final.
+          const retryMs = RETRY_ONCE_MS[def.key];
+          if (!isRetry && retryMs !== undefined && desiredOn.get(def.key) === true) {
+            retryTimers.set(
+              def.key,
+              setTimeout(() => {
+                retryTimers.delete(def.key);
+                void activateWithIndicator(def, true);
+              }, retryMs)
+            );
+          }
           return;
         }
         // Ease the just-added layers in (no-op for reduced-motion users and
@@ -248,11 +398,19 @@ export function createLayerController(
         reassertLabelOrder(map);
         registry.activate(def.key);
       } catch (err) {
+        abortAttempt(def.key);
+        // A setup failure may leave resources behind even after intent changed.
+        try {
+          mod?.deactivate(map);
+        } catch (cleanupError) {
+          console.error(`Layer "${def.key}" failed to deactivate cleanly:`, cleanupError);
+        }
+        if (!ownsIntent()) return;
         console.error(`Layer "${def.key}" failed to load:`, err);
-        registry.setStatus(def.key, 'error');
-        view.setCheckbox(def.key, false);
-        desiredOn.set(def.key, false);
-        registry.deactivate(def.key);
+        // Shared failure tail (DDM-P1-T03): nothing was reported here, so
+        // failActivation asserts 'error' once after registry.deactivate.
+        // See failActivation above.
+        failActivation(def.key);
       } finally {
         hideLoading(token);
       }
@@ -274,29 +432,36 @@ export function createLayerController(
    */
   function deactivateInternal(def: LayerDef): void {
     bumpIntent(def.key, false);
-    // Synchronously cancel any in-flight activation work through the optional
-    // LayerModule seam: the queued teardown below cannot run until the
-    // activation op ahead of it in the chain settles, so without this an
+    // Synchronously abort the controller-owned attempt FIRST (DDM-P1-T02):
+    // every fetch the module linked to it, the initial load and any viewport
+    // refresh alike, aborts here and now, and the module's late-response
+    // guards then drop whatever raced past the abort. Then the optional
+    // module seam: the queued teardown below cannot run until the
+    // activation op ahead of it in the chain settles, so without these an
     // abandoned activation fetch would run out its full network budget after
     // the user withdrew intent (invariant 5; Codex Unit B finding 1,
     // 2026-07-15). Map-state teardown stays serialized in the op below.
+    abortAttempt(def.key);
     try {
       getLoadedLayerModule(def.key)?.cancelActivation?.();
     } catch (err) {
       console.error(`Layer "${def.key}" failed to cancel cleanly:`, err);
     }
     void enqueueLayerOp(def.key, async () => {
-      // The user re-toggled the layer on while this off waited in the queue;
-      // the newer activation owns the outcome.
-      if (desiredOn.get(def.key) !== false) return;
+      // An active layer's signal was already aborted; tear it down even if
+      // on intent returned, so the queued activation gets a fresh signal.
+      if (desiredOn.get(def.key) !== false && !registry.getActiveKeys().has(def.key)) return;
       try {
         // A module that was never loaded has nothing on the map; the optional
         // chain is a no-op then, and the intent flip above makes any in-flight
         // activation stand down at its next checkpoint.
         const mod = getLoadedLayerModule(def.key);
         if (mod) {
-          await fadeOutLayers(map, mod.fadeLayerIds);
-          mod.deactivate(map);
+          try {
+            await fadeOutLayers(map, mod.fadeLayerIds);
+          } finally {
+            mod.deactivate(map);
+          }
         }
       } catch (err) {
         console.error(`Layer "${def.key}" failed to deactivate cleanly:`, err);
@@ -335,19 +500,32 @@ export function createLayerController(
     // pills) stays honest.
     if (def.role === 'surface') deactivateOtherSurfaces(def.key);
     const primary = activateWithIndicator(def);
-    // Co-activation (D-0.7.0-018: the wildfire event pair). Turning a layer on
-    // through a user toggle also turns on its partners, each still individually
-    // toggleable off. `cascade` is false for the partners so the pair activates
+    // Co-activation. Turning a layer on through a user toggle also turns on
+    // the partners its `coActivateWith` declares, each still individually
+    // toggleable off. `cascade` is false for the partners so a pair activates
     // one level and never ping-pongs. This lives ONLY here (the user-toggle
     // path): applyLayerSet and applyPreset name their layers explicitly, so a
     // deep link or preset stays authoritative about exactly what is on.
+    // No layer declares partners today: the wildfire event pair
+    // (D-0.7.0-018) was made independent by the owner's ruling of 2026-09-28
+    // (found-007), so this block is a no-op kept for any future pair.
     if (cascade && def.coActivateWith) {
       for (const partnerKey of def.coActivateWith) {
         const partner = getLayerDef(partnerKey);
         if (!partner) continue;
-        const isOn =
-          registry.getActiveKeys().has(partnerKey) || view.isCheckboxChecked(partnerKey);
-        if (isOn) continue;
+        // Read INTENT, never the registry (found-092, 2026-09-28). A manual
+        // uncheck bumps `desiredOn` to false synchronously (deactivateInternal,
+        // above), but `registry.deactivate` only runs inside that key's queued
+        // teardown op, AFTER any fade completes. Between those two moments the
+        // registry still reports the partner active, so checking it here would
+        // skip re-cascading a partner the user just turned off and is now
+        // turning back on through the OTHER member of the pair (unchecking
+        // both, then rechecking either, never brought the first back). The
+        // intent map is exactly right for "is this partner already on":
+        // activateWithIndicator, applyLayerSet, and applyPreset each bump it
+        // to true before the key can ever become active, so `desiredOn` is
+        // never a false negative here, only the registry read was.
+        if (desiredOn.get(partnerKey) === true) continue;
         view.setCheckbox(partnerKey, true);
         void activate(partnerKey, false);
       }
@@ -385,7 +563,18 @@ export function createLayerController(
     for (const key of preset.layers) {
       const def = getLayerDef(key);
       if (!def) continue;
-      const isOn = registry.getActiveKeys().has(key) || view.isCheckboxChecked(key);
+      // A key left checked by a failed activation (a recipe member of the
+      // committed cluster, D1 M5) is not on: it is checked, never
+      // registered, and holds 'error'. The preset asks for it again, the
+      // same re-request a press of the committed hazard makes.
+      const failedButChecked =
+        view.isCheckboxChecked(key) &&
+        !registry.getActiveKeys().has(key) &&
+        registry.getStatus(key) === 'error';
+      const isOn = desiredOn.get(key) !== false && (
+        registry.getActiveKeys().has(key) ||
+        (view.isCheckboxChecked(key) && !failedButChecked)
+      );
       if (isOn) continue;
       view.setCheckbox(key, true);
       void activateWithIndicator(def);
@@ -400,22 +589,38 @@ export function createLayerController(
    * a user-initiated toggle, and `Promise.allSettled` lets a single slow or
    * failing layer not delay the rest. The URL parser guarantees at most one
    * surface in the set, so no exclusivity pass is needed here.
+   *
+   * The boot runs this only once the lazy island settles, after the controls
+   * already work (found-114, S30D P3-BOOT). A key whose intent a command has
+   * recorded since then (a preset chip, the hazard rail, a toggle, a studio)
+   * belongs to that newer command, on or off, and is skipped: the boot applies
+   * its captured set as the person has since left it, so a surface they
+   * replaced never returns beside their choice, and a key their command kept
+   * checked still activates. The exclusivity holds too, since a command that
+   * turns any surface on has already turned the boot's surface off. With no
+   * command in the window no key has an intent yet, and every key activates
+   * exactly as before, with one automatic exception: a `studio=place` deep
+   * link whose Place studio mounts first records off intent for the surface
+   * its clean display sets aside (src/state/display-snapshot.ts,
+   * `beginPlaceStudioDisplay`). The end state is the same; that surface is
+   * simply no longer started and then cancelled here. Boot-only and called
+   * once: `desiredOn` is never cleared, so a second caller would skip every
+   * key a person has ever touched.
    */
   async function applyLayerSet(keys: Iterable<string>): Promise<void> {
+    // Enforce the boot-only rule (found-128): a second call is refused, not
+    // silently reduced to the keys no command has touched.
+    if (layerSetApplied) throw new Error('applyLayerSet is boot-only');
+    layerSetApplied = true;
     const tasks: Array<Promise<void>> = [];
     for (const key of keys) {
       const def = getLayerDef(key);
-      if (!def) continue;
+      if (!def || desiredOn.has(key)) continue;
       view.setCheckbox(key, true);
       tasks.push(activateWithIndicator(def));
     }
     await Promise.allSettled(tasks);
   }
 
-  /** Fire-and-forget activation (void, not awaited). */
-  function ensureActive(key: string): void {
-    void activate(key);
-  }
-
-  return { activate, deactivate, applyPreset, applyLayerSet, ensureActive };
+  return { activate, deactivate, applyPreset, applyLayerSet };
 }

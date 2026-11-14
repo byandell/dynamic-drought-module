@@ -9,7 +9,9 @@
  * documented in `data/README.md`. An empty placeholder is therefore the
  * expected first-run state, not an error; this module surfaces it as the
  * canonical `'no-data'` status (rendered by the sidebar as
- * "no data (see data/README.md)") and renders nothing visible.
+ * "no data") and renders nothing visible. The map's
+ * own Tribal boundaries are public data at T0 from public federal sources;
+ * the empty slot is about provenance and currency, not secrecy.
  *
  * Status reporting goes through the LayerRegistry (`registry.setStatus`,
  * wired below); the canonical states live in `src/types/layer.ts`. (An
@@ -17,20 +19,22 @@
  * long after the registry wiring landed; corrected 2026-07-28,
  * ground-truth audit.)
  *
- * Source / property reference: Bureau of Indian Affairs (BIA) American
- * Indian / Alaska Native Land Area Representation (AIAN-LAR), clipped to
- * the Pacific Northwest (PNW) by the deployer.
+ * Source: the deployment's own boundary data. The public federal boundaries
+ * (US Census AIANNH, BIA AIAN-LAR) already draw live through `aiannh.ts` and
+ * `bia-reservations.ts` with their sources named; the properties this layer
+ * reads are listed in `data/README.md`.
  */
 
 import type * as maplibregl from 'maplibre-gl';
 import type { FeatureCollection, GeoJsonProperties } from 'geojson';
 import { URLS } from '../config/urls';
 import { TRIBAL_FILL_COLOR, TRIBAL_OUTLINE_COLOR } from '../config/palette';
-import { buildTribalPopupHtml } from '../ui/popups';
+import { buildTribalPopupModel } from '../ui/popups';
+import { buildPlaceConditionsHtml } from '../ui/popup-conditions';
 import { buildBoundaryContext, resolveBoundaryTitle } from '../impact/context';
 import { registerClickTarget } from '../map/interaction-coordinator';
 import { registry } from '../state/registry';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchBufferedWithBudget } from '../util/fetch';
 
 /* ---------------------------------------------------------------------------
  * Identifiers
@@ -99,7 +103,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 
   let geojson: FeatureCollection;
   try {
-    const response = await fetchWithBudget(URLS.tribalLandsLocal, null, signal, FETCH_TIMEOUT_MS);
+    const response = await fetchBufferedWithBudget(URLS.tribalLandsLocal, null, signal, FETCH_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
@@ -223,10 +227,10 @@ export function bindPopups(_map: maplibregl.Map): void {
     kind: 'tribal-lands',
     layerIds: [FILL_LAYER_ID],
     label: (feature) => resolveBoundaryTitle('tribal', feature.properties ?? null),
-    respond: (feature, click) => {
+    respond: (feature, click, map) => {
       const props: GeoJsonProperties = feature.properties ?? null;
       return {
-        content: buildTribalPopupHtml(props),
+        model: buildTribalPopupModel(props, buildPlaceConditionsHtml(map, click.point, feature)),
         selection: buildBoundaryContext('tribal', props, feature.geometry, click.lngLat),
         // An id-less feature clears any prior emphasis (the old
         // emphasizePlace contract) rather than lighting an unknown one.

@@ -127,11 +127,11 @@ export const REGIONS: Record<RegionKey, Region> = {
     memberStates: ['WA']
   },
   national: {
-    // The national explore framing (E1 of the national roadmap). The curated
-    // PNW framings above remain the deployment's identity and default; this
-    // entry lets a user pull back to the contiguous United States, where the
-    // national layers (USDM, NIFC, WHP, BIA AIAN-LAR, gridded SPI) already
-    // cover the whole view. The bundled telemetry stations and the ecoregion
+    // The national explore framing (E1 of the national roadmap), and since
+    // DR-109 the default: a load with no region parameter frames the
+    // contiguous United States. The curated PNW framings above remain the
+    // deployment's identity; here the national layers (USDM, NIFC, WHP, BIA
+    // AIAN-LAR, gridded SPI) already cover the whole view. The bundled telemetry stations and the ecoregion
     // tile bundle remain PNW-scoped for now; their status pills stay honest
     // outside the PNW.
     label: 'United States',
@@ -182,12 +182,16 @@ export const REGIONS: Record<RegionKey, Region> = {
     // on 2026-07-27; this framing describes source coverage, not a boundary.
     bounds: [[48.2975, -139.0614], [60.0020, -114.0534]],
     padding: 0.4,
-    description: 'Province-wide basin drought-level framing; Canadian briefings are unavailable.',
+    // DRAFT wording (DR-177)
+    description: 'Province-wide framing; Canadian briefings are unavailable.',
     group: 'canada',
     coverageFamily: 'canada',
+    // DR-160 (2026-09-28): the Province of British Columbia basin edition
+    // is held; this region's upstream coverage is the Canadian Drought
+    // Monitor until the hold lifts.
     sourceEditions: [{
-      source: 'bc-basin',
-      cadence: 'weekly-in-season',
+      source: 'cdm',
+      cadence: 'monthly',
       scope: 'full'
     }]
   }
@@ -195,8 +199,14 @@ export const REGIONS: Record<RegionKey, Region> = {
 
 /**
  * Default region key used when no `region` URL parameter is present.
+ *
+ * DR-109 (S30D D1): the default frames the contiguous United States, not
+ * the Pacific Northwest. An old link or embed with no `region=` now opens
+ * on `national`; a deployer or embedder that wants the prior Washington
+ * framing adds `region=washington_state` explicitly (README.md's
+ * parameter table and the v0.8.0 release note carry the same sentence).
  */
-export const DEFAULT_REGION: RegionKey = 'washington_state';
+export const DEFAULT_REGION: RegionKey = 'national';
 
 /**
  * Convert a Region's Leaflet-shaped bounds (`[[south, west], [north, east]]`)

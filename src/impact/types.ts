@@ -18,9 +18,13 @@
  * supplies the long-range modifier.
  */
 
+import type { Geometry } from 'geojson';
 import type { RegionKey } from '../config/regions';
+import type { PlaceRef } from '../config/entities';
 import type { BriefingSourcePolicy } from './source-policy';
 import type { LayerStatus } from '../types/layer';
+import type { StateCode } from './resources';
+import type { ProductKey } from '../config/products';
 
 /**
  * What kind of knowledge a claim rests on (the 0.8.0 evidence/claim contract,
@@ -63,6 +67,14 @@ export interface ClaimSupport {
   readonly effective?: string;
   /** What the claim reports over, for example "statewide" or "basin forecast point". */
   readonly reporting?: string;
+  /**
+   * DDM-P13-T02: the key of the `src/ui/legend-registry.ts` section that
+   * carries this claim's product legend (for example `'usdm'`, `'heatrisk'`),
+   * when that legend already exists in the app. Set only to a key a real
+   * legend section is built under; the renderer uses this to make the
+   * per-product legend reachable from the claim, never to invent one.
+   */
+  readonly legendKey?: string;
 }
 
 /**
@@ -79,7 +91,122 @@ export interface ClaimMethod {
   readonly version?: string;
   readonly baseline?: string;
   readonly sourceVintage?: string;
+  /**
+   * DDM-P13-T02: the issuer's own statement of the method or basis behind the
+   * claim's value (for example a percentile basis or a forecast-period
+   * definition), quoted from prose the tree already carries elsewhere
+   * (never authored fresh at a construction site). Renders as its own line
+   * beneath the source, under the claim that carries it.
+   */
+  readonly basis?: string;
 }
+
+/**
+ * A typed reading beside a claim's text (owner direction 2026-11-09 (sprint),
+ * DR-pending): the issuer's own class, as data, for the surfaces that draw a
+ * gauge instead of a sentence (the priority briefing, src/ui/briefing-lead.ts).
+ *
+ * Three rules hold for every member. It is set at the claim's construction
+ * site, from the same parsed issuer field the sentence was built from, never
+ * parsed back out of prose. It adds no claim: source, dates, evidence class
+ * and product key are the claim's own. And it carries only what the issuer
+ * sent: a class the parser could not read yields no reading at all.
+ *
+ * `window`, where present, is the issuer's own validity window as epoch
+ * milliseconds, each edge set only when the issuer field gave it.
+ */
+export interface ReadingWindow {
+  readonly from?: number;
+  readonly to?: number;
+}
+
+/** U.S. Drought Monitor category at a point: `DM` 0 to 4 (D0 to D4), or null
+ * when no D0 to D4 polygon contains the point (never a "no drought" finding). */
+export interface UsdmCategoryReading {
+  readonly kind: 'usdm-category';
+  readonly dm: 0 | 1 | 2 | 3 | 4 | null;
+  readonly window?: ReadingWindow;
+  /** 'area' when `dm` is the worst category meeting the place's own outline; omitted for a point read. */
+  readonly scope?: 'area';
+}
+
+/** NWS HeatRisk class at a point for one 24-hour period: 0 to 4, or null for
+ * the service's NoData cell. `day` is the catalog day (1 to 7). */
+export interface HeatRiskLevelReading {
+  readonly kind: 'heatrisk-level';
+  readonly value: 0 | 1 | 2 | 3 | 4 | null;
+  readonly day: number;
+  readonly window?: ReadingWindow;
+}
+
+/**
+ * NWS products in effect at a point, by their verbatim `event` names, for one
+ * hazard row. An empty list is the read "none of this row's products is in
+ * effect", which is an absence the issuer feed established, not an all-clear.
+ */
+export interface NwsProductsReading {
+  readonly kind: 'nws-products';
+  readonly events: readonly string[];
+}
+
+/** Current mapped WFIGS perimeters intersecting the selection's bounding box,
+ * counted by incident class. `lowerBound` marks a count cut at the record cap. */
+export interface WfigsPerimetersReading {
+  readonly kind: 'wfigs-perimeters';
+  readonly wildfire: number;
+  readonly prescribed: number;
+  readonly other: number;
+  readonly lowerBound: boolean;
+}
+
+/**
+ * SPC Fire Weather Outlook at a point for the day or days one claim speaks
+ * for. `category` is the Day 1 or Day 2 `dn` (5, 8, 10); `probability` is the
+ * Days 3 to 8 `label` as the service sends it; neither set means no area is
+ * drawn over the point for those days.
+ */
+export interface SpcFireDaysReading {
+  readonly kind: 'spc-fire-days';
+  readonly days: readonly number[];
+  readonly category?: 5 | 8 | 10;
+  readonly probability?: '0.40' | '0.70' | 'Probability Too Low';
+  readonly window?: ReadingWindow;
+}
+
+/** NOAA CPC tercile outlook at a point: the service's `cat` code and `prob`. */
+export interface CpcTercileReading {
+  readonly kind: 'cpc-tercile';
+  readonly variable: 'temperature';
+  readonly cat: 'Above' | 'Below' | 'Normal' | 'EC';
+  readonly prob: number;
+  /** The issuer's season label as the claim states it, for example "Sep-Oct-Nov 2026". */
+  readonly season: string;
+}
+
+/**
+ * The observed ENSO index state: the newest operational RONI season and the
+ * CPC threshold conditions the snapshot states for it.
+ */
+export interface EnsoIndexReading {
+  readonly kind: 'enso-index';
+  readonly index: 'RONI';
+  readonly value: number;
+  readonly season: string;
+  readonly year: number;
+  readonly preliminary: boolean;
+  readonly conditions: 'el-nino' | 'la-nina' | 'neutral';
+  /** The CPC threshold, in degrees Celsius, as the snapshot carries it. */
+  readonly threshold: number;
+}
+
+export type ClaimReading =
+  | UsdmCategoryReading
+  | HeatRiskLevelReading
+  | NwsProductsReading
+  | WfigsPerimetersReading
+  | SpcFireDaysReading
+  | CpcTercileReading
+  | EnsoIndexReading;
 
 /**
  * One sourced statement in a horizon, under the evidence/claim contract
@@ -96,6 +223,26 @@ export interface SourcedClaim {
   readonly sourceUrl?: string;
   /** What kind of knowledge the statement rests on. Required; set truthfully. */
   readonly evidence: EvidenceClass;
+  /**
+   * The catalog product this claim reads (DDM-P14-T05 microtask 2), a key
+   * into `PRODUCTS` in `src/config/products.ts`. Required so every claim
+   * traces to the issuer, endpoint, layer and lane one catalog entry
+   * records; validated at runtime against `PRODUCT_KEYS` by `makeClaim`,
+   * never set independently of that catalog.
+   */
+  readonly product: ProductKey;
+  /**
+   * An explicit observed/outlook register that overrides `CLAIM_REGISTER_TAG`'s
+   * per-evidence-class default (DR-070 amended 2026-09-08): HeatRisk is
+   * `classified` evidence (the badge stays Classified, an issuer-published
+   * class of a currently valid state) but the issuer's own words describe a
+   * forecast, so its register reads `outlook` in the briefing and on the time
+   * bar alike. Set only where the owner has ruled a per-claim exception;
+   * every other classified claim, and every other evidence class, still gets
+   * its register from the class default. Read through `claimRegisterTag` in
+   * `src/impact/evidence.ts`, never this field or the table directly.
+   */
+  readonly register?: 'observed' | 'outlook';
   /**
    * Legacy compatibility tone, DERIVED from `evidence` by `makeClaim`
    * (observation for observed/analyzed/classified; outlook for the
@@ -123,6 +270,29 @@ export interface SourcedClaim {
    * claim text. Trusted, self-generated markup; never user-supplied.
    */
   readonly chartSvg?: string;
+  /**
+   * The hazard rows of the briefing matrix this claim belongs in. Omitted
+   * when the claim belongs to every hazard row its lane feeds, which is the
+   * usual case: a lane declares its hazards once (`src/impact/matrix.ts`)
+   * and only a claim that departs from its lane names its own. Set it where
+   * one fetch answers for more than one hazard, so a claim can never land in
+   * a row its issuer does not speak for.
+   */
+  readonly hazards?: readonly HazardKey[];
+  /**
+   * The horizon column this claim belongs in. Omitted when the claim belongs
+   * to its lane's only horizon. Set it where one fetch answers across
+   * horizons (the ENSO snapshot reads a current index state and a seasonal
+   * tendency from one file), so each claim sits under the clock it speaks
+   * for.
+   */
+  readonly horizon?: HorizonKey;
+  /**
+   * The issuer's class as data, beside the sentence (see `ClaimReading`).
+   * Optional: a claim with no single issuer class carries none, and a reader
+   * that finds none falls back to the sentence, never to a guessed class.
+   */
+  readonly reading?: ClaimReading;
 }
 
 /**
@@ -138,23 +308,52 @@ export type HorizonStatus = 'loading' | 'ready' | 'partial' | 'unavailable';
 /** Stable keys for the three temporal horizons. */
 export type HorizonKey = 'current' | 'nearTerm' | 'longRange';
 
+/** Stable keys for the four hazard rows of the briefing matrix. */
+export type HazardKey = 'drought' | 'fire' | 'heat' | 'enso';
+
 /**
- * One temporal horizon section of the briefing. Wildfire and extreme heat are
- * foregrounded inside `claims`, not modeled as separate fields, so the
- * ordering of claims (drought state, then wildfire, then heat, then water)
- * carries the foregrounding.
+ * One cell of the four-hazard by three-horizon matrix: what this briefing can
+ * say about one hazard at one horizon, and nothing else.
+ *
+ * A cell owns its own claims, its own status, and its own note, so a hazard
+ * can never borrow the issuer or the validity clock of the hazard beside it.
+ * A cell with no claims always carries a `note` that names the product it is
+ * missing and why; an empty cell with no explanation is a defect, not a
+ * state.
+ */
+export interface HazardCell {
+  readonly hazard: HazardKey;
+  readonly horizon: HorizonKey;
+  /** The row label, for example "Drought". */
+  readonly label: string;
+  claims: SourcedClaim[];
+  status: HorizonStatus;
+  /** The named unavailable, partial, or empty state for this cell alone. */
+  note?: string;
+}
+
+/**
+ * One temporal horizon section of the briefing, holding the four hazard rows
+ * of that horizon (DR-012 b: three horizon sections, four hazard rows each).
+ *
+ * `cells` is authoritative. `claims` remains the flattened view of the same
+ * content in hazard order, for the consumers that read one leading line out
+ * of the briefing rather than rendering the matrix.
  */
 export interface Horizon {
   readonly key: HorizonKey;
-  /** Section heading, for example "Current conditions". */
+  /** Section heading, for example "Current Conditions" (`HORIZON_CHROME`). */
   readonly title: string;
   /** Short definition of the time window, for example "now". */
   readonly subtitle: string;
+  /** The four hazard cells of this horizon, keyed by hazard. */
+  cells: Record<HazardKey, HazardCell>;
   claims: SourcedClaim[];
   status: HorizonStatus;
   /**
-   * Optional honest note shown when the horizon is unavailable or partial,
-   * for example "The near-term temperature outlook source did not respond."
+   * Optional honest note for the horizon as a whole, used only by the
+   * capability path that reports the whole synthesis unavailable. Per-cell
+   * honesty lives on `cells`, never here.
    */
   note?: string;
 }
@@ -275,6 +474,8 @@ export interface PointHeatGridGuidance {
   note?: string;
   office?: string;
   gridId?: string;
+  gridX?: number;
+  gridY?: number;
   generatedAt?: string;
   metrics: readonly PointHeatMetricSeries[];
 }
@@ -339,11 +540,26 @@ export interface HeatSynthesis {
 export type BoundaryKind = 'ecoregion' | 'tribal' | 'aiannh' | 'treaty' | 'bia-reservation' | 'state' | 'watershed';
 
 /**
+ * What contains the selected place, resolved FROM THE PLACE. THE INVARIANT:
+ * the camera region is NEVER a basis here. `basis: 'none'` with `state: null`
+ * is the honest answer when the place's own state is unknown; it must never
+ * be filled in from `regionKey`. A consumer may still fall back to the
+ * region afterwards, but that fallback must be visible at the consumer
+ * (see `resolveStateCode`, src/impact/resources.ts), never hidden inside
+ * this field.
+ */
+export interface ContainingPlaces {
+  readonly state: StateCode | null;
+  readonly basis: 'feature-property' | 'point-in-polygon' | 'none';
+}
+
+/**
  * The context handed from a boundary click to the briefing composer. Carries
  * the clicked feature's identity (kind, title, raw properties), the click
  * location, an optional bounding box derived from the feature geometry (used
- * to clip live queries in Phase 3), and the active region key (for resource
- * framing).
+ * to clip live queries in Phase 3), the active region key (for resource
+ * framing), and what the place is known to be contained by, resolved from
+ * the place itself rather than the camera (see `ContainingPlaces`).
  */
 export interface BoundarySelectionContext {
   readonly kind: BoundaryKind;
@@ -351,8 +567,44 @@ export interface BoundarySelectionContext {
   readonly title: string;
   /** The clicked feature's raw GeoJSON properties (may be null). */
   readonly properties: Readonly<Record<string, unknown>> | null;
-  /** Click location in WGS 84. */
+  /** Click location in WGS 84, or a point inside the place when `pointInsidePlace` is set. */
   readonly lngLat: { readonly lng: number; readonly lat: number };
+  /**
+   * True when `lngLat` is a point the app chose inside the selected place
+   * (`representativePoint`: a deep link, a search, a Place Studio selection),
+   * not a click, so point reads must not say "the clicked point". Omitted for a click.
+   */
+  readonly pointInsidePlace?: boolean;
+  /**
+   * Where a non-click point read is made when the point is not inside the place's
+   * land (a headquarters town): point reads say "at <readAt>", never "the clicked point".
+   */
+  readonly readAt?: string;
+  /**
+   * The place's whole outline as its publishing service supplied it, set only
+   * beside `pointInsidePlace` (a search, Locate, Place Studio or State
+   * briefing). The USDM read is made over it (sources.ts `fetchUsdmClaims`).
+   * Never a click's tile-clipped outline.
+   */
+  readonly placeGeometry?: Geometry | null;
+  /**
+   * The service's own area name ('Census area: Creek OTSA'), set only when a
+   * search titles the selection with a trusted formal Nation name. Shown beside
+   * the kind in the briefing subtitle.
+   */
+  readonly areaLabel?: string;
+  /**
+   * One plain line the briefing carries first, set by a search row for a
+   * Nation no federal area the map names finds: a state-recognized Census
+   * area, or the Nation's headquarters town.
+   */
+  readonly landNote?: string;
+  /**
+   * The briefing subtitle in place of the kind's own label, for a selection
+   * no boundary service drew (a Nation's headquarters town). Such a selection
+   * carries no boundary caveat: there is no boundary.
+   */
+  readonly kindLabel?: string;
   /**
    * Compatibility feature bounding box `[west, south, east, north]`, when
    * derivable. A crossing geometry retains its naive min/max walk here.
@@ -376,6 +628,21 @@ export interface BoundarySelectionContext {
   readonly bboxCrossesAntimeridian?: boolean;
   /** Active region key, or null if no region is selected yet. */
   readonly regionKey: RegionKey | null;
+  /** What contains the selected place, resolved from the place, never the camera region. */
+  readonly containing: ContainingPlaces;
+  /**
+   * The canonical `scheme:code` identity of the selected place (DDM-P2-T09),
+   * filled from the selected feature's OWN properties (`placeRefFromBoundary`,
+   * src/config/entities.ts), never from the camera or the active region. Null
+   * when the feature carries no stable code for its kind ('tribal', 'treaty',
+   * or a property miss); identity only, never a claim, and never URL state.
+   * Optional since the C3 housekeeping commit (2026-09-12): no reader exists
+   * yet, so the two boot doors (the interaction coordinator's condition door
+   * and the deep link's `select=` door) omit it and keep src/config/entities.ts
+   * out of the entry chunk, while `buildBoundaryContext` still fills it on
+   * the lazy path. DR-099 / DDM-P2-T13 (S31) is the first reader.
+   */
+  readonly place?: PlaceRef | null;
 }
 
 /**

@@ -16,16 +16,14 @@
  * Attribute honesty: issuer sentinel values are preserved verbatim
  * (VOLTAGE -999999 means unknown; OWNER and VOLT_CLASS may be
  * 'NOT AVAILABLE'); the presentation maps them to a disclosed
- * thinnest-width read, never to a fabricated value. Some source
- * geometries carry OpenStreetMap provenance (the SOURCE field), so the
- * attribution names OpenStreetMap contributors.
+ * thinnest-width read, never to a fabricated value.
  *
  * Usage: npm run build:power-tiles
  */
 
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { PMTiles } from 'pmtiles';
 import { transformWithOxc } from 'vite';
 import { geojsonLayersToPmtiles } from './lib/geojson-to-pmtiles.mjs';
@@ -45,11 +43,13 @@ const PNW_CENTER = [-119, 45.5, 5];
  *   z12  6,204,921 bytes  10,069 tiles   root directory  18,678 bytes
  *
  * z12 fits the 8,000,000-byte archive ceiling comfortably, so the limit
- * that stopped it is NOT size: this repository's PMTiles writer emits a
+ * that stopped it is NOT size: this repository's PMTiles writer emitted a
  * single root directory, and at z12 that directory runs past the
  * 16,384-byte first request every PMTiles reader makes, producing a file
- * that opens nowhere. The writer now refuses that outright rather than
- * writing an unreadable archive. Deeper bakes need leaf directories.
+ * that opens nowhere. The writer refused such a root until S30D-N2 W1
+ * (2026-09-30), which splits an oversized root into leaf directories
+ * (scripts/lib/pmtiles-writer.mjs), so a z12 bake is now writable; the
+ * default stays z11 until a re-bake is measured and ruled.
  *
  * Override with `--max-zoom N` to re-measure the ladder; `--dry-run`
  * skips the write.
@@ -79,8 +79,6 @@ const MAX_EXPECTED_FEATURES = 20_000;
  */
 const MAX_ARCHIVE_BYTES = 8_000_000;
 const FIELDS = ['ID', 'TYPE', 'STATUS', 'OWNER', 'VOLTAGE', 'VOLT_CLASS', 'SOURCEDATE', 'VAL_DATE'];
-/** UTC retrieval date, matching the archive attribution's own clock. */
-const RETRIEVED = new Date().toISOString().slice(0, 10);
 
 const OUT_PATH = fileURLToPath(new URL('../public/data/power-lines-pnw.pmtiles', import.meta.url));
 
@@ -146,25 +144,44 @@ const CACHE_PATH = fileURLToPath(
   new URL('./.cache/power-lines-pnw-raw.geojson', import.meta.url)
 );
 
-async function readCachedFeatures() {
+async function readCachedPull() {
   try {
     const raw = await readFile(CACHE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed?.features)) return null;
     console.log(`  using cached pull: ${CACHE_PATH} (${parsed.features.length} features)`);
-    return parsed.features;
+    return parsed;
   } catch {
     return null;
   }
 }
 
-async function main() {
+/**
+ * A cache pulled for another box or field list would bake stale data under
+ * the new request. Refuse rather than refetch (the upstream is archived); a
+ * legacy cache that predates the record only warns.
+ */
+function assertCacheMatchesRequest(cached) {
+  if (cached.bbox === undefined && cached.fields === undefined) {
+    console.warn('  WARNING: cached pull predates its bbox/fields record; delete it after changing either');
+    return;
+  }
+  if (JSON.stringify(cached.bbox) !== JSON.stringify(PNW_BBOX) || JSON.stringify(cached.fields) !== JSON.stringify(FIELDS)) {
+    throw new Error(`cached pull was made with a different bbox or field list; delete ${CACHE_PATH} to refetch`);
+  }
+}
+
+export async function main() {
   console.log('power transmission-line bake (archived HIFLD copy, PNW box)');
   console.log(`  service: ${SERVICE}`);
   console.log(`  max zoom: ${MAX_ZOOM}${DRY_RUN ? ' (dry run)' : ''}`);
 
-  let features = await readCachedFeatures();
-  if (features === null) {
+  const cached = await readCachedPull();
+  let features = cached?.features;
+  let retrieved = typeof cached?.retrieved === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(cached.retrieved)
+    ? cached.retrieved : 'unknown';
+  if (cached !== null) assertCacheMatchesRequest(cached);
+  if (cached === null) {
     features = [];
     let exhausted = false;
     for (let page = 0; page < MAX_PAGES; page++) {
@@ -186,10 +203,11 @@ async function main() {
         `page budget (${MAX_PAGES}) spent with the server still reporting more data; refusing to bake a truncated archive`
       );
     }
+    retrieved = new Date().toISOString().slice(0, 10);
     await mkdir(dirname(CACHE_PATH), { recursive: true });
     await writeFile(
       CACHE_PATH,
-      JSON.stringify({ type: 'FeatureCollection', features })
+      JSON.stringify({ type: 'FeatureCollection', features, retrieved, bbox: PNW_BBOX, fields: FIELDS })
     );
     console.log(`  cached the raw pull at ${CACHE_PATH}`);
   }
@@ -210,9 +228,8 @@ async function main() {
 
   const attribution =
     'U.S. Electric Power Transmission Lines (HIFLD, U.S. Government), via the Esri ' +
-    'Federal User Community archive; includes OpenStreetMap-derived geometries ' +
-    '(OpenStreetMap contributors); ARCHIVED source, last data update 2024-09-30, ' +
-    `no longer maintained; retrieved ${RETRIEVED}; not comprehensive or current and ` +
+    'Federal User Community archive; ARCHIVED source, last data update 2024-09-30, ' +
+    `no longer maintained; retrieved ${retrieved}; not comprehensive or current and ` +
     'not for siting or safety-critical decisions.';
 
   const { archive, tileCount } = geojsonLayersToPmtiles(
@@ -239,12 +256,7 @@ async function main() {
     );
     return;
   }
-  await writeFile(OUT_PATH, archive);
-  console.log(
-    `  wrote ${OUT_PATH} (${archive.length.toLocaleString()} bytes, ${tileCount} tiles, ${features.length} features)`
-  );
-
-  // Read-back validation through the runtime reader.
+  // Read-back validation through the runtime reader, before the write.
   const source = {
     getKey: () => 'build',
     getBytes: async (offset, length) => {
@@ -259,9 +271,15 @@ async function main() {
   console.log(`  header zooms ${header.minZoom}..${header.maxZoom}, tileType ${header.tileType}`);
   console.log(`  vector_layers: ${meta.vector_layers.map((l) => l.id).join(', ')}`);
   console.log(`  attribution: "${meta.attribution}"`);
+  await writeFile(OUT_PATH, archive);
+  console.log(
+    `  wrote ${OUT_PATH} (${archive.length.toLocaleString()} bytes, ${tileCount} tiles, ${features.length} features)`
+  );
 }
 
-main().catch((err) => {
-  console.error('build-power-tiles failed:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error('build-power-tiles failed:', err);
+    process.exit(1);
+  });
+}

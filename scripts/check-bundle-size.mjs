@@ -3,21 +3,37 @@
  * ratification 9.9 item 2a; hardened by D-0.7.0-045 at the S1 unit).
  * The maplibre and pmtiles vendor chunks are exempt as cache-stable.
  *
- * TWO ENFORCED LINES (D-0.7.0-045: "state both numbers, and the gate
- * command enforces both"):
+ * THREE ENFORCED LINES (D-0.7.0-045: "state both numbers, and the gate
+ * command enforces both"; the third line added under DR-158, found-085).
+ * Until DR-085 amendment_2026_09_12, the first two lines were fixed
+ * ceilings (45 kB entry, 100 kB eager app) that no measurement backed.
+ * That amendment replaced both with a ratified measurement plus
+ * ACTIVATION_HEADROOM (50 percent until 0.8.x, rounded to one decimal), the same
+ * rule and the same constant name as check-activation-budget.mjs, so
+ * the two gates read the same way even though they do not share code:
  *
  *   1. The ENTRY line: the entry chunk (assets/index-*.js) must stay
- *      under 45 kB gzip BY DEFAULT (the ADR 0002 condition; no
- *      remembered flag). --budget overrides this line only, for
- *      exploratory checks; the default is the gate.
+ *      under RATIFIED_ENTRY_KB plus headroom BY DEFAULT (the ADR 0002
+ *      condition; no remembered flag). --budget overrides this line
+ *      only, as an exploratory check; the default is the gate.
  *   2. The APP line: the eager boot payload (entry plus every
  *      modulepreload in dist/index.html, vendor exempt) must stay
- *      under 100 kB gzip, always. Enforcing it on the eager total
- *      keeps weight from hiding in a preloaded shared chunk.
+ *      under RATIFIED_EAGER_KB plus headroom, always. Enforcing it on
+ *      the eager total keeps weight from hiding in a preloaded shared
+ *      chunk.
+ *   3. The HTML line (DR-158, found-085): the built dist/index.html's
+ *      own gzip size (the file's bytes, not just the asset names it
+ *      names) must stay at or under RATIFIED_HTML_GZIP_B (9,000 B, the
+ *      ratified measurement) plus the same 8 percent headroom,
+ *      inclusive: 9,720 B computed in raw bytes, never rounded to kB
+ *      first (rounding to one decimal kB would turn 9.0 kB plus 8
+ *      percent into 9.7 kB and wrongly reject a page that gzips to
+ *      9,631 to 9,720 B, the measured range at ratification).
  *
  * Lazy chunks and CSS are informational.
  *
- * npm semantics: exit 0 under both lines, exit 1 over either or when
+ * npm semantics: exit 0 below both app lines and at or below the HTML
+ * line, exit 1 at/over an app line, over the HTML line, or when
  * dist/ is missing (run `npm run build` first; the gate script
  * sequences that). Sizes are reported in kB of 1000 bytes to match
  * Vite's build report.
@@ -29,14 +45,61 @@ import { gzipSync } from 'node:zlib';
 
 const DIST = 'dist';
 const ASSETS = join(DIST, 'assets');
-const DEFAULT_BUDGET_KB = 45;
-const APP_LINE_KB = 100;
+
+// Owner-ratified 2026-10-07: DR-085
+// bundle_measurements_ratified_2026_10_07. The W2 PMTiles repair bounds
+// range bodies and shared-reader cancellation; measured growth is 928 B
+// entry and 929 B eager. Ratified measurement build index SHA256:
+// 523bb337df88c34c7c94763ffe3fa10c0aaae25d9ae96c99e28dbc281051d009.
+// Future re-recording requires measured
+// bytes, a dated reason and owner ratification; headroom stays unchanged.
+const RATIFIED_ENTRY_KB = 38.637;
+
+// Eager boot payload (entry plus modulepreload, vendor exempt), from
+// the same 2026-10-07 measurement and owner ruling as the entry above.
+// First-party transport bytes are included; no vendor exemption changed.
+const RATIFIED_EAGER_KB = 56.619;
+
+// The last ratified measurement of the built dist/index.html's own gzip
+// size (DR-158, found-085): 9,000 B, measured near 8,452 to 9,631 B across
+// the D1 landing runs (RATIFICATION-6 Q7; I:/claude-temp/ddm-s30d/gates/
+// d1-m7.log). Kept in raw bytes, not kB, so the 8 percent headroom below
+// is computed on whole bytes and never loses precision to kB rounding.
+const RATIFIED_HTML_GZIP_B = 9000;
+
+// The one headroom both lines carry above their ratified measurement.
+// Same name and value as check-activation-budget.mjs's constant, by
+// intent (one rule stated twice), not by import: the two scripts do
+// not share code. Fifty percent by the owner's word of 2026-10-12
+// ("loosen them up so that we can get a fully functioning tool"): 0.8.0
+// is every feature working, and 0.8.x re-measures and tightens this back
+// (it was 0.08). Rounded to one decimal it turns 38.637 into 58.0 and
+// 56.619 into 84.9; see budgetForMeasurement() below.
+const ACTIVATION_HEADROOM = 0.5;
+const HEADROOM_PCT = Math.round(ACTIVATION_HEADROOM * 100);
+
+/** The enforced line for a ratified measurement, in kB to one decimal. */
+function budgetForMeasurement(measuredKb) {
+  return Math.round(measuredKb * (1 + ACTIVATION_HEADROOM) * 10) / 10;
+}
+
+// Enforced lines derived from the constants above: 58.0 kB entry, 84.9
+// kB eager app.
+const ENTRY_LINE_KB = budgetForMeasurement(RATIFIED_ENTRY_KB);
+const APP_LINE_KB = budgetForMeasurement(RATIFIED_EAGER_KB);
+
+// The HTML line, in raw bytes (DR-158): 9,000 B plus 8 percent headroom
+// rounded to the nearest whole byte, which is exactly 9,720 B and never
+// goes through the kB-rounding helper above. It keeps its own 8 percent:
+// feature work does not grow index.html.
+const HTML_LINE_B = Math.round(RATIFIED_HTML_GZIP_B * 1.08);
+
 const VENDOR_EXEMPT = /^(maplibre|pmtiles)-/;
 
 const budgetArgAt = process.argv.indexOf('--budget');
 const budgetKb = budgetArgAt !== -1
   ? Number(process.argv[budgetArgAt + 1])
-  : DEFAULT_BUDGET_KB;
+  : ENTRY_LINE_KB;
 if (!Number.isFinite(budgetKb) || budgetKb <= 0) {
   console.error('bundle gate: --budget must be a positive number (kB gzip)');
   process.exit(1);
@@ -79,22 +142,31 @@ const lazyJs = allJs.filter((f) => !eagerSet.has(f));
 const lazyGzip = lazyJs.reduce((sum, f) => sum + gzipBytes(join(ASSETS, f)), 0);
 const cssGzip = allCss.reduce((sum, f) => sum + gzipBytes(join(ASSETS, f)), 0);
 
-console.log(`bundle gate (gzip, kB = 1000 bytes; entry line ${budgetKb} kB, app line ${APP_LINE_KB} kB on the eager app total)`);
+// The HTML line (DR-158, found-085): the built dist/index.html's own gzip
+// size, in raw bytes, never a kB rounding of it.
+const htmlGzip = gzipBytes(join(DIST, 'index.html'));
+
+console.log(`bundle gate (gzip, kB = 1000 bytes; entry line ${budgetKb} kB (ratified ${RATIFIED_ENTRY_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom), app line ${APP_LINE_KB} kB (ratified ${RATIFIED_EAGER_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom) on the eager app total, HTML line ${HTML_LINE_B} B (ratified ${RATIFIED_HTML_GZIP_B} B plus 8% headroom))`);
 console.log(`  app entry chunk    ${kb(entryGzip).padStart(7)} kB  ${entryName}`);
 console.log('  eager boot payload (entry + modulepreload):');
 for (const row of eagerRows) console.log(row);
 console.log(`  eager app total    ${kb(eagerAppGzip).padStart(7)} kB  (vendor-exempt chunks excluded)`);
 console.log(`  lazy chunks        ${kb(lazyGzip).padStart(7)} kB  across ${lazyJs.length} files`);
 console.log(`  stylesheets        ${kb(cssGzip).padStart(7)} kB  across ${allCss.length} files`);
+console.log(`  index.html         ${String(htmlGzip).padStart(7)} B   gzip (HTML line ${HTML_LINE_B} B, ratified ${RATIFIED_HTML_GZIP_B} B plus 8% headroom)`);
 
 let failed = false;
 if (entryGzip / 1000 >= budgetKb) {
-  console.error(`bundle gate: FAIL; app entry chunk ${kb(entryGzip)} kB gzip is at or over the ${budgetKb} kB entry line`);
+  console.error(`bundle gate: FAIL; app entry chunk ${kb(entryGzip)} kB gzip is at or over the ${budgetKb} kB entry line (ratified ${RATIFIED_ENTRY_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom; re-ratify with a new measurement and a dated reason if this growth is real)`);
   failed = true;
 }
 if (eagerAppGzip / 1000 >= APP_LINE_KB) {
-  console.error(`bundle gate: FAIL; eager app total ${kb(eagerAppGzip)} kB gzip is at or over the ${APP_LINE_KB} kB app line`);
+  console.error(`bundle gate: FAIL; eager app total ${kb(eagerAppGzip)} kB gzip is at or over the ${APP_LINE_KB} kB app line (ratified ${RATIFIED_EAGER_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom; re-ratify with a new measurement and a dated reason if this growth is real)`);
+  failed = true;
+}
+if (htmlGzip > HTML_LINE_B) {
+  console.error(`bundle gate: FAIL; index.html ${htmlGzip} B gzip is over the ${HTML_LINE_B} B HTML line (ratified ${RATIFIED_HTML_GZIP_B} B plus 8% headroom; re-ratify with a new measurement and a dated reason if this growth is real, DR-158)`);
   failed = true;
 }
 if (failed) process.exit(1);
-console.log(`bundle gate: clean (entry ${kb(entryGzip)} kB under ${budgetKb} kB; eager app ${kb(eagerAppGzip)} kB under ${APP_LINE_KB} kB)`);
+console.log(`bundle gate: clean (entry ${kb(entryGzip)} kB under ${budgetKb} kB, ratified ${RATIFIED_ENTRY_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom; eager app ${kb(eagerAppGzip)} kB under ${APP_LINE_KB} kB, ratified ${RATIFIED_EAGER_KB.toFixed(1)} kB plus ${HEADROOM_PCT}% headroom; index.html ${htmlGzip} B under ${HTML_LINE_B} B, ratified ${RATIFIED_HTML_GZIP_B} B plus 8% headroom)`);

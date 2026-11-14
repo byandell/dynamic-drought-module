@@ -1,6 +1,7 @@
 import type * as maplibregl from 'maplibre-gl';
 import type { FeatureCollection } from 'geojson';
 
+import { MAP_GROUND_COLOR } from './interface-tokens';
 import { matchExpression } from './style-expressions';
 
 export interface ArcGisPolygonFeatureCollection {
@@ -89,6 +90,14 @@ export function parseArcGisPolygonFeatureCollection(
     throw new Error(`${sourceLabel} response was not a valid FeatureCollection.`);
   }
 
+  // ArcGIS f=geojson can put this collection flag in properties. Either
+  // true value means incomplete; a false at one location must not hide it.
+  const collectionProperties = isRecord(value['properties']) ? value['properties'] : null;
+  const nestedTransferLimit = collectionProperties?.['exceededTransferLimit'];
+  if (nestedTransferLimit !== undefined && typeof nestedTransferLimit !== 'boolean') {
+    throw new Error(`${sourceLabel} response was not a valid FeatureCollection.`);
+  }
+
   for (const feature of value['features']) {
     if (
       !isRecord(feature) ||
@@ -104,7 +113,7 @@ export function parseArcGisPolygonFeatureCollection(
 
   return {
     collection: value as unknown as FeatureCollection,
-    truncated: value['exceededTransferLimit'] === true
+    truncated: value['exceededTransferLimit'] === true || nestedTransferLimit === true
   };
 }
 
@@ -256,6 +265,52 @@ export function nifcIncidentTypeLabel(value: unknown): string {
  * says so. Shared with `src/impact/sources.ts`, which sends it. */
 export const NIFC_AREA_QUERY_RECORD_CAP = 50;
 
+/**
+ * The North America minimap's declared count filter (DDM-P14-T07), and ONLY
+ * the minimap's: `src/state/minimap-wildfire.ts`'s per-region wildfire
+ * counts, whether answered by the minimap's own count-only WFIGS query or
+ * (when the perimeters layer already covers a framing) by filtering that
+ * layer's already-loaded collection client-side instead of asking again.
+ * Active wildfire and incident-complex records only
+ * (`attr_ActiveFireCandidate = 1`, restricted to the `WF`/`CX` codes
+ * `NIFC_INCIDENT_PRESENTATION.wildfire` already names, never Prescribed fire
+ * or an unclassified record); the perimeters LAYER keeps `1=1` and draws
+ * every incident regardless, this filter governs only what the minimap
+ * COUNTS.
+ *
+ * NOT the briefing's filter. `src/impact/sources.ts`'s `fetchNifcClaims`
+ * counts a different, wider set on both of its own paths (every mapped
+ * incident intersecting the selection's bounding box, deduplicated by
+ * `attr_UniqueFireIdentifier`, split by type through
+ * `buildNifcAreaPerimeterClaim`): a design amended after the C3 report's own
+ * review found the earlier version of this comment claiming a shared filter
+ * the two consumers did not actually share the same way. `where` is the
+ * identical Esri where-clause the minimap's own count-only query has sent
+ * since before DDM-P14-T07 (kept here as the one declaration, not restated
+ * in `src/state/minimap-wildfire.ts`); `matches` is the same predicate
+ * evaluated over one already-fetched feature's properties, for the
+ * minimap's collection-read fast path, which issues no request at all.
+ */
+export const MINIMAP_ACTIVE_WILDFIRE_FILTER: {
+  readonly where: string;
+  readonly matches: (
+    properties: Readonly<Record<string, unknown>> | null | undefined
+  ) => boolean;
+} = {
+  where: "attr_ActiveFireCandidate = 1 AND attr_IncidentTypeCategory IN ('WF','CX')",
+  matches(properties) {
+    if (properties === null || properties === undefined) return false;
+    if (Number(properties['attr_ActiveFireCandidate']) !== 1) return false;
+    const code = properties['attr_IncidentTypeCategory'];
+    return (
+      typeof code === 'string' &&
+      (NIFC_INCIDENT_PRESENTATION.wildfire.codes as readonly string[]).includes(
+        code.trim().toUpperCase()
+      )
+    );
+  }
+};
+
 /** What the perimeter query actually covered: a bounding box around the
  * selection, not its boundary. Named in the sentence (DR-024 b) because a
  * box is strictly wider than the boundary, so a positive count over the box
@@ -292,8 +347,10 @@ export function buildNifcAreaPerimeterClaim(
     return `No current mapped NIFC fire perimeters intersect ${NIFC_AREA_QUERY_EXTENT}.`;
   }
 
+  // The cap is this briefing's own resultRecordCount, not the service's limit.
   const floor = options.truncated
-    ? ` The service returned its ${NIFC_AREA_QUERY_RECORD_CAP}-record maximum, so this count is a lower bound.`
+    // DRAFT wording
+    ? ` The service returned the ${NIFC_AREA_QUERY_RECORD_CAP} records this briefing asks for, so this count is a lower bound.`
     : '';
   const verb = total === 1 ? 'perimeter intersects' : 'perimeters intersect';
 
@@ -386,24 +443,24 @@ export function buildNifcLinePaint(
 
 export type HmsDensityClass = 'Light' | 'Medium' | 'Heavy' | 'Unknown';
 
-/** One cool hue, with density carried by opacity and an explicit neutral fallback. */
+/** A warm taupe ramp (owner palette, 2026-10-19), darker with density and carried with opacity, and an explicit neutral fallback. */
 export const HMS_DENSITY_PRESENTATION = {
   Light: {
-    color: '#93a8c4',
+    color: '#aa9c8d',
     opacity: 0.08,
-    legendLabel: 'Light smoke (8% veil)',
+    legendLabel: 'Light smoke',
     popupLabel: 'Light smoke'
   },
   Medium: {
-    color: '#93a8c4',
+    color: '#908477',
     opacity: 0.17,
-    legendLabel: 'Medium smoke (17% veil)',
+    legendLabel: 'Medium smoke',
     popupLabel: 'Medium smoke'
   },
   Heavy: {
-    color: '#93a8c4',
+    color: '#766d62',
     opacity: 0.33,
-    legendLabel: 'Heavy smoke (33% veil)',
+    legendLabel: 'Heavy smoke',
     popupLabel: 'Heavy smoke'
   },
   Unknown: {
@@ -414,8 +471,16 @@ export const HMS_DENSITY_PRESENTATION = {
   }
 } as const;
 
+/** A smoke legend swatch as the map draws the class: its colour at its fill opacity over the map's dark ground. */
+export function hmsLegendSwatch(densityClass: HmsDensityClass): string {
+  const { color, opacity } = HMS_DENSITY_PRESENTATION[densityClass];
+  // Inline legend styles bypass CSS lowering for our supported older browsers.
+  return interpolateHexColor(MAP_GROUND_COLOR, color, opacity);
+}
+
+/** The smoke plumes' note; reads in the Impact Briefing (src/ui/map-technical-information.ts), not in the legend. */
 export const HMS_OVERVIEW_QUALIFICATION =
-  'NOAA Hazard Mapping System, analyst-drawn from GOES imagery; current or previous UTC day. Its plume observation window is independent of the recent NOAA GeoColor basemap frame. Density opacity is presentation, not ground-level air quality.';
+  'NOAA Hazard Mapping System, analyst-drawn from GOES imagery; current or previous UTC day. Its plume observation window is independent of any satellite basemap frame shown. Density opacity is presentation, not ground-level air quality.';
 
 export function resolveHmsDensityClass(value: unknown): HmsDensityClass {
   if (typeof value !== 'string') return 'Unknown';
@@ -611,7 +676,7 @@ export const USFS_WHP_PRESENTATION = {
  * (the bake's own retrieval clock; scripts/build-fuels-tiles.mjs re-fetches
  * the legend on every rebake and HARD-FAILS when this table and the served
  * legend disagree, so the archive's pixels and this key cannot drift
- * apart). The drape drew these colors translucent (DRAPE_OPACITY) so
+ * apart). The drape drew these colors translucent (half opacity) so
  * terrain and incident layers stayed legible; the qualification below
  * discloses that. RETIRED FROM THE SCENE 2026-08-19: the hazard drape
  * replaced it, and this table now serves the builder's cross-check and a
@@ -670,17 +735,6 @@ export const FBFM40_PRESENTATION = {
     // vocab-allow: honesty disclaimer distinguishes the static fuel snapshot from a forecast
     'LANDFIRE 2024 fuel model classes (Scott and Burgan 40), shown with LANDFIRE\'s published class colors, drawn translucent at reduced resolution from the 30 m source; a static classified snapshot of vegetation as fuel, not current conditions, fire behavior, or a forecast.'
 } as const;
-
-/**
- * Drape opacity for the 3D scene's landscape surface.
- *
- * Named for the role rather than the layer since 2026-08-19, when the
- * fuel-model drape was replaced by the hazard drape: half opacity is what
- * keeps a full-viewport classified surface as CONTEXT beneath the
- * perimeters, smoke, and infrastructure that carry the incident, rather
- * than a wall of color the eye reads first. The value is unchanged.
- */
-export const DRAPE_OPACITY = 0.5;
 
 /**
  * Power infrastructure context for the desktop 3D Fire mode.
@@ -832,54 +886,40 @@ export const POWER_SHARED_QUALIFICATION =
   'Not comprehensive or current; never for siting or safety-critical decisions. Substations and distribution circuits are absent because no authoritative public national source publishes them: distribution networks are held privately by utilities, and substation locations have been withheld for security since 2022. Their absence here is not evidence that none are present.';
 
 /**
- * Structures context for the desktop 3D Fire mode: Overture Maps
- * Foundation building footprints (ODbL), central Oregon pilot bake.
+ * Buildings for the desktop 3D Fire mode: USA Structures footprints
+ * (Oak Ridge National Laboratory for the FEMA Geospatial Response Office),
+ * central Oregon pilot bake (scripts/build-structures-tiles.mjs).
  *
- * Height honesty is carried in the paint split: footprints with an
- * issuer-published height extrude to it in the measured tone; the rest
- * draw in a visibly DIMMER tone at a disclosed placeholder height (three
- * meters per published floor, otherwise a fixed four meters).
- * fill-extrusion-opacity is not data-driven in the MapLibre style
- * specification, so the distinction rides color, exactly like the smoke
- * volume's constant-opacity constraint.
+ * The source publishes no height for any footprint in the pilot box (the
+ * bake refuses to run if one appears), so every building stands at ONE low
+ * height, about one storey, in ONE quiet tone: a shape on the ground, never
+ * a measured rise. Both are constants on purpose; a data-driven height or
+ * tone would imply a measurement the source does not carry. The map and its
+ * key carry no credit, source line or caveat (owner, 2026-11-12); the credit
+ * is the Acknowledgements row.
  */
 export const STRUCTURES_PRESENTATION = {
-  measuredColor: '#cfc8bd',
-  placeholderColor: '#78706a',
+  color: '#78706a',
   opacity: 0.85,
-  metersPerFloor: 3,
-  placeholderMeters: 4
+  heightMeters: 4
 } as const;
 
-export function buildStructuresMeasuredPaint(): NonNullable<
+export function buildStructuresPaint(): NonNullable<
   maplibregl.FillExtrusionLayerSpecification['paint']
 > {
   return {
-    'fill-extrusion-color': STRUCTURES_PRESENTATION.measuredColor,
-    'fill-extrusion-height': ['get', 'h'],
+    'fill-extrusion-color': STRUCTURES_PRESENTATION.color,
+    'fill-extrusion-height': STRUCTURES_PRESENTATION.heightMeters,
     'fill-extrusion-base': 0,
     'fill-extrusion-opacity': STRUCTURES_PRESENTATION.opacity
   };
 }
 
-export function buildStructuresPlaceholderPaint(): NonNullable<
-  maplibregl.FillExtrusionLayerSpecification['paint']
-> {
-  return {
-    'fill-extrusion-color': STRUCTURES_PRESENTATION.placeholderColor,
-    'fill-extrusion-height': [
-      'case',
-      ['has', 'f'],
-      ['*', ['get', 'f'], STRUCTURES_PRESENTATION.metersPerFloor],
-      STRUCTURES_PRESENTATION.placeholderMeters
-    ],
-    'fill-extrusion-base': 0,
-    'fill-extrusion-opacity': STRUCTURES_PRESENTATION.opacity
-  };
-}
-
-export const STRUCTURES_QUALIFICATION =
-  'Overture Maps Foundation building footprints (ODbL; includes OpenStreetMap and other open sources), release 2026-07-22.0, central Oregon pilot coverage only, drawn from zoom 13. Buildings extrude to the issuer\'s published height where one exists (72 percent of this bake); the dimmer tone marks a disclosed placeholder height (three meters per published floor, otherwise four meters), never a measured value. Footprints and heights are open-data representations, not parcel, occupancy, or condition records.';
+// DRAFT wording (the owner's call): new public wording, held here and read by
+// nothing, so it renders nowhere. Its home, once approved, is the Impact
+// Briefing, never the map or its key (tests/structures-3d.test.mjs holds that).
+export const STRUCTURES_HEIGHT_NOTE_DRAFT =
+  `Building heights in the 3D view are not measured. The source publishes no height for these buildings, so each one is drawn ${STRUCTURES_PRESENTATION.heightMeters} meters tall, about one story, to show where buildings stand.`;
 
 /**
  * NIFC WFIGS query scope (FE-16, 2026-08-28).
@@ -900,7 +940,15 @@ export const STRUCTURES_QUALIFICATION =
  * latitudes. Measured the same day with the field list: 1.83 MB in 4.5 s.
  * That is a change to what the map shows, not only to transport, so the
  * note below travels with the legend, the popup, and the map key. Viewport
- * or region scoping stays with roadmap task DDM-P1-T06.
+ * scoping is built (DDM-P1-T06, 2026-09-12): the layer now queries an
+ * overscanned envelope of the current view, aiannh.ts's precedent, and
+ * re-queries when the view leaves it, rather than the national `where=1=1`
+ * scan this list was first sized against.
+ *
+ * `attr_ActiveFireCandidate` was added by DDM-P1-T06 for DDM-P14-T07: the
+ * minimap's per-region wildfire counts apply that field's predicate
+ * client-side against the layer's already-loaded collection instead of
+ * issuing their own service query.
  */
 export const NIFC_OUT_FIELDS = [
   'attr_IncidentName',
@@ -911,7 +959,8 @@ export const NIFC_OUT_FIELDS = [
   'attr_IncidentSize',
   'poly_GISAcres',
   'attr_FireDiscoveryDateTime',
-  'attr_POOState'
+  'attr_POOState',
+  'attr_ActiveFireCandidate'
 ] as const;
 
 /** Degrees of EPSG:4326; see the note above for the metric equivalent. */
@@ -920,10 +969,10 @@ export const NIFC_MAX_ALLOWABLE_OFFSET_DEG = 0.0005;
 /** Coordinate decimal places requested from the service (about one meter). */
 export const NIFC_GEOMETRY_PRECISION = 5;
 
-/** The full statement, for the sidebar legend and the perimeter popup. */
+/** The full statement, for Technical information and the perimeter popup. */
 export const NIFC_GENERALIZATION_NOTE =
   'Outlines are generalized by the NIFC service for display at a 0.0005 degree tolerance (roughly 37 to 56 m across mapped United States latitudes); the displayed edge is not the full-resolution source geometry.';
 
-/** The compact statement for the on-map key. */
-export const NIFC_KEY_GENERALIZATION_NOTE =
-  'Outlines generalized by the service at 0.0005 degree (up to about 56 m); not for tactical or evacuation decisions.';
+/** The perimeters' note; reads in the Impact Briefing (src/ui/map-technical-information.ts), not in the legend. */
+export const NIFC_PERIMETER_TECHNICAL_NOTE =
+  `NIFC WFIGS current interagency mapped perimeters. ${NIFC_GENERALIZATION_NOTE} Service cadence does not establish individual perimeter age. Not for evacuation, parcel, or tactical decisions; open NIFC for the source record.`;

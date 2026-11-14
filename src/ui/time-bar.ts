@@ -28,8 +28,20 @@
  * Accessibility: the rail is a native range input (arrow keys work, the
  * discrete `step` snaps by construction); the stamp is aria-live polite so
  * a step announces its new date; every button meets the 24 px target rule.
+ *
+ * ONE GRAMMAR (DDM-P8-T03 clause 2, closed by S13 on 2026-09-08). Every
+ * stamp now states the horizon its product answers, and the words come
+ * from `HORIZON_CHROME` (src/impact/horizon-chrome.ts), the same table the
+ * shell's horizon chips and the briefing panel headings read, so a horizon
+ * named anywhere in the interface can only be spelled one way. The owning
+ * layer DECLARES the horizon for the product it shows (`stamp.horizon`)
+ * rather than this module reading the committed timeline horizon: a custom
+ * display can commit a horizon its surface does not answer, and the stamp
+ * must describe the surface on the map, not the pressed chip.
  */
 
+import { HORIZON_CHROME } from '../impact/horizon-chrome';
+import type { HorizonKey } from '../impact/types';
 import { escapeHtml } from '../util/escape';
 
 /** A mode chip row (the USDM absolute / 1-week / 4-week change toggle). */
@@ -49,19 +61,67 @@ export interface TimeBarJump {
   readonly key: string;
   readonly label: string;
   readonly title: string;
-  /** Hatched styling marks a jump INTO the outlook register. */
-  readonly hatched: boolean;
 }
 
 /** The two typographic registers the stamp can render in. */
 export type StampRegister = 'observed' | 'outlook';
 
 export interface TimeBarStamp {
+  /** Feed-check freshness, distinct from a product's observation time. */
+  readonly freshness?: {
+    readonly state: 'current' | 'stale' | 'loading' | 'unavailable';
+    readonly checkedAt: string | null;
+  };
+  /**
+   * The horizon the displayed product answers, rendered as the
+   * `HORIZON_CHROME` title and subtitle above the headline. Declared by the
+   * owning layer for what is on the map (the CPC monthly outlook is
+   * `nearTerm`, a HeatRisk day that has not begun is `nearTerm`, an
+   * observed week is `current`), never inferred from the pressed chip.
+   */
+  readonly horizon: HorizonKey;
+  /**
+   * The shown data's own date ("Jun 23, 2026"), set by the owning layer when
+   * what is on the map is older than the newest it offers (a past drought
+   * week, an earlier SST day). The horizon line names it in place of the
+   * horizon subtitle, so a past frame is never stamped "now".
+   */
+  readonly asOf?: string;
   /** Headline line ("VALID JUN 30, 2026" / "ISSUED JUN 30 · THROUGH JUL"). */
   readonly headline: string;
   /** Context line (product name and register description). */
   readonly detail: string;
+  /**
+   * The typographic register. The stamp TEXT carries the same distinction
+   * in words: an `outlook` stamp names the issuer's outlook product; an
+   * `observed` stamp never calls its product an outlook (the S13 doctrine
+   * for bare stamps, mirroring CLAIM_REGISTER_TAG for rendered claims).
+   */
   readonly register: StampRegister;
+}
+
+/** The horizon line's text: "Near Term · days to weeks", or the shown data's date in place of the subtitle. */
+export function stampHorizonText(horizon: HorizonKey, asOf?: string): string {
+  const chrome = HORIZON_CHROME[horizon];
+  return `${chrome.title} · ${asOf ?? chrome.subtitle}`;
+}
+
+export function freshnessDate(stamp: TimeBarStamp): string {
+  const date = stamp.freshness?.checkedAt;
+  if (!date || !Number.isFinite(Date.parse(date))) return '';
+  return new Intl.DateTimeFormat('en-US', {
+    month: 'numeric', day: 'numeric', year: '2-digit'
+  }).format(new Date(date));
+}
+
+export function freshnessLabel(stamp: TimeBarStamp): string {
+  const freshness = stamp.freshness;
+  if (!freshness) return '';
+  if (freshness.state === 'current') return 'Current feed check';
+  if (freshness.state === 'loading') return 'Checking current conditions';
+  const date = freshnessDate(stamp);
+  // DRAFT wording: "browser check", the words of the detail beneath it and of the NIFC popup's clock.
+  return date ? `Last successful browser check ${date}` : 'Current feed check unavailable';
 }
 
 export interface TimeBarSpec {
@@ -97,12 +157,18 @@ export interface TimeBarSpec {
 
 let currentOwner: string | null = null;
 let currentSpec: TimeBarSpec | null = null;
+/**
+ * The stop last asked for since the owner's last install. An owner
+ * re-installs only once the asked-for stop has loaded (or failed), so a
+ * second quick press counts from here, not from the stop still shown.
+ */
+let askedIndex: number | null = null;
 
 /**
  * The compact/detail spec facade (S4c; the S4 design record section 3).
- * The shell's compact WHEN row and the "More time" popover render FROM
- * the same spec the owning surface installed, so the two surfaces can
- * never disagree about the product date or its capabilities. Listeners
+ * The shell's compact WHEN row renders FROM the same spec the owning
+ * surface installed, so it and the bar can never disagree about the
+ * product date or its capabilities. Listeners
  * fire after every install or clear (owners re-install on each temporal
  * change, so a subscriber sees every date step). Read-only: consumers
  * drive changes only through the spec's own callbacks.
@@ -145,6 +211,8 @@ function notifySpecChange(): void {
  * time, so a skipped swap never pins stale callbacks.
  */
 let lastRenderedHtml: string | null = null;
+/** Focus was in the bar when an owner cleared it (see render). */
+let refocusBar = false;
 
 const mobileSheetMedia: MediaQueryList | null =
   typeof window !== 'undefined' ? window.matchMedia('(max-width: 720px)') : null;
@@ -236,7 +304,8 @@ function syncEmbedStamp(spec: TimeBarSpec | null): void {
     stamp.textContent = '';
     return;
   }
-  stamp.hidden = false;
+  // Temporarily retire the floating date chip; dates remain in the time controls.
+  stamp.hidden = true;
   stamp.dataset.register = spec.stamp.register;
   stamp.textContent = spec.stamp.headline;
 }
@@ -248,9 +317,11 @@ function syncEmbedStamp(spec: TimeBarSpec | null): void {
  * bar a newly activated surface just installed.
  */
 export function setTimeBar(owner: string, spec: TimeBarSpec): void {
+  const sameOwner = currentOwner === owner;
   currentOwner = owner;
   currentSpec = spec;
-  render();
+  askedIndex = null;
+  render(sameOwner);
   notifySpecChange();
 }
 
@@ -259,6 +330,7 @@ export function clearTimeBar(owner: string): void {
   if (currentOwner !== owner) return;
   currentOwner = null;
   currentSpec = null;
+  askedIndex = null;
   render();
   notifySpecChange();
 }
@@ -278,13 +350,17 @@ function focusMarker(el: HTMLElement): string | null {
   if (!(active instanceof HTMLElement) || !el.contains(active)) return null;
   if (active.matches('[data-play]')) return '[data-play]';
   if (active.matches('.time-bar-rail')) return '.time-bar-rail';
+  if (active.matches('.time-bar-feed-details > summary')) return '.time-bar-feed-details > summary';
   if (active.dataset.step) return `[data-step="${active.dataset.step}"]`;
   if (active.dataset.mode) return `[data-mode="${active.dataset.mode}"]`;
   if (active.dataset.jump) return `[data-jump="${active.dataset.jump}"]`;
   return null;
 }
 
-function render(): void {
+function render(preserveFeedDisclosure = false): void {
+  // No document, nothing to render (the pure lane runs specs with no DOM
+  // runtime at all); `window` is guarded the same way above for mobileSheetMedia.
+  if (typeof document === 'undefined') return;
   armTimeBarHostSync();
   syncTimeBarHost();
   const el = container();
@@ -293,6 +369,8 @@ function render(): void {
   syncEmbedStamp(currentSpec);
 
   if (!currentSpec) {
+    // A jump chip clears the bar it sits in; the next owner's bar takes focus back.
+    refocusBar = el.contains(document.activeElement);
     el.hidden = true;
     el.innerHTML = '';
     lastRenderedHtml = null;
@@ -300,6 +378,10 @@ function render(): void {
   }
 
   const restoreFocus = focusMarker(el);
+  const reseatFocus = refocusBar || restoreFocus !== null;
+  refocusBar = false;
+  const feedOpen = preserveFeedDisclosure &&
+    el.querySelector<HTMLDetailsElement>('.time-bar-feed-details')?.open;
 
   const spec = currentSpec;
   el.hidden = false;
@@ -334,7 +416,7 @@ function render(): void {
   if (spec.jumps) {
     for (const j of spec.jumps.options) {
       parts.push(
-        `<button type="button" class="time-bar-jump${j.hatched ? ' hatched' : ''}" ` +
+        `<button type="button" class="time-bar-jump" ` +
           `data-jump="${escapeHtml(j.key)}" title="${escapeHtml(j.title)}">${escapeHtml(j.label)}</button>`
       );
     }
@@ -355,8 +437,23 @@ function render(): void {
   parts.push('</div>');
 
   // --- stamp: the register indicator ---
-  parts.push(
+  // The horizon line comes first and reads HORIZON_CHROME (one grammar);
+  // `data-horizon` carries the key so a test can pin the words to the table.
+  if (spec.stamp.freshness) {
+    const freshness = spec.stamp.freshness;
+    const lastCheck = freshness.state === 'stale' ? freshnessDate(spec.stamp) : '';
+    parts.push(
+      '<details class="time-bar-feed-details"><summary class="feed-current">' +
+        '<span>Current Conditions</span>' +
+        `<span class="feed-freshness-dot" data-freshness="${freshness.state}" role="img" aria-label="${escapeHtml(freshnessLabel(spec.stamp))}"></span>` +
+        (lastCheck ? `<span>${escapeHtml(lastCheck)}</span>` : '') +
+        (freshness.state === 'unavailable' ? '<span>Unavailable</span>' : '') +
+        '</summary>' +
+        `<p>${escapeHtml(spec.stamp.headline)}</p><p>${escapeHtml(spec.stamp.detail)}</p></details>`
+    );
+  } else parts.push(
     '<div class="time-bar-stamp" aria-live="polite" aria-atomic="true">' +
+      `<span class="time-bar-stamp-horizon" data-horizon="${escapeHtml(spec.stamp.horizon)}">${escapeHtml(stampHorizonText(spec.stamp.horizon, spec.stamp.asOf))}</span>` +
       `<span class="time-bar-stamp-headline">${escapeHtml(spec.stamp.headline)}</span>` +
       `<span class="time-bar-stamp-detail">${escapeHtml(spec.stamp.detail)}</span>` +
       '</div>'
@@ -374,6 +471,18 @@ function render(): void {
       );
     }
     parts.push('</div>');
+    // Defect 4 (owner report, 2026-09-10): a disabled mode chip's reason
+    // lived only in its `title` (hover-only; unreachable on touch, and not
+    // reliably surfaced by every screen reader for a disabled control). A
+    // control that is inert with no STATED reason is the honesty problem,
+    // not the disabling itself (the disabled state is legitimate: change
+    // maps exist for the current week only). Render the first disabled
+    // option's reason as a persistent, always-visible line so the
+    // explanation does not depend on hover.
+    const disabledHint = spec.modes.options.find((m) => m.disabled === true)?.title;
+    if (disabledHint) {
+      parts.push(`<p class="time-bar-modes-hint">${escapeHtml(disabledHint)}</p>`);
+    }
   }
 
   // Identical markup: keep the existing DOM and its listeners (the memo
@@ -400,6 +509,12 @@ function render(): void {
   }
   el.innerHTML = html;
   lastRenderedHtml = html;
+  // A feed check may finish or expire while its source details are being
+  // read. Keep that disclosure open across updates from the same owner.
+  if (feedOpen) {
+    const feed = el.querySelector<HTMLDetailsElement>('.time-bar-feed-details');
+    if (feed) feed.open = true;
+  }
 
   // --- wiring ---
   // Every handler reads `currentSpec` at EVENT time (never the `spec` this
@@ -410,12 +525,17 @@ function render(): void {
     const step = (delta: number): void => {
       const r = currentSpec?.rail;
       if (!r) return;
-      const next = Math.min(r.count - 1, Math.max(0, r.index + delta));
-      if (next !== r.index) r.onStep(next);
+      const from = askedIndex ?? r.index;
+      const next = Math.min(r.count - 1, Math.max(0, from + delta));
+      if (next === from) return;
+      askedIndex = next;
+      r.onStep(next);
     };
     rail?.addEventListener('change', () => {
       const v = Number(rail.value);
-      if (Number.isInteger(v)) currentSpec?.rail?.onStep(v);
+      if (!Number.isInteger(v)) return;
+      askedIndex = v;
+      currentSpec?.rail?.onStep(v);
     });
     // `input` fires per notch while dragging; stepping per notch would
     // spam fetches, so the fetch-triggering step waits for `change`
@@ -458,6 +578,15 @@ function render(): void {
   }
 
   if (restoreFocus) {
-    el.querySelector<HTMLElement>(restoreFocus)?.focus({ preventScroll: true });
+    const target = el.querySelector<HTMLElement>(restoreFocus);
+    // focus() on a now-disabled control (Next at the newest stop) is a no-op
+    // and drops focus to the body; the rail stays focusable.
+    const seat = target?.matches(':disabled') ? el.querySelector<HTMLElement>('.time-bar-rail') : target;
+    seat?.focus({ preventScroll: true });
+  }
+  // The used control is gone (a jump installs a bar without its chip): the
+  // nearest shown control takes focus, unless the person has moved on.
+  if (reseatFocus && (!document.activeElement || document.activeElement === document.body)) {
+    el.querySelector<HTMLElement>('.time-bar-jump, .time-bar-rail')?.focus({ preventScroll: true });
   }
 }

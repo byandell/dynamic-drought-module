@@ -32,6 +32,24 @@
  * as signals from `./index`. The per-group sources disclosure is local
  * ephemeral view state (`useState`), never a URL or registry concern.
  *
+ * THE LAYER STUDIO'S COPY (owner direction 2026-11-09 (sprint), DR-pending).
+ * Everything the `studio` prop changes is presentation, and only in the
+ * studio; the sidebar's own catalog renders exactly as before:
+ *
+ *   - condition surfaces are ONE CHOICE there, because one exclusive
+ *     condition surface at a time is the controller's rule: each surface
+ *     row is a radio in one radio group instead of a checkbox that unticks
+ *     its neighbour by surprise. The input keeps `data-layer-key` and its
+ *     id, a choice still goes through the bridge and `controller.activate`
+ *     (which turns the other surface off), and a pointer press on the chosen
+ *     one turns it off through `controller.deactivate`, so no condition
+ *     surface stays a reachable state. A key never turns the chosen
+ *     condition off: a radio group's tab stop is its chosen row, so a key
+ *     pressed on arrival must not clear the map. The keyboard's way off is
+ *     the "Turn off" button in the studio's "On the map now" list.
+ *   - each role group folds behind its heading and keeps its count. A
+ *     folded group's rows stay mounted and natively `hidden`.
+ *
  * Stewardship: no Tribal, Treaty, or sovereign-jurisdiction data is
  * surfaced here. All labels come from the config tables in `src/config/`.
  */
@@ -43,11 +61,12 @@ import { LAYER_DEFS, LAYER_ROLE_ORDER, getLayerDef } from '../../config/layers';
 import type { LayerDef } from '../../config/layers';
 import { TRIBAL_NATIONS_PROVENANCE_NOTE } from '../../config/provenance';
 import { TRIBAL_NATIONS_GROUP } from '../../config/layer-groups';
-import { activateTribalNationsGroup, formatGroupHealth } from '../tribal-nations-action';
+import { formatGroupHealth, toggleTribalNationsGroup } from '../tribal-nations-action';
 import type { LayerRole, LayerStatus } from '../../types/layer';
 import type { LayerController } from '../../state/layer-controller';
 import { resolveStatusPillText } from './pill-text';
 import { setChecked } from './bridge';
+import { isFailedCheckedLayer, requestLayerOn } from '../layer-toggle-command';
 
 /**
  * User-facing labels for the four role groups (UX-1), moved verbatim
@@ -98,6 +117,33 @@ interface RowProps extends CatalogProps {
  * so an island remount does not re-bury an in-use row. */
 const revealedThisSession = new Set<string>();
 
+/* Mirrors `.layer-toggle-source` in app.css (not owned here) without taking
+ * that class: collapsed groups must render no `.layer-toggle-source`. */
+const COVERAGE_STYLE = {
+  fontSize: '10.5px',
+  color: 'var(--fg-2)',
+  display: 'block',
+  marginTop: '2px',
+  letterSpacing: '0.02em'
+} as const;
+
+/**
+ * found-066: the terrain-shading row is on by default over CONUS while only
+ * the bundled Pacific Northwest archive draws, so the row carries the coverage
+ * tail of its existing source line ("... Pacific Northwest bake only") without
+ * the Sources disclosure. The words are the registry's own, not new text.
+ */
+function coverageCue(source: string): string | null {
+  const tail = source.split(' \u00b7 ').pop();
+  return tail && tail !== source ? tail : null;
+}
+
+/** The one radio group the studio's condition surfaces share. */
+const STUDIO_CONDITION_NAME = 'studio-condition';
+
+/** Rows whose bundled archive is regional, or a dated snapshot, while the layer reads `live`. */
+const COVERAGE_CUE_KEYS: ReadonlySet<string> = new Set(['hillshade', 'ecoregions', 'cdm-drought']);
+
 function LayerRow({
   def,
   controller,
@@ -110,9 +156,21 @@ function LayerRow({
   const id = `${studio ? 'studio-' : ''}layer-toggle-${def.key}`;
   const isOn = checked.value.get(def.key) ?? false;
   const status = statuses.value.get(def.key);
+  const coverage = COVERAGE_CUE_KEYS.has(def.key) ? coverageCue(def.source) : null;
+  // The studio draws the condition surfaces as one choice (see the header).
+  const single = studio === true && def.role === 'surface';
 
   const onChange = (event: Event): void => {
-    const on = (event.currentTarget as HTMLInputElement).checked;
+    const input = event.currentTarget as HTMLInputElement;
+    // A press retries the failed committed layer without withdrawing intent.
+    // Restore the native checkbox first: its change event has already flipped
+    // the DOM, while the bridge still records the committed checked state.
+    if (isFailedCheckedLayer(def.key)) {
+      input.checked = true;
+      requestLayerOn(def.key);
+      return;
+    }
+    const on = input.checked;
     setChecked(def.key, on);
     if (on) {
       void controller.activate(def.key);
@@ -121,14 +179,59 @@ function LayerRow({
     }
   };
 
+  // A radio's own click never unchecks it, so a press on the chosen condition
+  // is handled here: it retries a failed read, exactly as the checkbox row
+  // does, and otherwise turns the condition off through the controller.
+  const onSinglePress = (): void => {
+    if (!isOn) return;
+    if (isFailedCheckedLayer(def.key)) {
+      requestLayerOn(def.key);
+      return;
+    }
+    setChecked(def.key, false);
+    controller.deactivate(def.key);
+  };
+
+  // Arrow keys move among the conditions without choosing one: every choice
+  // starts a read from its source, so Space or Enter makes the choice. On
+  // the chosen condition Enter only retries a failed read; it never turns a
+  // drawn condition off (Space leaves a chosen radio alone natively).
+  const onSingleKeyDown = (event: KeyboardEvent): void => {
+    const input = event.currentTarget as HTMLInputElement;
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      if (!isOn || isFailedCheckedLayer(def.key)) input.click();
+      return;
+    }
+    const step =
+      event.key === 'ArrowDown' || event.key === 'ArrowRight'
+        ? 1
+        : event.key === 'ArrowUp' || event.key === 'ArrowLeft'
+          ? -1
+          : 0;
+    if (step === 0) return;
+    event.preventDefault();
+    const choices = Array.from(
+      document.querySelectorAll<HTMLInputElement>(`input[type="radio"][name="${input.name}"]`)
+    ).filter((choice) => choice.offsetParent !== null);
+    choices[choices.indexOf(input) + step]?.focus();
+  };
+
   return (
-    <label class="layer-toggle" for={id} hidden={rowHidden ?? false}>
+    <label
+      class={single ? 'layer-toggle layer-toggle-single' : 'layer-toggle'}
+      for={id}
+      hidden={rowHidden ?? false}
+    >
       <input
-        type="checkbox"
+        type={single ? 'radio' : 'checkbox'}
         id={id}
         data-layer-key={def.key}
         checked={isOn}
         onChange={onChange}
+        {...(single
+          ? { name: STUDIO_CONDITION_NAME, onClick: onSinglePress, onKeyDown: onSingleKeyDown }
+          : {})}
       />
       <span class="layer-toggle-text">
         <span class="layer-toggle-name">{def.name}</span>
@@ -138,7 +241,13 @@ function LayerRow({
         >
           {status ? resolveStatusPillText(status, def.noDataLabel) : ''}
         </span>
-        {showSource ? <span class="layer-toggle-source">{def.source}</span> : null}
+        {showSource ? (
+          <span class="layer-toggle-source">{def.source}</span>
+        ) : coverage ? (
+          <span class="layer-toggle-coverage" style={COVERAGE_STYLE}>
+            {coverage}
+          </span>
+        ) : null}
       </span>
     </label>
   );
@@ -153,9 +262,11 @@ interface UmbrellaProps extends CatalogProps {
  * The Tribal Nations umbrella (D-0.7.0-033; Unit F): the featured group
  * card inside the reference role group, per the 2026-07-15 Codex front-end
  * consultation.
- * Two SEPARATE controls: the prominent activation button is a command (it
- * requests the configured live member set on through the bridge-safe
- * shared door; no aria-expanded, no aria-pressed, never disabled), and the
+ * Two SEPARATE controls: the prominent button is a toggle like the
+ * Brief-door control (found-006; P3-03 of the 2026-11-05 look): pressed
+ * while every member is on, its press then turns the set off, otherwise it
+ * requests the configured set on through the bridge-safe shared door; no
+ * aria-expanded, never disabled), and the
  * quieter "Layer details" disclosure reveals the granular member rows.
  * Member rows stay PERMANENTLY MOUNTED inside a natively `hidden` region:
  * checkboxes leave the tab order and the accessibility tree while
@@ -176,6 +287,10 @@ function LayerUmbrella({ sourcesOpen, ...props }: UmbrellaProps) {
   const selectedCount = group.buttonActivates.filter(
     (key) => checked.value.get(key) ?? false
   ).length;
+  // found-006 / P3-03: the same toggle as the Brief-door control; pressed
+  // only while every member is on (`isTribalNationsGroupOn`'s rule, read
+  // from this catalog's own checked signal).
+  const pressed = selectedCount === group.buttonActivates.length;
   // Outcome beside intent (the final-pass finding 2): a terminally failed
   // agency shows here too, in the same shared format the Brief hosts use.
   const unavailableCount = group.buttonActivates.filter(
@@ -195,14 +310,15 @@ function LayerUmbrella({ sourcesOpen, ...props }: UmbrellaProps) {
       <button
         type="button"
         class="layer-umbrella-cta"
-        aria-label={`Show ${group.label} layers`}
+        aria-pressed={pressed}
+        aria-label={`${pressed ? 'Hide' : 'Show'} ${group.label} layers`}
         aria-describedby={descId}
-        onClick={() => activateTribalNationsGroup()}
+        onClick={() => toggleTribalNationsGroup()}
       >
         {group.label}
       </button>
       <p id={descId} class="sr-only">
-        {group.actionDescription}
+        {pressed ? group.actionOffDescription : group.actionDescription}
       </p>
       {/* "selected", never "live": activation may still be loading or may
           fail; the pills carry the honest per-layer status, and a terminal
@@ -268,6 +384,18 @@ export function Catalog(props: CatalogProps) {
     });
   };
 
+  // Which groups the studio has folded. Ephemeral view state, like the
+  // sources disclosure: every group is open on every mount.
+  const [folded, setFolded] = useState<Set<LayerRole>>(() => new Set());
+  const toggleFold = (role: LayerRole): void => {
+    setFolded((prev) => {
+      const next = new Set(prev);
+      if (next.has(role)) next.delete(role);
+      else next.add(role);
+      return next;
+    });
+  };
+
   return (
     <>
       {LAYER_ROLE_ORDER.map((role) => {
@@ -292,20 +420,8 @@ export function Catalog(props: CatalogProps) {
         const flatDefs = grouped.filter(
           (def) => !def.uiHidden || (checked.value.get(def.key) ?? false)
         );
-        return (
-          <div class="layer-group" role="group" aria-labelledby={headingId} key={role}>
-            <div class="layer-group-title">
-              {/* The group's accessible name is the title + hint only; the
-                  active count sits OUTSIDE the labelledby target so the group
-                  name does not mutate as layers toggle (Opus review nit). */}
-              <span class="layer-group-title-text" id={headingId}>
-                {label.title}
-                {label.hint ? <> <span class="layer-group-hint">{label.hint}</span></> : null}
-              </span>
-              {onCount > 0 ? (
-                <span class="layer-group-count">{onCount} on</span>
-              ) : null}
-            </div>
+        const rows = (
+          <>
             {isReference ? <LayerUmbrella sourcesOpen={sourcesOpen} {...props} /> : null}
             {flatDefs.map((def) => (
               <LayerRow key={def.key} def={def} showSource={sourcesOpen} {...props} />
@@ -318,6 +434,48 @@ export function Catalog(props: CatalogProps) {
             >
               {sourcesOpen ? 'Hide sources' : 'Sources'}
             </button>
+          </>
+        );
+        const isFolded = studio && folded.has(role);
+        const rowsId = `studio-layer-group-rows-${role}`;
+        return (
+          <div
+            class="layer-group"
+            role={studio && role === 'surface' ? 'radiogroup' : 'group'}
+            aria-labelledby={headingId}
+            key={role}
+          >
+            <div class="layer-group-title">
+              {/* The group's accessible name is the title + hint only; the
+                  active count sits OUTSIDE the labelledby target so the group
+                  name does not mutate as layers toggle (Opus review nit). */}
+              <span class="layer-group-title-text" id={headingId}>
+                {label.title}
+                {label.hint ? <> <span class="layer-group-hint">{label.hint}</span></> : null}
+              </span>
+              {onCount > 0 ? (
+                <span class="layer-group-count">{onCount} on</span>
+              ) : null}
+              {studio ? (
+                <button
+                  type="button"
+                  class="layer-group-fold"
+                  aria-expanded={!isFolded}
+                  aria-controls={rowsId}
+                  aria-label={`${isFolded ? 'Show' : 'Hide'} the ${label.title} layers`}
+                  onClick={() => toggleFold(role)}
+                >
+                  {isFolded ? 'Show' : 'Hide'}
+                </button>
+              ) : null}
+            </div>
+            {studio ? (
+              <div id={rowsId} class="layer-group-rows" hidden={isFolded}>
+                {rows}
+              </div>
+            ) : (
+              rows
+            )}
           </div>
         );
       })}

@@ -1,11 +1,8 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 import { PNG } from 'pngjs';
 
 import { HAZARD_CLUSTERS } from '../src/config/clusters';
-import {
-  MOBILE_HAZARD_PRESETS,
-  VIEW_PRESETS
-} from '../src/config/presets';
+import { MOBILE_HAZARD_PRESETS } from '../src/config/presets';
 import {
   gotoApp,
   layerCheckbox,
@@ -24,11 +21,6 @@ const TIMES = [
   1785672000000
 ] as const;
 
-const TRANSPARENT_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64'
-);
-
 function solidPng(red: number, green: number, blue: number): Buffer {
   const png = new PNG({ width: 1, height: 1 });
   png.data[0] = red;
@@ -45,7 +37,7 @@ interface HeatRouteOptions {
   readonly metadataTimeInfo?: unknown;
   readonly rasterResponse?: (
     time: number,
-    route: import('@playwright/test').Route
+    route: import('./offline-test').Route
   ) => Promise<void> | void;
 }
 
@@ -54,13 +46,6 @@ async function routeHeatRisk(
   exportedTimes: number[],
   options: HeatRouteOptions = {}
 ): Promise<void> {
-  await page.route('https://tile.openstreetmap.org/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'image/png',
-      body: TRANSPARENT_PNG
-    })
-  );
 
   await page.route(
     (url) => url.pathname.startsWith(SERVICE_PATH),
@@ -134,6 +119,13 @@ function heatDaySelect(page: Page) {
   return page.locator('#map-key select[data-heatrisk-day]');
 }
 
+async function openHeatKey(page: Page): Promise<void> {
+  const toggle = page.locator('#map-key-details-toggle');
+  await expect(toggle).toBeVisible();
+  if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+  await expect(page.locator('#map-key-content')).toBeVisible();
+}
+
 async function visibleHeatRiskStrings(page: Page): Promise<readonly string[]> {
   return page.locator('body *').evaluateAll((elements) => {
     const strings = new Set<string>();
@@ -175,10 +167,7 @@ async function canvasCenter(page: Page): Promise<readonly [number, number, numbe
 
 test.describe('U-HEATRISK-DAYS multi-day read', () => {
   test('HeatRisk preset and cluster descriptions state published dated impact levels', () => {
-    const presetDescriptions = [
-      ...MOBILE_HAZARD_PRESETS,
-      ...VIEW_PRESETS
-    ]
+    const presetDescriptions = MOBILE_HAZARD_PRESETS
       .filter((preset) => preset.layers.includes('heatrisk'))
       .map((preset) => preset.description);
     const descriptions = [
@@ -186,8 +175,8 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
       HAZARD_CLUSTERS.heat.description
     ];
 
-    expect(presetDescriptions).toHaveLength(2);
-    expect(descriptions).toHaveLength(3);
+    expect(presetDescriptions).toHaveLength(1);
+    expect(descriptions).toHaveLength(2);
     for (const description of descriptions) {
       expect(description).toMatch(
         /published National Weather Service HeatRisk heat-impact levels/i
@@ -209,6 +198,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
     await expect(heatRow(page)).toContainText('HeatRisk (Experimental)');
     await expect(heatRow(page)).not.toContainText('Today');
 
+    await openHeatKey(page);
     const select = heatDaySelect(page);
     await expect(select).toHaveValue('1');
     await expect(select.locator('option')).toHaveCount(TIMES.length);
@@ -247,6 +237,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
       '?layers=heatrisk&heatday=4&embed=true&view=console'
     );
 
+    await openHeatKey(page);
     const select = heatDaySelect(page);
     await expect(select).toBeVisible();
     await expect(select).toHaveValue('4');
@@ -327,6 +318,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
       .poll(() => exportedTimes.includes(TIMES[0]), { timeout: 15_000 })
       .toBe(true);
 
+    await openHeatKey(page);
     const select = heatDaySelect(page);
     await select.selectOption('2');
     await expect(select).toHaveValue('2');
@@ -354,6 +346,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
     const exportedTimes: number[] = [];
     await routeHeatRisk(page, exportedTimes);
     await gotoApp(page, '?layers=heatrisk&view=console');
+    await openHeatKey(page);
     const box = await heatDaySelect(page).boundingBox();
     expect(box).not.toBeNull();
     expect(box!.height).toBeLessThanOrEqual(32);
@@ -370,6 +363,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
       const exportedTimes: number[] = [];
       await routeHeatRisk(page, exportedTimes);
       await gotoApp(page, '?layers=heatrisk');
+      await openHeatKey(page);
 
       expect(
         await page.evaluate(() => window.matchMedia('(pointer: coarse)').matches)
@@ -419,6 +413,7 @@ test.describe('U-HEATRISK-DAYS multi-day read', () => {
     });
 
     await gotoApp(page, '?layers=heatrisk&view=console');
+    await openHeatKey(page);
     const select = heatDaySelect(page);
     await expect(select).toHaveValue('1');
     await expect

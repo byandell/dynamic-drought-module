@@ -25,16 +25,13 @@
  * browser exposes it, since mobile browser chrome, pinch zoom, and the
  * on-screen keyboard move it without any layout resize; the layout
  * viewport as the fallback), intersected with the map container rect,
- * minus the app's own occluding chrome, inset by a small margin. The
- * modeled occluders are exactly two, both read from their LIVE bounding
- * rects at every clamp: the active mobile sheet (the `#sidebar` element
- * exactly while the `#app[data-sheet-detent]` shell attribute is present;
- * on desktop the same element is a grid column beside the map and
- * occludes nothing) and the persistent mobile footer
- * (`#mobile-footer-nav`). Both are fixed, full-width, bottom-docked
- * surfaces, so occlusion is modeled as raising the region's bottom edge
- * to the topmost occluding edge; an occluder that is not bottom-docked
- * would need a richer model than this.
+ * minus the app's own bottom-docked chrome and phone action rail, inset by a small margin. The
+ * two candidates are read from their LIVE bounding rects at every clamp:
+ * the mobile panel (`#sidebar` while `#app[data-sheet-detent]` is present)
+ * and the mobile navigation (`#mobile-footer-nav`). A candidate only
+ * raises the region's bottom edge when its live rect touches that edge.
+ * A side-positioned phone action rail instead reserves its horizontal strip,
+ * leaving the full vertical map region available.
  *
  * Three mechanisms compose to keep the card inside the region:
  *
@@ -69,15 +66,13 @@
  * the spec prose in tests/popup-viewport.spec.ts cite it rather than
  * restating limits of their own, and on any divergence the table wins.
  *
- * Overlap by chrome OTHER than the two modeled occluders is not detected
- * here. The body scroll window itself is CSS-side (the coordinated
+ * Other floating chrome is not modeled here. The body scroll window is CSS-side (the coordinated
  * head/body flex rules and the U-UX-FIX-1 section in app.css); the tier
  * table states exactly when that CSS can and cannot deliver it.
  *
  * Re-clamp triggers: popup insertion; MapLibre rewriting the container's
- * inline transform (map move or anchor flip; this also covers a sheet
- * detent change, whose settle re-pads the camera and so rewrites every
- * popup transform); content mutations (hydration); content box resizes
+ * inline transform (map move or anchor flip); content mutations
+ * (hydration); content box resizes
  * (font, image, or stylesheet reflow, via ResizeObserver); window resize;
  * visual-viewport resize and scroll.
  *
@@ -87,6 +82,38 @@
 
 /** Breathing room between a clamped popup edge and the region edge. */
 const EDGE_MARGIN_PX = 12;
+
+/** Clearance a popup keeps past the open Key drawer's right edge (S30D
+ * D1 M11; design record interface-chrome-popups-text.md section 5,
+ * "Drawers": "with the drawer open, a popup committed at x 100 renders
+ * at or beyond the drawer's right edge plus 8 px"). */
+const DRAWER_CLEARANCE_PX = 8;
+
+/** The Key's own desktop-chip breakpoint (src/ui/map-key.ts's
+ * MOBILE_MAP_KEY_QUERY near :120, reused verbatim by its isDesktopChip
+ * predicate near :1239): the drawer exclusion below applies only where
+ * the Key itself limits the always-visible chip to, the desktop shell
+ * outside embeds, never on phone or in an embed where `#map-key-content`
+ * can also be visible. Reused literally rather than inventing a second
+ * breakpoint. */
+const DESKTOP_KEY_DRAWER_QUERY = '(max-width: 720px)';
+
+/**
+ * The X term of a computed `transform`'s 2D matrix (`matrix(a, b, c, d,
+ * tx, ty)`), or 0 when the transform is `none`, unparseable, or carries a
+ * 3D matrix (`matrix3d`, never emitted by the drawer's translateX-only
+ * keyframes). Used to recover an animating element's settled (untranslated)
+ * edge from its live `getBoundingClientRect()` without waiting on the
+ * animation to finish.
+ */
+function currentTranslateX(computedTransform: string): number {
+  if (!computedTransform || computedTransform === 'none') return 0;
+  const match = /^matrix\(([^)]+)\)$/.exec(computedTransform);
+  if (!match) return 0;
+  const parts = match[1]!.split(',').map((part) => Number.parseFloat(part.trim()));
+  const tx = parts[4];
+  return typeof tx === 'number' && Number.isFinite(tx) ? tx : 0;
+}
 
 /**
  * THE CANONICAL TIER TABLE (DG-080-REVIEW r3 finding 1): the ONE
@@ -165,6 +192,11 @@ const EDGE_MARGIN_PX = 12;
  *   in the top-right padding. The column is the basis for the FULL
  *   row's scroll-reachable link claim; it is not a promise that every
  *   label fits it without horizontal overflow (the tier table says so).
+ *   Since D1 M23 (DDM-P17-T11) the coordinated HEAD also reserves the
+ *   close control's seat on desktop widths (app.css, "THE CLOSE SEAT"),
+ *   so the head's own column there is narrower by the control's overhang
+ *   past the padding; the body column, which carries the link claim, is
+ *   not, and no boundary number changes.
  *
  * Below either boundary the clamp swaps to the compact presentation
  * (`ddm-popup-compact` in app.css: 6 px by 8 px padding, so 14 by 18 px
@@ -255,8 +287,11 @@ export function installPopupViewportContainment(): void {
  * container's inline transform on every map move, async hydration (the
  * telemetry data slot) can grow the content after open, and size-only
  * reflow (fonts arriving, an image, a stylesheet change) can change the
- * box with no mutation at all; all three trigger a re-clamp (throttled
- * to one per animation frame).
+ * box with no mutation at all. A mutation (MapLibre's re-anchor on its
+ * own idle and move events, or the hydration repaint) re-clamps at once
+ * in the observer callback, so no frame paints the card unclamped and no
+ * reader sees it; size-only reflow is throttled to one per animation
+ * frame.
  */
 function wirePopup(popup: HTMLElement): void {
   if (wired.has(popup)) return;
@@ -289,16 +324,21 @@ function wirePopup(popup: HTMLElement): void {
       if (popup.isConnected) clampPopupToViewport(popup);
     });
   };
+  const clampNow = (): void => {
+    if (popup.isConnected) clampPopupToViewport(popup);
+  };
 
   // Reposition: attribute-only on the container, so this module's own
   // writes to the content element never feed back into the observer.
-  const repositionObserver = new MutationObserver(schedule);
+  const repositionObserver = new MutationObserver(clampNow);
   repositionObserver.observe(popup, { attributes: true, attributeFilter: ['style', 'class'] });
 
   // Content growth (hydration replacing the skeleton slot).
   const content = popup.querySelector<HTMLElement>('.maplibregl-popup-content');
   if (content) {
-    const growthObserver = new MutationObserver(schedule);
+    // The clamp writes only the content's own style and class, which this
+    // childList/characterData observer does not watch: no feedback loop.
+    const growthObserver = new MutationObserver(clampNow);
     growthObserver.observe(content, { childList: true, subtree: true, characterData: true });
 
     // Size-only reflow (DG-080-REVIEW recommendation 4). No feedback
@@ -321,8 +361,8 @@ interface Bounds {
 
 /**
  * The reachable region for a popup: visual viewport intersected with the
- * map container rect, minus the two modeled bottom-docked occluders (the
- * module comment defines all four terms), inset by the edge margin. May
+ * map container rect, minus any candidate that actually touches its
+ * bottom edge, inset by the edge margin. May
  * be empty; `clampPopupToViewport` checks.
  */
 function containingBounds(popup: HTMLElement): Bounds {
@@ -341,15 +381,16 @@ function containingBounds(popup: HTMLElement): Bounds {
     right = Math.min(right, rect.right);
   }
 
-  // The occluding chrome, live rects only. The sheet qualifies exactly
-  // while the mobile shell attribute is present (on desktop the same
-  // element is the sidebar column beside the map); a hidden footer
-  // (desktop, embed) drops out via its zero-size rect. Occluders are
-  // processed bottom-most first so a stack (sheet riding above the
-  // footer) raises the region edge step by step.
+  // Candidate chrome, live rects only. The panel qualifies exactly while
+  // the mobile shell attribute is present; hidden or side-positioned
+  // candidates drop out through the rect filters and bottom-edge test.
+  // Bottom-docked stacks are processed from the viewport edge upward.
   const occluders: HTMLElement[] = [];
   const footer = document.getElementById('mobile-footer-nav');
-  if (footer) occluders.push(footer);
+  const footerBox = footer?.getBoundingClientRect();
+  // A side rail (taller than wide) is never bottom chrome: chained after the
+  // half sheet, a rail straddling the sheet's top would lift the region to its own top.
+  if (footer && footerBox && footerBox.width > footerBox.height) occluders.push(footer);
   if (document.getElementById('app')?.hasAttribute('data-sheet-detent')) {
     const sheet = document.getElementById('sidebar');
     if (sheet) occluders.push(sheet);
@@ -364,9 +405,53 @@ function containingBounds(popup: HTMLElement): Bounds {
     }
   }
 
+  // The phone navigation is a right-side rail, not a bottom footer. Its
+  // buttons paint above map popups. Reserve that strip even when the
+  // anchor is beside it, so hydration and body scrolling cannot put source
+  // text underneath an action button. Hidden embed/desktop rails have no box.
+  if (footer) {
+    const rail = footer.getBoundingClientRect();
+    const style = getComputedStyle(footer);
+    if (style.display !== 'none' && style.visibility !== 'hidden' &&
+        rail.width > 0 && rail.height > 0 && rail.height > rail.width &&
+        rail.left > (left + right) / 2 && rail.left < right &&
+        rail.bottom > top && rail.top < bottom) {
+      right = rail.left;
+    }
+  }
+
+  let leftBound = left + EDGE_MARGIN_PX;
+  // The open Key drawer (S30D D1 M11) occupies the left edge on the
+  // desktop shell outside embeds; a popup committed near it must clear
+  // its right edge plus DRAWER_CLEARANCE_PX, never the plain edge
+  // margin alone. The drawer's entrance motion (app.css:6123-6137,
+  // "map-key-drawer-in") animates its OWN transform, so a popup can
+  // commit while the drawer is still sliding in; getBoundingClientRect
+  // during that animation reads the in-progress paint box, short of the
+  // settled edge by the animation's remaining translateX. Rather than
+  // wait on the animation (never done here), the settled edge is
+  // recovered directly: the drawer's own computed transform is a pure
+  // translateX (the keyframes carry no other component), so subtracting
+  // its current X term from the live rect's right edge always yields the
+  // element's un-translated (settled) right edge, at any animation frame.
+  const isDesktopNonEmbed =
+    !window.matchMedia(DESKTOP_KEY_DRAWER_QUERY).matches &&
+    !document.getElementById('app')?.classList.contains('embed');
+  const drawer = document.getElementById('map-key-content');
+  if (isDesktopNonEmbed && drawer && !drawer.hidden) {
+    const style = getComputedStyle(drawer);
+    if (style.display !== 'none' && style.visibility !== 'hidden') {
+      const drawerBox = drawer.getBoundingClientRect();
+      if (drawerBox.width > 0 && drawerBox.height > 0) {
+        const settledRight = drawerBox.right - currentTranslateX(style.transform);
+        leftBound = Math.max(leftBound, settledRight + DRAWER_CLEARANCE_PX);
+      }
+    }
+  }
+
   return {
     top: top + EDGE_MARGIN_PX,
-    left: left + EDGE_MARGIN_PX,
+    left: leftBound,
     bottom: bottom - EDGE_MARGIN_PX,
     right: right - EDGE_MARGIN_PX
   };

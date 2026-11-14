@@ -24,12 +24,14 @@ turns them on. They exist so a deployer
 (most importantly a Tribal Nation) can display its own boundary data,
 under its own governance and authorization, without that data ever
 entering this repository. When the file is empty the layer reports
-`no data (see data/README.md)`; when the file cannot be fetched it
+`no data`; when the file cannot be fetched it
 reports `unavailable`.
 
 > **Stewardship note.** Anyone populating these files is responsible for
-> the underlying authorizations. Tribal Lands, Treaty Areas, and any
-> sovereign-jurisdiction polygons must be redistributed only with the
+> the underlying authorizations. The map's default Tribal geography is public
+> data (T0) from the federal services named above and needs nothing from this
+> folder. For data an operator supplies here, Tribal Lands, Treaty Areas, and
+> any sovereign-jurisdiction polygons must be redistributed only with the
 > relevant Tribal Nation's consent. The empty-placeholder pattern is a
 > deliberate part of this module's design; please preserve it on
 > contributions back upstream.
@@ -88,10 +90,35 @@ state-curated set).
 
 ## Bundled public reference data (not placeholders)
 
+- `ddm-base-na-2026-11.pmtiles`, `ddm-roads-na-2026-11.pmtiles`,
+  `ddm-base-world-2026-11.pmtiles`, `ddm-forests-2026-11.pmtiles`: DDM's own
+  base map and its reference layers (built by
+  `node --max-old-space-size=16000 scripts/build-base-tiles.mjs`; every input
+  pinned by SHA-256 in `scripts/data/base-tiles-inputs.json`). North America
+  (180°W to 50°W, 14°N to 84°N) zoom 0 to 8, overzoomed by the map to 14:
+  land, lakes, reservoirs, wetlands and glaciers, rivers and canals by stream
+  order, country, province and Mexican state lines, county lines, place, lake
+  and sea names (16,155,213 bytes); federal and state highways in the U.S. and
+  principal highways in Canada, with route names, main-line railroads in the
+  U.S. and large or high-hazard dams (10,575,287 bytes); the rest of the world
+  zoom 0 to 5 (1,602,643 bytes); the National Forests' administrative
+  boundaries (3,194,065 bytes). Sources: U.S. Census Bureau 2025 cartographic
+  boundary files and TIGER/Line 2025 roads and railroads (public domain); USDA
+  Forest Service administrative forest boundaries (public; data.gov lists CC
+  BY 4.0); U.S. Army Corps of
+  Engineers National Inventory of Dams; USGS
+  1:1,000,000-scale waterbodies, streams and cities, 2014 (public domain);
+  Natural Resources Canada, Atlas of Canada National Scale Data 1:1,000,000
+  (Open Government Licence - Canada); Natural Earth 1:10m v5.1.2 (public
+  domain) for Mexico, Central America, the Caribbean and the world. Mesoscale
+  by design; inside Tribal areas the street names are read live from the
+  Census at zoom 12 and above (`src/layers/tribal-streets.ts`). No Tribal or
+  Treaty boundary is stored in these files: those stay live-read. Retrieved
+  2026-11-12 and 2026-11-13; sizes measured from the files and matching the
+  receipt.
 - `us-states.geojson`: state boundaries (US Census, public domain).
 - `ecoregions-pnw.pmtiles`: EPA Omernik ecoregions, the served artifact
-  (built by `npm run build:ecoregion-tiles`); `ecoregions-pnw.geojson`
-  is the legacy placeholder retained for compatibility.
+  (built by `npm run build:ecoregion-tiles`).
 - `hillshade-dem-pnw.pmtiles`: retained terrain hillshade derived from USGS
   3DEP. The repository does not currently expose a supported rebuild command.
 - `whp-2023-pnw.pmtiles`: USFS Wildfire Hazard Potential 2023 drape for
@@ -110,8 +137,7 @@ state-curated set).
   A one-time extract of the ARCHIVED federal HIFLD dataset via the public
   Esri Federal User Community copy (accessInformation "U.S. Government";
   Extract capability enabled; the item states it is archived with last
-  data update 2024-09-30; some geometries carry OpenStreetMap provenance,
-  credited in the attribution). 6,941 features, zooms 0-11, 3,816 tiles,
+  data update 2024-09-30). 6,941 features, zooms 0-11, 3,816 tiles,
   3,827,596 bytes, retrieved 2026-08-19 UTC. Issuer sentinel attributes are
   preserved verbatim (VOLTAGE -999999, VOLT_CLASS 'NOT AVAILABLE'). The in-app qualification
   carries the mandatory caveat: not comprehensive or current, never for
@@ -119,50 +145,30 @@ state-curated set).
   views, is never activated automatically by Fire 3D, and reports `zoom in to
   load` below zoom 6. Its live power-plant companion comes from EIA and is not
   stored in this archive.
-- `structures-central-oregon.pmtiles`: building footprints for the 3D
-  Fire view's structures context (Overture Maps Foundation buildings
-  theme, ODbL, release 2026-07-22.0; includes OpenStreetMap and other
-  open sources; extracted by `scripts/extract-overture-buildings.py`,
-  baked by `npm run build:structures-tiles`). 189,769 footprints,
-  7,950,204 bytes, z13-14, retrieved 2026-08-19 UTC; 72% carry an
-  issuer-published height (`h`, meters, kept only at 0.1 m or above so a
-  sub-decimeter record cannot flatten a building out of both height
-  layers) and the app draws the rest at a disclosed placeholder height. Coverage is the `central_oregon` region
-  framing ONLY: the full PNW box holds 9.16 million footprints, projected
-  from the measured per-building tile rate at roughly 240 MB (z14-only)
-  to 380 MB (the shipped z13-14 scheme), beyond the same-origin hosting
-  path.
-
-  **Deployer path for another region.** The extract is parameterized
-  (`.venv/Scripts/python.exe scripts/extract-overture-buildings.py
-  --bbox minLon,minLat,maxLon,maxLat --out scripts/.cache/overture-buildings-central-oregon.json`;
-  it writes a `.meta.json` provenance sidecar the bake requires, and the
-  Overture release bucket keeps only ~60 days of releases, so `--release`
-  needs periodic re-pinning (`DEFAULT_RELEASE` moved from 2026-07-22.0 to
-  2026-08-19.0 on 2026-09-03, ahead of the earlier pin's 2026-09-21 bucket
-  expiry, DR-011 a; check the script's current default before relying on
-  it). Changing
-  regions is a DELIBERATE edit set, not just a new bbox; the bake
-  hard-fails on a sidecar bbox that disagrees with its constants, and
-  the in-app disclosures are cross-gated against the bake. Update, all
-  named for the region they claim: `BBOX`, `CENTER`, the expected
-  feature band, and the output filename in
-  `scripts/build-structures-tiles.mjs`; the region wording in
-  `STRUCTURES_QUALIFICATION` (`src/config/wildfire-presentation.ts`),
-  `FIRE3D_COVERAGE_NOTE` (`src/config/fire3d-presentation.ts`), and the
-  structures embed line (`src/map/fire3d-context.ts`); plus
-  `structuresPmtilesLocal` in `src/config/urls.ts` and the dataAssets
-  path in `scripts/check-activation-budget.mjs` if the filename changes.
-  The bake refuses to write when the qualification's release id or
-  published-height share no longer matches the extract.
-
-  Loaded only while the 3D Fire view is active.
+- `structures-central-oregon-2023.pmtiles`: building outlines for the 3D Fire
+  view (USA Structures, 2023 edition, Oak Ridge National Laboratory for the
+  FEMA Geospatial Response Office; published on Figshare under CC0 1.0).
+  153,805 footprints, 4,074 tiles, 5,186,150 bytes, z13-14, outlines only; the
+  edition publishes no height in this box and the app draws every building at
+  one stated height. Coverage is the `central_oregon` region framing only.
+  Rebuild: download the two state zips outside the repository, run
+  `.venv/Scripts/python.exe -I scripts/extract-fema-structures.py --zip <Oregon zip> --zip <Washington zip>`,
+  then `npm run build:structures-tiles`; inputs and output are pinned by
+  SHA-256 in `scripts/data/structures-tiles-receipt.json`. Loaded only while
+  the 3D Fire view is active.
 - `us-places.json`: municipal label points (Natural Earth, built by
-  `npm run build:states` tooling; see scripts/).
+  `npm run build:places`; see scripts/).
 - `tribal-roster.json` + `tribal-larname-crosswalk.json`: the
   names-only roster of federally recognized Tribes from the BIA annual
-  Federal Register notice, with the reviewed LARNAME crosswalk (names
-  only; no geometry). Regenerated by script; do not hand-edit.
+  Federal Register notice, with the reviewed LARNAME crosswalk and a
+  Census AIANNH supplement (names only; no geometry): every federal
+  statistical area (OTSA, TDSA, ANVSA), plus reservation and trust land
+  areas only for Tribes AIAN-LAR does not locate. A Nation can appear both
+  as a LAR land area and as a Census statistical area. A Nation neither
+  source draws a federal area for has one row too: three through their
+  state-recognized Census area, the rest at their headquarters town (the
+  Census place's internal point, a town point and never an area). Regenerated
+  by script; do not hand-edit.
 
 These are public, non-sovereign reference data; they are not deployer
 slots.
@@ -175,7 +181,7 @@ shipped artifact or an active Fire 3D input.
 
 ## `enso-indices.json` (committed snapshot, not a placeholder)
 
-A committed snapshot of four National Oceanic and Atmospheric
+A committed snapshot of five National Oceanic and Atmospheric
 Administration (NOAA) Climate Prediction Center (CPC) El Nino / Southern
 Oscillation (ENSO) index series:
 
@@ -187,18 +193,18 @@ Oscillation (ENSO) index series:
   the Nino 3.4 sea surface temperature anomaly, kept as the historical
   continuity comparison;
 - the analyzed monthly Nino 3.4 anomaly, a fast-moving companion that
-  never declares a phase on its own; and
+  never declares a phase on its own;
+- the weekly Nino 3.4 sea surface temperature anomaly (`nino34Weekly`); and
 - the standardized Southern Oscillation Index (SOI), a supporting
   ocean-atmosphere agreement flag only.
 
 Seasonal points carry a `preliminary` flag (recent seasons may still be
 revised). They drive the drought-impact briefing's long-range ENSO tilt
-and its index chart. The publish script refuses to copy back any
-externally refreshed snapshot that lacks this shape or drops a series
-(see `scripts/publish-public.mjs`), so a stale builder can never regress
-the live read again.
+and its index chart. `npm run check:enso` (`scripts/validate-enso-snapshot.mjs`,
+part of `check:all`) refuses a snapshot that lacks this shape or drops a
+required series, so a stale builder can never regress the live read again.
 
-Both CPC sources are served without Cross-Origin Resource Sharing (CORS)
+The CPC sources are served without Cross-Origin Resource Sharing (CORS)
 headers, so a browser cannot fetch them directly. Per the
 climate-data-sources doctrine, a slow monthly index is snapshotted at
 build or commit time rather than proxied at runtime. Refresh the snapshot
@@ -208,7 +214,7 @@ build or commit time rather than proxied at runtime. Refresh the snapshot
 npm run build:enso
 ```
 
-That runs `scripts/build-enso-snapshot.mjs`, which fetches all four
+That runs `scripts/build-enso-snapshot.mjs`, which fetches all five
 index products, parses each table, determines each ENSO phase, and rewrites
 `enso-indices.json` with its retrieval date. Commit the regenerated file.
 There is no deployer authorization concern here; this is public federal
@@ -216,24 +222,50 @@ climate data.
 
 ---
 
-## British Columbia basin drought levels (live, not bundled)
+## `rtofs-surface-currents*` (committed model frame, not a placeholder)
 
-The British Columbia drought framing fetches basin geometry directly from
-the Province of British Columbia ArcGIS FeatureServer at activation time.
-No British Columbia basin geometry is copied into this repository or stored
-under `public/data/`.
+One dated frame of ocean surface currents from the NOAA/NCEP Global RTOFS
+ocean model, drawn by the ENSO "Ocean currents" choice: a JSON header
+(`rtofs-surface-currents.json`: model run, valid instant, grids, scale)
+and one gzip file per model grid, each on its own spacing and never
+joined:
 
-The source attribution is `Province of British Columbia`. Its ArcGIS item
-terms were reconfirmed on 2026-07-27 and remain `Access Only`, `Copyright
-(c), Province of British Columbia. All rights reserved.` The maintainer's
-2026-07-08 display-and-attribution sign-off therefore remains applicable.
-The layer asks only for the basin identifier, basin name, drought level, and
-source date needed by the display.
+- `rtofs-surface-currents-trop-paci.i16.gz`: 1.0 degree, 40 S to 39 N and
+  130 E to 111 W;
+- `rtofs-surface-currents-alaska.i16.gz`: 0.3 degree, 40 N to 84.7 N and
+  140 E to 115.3 W.
 
-The provincial 0 through 5 scale is not converted to United States Drought
-Monitor categories. Source value 99 renders as `No update`, meaning the basin
-is not measured outside the core drought season; it is never put on the
-severity ramp.
+Each file is Int16 little-endian counts of 0.01 m/s (the model's own
+precision), all eastward values then all northward values, rows north to
+south, with -32768 where the model's own mask marks land. The values are
+the issuer's, re-encoded and unchanged; this is not an official NOAA
+product. The frame is as old as the last time it was built, and the map
+states its run, valid instant and age.
+
+NOAA serves these files without Cross-Origin Resource Sharing (CORS)
+headers and keeps two days of them, so a browser cannot read them. Build
+a new frame by hand, then commit the three files:
+
+```bash
+node scripts/build-rtofs-currents.mjs
+```
+
+There is no schedule and no deployer authorization concern here; this is
+public federal model output (https://www.weather.gov/disclaimer).
+
+---
+
+## British Columbia basin drought levels (held)
+
+The Province of British Columbia basin drought-level edition is held by
+DR-160 (2026-09-28) until the Province's written permission or the owner's
+re-ruling: its ArcGIS item terms say "you may not reproduce or distribute
+them without the prior written permission of the Province". While the hold
+stands (`BC_BASIN_EDITION_HELD` in `src/config/layers.ts`), no code path
+selects, presents or fetches that edition, and no British Columbia basin
+geometry is stored under `public/data/`. British Columbia keeps the drought
+monitors (the Canadian Drought Monitor and the North American Drought
+Monitor).
 
 ---
 
@@ -245,7 +277,7 @@ Open Government Licence - Canada. The dataset licence was reconfirmed through
 the open.canada.ca record
 `292646cd-619f-4200-afb1-8b2c52f984a2` on 2026-07-27.
 
-The committed artifact is for June 2026. It records its month, source URL,
+The committed artifact records its own month (see its `month` field), source URL,
 retrieval date, source archive byte count, present and absent classes,
 reprojection, simplification, and stewardship result. The source archive
 contained D0, D1, D2, and D3 files. D4 was absent, which means no area was in
@@ -263,7 +295,7 @@ The builder downloads one archive, expands it only in Node with the dev-only
 First Nations, Metis, Métis, Inuit, reserve, and Treaty terms, and fails
 before write on any match. It also rejects unexpected GeoJSON or properties,
 reprojects EPSG:3857 to WGS 84, and enforces a 5,000,000-byte build ceiling.
-For the June 2026 snapshot the mandatory result was:
+For the committed snapshot the mandatory result was:
 
 `PASS: no First Nations, Metis, Métis, Inuit, reserve, or Treaty terms found in 4 archive member names or decoded contents.`
 
@@ -280,10 +312,10 @@ After populating a deployer slot, test locally from the repo root:
 
 ```bash
 npm run dev
-# open http://localhost:5173/dynamic-drought-module/?layers=tribal
+# open http://localhost:5173/?layers=tribal
 ```
 
-If the layer toggle reports `no data (see data/README.md)`, the file is
+If the layer toggle reports `no data`, the file is
 loading but contains zero features. If it reports `unavailable`, check
 the path and that the file is valid JSON.
 

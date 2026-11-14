@@ -27,31 +27,18 @@
  */
 
 import type { RegionKey } from '../config/regions';
+import { STATE_FIPS, isStateCode } from '../config/state-codes';
+import type { StateCode } from '../config/state-codes';
 import type { BoundarySelectionContext, ResourceLink } from './types';
 
-/**
- * Two-letter state, district, or territory postal code used for resource
- * routing. Covers the 52 features in the bundled Census cartographic boundary
- * file (public/data/us-states.geojson): the 50 states, the District of
- * Columbia, and Puerto Rico.
- */
-export type StateCode =
-  | 'AL' | 'AK' | 'AZ' | 'AR' | 'CA' | 'CO' | 'CT' | 'DE' | 'FL' | 'GA'
-  | 'HI' | 'ID' | 'IL' | 'IN' | 'IA' | 'KS' | 'KY' | 'LA' | 'ME' | 'MD'
-  | 'MA' | 'MI' | 'MN' | 'MS' | 'MO' | 'MT' | 'NE' | 'NV' | 'NH' | 'NJ'
-  | 'NM' | 'NY' | 'NC' | 'ND' | 'OH' | 'OK' | 'OR' | 'PA' | 'RI' | 'SC'
-  | 'SD' | 'TN' | 'TX' | 'UT' | 'VT' | 'VA' | 'WA' | 'WV' | 'WI' | 'WY'
-  | 'DC' | 'PR';
-
-/** Federal Information Processing Standards (FIPS) state codes. */
-const STATE_FIPS: Record<StateCode, number> = {
-  AL: 1, AK: 2, AZ: 4, AR: 5, CA: 6, CO: 8, CT: 9, DE: 10, FL: 12, GA: 13,
-  HI: 15, ID: 16, IL: 17, IN: 18, IA: 19, KS: 20, KY: 21, LA: 22, ME: 23,
-  MD: 24, MA: 25, MI: 26, MN: 27, MS: 28, MO: 29, MT: 30, NE: 31, NV: 32,
-  NH: 33, NJ: 34, NM: 35, NY: 36, NC: 37, ND: 38, OH: 39, OK: 40, OR: 41,
-  PA: 42, RI: 44, SC: 45, SD: 46, TN: 47, TX: 48, UT: 49, VT: 50, VA: 51,
-  WA: 53, WV: 54, WI: 55, WY: 56, DC: 11, PR: 72
-};
+// Re-exported so every existing `import ... from './resources'` inside the
+// briefing cluster keeps compiling unchanged; the type and the guard now
+// live in the eager-safe `src/config/state-codes.ts` (activation-gate fix,
+// see that module's own doc comment), because an eager import of only the
+// guard (src/map/interaction-coordinator.ts, src/state/deep-link.ts) was
+// hoisting this whole cluster into the initial chunk.
+export type { StateCode } from '../config/state-codes';
+export { isStateCode } from '../config/state-codes';
 
 export const STATE_LABEL: Record<StateCode, string> = {
   AL: 'Alabama', AK: 'Alaska', AZ: 'Arizona', AR: 'Arkansas', CA: 'California',
@@ -70,13 +57,17 @@ export const STATE_LABEL: Record<StateCode, string> = {
 };
 
 /**
- * Resolve the state for a selection. A clicked state boundary carries its own
- * postal code (`STUSPS` from the Census file); every other boundary kind falls
- * back to the active region framing. The national explore framing has no
- * primary state, so a non-state selection there resolves to null and the
- * routing degrades honestly to the national federal set. (Point-in-state
- * resolution for non-state clicks under the national framing is a known
- * follow-up, not yet implemented.)
+ * Resolve the state for a selection, in order:
+ *   1. A clicked state boundary's own postal code (`STUSPS` from the Census
+ *      file), when the selection kind is `state`.
+ *   2. `context.containing.state`, resolved FROM THE PLACE (never the camera
+ *      region) by whichever door built this context; see `ContainingPlaces`
+ *      (src/impact/types.ts). Consulted for every selection kind, not only
+ *      `state`.
+ *   3. Last resort: `regionPrimaryState(context.regionKey)`, a guess from the
+ *      current camera region framing, used only when neither of the above
+ *      yields a place-derived state. Exercised by
+ *      tests/camera-region-fallbacks.spec.ts.
  */
 export function resolveStateCode(
   context: BoundarySelectionContext
@@ -85,9 +76,10 @@ export function resolveStateCode(
     const raw = context.properties?.['STUSPS'];
     if (typeof raw === 'string') {
       const code = raw.toUpperCase();
-      if (code in STATE_FIPS) return code as StateCode;
+      if (isStateCode(code)) return code;
     }
   }
+  if (context.containing.state !== null) return context.containing.state;
   return regionPrimaryState(context.regionKey);
 }
 
@@ -175,7 +167,7 @@ function federalResources(state: StateCode | null): ResourceLink[] {
         tier: 'federal',
         description: 'Federal drought portal: national current conditions, outlooks, and impacts.'
       };
-  return [
+  const anchors: ResourceLink[] = [
     droughtGov,
     {
       label: 'U.S. Drought Monitor',
@@ -192,21 +184,87 @@ function federalResources(state: StateCode | null): ResourceLink[] {
       description: 'Federal disaster designations and producer relief programs for drought.'
     }
   ];
+  // Each is a drought page: it leads in the drought mode and follows the mode's own programs elsewhere.
+  return anchors.map((row) => ({ ...row, conditions: ['drought'] }));
+}
+
+/** The kinds of help a federal program row can be, from the row's own words. */
+// `funding`: the row says funding or financial help without settling grant or loan. `program`: a standing program
+// whose words name no kind of help. Neither is guessed into a narrower word.
+export const RESOURCE_KINDS = ['technical-assistance', 'grant', 'loan', 'funding', 'disaster-program', 'program', 'information'] as const;
+export type ResourceKind = (typeof RESOURCE_KINDS)[number];
+
+export const RESOURCE_KIND_LABEL: Record<ResourceKind, string> = {
+  'technical-assistance': 'Technical assistance',
+  grant: 'Grant',
+  loan: 'Loan',
+  funding: 'Funding',
+  'disaster-program': 'Disaster program',
+  program: 'Program',
+  information: 'Information'
+};
+
+/**
+ * What a catalog row carries beyond `ResourceLink` (`public/data/resources/`):
+ * the hazard modes it answers (`HAZARD_CLUSTERS` keys, or `["any"]`), its kind,
+ * and its file's `verified` date. Intersected here because `types.ts` is not
+ * this module's to widen; the runtime objects carry the fields either way.
+ */
+export interface ResourceCatalogFields {
+  readonly conditions?: readonly string[];
+  readonly kind?: ResourceKind;
+  readonly verified?: string;
+}
+export type CatalogResource = ResourceLink & ResourceCatalogFields;
+
+/**
+ * Federal program rows (those carrying `conditions`) whose conditions include
+ * the active mode first, then the rest, each group in its existing order.
+ * `any` rows are not moved up. Rows without `conditions` (the in-code anchors)
+ * and rows of other tiers keep their places; no active or an unknown mode
+ * matches nothing, so the order is unchanged.
+ */
+export function orderFederalByCondition<T extends ResourceLink>(rows: readonly T[], mode: string | null): T[] {
+  const isProgram = (r: T): boolean => r.tier === 'federal' && Array.isArray((r as CatalogResource).conditions);
+  const answers = (r: T): boolean => mode !== null && ((r as CatalogResource).conditions ?? []).includes(mode);
+  const programs = rows.filter(isProgram);
+  const sorted = [...programs.filter(answers), ...programs.filter((r) => !answers(r))];
+  let next = 0;
+  return rows.map((r) => (isProgram(r) ? sorted[next++]! : r));
+}
+
+/** The agency line: the kind as quiet text before the agency, when the row has one. */
+export function resourceAgencyLine(r: { readonly agency: string; readonly kind?: string }): string {
+  const label = (RESOURCE_KIND_LABEL as Record<string, string | undefined>)[r.kind ?? ''];
+  return label ? `${label} · ${r.agency}` : r.agency;
+}
+
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+
+/** "Program pages checked July 9, 2026." from the oldest `verified` date among the rows, or null. */
+export function resourcesCheckedLine(rows: readonly (ResourceLink | ResourceCatalogFields)[]): string | null {
+  const dates = rows.map((r) => (r as ResourceCatalogFields).verified).filter((v): v is string => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v));
+  const oldest = dates.sort()[0];
+  if (oldest === undefined) return null;
+  const [y, m, d] = oldest.split('-').map(Number);
+  const month = MONTHS[m! - 1];
+  return month ? `Program pages checked ${month} ${d}, ${y}.` : null;
 }
 
 /**
  * The deployer-owned Tribe's-own-resources slot. Always present, always first,
  * empty by default. No specific Tribe's links are shipped; a deployer with
  * authorization populates this slot (documented in data/README.md). The panel
- * renders the empty slot as a "populate" affordance, not a broken link.
+ * leaves the slot out, heading included, until it carries a link.
  */
 function tribeOwnSlot(): ResourceLink {
   return {
     label: "Your Nation's drought, water, and emergency resources",
     agency: 'Deployer-populated',
     tier: 'tribe-own',
+    // P3-26 (2026-11-05): no repository path in public copy; data/README.md stays the deployer's guide.
     description:
-      "Primary: your Nation's own emergency management, water and drinking-water authority, and adaptation or hazard-mitigation plan. Populate this slot for your deployment (see data/README.md)."
+      "Primary: your Nation's own emergency management, water and drinking-water authority, and adaptation or hazard-mitigation plan. Populate this slot for your deployment."
   };
 }
 

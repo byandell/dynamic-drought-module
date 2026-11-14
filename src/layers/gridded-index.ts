@@ -12,23 +12,46 @@
  * and 365 day), each a distinct verified tile slug. A small selector in the
  * legend panel swaps the window; the default is 90 day. The chosen window
  * round-trips through the URL as `spi=<days>` (`src/state/url.ts`), with the
- * 90 day default encoded by absence, so a shared link restores it. The
- * Standardized
- * Precipitation Evapotranspiration Index (SPEI) and the Evaporative Demand
- * Drought Index (EDDI) are not published under this tile prefix, so they are
- * not offered (see urls.ts); adding them is a future refinement, not a guess.
+ * 90 day default encoded by absence, so a shared link restores it.
+ *
+ * Issuer prefix: every product in the table below resolves through the dataset
+ * prefix its issuer publishes it under, rather than through an opaque literal.
+ * drought.gov's Data Download page lists the foundational dataset as ACIS
+ * "Grid 1"; its products carry the slug prefix `ce-ACIS_NRCC_NN-`, and the
+ * index and accumulation window follow it (`ce-ACIS_NRCC_NN-spi-90d`).
+ * An earlier note here said the Standardized Precipitation Evapotranspiration
+ * Index (SPEI) and the Evaporative Demand Drought Index (EDDI) "are not
+ * published under this tile prefix". That was wrong. They ARE published under
+ * it, as `speih` and `eddih` (EDDI is also published under its own
+ * `noaa-eddi-conus-` prefix, at zoom ceiling 7); the earlier 404 came from
+ * guessing the slugs `spei` and `eddi`, and a guessed slug is not an absence.
+ * They stay unoffered because how far this selector expands is an open
+ * product question, not because the issuer withholds them: DR-049 ratified
+ * reading a true date and zoom limit and keeping SPI only for now, and left
+ * expansion as a later item.
+ *
+ * Coverage: the raster stack covers the contiguous United States only.
+ * drought.gov gives the ACIS "Grid 1" Data Coverage as "Contiguous U.S." and
+ * its Coverage and Resolution as "ConUS 4km", and every window wired here
+ * publishes the same extent in its own `info.json`:
+ * `"bbox": "-128.8,24.4,-66.0,50.3"` (re-verified live on all five windows
+ * 2026-09-03). That box excludes Alaska, Hawaii, Puerto Rico and the Pacific
+ * territories, so the legend states the limit. The layer state follows the
+ * tiles (DR-050 a, DDM-P14-T04): a view straddling the box reads live
+ * (partial), and a view wholly outside it reads unavailable, never live,
+ * because no tile there is proven (NIDIS answers 404 outside the box).
  *
  * No popups: the index color scale is baked into the tiles and they carry no
  * per-feature properties, so there is nothing to query on click. The legend
- * panel provides an orientation gradient and links the authoritative drought.gov
+ * panel provides the issuer's discrete legend swatches and links drought.gov's
  * legend.
  *
  * Valid date: each product publishes `<slug>/info.json` beside its tiles,
  * carrying the valid `date` of the raster and the product's true `tilezmax`.
  * drought.gov documents it: "info.json contains the valid date in JSON
  * format". The layer reads it on activation and on every window change,
- * because the windows are NOT equally fresh (on 2026-09-01 the 90 day raster
- * was 3 days old and the 365 day raster was 62 days old) and an undated
+ * because the windows are NOT equally fresh (on 2026-09-03 the 90 day raster
+ * was 3 days old and the 365 day raster was 64 days old) and an undated
  * raster reads as current conditions when it is not (DWH-02). When the file
  * does not answer, the legend says the date is unavailable; it never shows a
  * date the issuer did not publish, and it applies no staleness threshold of
@@ -39,18 +62,26 @@
  * publishes 6; siblings on this bucket publish 7). MapLibre overzooms
  * (upscales) above the ceiling rather than requesting tiles that do not exist.
  *
- * Source: `URLS.nidisGriddedTileRoot` (verified 2026-05-30; see urls.ts).
+ * Source: `URLS.nidisGriddedTileRoot` (verified 2026-05-30, re-verified
+ * 2026-09-03; see urls.ts).
  */
 
 import type * as maplibregl from 'maplibre-gl';
 import { URLS } from '../config/urls';
 import { registry } from '../state/registry';
+import { GRIDDED_INDEX_RAMP } from '../config/palette';
+import { ExpiringLruCache } from '../util/bounded-cache';
 import { escapeHtml } from '../util/escape';
 import { fetchJsonWithBudget } from '../util/fetch';
 import { isObject } from '../util/guards';
 import { parseSpiWindowParam, syncSpiWindowParam } from '../state/url';
 import { showLegend, hideLegend, LEGEND_ORDER } from '../ui/legend-registry';
-import { watchRasterTiles, type RasterTileWatch } from '../util/raster-status';
+import {
+  watchRasterTiles,
+  type RasterTileOutcome,
+  type RasterTileWatch
+} from '../util/raster-status';
+import { TILE_PROOF_WATCH } from '../util/raster-proof';
 
 const LAYER_KEY = 'gridded-index';
 const SOURCE_ID = 'gridded-index';
@@ -77,26 +108,80 @@ const DEFAULT_MAX_ZOOM = 6;
 const INFO_TIMEOUT_MS = 6_000;
 
 /**
- * Verified SPI products (slug plus label). Each slug was confirmed live
- * (HTTP 200, image/png, CORS open) on 2026-05-30. The slug is appended to
+ * One published NIDIS foundational dataset: the issuer's own name for it, the
+ * slug prefix every product of it is published under, and the coverage the
+ * issuer states for it. Products name their dataset instead of carrying a
+ * literal slug, so the prefix and the coverage are recorded once, beside the
+ * page that proves them, and a product cannot drift onto a prefix its issuer
+ * does not publish it under.
+ */
+interface GriddedDataset {
+  /** The issuer's own name for the dataset. */
+  readonly name: string;
+  /** The slug prefix the issuer publishes this dataset's products under. */
+  readonly slugPrefix: string;
+  /** The coverage limit, in the issuer's own terms, for the legend to state. */
+  readonly coverage: string;
+  /** The issuer page that publishes both of the above. */
+  readonly datasetPage: string;
+}
+
+/**
+ * ACIS "Grid 1", the Applied Climate Information System interpolated grid from
+ * NOAA's Northeast Regional Climate Center. drought.gov's dataset page carries
+ * the field "Data Coverage: Contiguous U.S." and describes it as covering
+ * "the contiguous United States from January 1, 1950 to the present"; the Data
+ * Download page's foundational-dataset table gives its Coverage and Resolution
+ * as "ConUS 4km". Every wired product's own `info.json` agrees, publishing
+ * `"bbox": "-128.8,24.4,-66.0,50.3"` (re-verified live 2026-09-03), which
+ * excludes Alaska, Hawaii, Puerto Rico and the Pacific territories.
+ */
+const ACIS_GRID1: GriddedDataset = {
+  name: 'ACIS "Grid 1"',
+  slugPrefix: 'ce-ACIS_NRCC_NN-',
+  coverage: 'the contiguous United States only',
+  datasetPage:
+    'https://www.drought.gov/data-maps-tools/gridded-climate-datasets-applied-climate-information-system-acis-nrcc-interpolated'
+};
+
+/**
+ * Verified SPI products. Each is the issuer's dataset prefix plus the index
+ * and accumulation window the issuer appends to it, so `slug` is derived, not
+ * asserted. Every slug was confirmed live (HTTP 200, image/png, CORS open) on
+ * 2026-05-30 and re-read on 2026-09-03. The slug is appended to
  * `URLS.nidisGriddedTileRoot` to form the tile template.
  */
 interface GriddedProduct {
+  /** The dataset this product belongs to, and the prefix it resolves through. */
+  readonly dataset: GriddedDataset;
+  /** The index and accumulation window the issuer appends to the prefix. */
+  readonly indexWindow: string;
+  /** The published slug: the dataset prefix followed by the index and window. */
   readonly slug: string;
   readonly label: string;
   /** Accumulation window in days; the value carried by the `spi=` parameter. */
   readonly days: number;
 }
 
+/** One product of a dataset, resolved through that dataset's own prefix. */
+function product(
+  dataset: GriddedDataset,
+  indexWindow: string,
+  label: string,
+  days: number
+): GriddedProduct {
+  return { dataset, indexWindow, slug: `${dataset.slugPrefix}${indexWindow}`, label, days };
+}
+
 const PRODUCTS: readonly GriddedProduct[] = [
-  { slug: 'ce-ACIS_NRCC_NN-spi-30d', label: 'SPI, 30 day', days: 30 },
-  { slug: 'ce-ACIS_NRCC_NN-spi-60d', label: 'SPI, 60 day', days: 60 },
-  { slug: 'ce-ACIS_NRCC_NN-spi-90d', label: 'SPI, 90 day', days: 90 },
-  { slug: 'ce-ACIS_NRCC_NN-spi-180d', label: 'SPI, 180 day', days: 180 },
-  { slug: 'ce-ACIS_NRCC_NN-spi-365d', label: 'SPI, 365 day', days: 365 }
+  product(ACIS_GRID1, 'spi-30d', 'SPI, 30 day', 30),
+  product(ACIS_GRID1, 'spi-60d', 'SPI, 60 day', 60),
+  product(ACIS_GRID1, 'spi-90d', 'SPI, 90 day', 90),
+  product(ACIS_GRID1, 'spi-180d', 'SPI, 180 day', 180),
+  product(ACIS_GRID1, 'spi-365d', 'SPI, 365 day', 365)
 ];
 
-const DEFAULT_PRODUCT = 'ce-ACIS_NRCC_NN-spi-90d';
+const DEFAULT_PRODUCT = `${ACIS_GRID1.slugPrefix}spi-90d`;
 
 /** Source attribution, declared once (used by every source-add). */
 const ATTRIBUTION = 'NOAA NIDIS / drought.gov';
@@ -108,6 +193,21 @@ let currentSlug: string = DEFAULT_PRODUCT;
 
 /** The tile-load honesty watcher (util/raster-status.ts); null when inactive. */
 let tileWatch: RasterTileWatch | null = null;
+/** Its latest verdict on the source on the map; null until a cycle ends. */
+let tileVerdict: RasterTileOutcome | null = null;
+
+/**
+ * A rebuilt source is a fresh evidence slate: the watcher's, the verdict's,
+ * and the pill's. While the layer is active the pill reads loading until the
+ * new source proves a tile, so the previous product's verdict never speaks
+ * for the new one (DDM-P14-T04, found-001).
+ */
+function resetTileProof(): void {
+  tileVerdict = null;
+  if (tileWatch === null) return;
+  tileWatch.reset();
+  registry.setStatus(LAYER_KEY, 'loading');
+}
 
 /**
  * What one product's `info.json` says. The published contract is not uniform:
@@ -130,8 +230,15 @@ type InfoState =
   | { readonly kind: 'ready'; readonly info: ProductInfo }
   | { readonly kind: 'unavailable' };
 
-/** Parsed `info.json` per slug, for the session (a re-select re-uses it). */
-const infoBySlug = new Map<string, ProductInfo>();
+/**
+ * Parsed `info.json` per slug for one hour, the issuer's own `max-age=3600`:
+ * a re-select or re-toggle within the hour re-uses it, a later one re-reads
+ * the daily product's date. shortcut: a layer left on without a toggle or
+ * window change keeps its stamp past the hour; re-read on tile reload if
+ * that is ever reported.
+ */
+const infoBySlug = new ExpiringLruCache<string, ProductInfo>(PRODUCTS.length);
+const INFO_TTL_MS = 60 * 60 * 1000;
 
 /** The current read, and the slug it describes (never shown for another). */
 let infoState: InfoState = { kind: 'loading' };
@@ -150,6 +257,15 @@ function resolveBeforeId(map: maplibregl.Map): string | undefined {
 /** Build the XYZ tile template for a product slug. */
 function tileTemplate(slug: string): string {
   return `${URLS.nidisGriddedTileRoot}/${slug}/{z}/{x}/{y}.png`;
+}
+
+/**
+ * The dataset a slug belongs to. Every wired product is an ACIS "Grid 1"
+ * product today, so an unknown slug falls back to it rather than inventing a
+ * coverage claim for a dataset the layer does not serve.
+ */
+function datasetForSlug(slug: string): GriddedDataset {
+  return PRODUCTS.find((p) => p.slug === slug)?.dataset ?? ACIS_GRID1;
 }
 
 function productLabel(slug: string): string {
@@ -319,7 +435,7 @@ async function loadProductInfo(map: maplibregl.Map): Promise<void> {
     );
     if (controller.signal.aborted || currentSlug !== slug) return;
     const info = parseProductInfo(json);
-    infoBySlug.set(slug, info);
+    infoBySlug.set(slug, info, INFO_TTL_MS);
     infoStateSlug = slug;
     infoState = { kind: 'ready', info };
     applyProductInfo(map, slug);
@@ -349,31 +465,53 @@ function applyProductInfo(map: maplibregl.Map, slug: string): void {
   if (map.getLayer(LAYER_ID)) map.removeLayer(LAYER_ID);
   map.removeSource(SOURCE_ID);
   addRasterSourceAndLayer(map);
-  tileWatch?.reset();
+  resetTileProof();
 }
 
 /**
- * Add the raster source and layer for the current product. Idempotent: a
- * re-activation with the source already present is a no-op (so the URL-restore
- * path cannot stack duplicates). Raster tiles load lazily through MapLibre, so
- * there is no fetch to await; status goes to `ready` and the tile watcher
- * keeps it honest afterward (degrade on repeated tile failures, heal on the
- * next successful load).
+ * Add the raster source and layer for the current product. Raster tiles load
+ * lazily through MapLibre, so there is no fetch to await, and the status stays
+ * `loading` (set by the layer controller) until tile proof decides it
+ * (DDM-P14-T04, found-001): the shared completeness watch reads `ready` when
+ * the view's tiles all load, `degraded` (live, partial) when some fail, and
+ * `error` (unavailable) when none load or none were requested, which is what a
+ * view wholly outside the CONUS box reads (NIDIS answers 404 there; DR-050 a).
+ * The valid-date sidecar does not gate it: the tiles are the layer.
+ *
+ * Idempotent: a re-activation with the source already present adds nothing (so
+ * the URL-restore path cannot stack duplicates) and keeps the watcher that has
+ * been proving that source, with its evidence, and re-reports its verdict over
+ * the controller's `loading` (loading until its first cycle ends). A rendered
+ * source whose tiles are cached emits no new tile event, so a fresh watcher
+ * would read unavailable on its deadline alone. A source this call rebuilds
+ * (a changed `spi=` window, or one dropped from the map) is proven afresh.
  */
 export async function activate(map: maplibregl.Map): Promise<void> {
   applyUrlWindow(map);
+  const kept = tileWatch !== null && map.getSource(SOURCE_ID) !== undefined;
   addRasterSourceAndLayer(map);
   // The valid date is read alongside the tiles, not before them: the raster
   // renders immediately and the legend's date stamp fills in when the sidecar
   // answers (or says it did not).
   void loadProductInfo(map);
-  tileWatch?.detach();
-  tileWatch = watchRasterTiles(map, SOURCE_ID, (state) => registry.setStatus(LAYER_KEY, state));
+  if (!kept) {
+    tileWatch?.detach();
+    tileVerdict = null;
+    tileWatch = watchRasterTiles(
+      map,
+      SOURCE_ID,
+      (state) => {
+        tileVerdict = state;
+        registry.setStatus(LAYER_KEY, state);
+      },
+      TILE_PROOF_WATCH
+    );
+  }
+  if (tileVerdict !== null) registry.setStatus(LAYER_KEY, tileVerdict);
   showLegend(LAYER_KEY, {
     order: LEGEND_ORDER.surface,
     render: (body) => renderLegendSection(map, body)
   });
-  registry.setStatus(LAYER_KEY, 'ready');
 }
 
 /** Remove the raster layer and source and hide the legend. Symmetric, safe. */
@@ -410,7 +548,7 @@ function setProduct(map: maplibregl.Map, slug: string): void {
   addRasterSourceAndLayer(map);
   // A product swap is a fresh evidence slate; old failures must not count
   // against the new template.
-  tileWatch?.reset();
+  resetTileProof();
   updateLegendLabel();
   // Each window has its own valid date (they are not equally fresh), so the
   // swap re-reads the sidecar and the previous read is abandoned.
@@ -426,6 +564,7 @@ function setProduct(map: maplibregl.Map, slug: string): void {
  * state honestly supports and is refreshed in place by `updateLegendLabel`.
  */
 function renderLegendSection(map: maplibregl.Map, body: HTMLElement): void {
+  const dataset = datasetForSlug(currentSlug);
   body.innerHTML =
     '<h3 class="legend-section-title">Gridded index key</h3>' +
     '<label class="legend-control">' +
@@ -433,10 +572,20 @@ function renderLegendSection(map: maplibregl.Map, body: HTMLElement): void {
     '<select id="gridded-index-product" class="legend-select" aria-label="Gridded drought index product"></select>' +
     '</label>' +
     '<div class="gridded-index-ramp" role="img" aria-label="Standardized Precipitation Index scale: drier on the left, wetter on the right">' +
-    '<span class="gridded-index-ramp-bar"></span>' +
+    '<span class="gridded-index-ramp-bar" aria-hidden="true">' +
+    GRIDDED_INDEX_RAMP.map(({ color }) =>
+      `<span style="background-color:${color}"></span>`
+    ).join('') +
+    '</span>' +
     '<div class="gridded-index-ramp-labels"><span>Drier</span><span>Wetter</span></div>' +
     '</div>' +
-    `<p class="legend-note"><span id="gridded-index-product-label">${escapeHtml(productLabel(currentSlug))}</span> · <span id="gridded-index-valid">${escapeHtml(validDateStamp())}</span> · NOAA NIDIS. The exact color scale is baked into the tiles; <a href="https://www.drought.gov/current-conditions" target="_blank" rel="noopener">see the drought.gov legend</a>.</p>`;
+    `<p class="legend-note"><span id="gridded-index-product-label">${escapeHtml(productLabel(currentSlug))}</span> · <span id="gridded-index-valid">${escapeHtml(validDateStamp())}</span> · NOAA NIDIS. The exact color scale is baked into the tiles; <a href="https://www.drought.gov/current-conditions" target="_blank" rel="noopener">see the drought.gov legend</a>.</p>` +
+    // The coverage limit, stated rather than left to be discovered as an empty
+    // map. NOAA NIDIS publishes this dataset's Data Coverage as "Contiguous
+    // U.S." and every wired window publishes the same bbox; being outside it
+    // is a coverage fact, not a failed fetch, so nothing here touches the
+    // layer's six-state status.
+    `<p class="legend-note" id="gridded-index-coverage">Coverage: ${escapeHtml(dataset.coverage)}. NOAA NIDIS gives the <a href="${escapeHtml(dataset.datasetPage)}" target="_blank" rel="noopener">${escapeHtml(dataset.name)}</a> Data Coverage as &quot;Contiguous U.S.&quot;, and every window offered here publishes that same extent; Alaska, Hawaii, Puerto Rico and the Pacific territories are outside it.</p>`;
 
   const select = body.querySelector<HTMLSelectElement>('#gridded-index-product');
   if (!select) return;

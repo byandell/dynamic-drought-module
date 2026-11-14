@@ -4,17 +4,16 @@ import { URLS } from '../config/urls';
 import type { PlaceCatalogEntry } from '../config/place-catalog';
 import type { OceanKey } from '../config/oceans';
 import type { LayerStatus } from '../types/layer';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchBufferedWithBudget, fetchSharedJsonWithBudget, US_STATES_SHARED_KEY } from '../util/fetch';
 import { isChecked, checkedSnapshot, onCheckedChange } from '../ui/island/bridge';
 import {
   requestLayerOff,
   requestLayerOnExact
 } from '../ui/layer-toggle-command';
-import {
-  getHazardCluster,
-  getOceanFraming,
-  setHazardCluster
-} from './cluster-store';
+import { getHazardCluster, getOceanFraming } from './cluster-store';
+import { getSelectedHazard, restoreCommittedCluster } from './cluster-service';
+import type { Geometry } from 'geojson';
+import { showLocatedBoundary } from './located-boundary';
 import { getMap } from './map-store';
 import {
   clearEmphasis,
@@ -27,7 +26,10 @@ import {
   showStudioBoundary,
   type StudioBoundaryGeometry
 } from './studio-boundary';
+import { escapeSql } from '../util/arcgis-features';
+import { setPlaceDisplayHeld } from './place-display-hold';
 import { registry } from './registry';
+import { holdStudioReturnDisplay } from './url';
 import type { TypedPlaceKind, TypedPlaceRef } from './typed-place';
 
 /**
@@ -40,6 +42,8 @@ export interface DisplaySnapshot {
   readonly statuses: ReadonlyMap<string, LayerStatus>;
   readonly cluster: HazardClusterKey;
   readonly ocean: OceanKey | null;
+  /** The person's hazard; for a custom set `cluster` reads Drought. */
+  readonly selectedHazard: HazardClusterKey;
 }
 
 const SET_ASIDE_ROLES = new Set(['surface', 'event']);
@@ -79,7 +83,7 @@ const failedKeys = new Set<string>();
 let ecoregionLevelBeforeStudio: 'ecoregions-l3' | 'ecoregions-l4' | null = null;
 
 /** Capture the current checkbox intent and the registry's honest statuses. */
-export function captureDisplaySnapshot(): DisplaySnapshot {
+function captureDisplaySnapshot(): DisplaySnapshot {
   const intentKeys = new Set<string>();
   for (const [key, checked] of checkedSnapshot()) {
     if (checked) intentKeys.add(key);
@@ -95,7 +99,8 @@ export function captureDisplaySnapshot(): DisplaySnapshot {
     intentKeys,
     statuses,
     cluster: getHazardCluster(),
-    ocean: getOceanFraming()
+    ocean: getOceanFraming(),
+    selectedHazard: getSelectedHazard()
   };
 }
 
@@ -107,6 +112,10 @@ export function captureDisplaySnapshot(): DisplaySnapshot {
 export function beginPlaceStudioDisplay(kind: TypedPlaceKind): DisplaySnapshot {
   if (!activeSnapshot) {
     activeSnapshot = captureDisplaySnapshot();
+    // On from the capture, before the clean display sets anything aside,
+    // until the restore has finished (src/state/place-display-hold.ts).
+    setPlaceDisplayHeld(true);
+    holdStudioReturnDisplay(activeSnapshot);
     failedKeys.clear();
     unsubscribeIntent = onCheckedChange(() => queueCleanIntentEnforcement());
     unsubscribeRegistry = registry.on('change', () => reapplyEmphasisWhenReady());
@@ -216,6 +225,49 @@ function applyCurrentEmphasis(): void {
 }
 
 /**
+ * Seed the tribe emphasis cache from a geometry response that already
+ * carries every LARID for a Nation's representations (DDM-P2-T10, DR-094):
+ * the Place studio's own AIAN-LAR geometry request (src/ui/island/place-studio.tsx
+ * resolveTribeSelection) calls this so that ONE no-store request serves both
+ * the geometry and the emphasis, and `resolveEmphasisTargets`'s own
+ * LARID-only fetch below is never reached for this selection. A call with no
+ * ids is a no-op: nothing is seeded, so a later `applyCurrentEmphasis` still
+ * falls back to that fetch, exactly as it does for a restore or any other
+ * re-emphasis where nothing was seeded.
+ */
+export function seedTribeEmphasisTargets(
+  entry: PlaceCatalogEntry,
+  larIds: readonly (string | number)[]
+): void {
+  if (larIds.length === 0) return;
+  const cacheKey = `${entry.kind}:${entry.id}:${entry.representationIds.join('|')}`;
+  const seen = new Set<string>();
+  const targets: EmphasisTarget[] = [];
+  for (const id of larIds) {
+    const dedupeKey = String(id);
+    if (seen.has(dedupeKey)) continue;
+    seen.add(dedupeKey);
+    targets.push({ source: 'bia-reservations', id });
+  }
+  featureIdCache.set(cacheKey, targets);
+}
+
+/** The studio exit with no briefing handed back: nothing else would ever unlight the place the studio lit. */
+export function clearStudioEmphasis(): void {
+  const map = getMap();
+  if (map) clearEmphasis(map);
+}
+
+/**
+ * Draw a Nation's boundary under its exit briefing as the located overlay:
+ * the restore turns the Tribal layers that lit it off again when the person had them off.
+ */
+export function showStudioReturnBoundary(geometry: Geometry): void {
+  const map = getMap();
+  if (map) showLocatedBoundary(map, geometry);
+}
+
+/**
  * Restore the exact captured intent. Status values are deliberately not
  * replayed: deactivated layers activate again through the controller and
  * publish loading plus their truthful terminal status from current data.
@@ -225,32 +277,49 @@ export function restoreDisplaySnapshot(): DisplaySnapshot | null {
   if (!snapshot) return null;
 
   activeSnapshot = null;
-  unsubscribeIntent?.();
-  unsubscribeIntent = null;
-  unsubscribeRegistry?.();
-  unsubscribeRegistry = null;
-  emphasisGeneration += 1;
-  emphasisAbort?.abort();
-  emphasisAbort = null;
-  currentPlace = null;
-  currentEntry = null;
-  failedKeys.clear();
-  const map = getMap();
-  if (map) {
-    clearStudioBoundary(map);
-    // Put the user's ecoregion detail level back if the studio moved it
-    // for a selection (R2 H3).
-    const priorLevel = ecoregionLevelBeforeStudio;
-    if (priorLevel !== null) {
-      void import('../layers/ecoregions')
-        .then((m) => m.setEcoregionDisplayLevel(map, priorLevel))
-        .catch(() => undefined);
+  try {
+    holdStudioReturnDisplay(null);
+    unsubscribeIntent?.();
+    unsubscribeIntent = null;
+    unsubscribeRegistry?.();
+    unsubscribeRegistry = null;
+    emphasisGeneration += 1;
+    emphasisAbort?.abort();
+    emphasisAbort = null;
+    currentPlace = null;
+    currentEntry = null;
+    failedKeys.clear();
+    const map = getMap();
+    if (map) {
+      clearStudioBoundary(map);
+      // Put the user's ecoregion detail level back if the studio moved it
+      // for a selection (R2 H3).
+      const priorLevel = ecoregionLevelBeforeStudio;
+      if (priorLevel !== null) {
+        void import('../layers/ecoregions')
+          .then((m) => m.setEcoregionDisplayLevel(map, priorLevel))
+          .catch(() => undefined);
+      }
     }
-  }
-  ecoregionLevelBeforeStudio = null;
+    ecoregionLevelBeforeStudio = null;
 
-  syncIntent(snapshot.intentKeys);
-  setHazardCluster(snapshot.cluster, snapshot.ocean);
+    syncIntent(snapshot.intentKeys);
+    // found-011 (CODEMAP:1749): restore through the cluster service, not the
+    // raw store setter, which only notifies on a VALUE change and misses the
+    // common case where the captured cluster (often Drought, the store's
+    // ever-present default) never actually left the store even though the
+    // studio's clean-display enforcement demoted the service's OWN committed
+    // claim to 'custom' by unchecking a set-aside hazard surface. The
+    // service door forces the re-derivation a real store change would have
+    // triggered either way, so the hazard re-presses on every restore, not
+    // only when the captured cluster differs from whatever it degraded to.
+    restoreCommittedCluster(snapshot.cluster, snapshot.ocean, snapshot.selectedHazard);
+  } finally {
+    // Released only now, so no reader sees the half-restored set; and
+    // released even if a step above throws, so a stale hold never keeps a
+    // scene up in another view (src/state/place-display-hold.ts).
+    setPlaceDisplayHeld(false);
+  }
   return snapshot;
 }
 
@@ -332,14 +401,17 @@ async function resolveEmphasisTargets(
   if (cached) return cached;
 
   if (place.kind === 'state') {
-    const response = await fetchWithBudget(
+    // Shared, page-lifetime transport (DDM-P14-T06): joins whatever fetch the
+    // states layer, the deep link, the click-door fallback, or the Place
+    // studio already made for the same bundled file. `findIndex` below is
+    // read-only, so sharing the reference is safe.
+    const collection = (await fetchSharedJsonWithBudget(
+      US_STATES_SHARED_KEY,
       URLS.usStatesLocal,
       null,
       signal,
       EMPHASIS_TIMEOUT_MS
-    );
-    if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    const collection = (await response.json()) as {
+    )) as {
       readonly features?: readonly {
         readonly properties?: Readonly<Record<string, unknown>>;
       }[];
@@ -354,10 +426,16 @@ async function resolveEmphasisTargets(
   }
 
   if (place.kind === 'tribe') {
+    // The FALLBACK path (DDM-P2-T10): reached only when nothing was seeded
+    // by `seedTribeEmphasisTargets` above (the cache lookup at the top of
+    // this function missed), a restore, or a re-emphasis whose geometry
+    // request never ran in this session. The Place studio's own selection
+    // flow seeds the cache from its one AIAN-LAR geometry request instead,
+    // so this fetch is not the common path.
     const larNames = entry.representationIds.filter((name) => name !== '');
     if (larNames.length === 0) return [];
     const quoted = larNames
-      .map((name) => `'${name.replace(/'/g, "''")}'`)
+      .map((name) => `'${escapeSql(name)}'`)
       .join(',');
     const params = new URLSearchParams({
       where: `LARNAME IN (${quoted})`,
@@ -365,7 +443,7 @@ async function resolveEmphasisTargets(
       returnGeometry: 'false',
       f: 'json'
     });
-    const response = await fetchWithBudget(
+    const response = await fetchBufferedWithBudget(
       `${URLS.biaLarFeatureServer}/query?${params.toString()}`,
       { cache: 'no-store' },
       signal,

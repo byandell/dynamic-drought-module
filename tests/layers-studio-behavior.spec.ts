@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 
 import { STATUS_PILL_TEXT } from '../src/ui/island/pill-text';
 import { gotoApp, search, urlLayers } from './helpers';
@@ -53,7 +53,7 @@ test.describe('LAYERS studio behavior', () => {
     expect(STATUS_PILL_TEXT.ready).toBe('live');
     expect(STATUS_PILL_TEXT.degraded).toBe('live (partial)');
     expect(STATUS_PILL_TEXT.error).toBe('unavailable');
-    expect(STATUS_PILL_TEXT['no-data']).toBe('no data (see data/README.md)');
+    expect(STATUS_PILL_TEXT['no-data']).toBe('no data');
     expect(STATUS_PILL_TEXT['zoom-in']).toBe('zoom in to load');
   });
 
@@ -191,7 +191,7 @@ test.describe('LAYERS studio behavior', () => {
     await expect(pill('states')).toHaveText('live');
     await expect(pill('aiannh')).toHaveText('live (partial)');
     await expect(pill('bia-reservations')).toHaveText('unavailable');
-    await expect(pill('tribal')).toHaveText('no data (see data/README.md)');
+    await expect(pill('tribal')).toHaveText('no data');
     await expect(pill('telemetry')).toHaveText('zoom in to load');
 
     releasePlaces();

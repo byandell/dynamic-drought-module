@@ -1,9 +1,9 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './offline-test';
 
 import { TRIBAL_NATIONS_PROVENANCE_NOTE } from '../src/config/provenance';
 import { parseStudioParam } from '../src/state/url';
 import { STATUS_PILL_TEXT } from '../src/ui/island/pill-text';
-import { gotoApp, ROLE_GROUPS, search, urlLayers } from './helpers';
+import { gotoApp, layerPill, PILL, ROLE_GROUPS, search, urlLayers } from './helpers';
 
 const STUDIO = '#layers-studio-root';
 
@@ -18,6 +18,44 @@ async function stubPlaces(page: Page): Promise<void> {
 }
 
 test.describe('minimal LAYERS studio', () => {
+  for (const width of [1440, 820]) {
+    test(`D3 neutral layer controls survive studio rehosting at ${width}`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 });
+      await gotoApp(page, '?view=console&layers=places&studio=layers&flow=off');
+      const studio = page.locator(STUDIO);
+      await expect(studio).toBeVisible();
+      const input = studio.locator('input[data-layer-key="places"]');
+      const row = studio.locator('.layer-toggle').filter({ has: page.locator('input[data-layer-key="places"]') });
+      await expect(input).toBeChecked();
+      await expect(studio.locator('[data-layer-status="places"]')).toHaveClass(/\bready\b/);
+      await expect(studio.locator('.layers-studio-catalog')).toHaveCSS('background-color', 'rgb(20, 20, 20)');
+      // In the studio the on row has no plate; the strong name and the inverted checkbox mark it. The sidebar row keeps its plate (asserted below).
+      await expect(row).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+      await expect(row).toHaveCSS('border-top-color', 'rgba(0, 0, 0, 0)');
+      await expect(row).toHaveCSS('box-shadow', 'none');
+      await expect(row.locator('.layer-toggle-name')).toHaveCSS('font-weight', '700');
+      await expect(input).toHaveCSS('background-color', 'rgb(255, 255, 255)');
+      await row.hover();
+      await expect(row).toHaveCSS('background-color', 'rgb(30, 36, 44)');
+      await input.focus();
+      await expect(input).toHaveCSS('outline-color', 'rgb(255, 255, 255)');
+      await expect(input).toHaveCSS('outline-offset', '0px');
+      await expect(input).toHaveCSS('box-shadow', 'rgb(1, 11, 19) 0px 0px 0px 4px');
+      await input.press('Space');
+      await expect(input).not.toBeChecked();
+      await expect.poll(async () => (await urlLayers(page)).has('places')).toBe(false);
+      await expect(row).toHaveCSS('box-shadow', 'none');
+      await input.press('Space');
+      await expect(input).toBeChecked();
+      await expect(studio.locator('[data-layer-status="places"]')).toHaveClass(/\bready\b/);
+      await expect.poll(async () => (await urlLayers(page)).has('places')).toBe(true);
+      await studio.getByRole('button', { name: 'Back to map' }).click();
+      await expect(studio).toHaveCount(0);
+      const restored = page.locator('#sidebar .layer-toggle').filter({ has: page.locator('input[data-layer-key="places"]') });
+      await expect(restored).toHaveCSS('background-color', 'rgb(42, 49, 56)');
+      await expect(restored.locator('input')).toBeChecked();
+    });
+  }
   test.beforeEach(async ({ page }) => {
     await stubPlaces(page);
   });
@@ -30,7 +68,7 @@ test.describe('minimal LAYERS studio', () => {
     expect(STATUS_PILL_TEXT.ready).toBe('live');
     expect(STATUS_PILL_TEXT.degraded).toBe('live (partial)');
     expect(STATUS_PILL_TEXT.error).toBe('unavailable');
-    expect(STATUS_PILL_TEXT['no-data']).toBe('no data (see data/README.md)');
+    expect(STATUS_PILL_TEXT['no-data']).toBe('no data');
     expect(STATUS_PILL_TEXT['zoom-in']).toBe('zoom in to load');
   });
 
@@ -39,7 +77,7 @@ test.describe('minimal LAYERS studio', () => {
     const beforeLength = await page.evaluate(() => window.history.length);
 
     const entry = page.locator('#layers-studio-entry');
-    await expect(entry).toHaveText('LAYERS');
+    await expect(entry).toHaveText('Layers'); // mixed case since visual uniformity wave 1, D1
     await expect(entry).toHaveAttribute(
       'aria-label',
       'Open the LAYERS studio: layer search, toggles, and sources'
@@ -142,4 +180,55 @@ test.describe('minimal LAYERS studio', () => {
     await expect(page.locator('#panel-layers')).toBeVisible();
     expect(new URLSearchParams(await search(page)).get('view')).toBe('console');
   });
+
+  // found-013 (register key: found-013; D1 M18): a Water & Snow station
+  // press used to fly the camera and open the station's popup UNDERNEATH
+  // the full-screen studio overlay, so nothing visible happened. The
+  // curated Ice Harbor Dam station renders without any live network (the
+  // national default's viewport exceeds the discovery area cap, so
+  // src/config/station-registry.ts's discoverStationsForViewport returns
+  // "zoom-in" before issuing any fetch; the curated seed still renders).
+  for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+    test(`a Water & Snow station press closes the studio and frames the station with its popup open (${reducedMotion})`, async ({
+      page
+    }) => {
+      // deriveViewMode (src/state/view-mode.ts) sends a bare `layers=` URL to
+      // CONSOLE, whose surface has no on-screen studio door (#layers-studio-entry
+      // lives only in #brief-display, the Brief surface); an explicit
+      // view=brief keeps the door visible, matching every other case in this
+      // file that opens the studio by pressing it.
+      await page.emulateMedia({ reducedMotion });
+      await gotoApp(page, '?view=brief&layers=telemetry');
+      await expect(layerPill(page, 'telemetry')).toHaveText(PILL.zoomIn);
+      const marker = page.locator('.telemetry-marker[data-telemetry-station-id="ihr"]');
+      const initialMarker = await marker.elementHandle();
+      expect(initialMarker).not.toBeNull();
+
+      await page.locator('#layers-studio-entry').click();
+      await expect(page.locator(STUDIO)).toBeVisible();
+
+      await page.locator('#telemetry-reveal').click();
+      await page
+        .locator('.telemetry-item', { hasText: 'Ice Harbor Dam' })
+        .click();
+
+      // The visible response: the studio is gone (never merely covered by
+      // it), the station's own marker exists, and its popup is open and
+      // named for the pressed station, not silent.
+      await expect(page.locator(STUDIO)).toHaveCount(0);
+      // The national boot skipped discovery. The destination now discovers
+      // against the offline backstop, then reports live (partial). Check after
+      // that refresh so a transient popup before marker replacement cannot pass.
+      await expect(layerPill(page, 'telemetry')).toHaveText(PILL.degraded);
+      await expect(marker).toHaveCount(1);
+      expect(await initialMarker!.evaluate((element) => element.isConnected)).toBe(true);
+      const popup = page.locator('.maplibregl-popup');
+      await expect(popup).toBeVisible();
+      await expect(popup.locator('.popup-title')).toHaveText('Ice Harbor Dam');
+      await popup.getByRole('button', { name: 'Close popup' }).focus();
+      await page.keyboard.press('Escape');
+      await expect(popup).toHaveCount(0);
+      await expect(page.locator('#map canvas.maplibregl-canvas')).toBeFocused();
+    });
+  }
 });

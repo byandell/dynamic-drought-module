@@ -1,4 +1,5 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
+import { stubUsdmWeeks } from './usdm-fixtures';
 
 import {
   gotoApp,
@@ -13,7 +14,7 @@ import {
 import { FRAMING_KEYS } from '../src/config/framings';
 import { HAZARD_CLUSTER_KEYS, HAZARD_CLUSTERS } from '../src/config/clusters';
 import { OCEAN_KEYS } from '../src/config/oceans';
-import { LAYER_DEFS } from '../src/config/layers';
+import { LAYER_DEFS, type LayerKey } from '../src/config/layers';
 import { parseFramingParam } from '../src/state/framing-store';
 import { parseClusterParam, parseOceanParam } from '../src/state/cluster-store';
 // The boot composition moved to the S3 cluster service (the S2 interim
@@ -139,22 +140,28 @@ test.describe('S2 precedence table (Node)', () => {
     expect(parseFramingParam('national')).toBeNull();
   });
 
-  test('view derivation: display links open the console; select= still outranks (D-0.7.0-017/041/044)', () => {
-    // The new display parameters mean "the sharer meant the map",
-    // exactly like layers= and region=.
-    expect(deriveViewMode(new URLSearchParams('?cluster=wildfire'))).toBe('console');
-    expect(deriveViewMode(new URLSearchParams('?cluster=enso&ocean=pacific'))).toBe('console');
-    expect(deriveViewMode(new URLSearchParams('?framing=arid-west'))).toBe('console');
-    // select= keeps outranking every display clause for view derivation.
+  test('view derivation: only view=console opens the full-site console; embeds keep the display-link rule', () => {
+    // A full-site display link opens Brief (owner, 2026-10-19).
+    expect(deriveViewMode(new URLSearchParams('?cluster=wildfire'))).toBe('brief');
+    expect(deriveViewMode(new URLSearchParams('?cluster=enso&ocean=pacific'))).toBe('brief');
+    expect(deriveViewMode(new URLSearchParams('?framing=arid-west'))).toBe('brief');
+    expect(deriveViewMode(new URLSearchParams('?region=washington_state&layers=states'))).toBe(
+      'brief'
+    );
     expect(deriveViewMode(new URLSearchParams('?select=state:WA&cluster=wildfire'))).toBe(
       'brief'
     );
-    expect(deriveViewMode(new URLSearchParams('?select=state:WA&layers=states'))).toBe('brief');
-    // An explicit view= still wins over everything.
+    // An explicit view= wins over everything.
+    expect(deriveViewMode(new URLSearchParams('?view=console&cluster=heat'))).toBe('console');
     expect(deriveViewMode(new URLSearchParams('?view=brief&cluster=heat'))).toBe('brief');
-    // A bare URL still opens Brief (with no unsolicited briefing behind
-    // it since D-0.7.0-041; pinned in view-mode.spec.ts).
     expect(deriveViewMode(new URLSearchParams(''))).toBe('brief');
+    // An embed naming a display parameter without select= keeps the console.
+    expect(deriveViewMode(new URLSearchParams('?embed=true&layers=usdm'))).toBe('console');
+    expect(deriveViewMode(new URLSearchParams('?embed=1&cluster=wildfire'))).toBe('console');
+    expect(deriveViewMode(new URLSearchParams('?embed=true&select=state:WA&layers=states'))).toBe(
+      'brief'
+    );
+    expect(deriveViewMode(new URLSearchParams('?embed=true'))).toBe('brief');
   });
 });
 
@@ -168,9 +175,7 @@ test.describe('S2 cluster boot composition (Node)', () => {
   });
 
   test('a hazard cluster is the untouched reference set plus its current recipe, one surface at most', () => {
-    const reference = (DEFAULT_ON as readonly string[]).filter(
-      (key) => !SURFACE_KEYS.has(key)
-    );
+    const reference = DEFAULT_ON.filter((key) => !SURFACE_KEYS.has(key));
     for (const cluster of HAZARD_CLUSTER_KEYS) {
       const composed = composeClusterIntent(cluster);
       // The default-on reference set is left alone (D-0.7.0-044).
@@ -181,8 +186,12 @@ test.describe('S2 cluster boot composition (Node)', () => {
       for (const key of HAZARD_CLUSTERS[cluster].recipes.current) {
         expect(composed, `${cluster}: recipe ${key} applied`).toContain(key);
       }
-      // The one-surface invariant (UX-1) holds by construction.
-      const surfaces = composed.filter((key) => SURFACE_KEYS.has(key));
+      // The one-surface invariant (UX-1) holds by construction. Cast: every
+      // member `composeClusterIntent` pushes comes from a LayerDef's own
+      // `key` (a LayerKey), but the function's own return type is the wider
+      // `readonly string[]` (src/state/cluster-service.ts:146); a src typing
+      // gap, worked around here rather than widened.
+      const surfaces = composed.filter((key) => SURFACE_KEYS.has(key as LayerKey));
       expect(surfaces.length, `${cluster}: at most one surface`).toBeLessThanOrEqual(1);
       // No duplicates.
       expect(new Set(composed).size).toBe(composed.length);
@@ -204,7 +213,7 @@ test.describe('S2 cluster boot composition (Node)', () => {
  * cannot be dropped by a live-agency outage mid-spec (smoke-suite
  * doctrine: never couple to live values).
  */
-async function stubWildfireRecipe(page: import('@playwright/test').Page): Promise<void> {
+async function stubWildfireRecipe(page: import('./offline-test').Page): Promise<void> {
   const empty = JSON.stringify({ type: 'FeatureCollection', features: [] });
   await page.route('**/WFIGS_Interagency_Perimeters_Current/**', (route) =>
     route.fulfill({ contentType: 'application/geo+json', body: empty })
@@ -221,7 +230,7 @@ test.describe('S2 cluster= in the browser', () => {
     await stubWildfireRecipe(page);
     await gotoApp(page, '?cluster=wildfire');
 
-    // A display link opens the console (the sharer meant the map).
+    // gotoApp pins a display boot to the console (tests/helpers.ts).
     await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
 
     // The current-horizon recipe: perimeters plus smoke ONLY
@@ -266,7 +275,10 @@ test.describe('S2 cluster= in the browser', () => {
   test('layers= outranks cluster= at boot: layers wins, cluster is dropped on sync', async ({
     page
   }) => {
+    await stubUsdmWeeks(page);
     await gotoApp(page, '?layers=usdm&cluster=wildfire');
+    await waitForLayerSettled(page, 'usdm');
+    await expect(page.locator('[data-layer-status="usdm"]')).toHaveClass(/\bready\b/);
 
     await expect(layerCheckbox(page, 'usdm')).toBeChecked();
     await expect(layerCheckbox(page, 'nifc-fires')).not.toBeChecked();
@@ -319,6 +331,9 @@ test.describe('S2 ocean= in the browser', () => {
     expect(params.get('cluster')).toBe('enso');
     expect(params.get('ocean')).toBe('pacific');
     expect(params.get('layers')).toBeNull();
+    // ENSO's default flow kind (wind, E2-4) is the absence of `flow=`: the
+    // boot opens it without writing it back (tests/enso-flow-default.spec.ts).
+    expect(params.has('flow')).toBe(false);
   });
 
   test('ocean= without cluster=enso is ignored and dropped on sync', async ({ page }) => {
@@ -364,8 +379,9 @@ test.describe('S2 framing= and the legacy links in the browser', () => {
     await waitForLayerSettled(page, 'states');
     const params = new URLSearchParams(await search(page));
     expect(params.get('framing')).toBeNull();
-    // With no framing active, the legacy region emission is unchanged.
-    expect(params.get('region')).toBe('washington_state');
+    // With no framing active, the legacy region emission is unchanged: it
+    // falls back to DEFAULT_REGION, national since DR-109.
+    expect(params.get('region')).toBe('national');
   });
 
   test('a region click clears the minimap framing (one camera vocabulary)', async ({
@@ -390,23 +406,27 @@ test.describe('S2 framing= and the legacy links in the browser', () => {
   test('legacy region= links keep working byte for byte, national included (D-0.7.0-039)', async ({
     page
   }) => {
+    await stubUsdmWeeks(page);
     // An ordinary curated region: honored exactly as today.
     await gotoApp(page, '?region=central_oregon&layers=usdm');
+    await waitForLayerSettled(page, 'usdm');
+    await expect(page.locator('[data-layer-status="usdm"]')).toHaveClass(/\bready\b/);
     await expect(regionSelect(page)).toHaveValue('region:central_oregon');
     await expect(layerCheckbox(page, 'usdm')).toBeChecked();
 
     // The national alias: still a valid region (the camera fit rides
     // REGIONS.national as always), still re-emitted as region=national,
-    // and it produces NO framing token. NOTE the deliberate staging
-    // (Codex S2 finding 1, reconciled): D-0.7.0-041's full
-    // normalization to absence waits on the bare-URL default camera,
-    // because dropping the parameter while a bare URL still boots the
-    // Washington fit would re-camera this legacy link to that retired
-    // default. That precondition still holds today: DEFAULT_REGION in
-    // src/config/regions.ts is 'washington_state' and neither syncUrl
-    // nor pushUrl normalizes region=national to absence. This assertion
-    // flips to expect region absent only when the bare-URL camera stops
-    // defaulting to Washington and the serializer drops the token.
+    // and it produces NO framing token. D-0.7.0-041's staged plan would
+    // have normalized region=national to absence once the bare-URL
+    // default stopped framing Washington; DR-109 (S30D D1, ruling R3
+    // option a) met that precondition and DECLINED the normalization:
+    // region= is written on every canonical URL, national included, so a
+    // link written after the flip stays immune to any future default
+    // change and a deliberate national choice made inside ENSO survives a
+    // reload instead of being overridden by the ENSO zoom camera. This
+    // assertion therefore does not flip to absence; DEFAULT_REGION in
+    // src/config/regions.ts is now 'national' and both syncUrl and pushUrl
+    // keep writing the token regardless.
     await gotoApp(page, '?region=national');
     await expect(regionSelect(page)).toHaveValue('region:national');
     await waitForLayerSettled(page, 'states');

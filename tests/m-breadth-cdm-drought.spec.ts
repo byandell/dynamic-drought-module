@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 import { readFileSync, statSync } from 'node:fs';
 
 import {
@@ -12,11 +12,6 @@ const ARTIFACT_ROUTE = '**/data/cdm-drought-areas.json';
 const LICENSE_TITLE = 'Open Government Licence - Canada';
 const LICENSE_URL =
   'https://open.canada.ca/en/open-government-licence-canada';
-const TRANSPARENT_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64'
-);
-
 function classRows(present: readonly number[]) {
   return [0, 1, 2, 3, 4].map((dm) => ({
     class: `D${dm}`,
@@ -104,16 +99,6 @@ function artifactFixture(present: readonly number[] = [2]) {
   };
 }
 
-async function routeBasemap(page: Page): Promise<void> {
-  await page.route('https://tile.openstreetmap.org/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'image/png',
-      body: TRANSPARENT_PNG
-    })
-  );
-}
-
 async function routeArtifact(
   page: Page,
   body: unknown,
@@ -129,20 +114,78 @@ async function routeArtifact(
 }
 
 test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
+  test('D3 CDM key agrees with actual rendered class paint', async ({ page }) => {
+    type CdmMap = {
+      getContainer(): HTMLElement;
+      getPaintProperty(layer: string, property: string): unknown;
+      queryRenderedFeatures(options: { layers: string[] }): Array<{ properties: { dm?: number } }>;
+    };
+    type CdmWindow = Window & { __cdmMaps: CdmMap[] };
+    await page.addInitScript(() => {
+      const maps: CdmMap[] = [];
+      (window as unknown as CdmWindow).__cdmMaps = maps;
+      // Existing actual-map observation seam; no production test hook.
+      Object.defineProperty(Object.prototype, '_onWindowOnline', {
+        configurable: true,
+        set(this: CdmMap, value: unknown) {
+          Object.defineProperty(this, '_onWindowOnline', {
+            configurable: true, enumerable: true, writable: true, value
+          });
+          maps.push(this);
+        }
+      });
+    });
+    const fixture = artifactFixture([0, 1, 2, 3, 4]);
+    // Separate class interiors, all visible inside the BC initial view.
+    fixture.data.features.forEach((feature, dm) => {
+      const west = -132 + dm * 3;
+      feature.geometry.coordinates = [[
+        [west, 50], [west + 2, 50], [west + 2, 56], [west, 56], [west, 50]
+      ]];
+    });
+    await routeArtifact(page, fixture);
+    await gotoApp(page, '?embed=true&region=british_columbia&layers=cdm-drought');
+    await expect(layerPill(page, 'cdm-drought')).toHaveText('live');
+    await page.locator('#map-key-details-toggle').click();
+    const expected = ['#FFFF00', '#FFD37F', '#E69800', '#E60000', '#730000'];
+    await expect.poll(() => page.evaluate(() => {
+      const map = (window as unknown as CdmWindow).__cdmMaps.find(candidate =>
+        candidate.getContainer()?.id === 'map');
+      return [...new Set(map?.queryRenderedFeatures({ layers: ['cdm-drought-fill'] })
+        .map(feature => feature.properties.dm) ?? [])].sort();
+    })).toEqual([0, 1, 2, 3, 4]);
+    const paints = await page.evaluate(() => {
+      const map = (window as unknown as CdmWindow).__cdmMaps.find(candidate =>
+        candidate.getContainer()?.id === 'map')!;
+      return ['fill', 'outline'].map(kind => map.getPaintProperty(
+        'cdm-drought-' + kind, kind === 'fill' ? 'fill-color' : 'line-color'));
+    });
+    for (const paint of paints) expect(paint).toEqual([
+      'match', ['get', 'dm'], 0, expected[0], 1, expected[1],
+      2, expected[2], 3, expected[3], 4, expected[4], 'rgba(0,0,0,0)'
+    ]);
+    const keyColors = await page.locator('#map-key-content .map-key-swatch').evaluateAll(nodes =>
+      nodes.map(node => getComputedStyle(node).backgroundColor));
+    expect(keyColors).toEqual([
+      'rgb(255, 255, 0)', 'rgb(255, 211, 127)', 'rgb(230, 152, 0)',
+      'rgb(230, 0, 0)', 'rgb(115, 0, 0)'
+    ]);
+  });
+
   test('committed artifact records publication, class occupancy, provenance, and stewardship', () => {
     const artifact = JSON.parse(readFileSync(ARTIFACT_PATH, 'utf8'));
-    expect(statSync(ARTIFACT_PATH).size).toBeLessThanOrEqual(1_000_000);
+    expect(statSync(ARTIFACT_PATH).size).toBeLessThanOrEqual(2_450_000);
     expect(artifact.schemaVersion).toBe(1);
     expect(artifact.product).toBe('Canadian Drought Monitor');
-    expect(artifact.month).toBe('2026-06');
+    expect(artifact.month).toBe('2026-10');
     expect(artifact.monthState).toBe('published');
     expect(artifact.license.title).toBe(LICENSE_TITLE);
     expect(artifact.license.url).toBe(LICENSE_URL);
     expect(artifact.provenance.sourceUrl).toBe(
-      'https://agriculture.canada.ca/atlas/data_donnees/canadianDroughtMonitor/data_donnees/geoJSON/areasofDrought/2026/cdm_2606_drought_areas_json.zip'
+      'https://agriculture.canada.ca/atlas/data_donnees/canadianDroughtMonitor/data_donnees/geoJSON/areasofDrought/2026/cdm_2610_drought_areas_json.zip'
     );
-    expect(artifact.provenance.retrieved).toBe('2026-07-28');
-    expect(artifact.provenance.archiveBytes).toBe(3_682_468);
+    expect(artifact.provenance.retrieved).toBe('2026-11-13');
+    expect(artifact.provenance.archiveBytes).toBe(7_802_370);
     expect(artifact.provenance.classesPresent).toEqual([
       'D0',
       'D1',
@@ -163,10 +206,10 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
       'PASS: shipped component count equals source component count for every class.'
     );
     const expectedComponentCounts = {
-      D0: 967,
-      D1: 759,
-      D2: 478,
-      D3: 7,
+      D0: 1837,
+      D1: 1237,
+      D2: 614,
+      D3: 347,
       D4: 0
     };
     expect(
@@ -204,7 +247,6 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
         upstreamRequests.push(url);
       }
     });
-    await routeBasemap(page);
 
     await gotoApp(
       page,
@@ -216,37 +258,47 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
       '#legend-panel [data-legend="cdm-drought"]'
     );
     await expect(legend).toContainText(
-      'Canadian Drought Monitor · June 2026'
+      'Canadian Drought Monitor · October 2026'
     );
     await expect(legend).toContainText('D4 · no area in this class this month');
     await expect(legend).toContainText(
       'bare map means no polygon coverage in this artifact, not class zero'
     );
-    await expect(page.locator('#time-bar')).toContainText('Month June 2026');
-    await expect(page.locator('#map-key')).toBeHidden();
+    await expect(page.locator('#time-bar')).toContainText('Month October 2026');
+    await expect(page.locator('#map-key')).toBeVisible();
+    await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('#map-key-content')).toBeHidden();
     const legendLicense = legend.getByRole('link', { name: LICENSE_TITLE });
     await expect(legendLicense).toHaveAttribute('href', LICENSE_URL);
+    // Value-only migration (S30D D1 M22; design record
+    // acknowledgements-table.md section 4.3): the OGL-Canada licence link
+    // moved from the credits line into the Acknowledgements' AAFC row,
+    // reached through the credits line's pointer. Its link text there is
+    // the published title with its U+2013 dash (cite sheet c18), so the row
+    // is matched by the licence URL.
     await page.locator('#map-info-btn').click();
+    await page.locator('#map-info-attribution button[data-open-acknowledgements]').click();
     const attributionLicense = page
-      .locator('#map-info-attribution')
-      .getByRole('link', { name: LICENSE_TITLE });
+      .locator('#impact-panel [data-ack-id="aafc"] a')
+      .filter({ hasText: 'Open Government Licence' })
+      .first();
     await expect(attributionLicense).toHaveAttribute('href', LICENSE_URL);
     await page.keyboard.press('Escape');
+    await expect(page.locator('#impact-panel')).toBeHidden();
     expect(upstreamRequests).toEqual([]);
 
     await page.emulateMedia({ media: 'print' });
-    await expect(page.locator('#time-bar')).toContainText('Month June 2026');
+    await expect(page.locator('#time-bar')).toContainText('Month October 2026');
     await expect(legend).toContainText('Agriculture and Agri-Food Canada');
     await expect(legendLicense).toBeVisible();
     await expect(legendLicense).toHaveText(LICENSE_TITLE);
     await expect(legendLicense).toHaveAttribute('href', LICENSE_URL);
-    await expect(page.locator('#map-key')).toBeHidden();
+    await expect(page.locator('#map-key-content')).toBeHidden();
   });
 
   test('embed on-map key renders the exact licence title and link', async ({
     page
   }) => {
-    await routeBasemap(page);
     await gotoApp(
       page,
       '?embed=true&region=british_columbia&layers=cdm-drought&view=console'
@@ -255,6 +307,7 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
 
     const key = page.locator('#map-key');
     await expect(key).toBeVisible();
+    await key.locator('#map-key-details-toggle').click();
     const keyLicense = key.getByRole('link', { name: LICENSE_TITLE });
     await expect(keyLicense).toBeVisible();
     await expect(keyLicense).toHaveText(LICENSE_TITLE);
@@ -264,7 +317,6 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
   test('a polygon popup names the Canadian product, issuer, and month without blending', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeArtifact(page, artifactFixture([2]));
     await gotoApp(
       page,
@@ -279,10 +331,9 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
 
     const popup = page.locator('.maplibregl-popup-content');
     await expect(popup).toContainText('D2');
-    await expect(popup).toContainText(
-      'Canadian Drought Monitor · Agriculture and Agri-Food Canada'
-    );
-    await expect(popup).toContainText('Month: June 2026');
+    await expect(popup.locator('[data-popup-slot="title"]')).toHaveText('Canadian Drought Monitor');
+    await expect(popup.locator('[data-popup-slot="issuer"]')).toHaveText('Issued by: Agriculture and Agri-Food Canada');
+    await expect(popup).toContainText('Month Jun 2026');
     await expect(popup).toContainText(
       'not blended with a United States or provincial product'
     );
@@ -295,7 +346,6 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
   test('a published month with no occupied classes is live, not missing data', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeArtifact(page, artifactFixture([]));
     await gotoApp(
       page,
@@ -318,7 +368,6 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
   test('a missing monthly artifact is unavailable and cannot read as no drought', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeArtifact(page, null, 404);
     await gotoApp(
       page,
@@ -330,6 +379,11 @@ test.describe('Canadian Drought Monitor committed monthly snapshot', () => {
     await expect(
       page.locator('#legend-panel [data-legend="cdm-drought"]')
     ).toHaveCount(0);
-    await expect(page.locator('#map-key')).toBeHidden();
+    // Value-only migration (S30D D1 M10; interface-chrome-popups-text.md
+    // section 2.4, "the chip never hides"): with no key eligible the chip
+    // falls back to the committed mode's own word instead of going
+    // `hidden`. The committed mode here is Drought (no `cluster=` param).
+    await expect(page.locator('#map-key')).toBeVisible();
+    await expect(page.locator('#map-key .map-key-chip-label')).toHaveText('Drought');
   });
 });

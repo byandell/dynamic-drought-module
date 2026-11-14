@@ -29,8 +29,8 @@ import {
   renderSwatchLegend,
   showLegend
 } from '../ui/legend-registry';
-import { escapeHtml } from '../util/escape';
-import { fetchWithBudget } from '../util/fetch';
+import type { IssuedModel, IssuerSwatch, PopupClock } from '../ui/popup-frame';
+import { fetchBufferedWithBudget } from '../util/fetch';
 
 const CONTROLLER_KEY = 'usdm';
 export const BC_DROUGHT_SOURCE_ID = 'bc-drought-basins';
@@ -171,6 +171,7 @@ function showBcTimeBar(date: string | null): void {
   setTimeBar(CONTROLLER_KEY, {
     ariaLabel: 'British Columbia basin drought levels source date',
     stamp: {
+      horizon: 'current',
       headline:
         date === null
           ? 'Source date unavailable'
@@ -225,13 +226,16 @@ function installMapState(
   }
 }
 
-function levelRead(level: unknown): { title: string; description: string } {
+function levelRead(level: unknown): { title: string; description: string; swatch?: IssuerSwatch } {
   const numeric = Number(level);
   if (numeric === BC_DROUGHT_NO_UPDATE.value) {
     return {
       title: 'No update',
       description:
-        'This basin is not measured right now because it is outside the core drought season. This is not a drought severity.'
+        'This basin is not measured right now because it is outside the core drought season. This is not a drought severity.',
+      // The popup swatch is an opaque patch (#RRGGBB only), so it takes the
+      // issuer's RGB without the map fill's 191/255 alpha.
+      swatch: { table: 'BC_DROUGHT_NO_UPDATE', classKey: BC_DROUGHT_NO_UPDATE.code, color: '#CCCCCC' }
     };
   }
   const entry = BC_DROUGHT_LEVELS.find((candidate) => candidate.value === numeric);
@@ -244,28 +248,61 @@ function levelRead(level: unknown): { title: string; description: string } {
   return {
     title: entry.label,
     description:
-      `Province scale ${entry.label}; this value is not equivalent to a United States Drought Monitor D-category.`
+      `Province scale ${entry.label}; this value is not equivalent to a United States Drought Monitor D-category.`,
+    swatch: { table: 'BC_DROUGHT_LEVELS', classKey: entry.code, color: entry.color }
   };
 }
 
-function buildPopupHtml(properties: GeoJsonProperties): string {
+/** The frame's explanation for issuer time text DDM does not parse (PF1). */
+const SUPPLIED_TIME_EXPLANATION = 'As the issuer states it; DDM does not read it as a full date.';
+
+/**
+ * The basin's popup model (D1 M25; the frame's surface head): the basin is
+ * the title, the level in the issuer's words the value. Held by DR-160:
+ * this module is never imported while BC_BASIN_EDITION_HELD is true
+ * (src/layers/usdm.ts editionForRegion), so this model is proven only
+ * statically and in Node until the hold is released.
+ */
+export function buildBcDroughtPopupModel(properties: GeoJsonProperties): IssuedModel {
   const values = properties ?? {};
   const basin =
     typeof values['BasinName'] === 'string' && values['BasinName'].trim() !== ''
       ? values['BasinName'].trim()
       : 'Unnamed basin';
   const read = levelRead(values['DroughtLevel']);
-  const date = formatSourceDate(values['Date_Modified']);
-  return `
-    <div class="popup-title">${escapeHtml(basin)}: ${escapeHtml(read.title)}</div>
-    <div class="popup-agency">Province of British Columbia</div>
-    <div class="popup-treaty-meta">Source date: ${escapeHtml(date ?? 'unavailable')}</div>
-    <div class="popup-description">${escapeHtml(read.description)}</div>
-    <div class="popup-treaty-meta">Updated weekly during the core drought season.</div>
-    <div class="popup-links">
-      <a href="https://www.arcgis.com/home/item.html?id=f1842161d9c2454a98f9fc3b45d5d92e" target="_blank" rel="noopener">British Columbia drought levels source</a>
-    </div>
-  `;
+  const rawDate: unknown = values['Date_Modified'];
+  // Absent (PF1): missing, null, blank, or neither text nor a finite number
+  // (an array or a boolean is never shown as its String(), never 1970).
+  // Decided before any conversion: an object whose coercion throws is
+  // simply absent (Codex block 2 review, P3).
+  const absent =
+    typeof rawDate === 'string' ? rawDate.trim() === '' : !(typeof rawDate === 'number' && Number.isFinite(rawDate));
+  const date = absent ? '' : formatSourceDate(rawDate);
+  const clock: PopupClock = absent
+    ? { kind: 'not-stated', label: 'Source date', reason: 'unavailable' }
+    : {
+        kind: 'point',
+        meaning: 'as-of',
+        label: 'Source date',
+        at:
+          date !== null && /^\d{4}-\d{2}-\d{2}$/.test(date)
+            ? { precision: 'date', date }
+            : { precision: 'supplied', text: String(rawDate), explanation: SUPPLIED_TIME_EXPLANATION }
+      };
+  return {
+    kind: 'surface',
+    title: basin,
+    issuer: { role: 'issued-by', name: 'Province of British Columbia', productKey: 'usdm' },
+    value: [read.swatch ? { text: read.title, swatch: read.swatch } : { text: read.title }],
+    clocks: [clock],
+    source: {
+      link: {
+        label: 'British Columbia drought levels source',
+        href: 'https://www.arcgis.com/home/item.html?id=f1842161d9c2454a98f9fc3b45d5d92e'
+      }
+    },
+    qualifications: [read.description, 'Updated weekly during the core drought season.']
+  };
 }
 
 export async function activate(map: maplibregl.Map): Promise<void> {
@@ -280,7 +317,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 
   let collection: GeoJSON.FeatureCollection;
   try {
-    const response = await fetchWithBudget(
+    const response = await fetchBufferedWithBudget(
       buildBcDroughtQueryUrl(),
       null,
       signal,
@@ -339,7 +376,7 @@ export function bindPopups(map: maplibregl.Map): void {
       return typeof name === 'string' && name.trim() !== '' ? name.trim() : null;
     },
     respond: (feature) => ({
-      content: buildPopupHtml(feature.properties ?? {})
+      model: buildBcDroughtPopupModel(feature.properties ?? {})
     })
   });
   map.on('mouseenter', BC_DROUGHT_FILL_ID, () => {

@@ -1,13 +1,13 @@
 import * as maplibregl from 'maplibre-gl';
-// Vite's `?worker&url` form: the worker and the shared chunk it imports
-// (`maplibre-gl-shared.mjs`) are bundled into ONE emitted asset and this
-// import resolves to that asset's URL. A plain `?url` would copy
-// `maplibre-gl-worker.mjs` alone without following its import, and the
-// shared chunk would 404 on a static host. `vite.config.ts` sets
-// `base: './'`, so the emitted URL stays relative and works both at a
-// domain root and at the `/dynamic-drought-module/` project subpath.
+// Vite's `?worker&url` form: the worker is bundled into one emitted asset and
+// this import resolves to that asset's URL. Since MapLibre 6.13 the worker
+// file is self-contained (`maplibre-gl-shared.mjs` ships empty and nothing
+// imports it), so a plain `?url` would also work; the `?worker&url` form is
+// kept as it was. `vite.config.ts` sets `base: './'`, so the emitted URL
+// stays relative and works both at a domain root and at the
+// `/dynamic-drought-module/` project subpath.
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
-import { Protocol } from 'pmtiles';
+import { pmtilesTransport } from './tile-protocol';
 import { buildBaseStyle } from './style';
 import { BasemapSwitcherControl } from './basemap-switcher';
 import { MAP_MIN_ZOOM } from '../config/regions';
@@ -25,8 +25,7 @@ import { watchDesktopMapSeat } from '../ui/map-control-seat';
 let pmtilesRegistered = false;
 function registerPmtilesProtocol(): void {
   if (pmtilesRegistered) return;
-  const protocol = new Protocol();
-  maplibregl.addProtocol('pmtiles', protocol.tile);
+  maplibregl.addProtocol('pmtiles', pmtilesTransport.tilev4);
   pmtilesRegistered = true;
 }
 
@@ -50,12 +49,17 @@ function registerWorkerUrl(): void {
 }
 
 /**
- * Default initial view. The Pacific Northwest (PNW) center sits over the
- * Cascades; the same point as the vanilla Leaflet baseline's `[47, -121]`
- * but expressed in MapLibre's `[longitude, latitude]` order.
+ * Default initial view. DR-109 (S30D D1): the default region is `national`
+ * (`src/config/regions.ts:199`), so first paint frames the contiguous
+ * United States (the midpoint of `REGIONS.national`'s bounds,
+ * `regions.ts:139`) rather than the retired Pacific Northwest center. The
+ * boot's silent region fit (`src/ui/sidebar.ts:1372`) runs synchronously
+ * right after `load` and is unanimated, so this value is what a first-paint
+ * screenshot or the mode-switch measurement actually sees; it must not
+ * flash a PNW frame the fit then jumps away from.
  */
-const DEFAULT_CENTER: [number, number] = [-121, 47];
-const DEFAULT_ZOOM = 7;
+const DEFAULT_CENTER: [number, number] = [-95.95, 36.9];
+const DEFAULT_ZOOM = 3.5;
 // U4a: the zoom floor moved to src/config/regions.ts (MAP_MIN_ZOOM) so the
 // whole-US fit invariant is testable in Node; see the rationale there.
 const DEFAULT_MIN_ZOOM = MAP_MIN_ZOOM;
@@ -87,7 +91,7 @@ const SCALE_MAX_WIDTH_PX = 160;
  * stays a single, side-effect-light call.
  *
  * Open-data invariant: no proprietary tile providers are configured. The
- * base style uses a subdued OpenStreetMap base (see `buildBaseStyle()`);
+ * base style is DDM's own base map from public files (see `buildBaseStyle()`);
  * recent NOAA GeoColor is the default satellite context.
  */
 export function createMap(containerId: string): maplibregl.Map {
@@ -194,6 +198,9 @@ function seatBasemapSwitcherOnDesktop(map: maplibregl.Map): void {
     home: corner,
     placeHome: () => {
       if (node.parentElement !== corner) corner.appendChild(node);
-    }
+    },
+    // On phones it leads the view tools in the right-edge column (owner
+    // direction 2026-11-09 (sprint), DR-pending; src/ui/edge-column.ts).
+    phone: { group: 'view', order: 10, word: 'SAT' }
   });
 }

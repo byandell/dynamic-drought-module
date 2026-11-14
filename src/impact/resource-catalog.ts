@@ -36,8 +36,11 @@
  */
 
 import { URLS } from '../config/urls';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchBufferedWithBudget } from '../util/fetch';
+import { checkPopupHref } from '../util/escape';
 import type { ResourceLink } from './types';
+import { RESOURCE_KINDS } from './resources';
+import type { CatalogResource, ResourceKind } from './resources';
 import type { LocationIdentity } from '../state/location-identity';
 
 /** One state's catalog entry. `verified` is the entry-level verification stamp. */
@@ -76,21 +79,29 @@ type CatalogTier = 'state' | 'federal';
  * the Tribe's-own link-less affordance and the BIA regional entry are composed
  * in code, never supplied by a catalog file.
  */
-function normalizeRow(raw: unknown, expectedTier: CatalogTier): ResourceLink | null {
+function normalizeRow(raw: unknown, expectedTier: CatalogTier, verified: string): CatalogResource | null {
   if (!raw || typeof raw !== 'object') return null;
   const row = raw as Record<string, unknown>;
   if (!isNonEmptyString(row['label'])) return null;
   if (!isNonEmptyString(row['agency'])) return null;
   if (row['tier'] !== expectedTier) return null;
   const url = row['url'];
-  if (typeof url !== 'string' || !url.startsWith('https://')) return null;
+  if (typeof url !== 'string' || checkPopupHref(url) === null) return null;
   const description = row['description'];
+  const conditions = row['conditions'];
+  const kind = row['kind'];
   return {
     label: row['label'] as string,
     agency: row['agency'] as string,
     tier: expectedTier,
     url,
-    ...(isNonEmptyString(description) ? { description: description } : {})
+    verified,
+    ...(isNonEmptyString(description) ? { description: description } : {}),
+    // Optional here (the build gate requires both on federal rows); a bad value is dropped, never guessed.
+    ...(Array.isArray(conditions) && conditions.length > 0 && conditions.every(isNonEmptyString)
+      ? { conditions: conditions as string[] }
+      : {}),
+    ...(RESOURCE_KINDS.includes(kind as ResourceKind) ? { kind: kind as ResourceKind } : {})
   };
 }
 
@@ -106,8 +117,8 @@ function normalizeCatalog(raw: unknown, expectedTier: CatalogTier): StateResourc
   }
   if (!Array.isArray(obj['resources'])) return null;
   const resources = obj['resources']
-    .map((row) => normalizeRow(row, expectedTier))
-    .filter((r): r is ResourceLink => r !== null);
+    .map((row) => normalizeRow(row, expectedTier, obj['verified'] as string))
+    .filter((r): r is CatalogResource => r !== null);
   return {
     label: obj['label'] as string,
     verified: obj['verified'] as string,
@@ -131,7 +142,7 @@ function loadCatalogFile(
 
   const load = (async (): Promise<StateResourceCatalog | null> => {
     try {
-      const response = await fetchWithBudget(
+      const response = await fetchBufferedWithBudget(
         `${URLS.resourcesLocalBase}${key}.json`,
         null,
         null,

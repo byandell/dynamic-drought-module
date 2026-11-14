@@ -1,4 +1,5 @@
-import { parseStudioParam } from './url';
+import { clearPlaceReturn } from './place-return';
+import { normalizeSidebarParam, parseStudioParam } from './url';
 
 /** The bounded query-state route vocabulary for the two studios. */
 export type StudioRoute = 'layers' | 'place' | null;
@@ -12,7 +13,6 @@ type StudioRouteListener = (
 let route: StudioRoute = null;
 let popstateBound = false;
 const listeners = new Set<StudioRouteListener>();
-let placeReturnAction: (() => void) | null = null;
 
 /**
  * Physical framing is immutable for this document, so detect it eagerly.
@@ -56,6 +56,10 @@ function locationWithStudio(
   if (next === null) url.searchParams.delete('studio');
   else url.searchParams.set('studio', next);
   if (options?.dropOneShotSelect) url.searchParams.delete('select');
+  // A clone of the current URL: on a direct studio boot this is the FIRST
+  // URL mutation, ahead of the canonical write, so it drops an invalid,
+  // duplicated or embed-ignored sidebar= itself (D1 M7, S3).
+  normalizeSidebarParam(url.searchParams);
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
@@ -117,8 +121,9 @@ export function initializeStudioRoute(
         // so the ruled restore-then-brief order holds on both exits (a
         // bare microtask here raced the lazy island's unmount: the
         // briefing could open before restore, or be cancelled by the
-        // restore's intent supersede and never open).
-        placeReturnAction = null;
+        // restore's intent supersede and never open). Both hand-off slots
+        // go: a display command deferred behind this exit is void too.
+        clearPlaceReturn();
       }
       notify('popstate');
     });
@@ -128,6 +133,19 @@ export function initializeStudioRoute(
 
 export function getStudioRoute(): StudioRoute {
   return route;
+}
+
+/**
+ * Whether a studio actually owns the screen. The route is set from the URL even
+ * where no studio ever mounts (an embed, a frame), so gates that wait on the
+ * studio must ask this, not `getStudioRoute() !== null`.
+ */
+export function studioOwnsScreen(): boolean {
+  return (
+    route !== null &&
+    !physicallyFramed &&
+    !(document.getElementById('app')?.classList.contains('embed') ?? false)
+  );
 }
 
 export function onStudioRouteChange(listener: StudioRouteListener): () => void {
@@ -146,7 +164,7 @@ export function onStudioRouteChange(listener: StudioRouteListener): () => void {
  */
 function enterStudio(next: Exclude<StudioRoute, null>): void {
   if (route === next) return;
-  if (route === 'place') placeReturnAction = null;
+  if (route === 'place') clearPlaceReturn();
   const target = locationWithStudio(next);
   if (route === null) {
     window.history.pushState({ ddmStudioEntry: true }, '', target);
@@ -170,25 +188,13 @@ export function backToMap(): void {
   window.history.back();
 }
 
-/** Run one lazy PLACE callback after popstate has unmounted the studio. */
-export function setPlaceStudioReturnAction(action: (() => void) | null): void {
-  placeReturnAction = action;
-}
-
-/**
- * Take (and clear) the pending PLACE return action. Called by the PLACE
- * studio island's unmount cleanup AFTER restoreDisplaySnapshot(), which is
- * the only ordering that honors restore-then-brief deterministically.
- */
-export function takePlaceStudioReturnAction(): (() => void) | null {
-  const action = placeReturnAction;
-  placeReturnAction = null;
-  return action;
-}
-
 /** Build an embed link-out from the latest current URL state. */
 function fullSiteStudioUrl(next: Exclude<StudioRoute, null>): string {
   const url = new URL(window.location.href);
+  // Normalize BEFORE embed is dropped: an embed ignores sidebar=, so the
+  // link-out out of an embed never carries it, while a full-chrome frame's
+  // valid key travels (D1 M7, S3 and S6).
+  normalizeSidebarParam(url.searchParams);
   url.searchParams.delete('embed');
   url.searchParams.set('studio', next);
   return url.href;

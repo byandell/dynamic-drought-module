@@ -12,9 +12,13 @@ import {
   type BriefingSourceKey,
   type SourceCapabilityCell
 } from '../config/source-capability';
+import { HORIZON_CHROME } from '../impact/horizon-chrome';
 import type {
   BoundarySelectionContext,
+  HazardCell,
+  HazardKey,
   Horizon,
+  HorizonKey,
   ImpactBriefing
 } from '../impact/types';
 import {
@@ -30,12 +34,16 @@ import {
   onSheetDetentSettle,
   restoreSheetDetent,
   setSheetBriefing,
+  setSheetBriefingCloser,
+  setSheetBriefingOpener,
   setSheetDetent,
   sheetAllowsAutoRaise,
   sheetReportHost
 } from './mobile-sheet';
 import { hideLoading, showLoading } from './overlay';
+import { buildShareLink } from './share';
 import { buildTribalNationsBriefAction } from './tribal-nations-action';
+import { postalCodeFromProperties } from '../config/geography';
 
 type ImpactPanelRuntime = typeof import('./impact-panel-runtime');
 type RuntimeLoader = () => Promise<ImpactPanelRuntime>;
@@ -44,6 +52,13 @@ interface PendingOpen {
   readonly token: number;
   delayId: number | null;
   loadingToken: number | null;
+  /**
+   * Owns the in-flight containing-state resolution, when this pending open
+   * needed one. Aborted whenever this pending open is superseded or closed,
+   * so a stale resolution never applies to a later panel (see
+   * `finishPendingOpen`).
+   */
+  abortController: AbortController | null;
 }
 
 export interface ImpactPanelShell {
@@ -73,15 +88,47 @@ let unavailableSelection: PlaceSelection | null = null;
 
 let shell: ImpactPanelShell | null = null;
 let shellOpener: HTMLElement | null = null;
-let shellHardClose: (() => void) | null = null;
+let shellHardClose: ((keepSelection?: boolean) => void) | null = null;
 let hostSyncArmed = false;
+
+/**
+ * The open briefing's title and place context, as last passed to
+ * `refreshBriefingActions` (found-098): held so `rearmMailHref` can rebuild
+ * the Email href from the CURRENT URL just before the control is activated,
+ * without waiting for a render that may never come.
+ */
+let lastBriefingTitle: string | null = null;
+let lastBriefingContext: BoundarySelectionContext | null = null;
+
+/**
+ * Whether `el` sits in the hidden content of a closed `<details>` (anywhere
+ * but that disclosure's own summary). Tab skips such content, but it can
+ * still report an `offsetParent`, so the trap below must skip it too or a
+ * closed disclosure's links (the acknowledgements' licence links, S30D D1
+ * M22) become its "last" stop and a forward Tab from the real last stop
+ * leaves the modal.
+ */
+function insideClosedDetails(el: HTMLElement): boolean {
+  for (
+    let details = el.closest('details');
+    details !== null;
+    details = details.parentElement?.closest('details') ?? null
+  ) {
+    if (details.open) continue;
+    const summary = details.querySelector(':scope > summary');
+    if (!summary || !summary.contains(el)) return true;
+  }
+  return false;
+}
 
 /** Visible, keyboard-focusable descendants of the panel, in DOM order. */
 function getFocusable(container: HTMLElement): HTMLElement[] {
   const selector =
-    'a[href], button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
   return Array.from(container.querySelectorAll<HTMLElement>(selector)).filter(
-    (el) => el.offsetParent !== null || el === document.activeElement
+    (el) =>
+      el === document.activeElement ||
+      (el.offsetParent !== null && !insideClosedDetails(el))
   );
 }
 
@@ -91,11 +138,14 @@ function requestPanelDismiss(): void {
     isSheetActive() &&
     getViewMode() === 'brief'
   ) {
-    restoreSheetDetent();
-    document.getElementById('sheet-report-door')?.focus();
+    // The phone window goes back to the map with the briefing kept, as its
+    // "Back to map" does; the sheet returns focus to the lit door.
+    setSheetDetent('closed');
     return;
   }
-  shellHardClose?.();
+  // "Back to map" and Escape only close the window: the place stays selected
+  // and lit (owner, 2026-11-13). A programmatic close still ends the selection.
+  shellHardClose?.(true);
 }
 
 /** Create or return the one panel shell shared by every presentation. */
@@ -111,25 +161,50 @@ export function ensureImpactPanelShell(): ImpactPanelShell {
   panel.hidden = true;
   panel.innerHTML = `
     <header class="impact-panel-header">
+      <button type="button" class="impact-panel-close">Back to map</button>
       <div class="impact-panel-heading">
         <p class="impact-panel-kicker">Impact briefing</p>
         <h2 id="impact-panel-title" class="impact-panel-title"></h2>
         <p class="impact-panel-kind"></p>
       </div>
-      <button type="button" class="impact-panel-close" aria-label="Close briefing">
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
+      <div class="impact-panel-actions">
+        <a class="impact-panel-action impact-panel-action-mail" aria-label="Email this briefing" title="Email this briefing" href="mailto:">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m4 7 8 6 8-6"/></svg>
+        </a>
+        <button type="button" class="impact-panel-action impact-panel-action-print" aria-label="Print this briefing" title="Print this briefing">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="7"/></svg>
+        </button>
+      </div>
     </header>
     <div class="impact-panel-body"></div>
+    <footer class="impact-print-brand" aria-hidden="true"><img src="${import.meta.env?.BASE_URL ?? './'}brand/atni-climate-lockup.png" alt="" /></footer>
   `;
   document.body.appendChild(panel);
 
   const isEmbedBoot =
     document.getElementById('app')?.classList.contains('embed') ?? false;
+  const mailAction = panel.querySelector<HTMLAnchorElement>(
+    '.impact-panel-action-mail'
+  );
   if (isEmbedBoot) {
     panel
       .querySelector('.impact-panel-header')
       ?.insertAdjacentElement('afterend', buildTribalNationsBriefAction());
+    if (mailAction) {
+      mailAction.target = '_blank';
+      mailAction.rel = 'noopener';
+    }
+  }
+  // Rearm the mailto href just before the control is read (found-098): the
+  // href is a snapshot baked by refreshBriefingActions on the last render or
+  // hydration refresh, so a durable URL key changed afterward without a
+  // repaint (a sidebar collapse, a horizon switch) would otherwise be
+  // missing when the link is followed. Capture phase runs before the
+  // browser reads href for navigation or a screen reader announces it.
+  if (mailAction) {
+    for (const eventType of ['pointerdown', 'focus', 'click'] as const) {
+      mailAction.addEventListener(eventType, rearmMailHref, { capture: true });
+    }
   }
 
   const body = panel.querySelector<HTMLElement>('.impact-panel-body');
@@ -143,6 +218,15 @@ export function ensureImpactPanelShell(): ImpactPanelShell {
   panel
     .querySelector<HTMLButtonElement>('.impact-panel-close')
     ?.addEventListener('click', requestPanelDismiss);
+  // Print calls window.print() exactly once per press (owner-1o, D1 M21);
+  // the disclosure-opening side of printing is a window-level `beforeprint`
+  // listener in impact-panel-runtime.ts, so it fires the same way whether
+  // this control or the browser's own Print starts the print.
+  panel
+    .querySelector<HTMLButtonElement>('.impact-panel-action-print')
+    ?.addEventListener('click', () => {
+      window.print();
+    });
   // Escape is scoped to the panel (IB-16). A document-level listener stayed
   // armed for the whole session and dismissed the briefing from anywhere, so
   // an Escape aimed at another open overlay (the map-information panel keeps
@@ -184,14 +268,11 @@ export function syncImpactPanelHost(): void {
   if (!shell) return;
   const { panel } = shell;
   const host = sheetReportHost();
-  const closeBtn = panel.querySelector<HTMLButtonElement>('.impact-panel-close');
   if (host) {
     const entering = panel.parentElement !== host;
     if (entering) host.appendChild(panel);
     panel.classList.add('sheet-hosted');
     panel.setAttribute('aria-modal', 'false');
-    // Accessible name only (W2-D7): no title duplicating it verbatim.
-    closeBtn?.setAttribute('aria-label', 'Close the full report');
     if (entering && !panel.hidden && getViewMode() === 'console') {
       driveSheetForReport('full');
     }
@@ -200,7 +281,6 @@ export function syncImpactPanelHost(): void {
 
   if (panel.parentElement !== document.body) document.body.appendChild(panel);
   panel.classList.remove('sheet-hosted');
-  closeBtn?.setAttribute('aria-label', 'Close briefing');
   if (!panel.hidden) panel.setAttribute('aria-modal', 'true');
 }
 
@@ -209,7 +289,7 @@ export function syncImpactPanelHost(): void {
  * hard-close owner.
  */
 export function openImpactPanelShell(
-  onHardClose: () => void,
+  onHardClose: (keepSelection?: boolean) => void,
   requestedOpener?: HTMLElement | null
 ): ImpactPanelShell {
   const current = ensureImpactPanelShell();
@@ -237,11 +317,9 @@ export function openImpactPanelShell(
   if (panel.classList.contains('sheet-hosted')) {
     if (getViewMode() === 'console') {
       driveSheetForReport('full');
-    } else if (
-      getSheetDetent() === 'peek' ||
-      (getSheetDetent() === 'closed' && sheetAllowsAutoRaise())
-    ) {
-      setSheetDetent('half');
+    } else if (getSheetDetent() !== 'closed' || sheetAllowsAutoRaise()) {
+      // Every phone window is full screen (owner, 2026-11-13).
+      setSheetDetent('full');
     }
   } else {
     panel.setAttribute('aria-modal', 'true');
@@ -249,15 +327,37 @@ export function openImpactPanelShell(
   void panel.offsetWidth;
   panel.classList.add('open');
 
-  const closeBtn = panel.querySelector<HTMLButtonElement>('.impact-panel-close');
-  if (
-    closeBtn &&
-    (!panel.classList.contains('sheet-hosted') || getSheetDetent() === 'full')
-  ) {
-    closeBtn.focus();
-  }
+  // On a phone the window's own "Back to map" leads; the report's is hidden there.
+  const back = !panel.classList.contains('sheet-hosted')
+    ? panel.querySelector<HTMLButtonElement>('.impact-panel-close')
+    : getSheetDetent() === 'full'
+      ? document.getElementById('sheet-close')
+      : null;
+  back?.focus();
   body.scrollTop = 0;
   return current;
+}
+
+/**
+ * Return focus to the control that opened the briefing, never the page body.
+ * Hard close retires the panel-owned selection, which hides the doors that
+ * name it (the sidebar's "See what this means", the Brief report link), and a
+ * popup's door left with its popup on the click. A door the close hid hands
+ * focus to the place-search entry beside it, shown only in Brief mode, and
+ * otherwise to the map; a map popup's door hands it to the map, as the
+ * Technical door does.
+ */
+function returnBriefingFocus(opener: HTMLElement): void {
+  opener.focus();
+  if (document.activeElement === opener) return;
+  const fallbacks = opener.closest('.maplibregl-popup')
+    ? ['.maplibregl-canvas']
+    : ['#brief-search [data-ddm-search]', '.maplibregl-canvas'];
+  for (const selector of fallbacks) {
+    const target = document.querySelector<HTMLElement>(selector);
+    target?.focus();
+    if (target && document.activeElement === target) return;
+  }
 }
 
 /** Close the shared shell and restore its detent and opener. */
@@ -277,7 +377,7 @@ export function closeImpactPanelShell(restoreFocus = true): void {
 
   const opener = shellOpener;
   shellOpener = null;
-  if (restoreFocus && opener && document.contains(opener)) opener.focus();
+  if (restoreFocus && opener) returnBriefingFocus(opener);
   window.setTimeout(() => {
     if (shell && !shell.panel.classList.contains('open')) {
       shell.panel.hidden = true;
@@ -293,16 +393,23 @@ export function isImpactPanelShellOpen(): boolean {
 function finishPendingOpen(token?: number): void {
   if (!pendingOpen || (token !== undefined && pendingOpen.token !== token)) return;
   if (pendingOpen.delayId !== null) window.clearTimeout(pendingOpen.delayId);
+  // A superseded or closed pending open cancels its own in-flight
+  // containing-state resolution (harmless no-op if it already settled).
+  pendingOpen.abortController?.abort();
   hideLoading(pendingOpen.loadingToken);
   pendingOpen = null;
 }
 
-function beginPendingOpen(token: number): void {
+function beginPendingOpen(
+  token: number,
+  abortController: AbortController | null = null
+): void {
   finishPendingOpen();
   const pending: PendingOpen = {
     token,
     delayId: null,
-    loadingToken: null
+    loadingToken: null,
+    abortController
   };
   pending.delayId = window.setTimeout(() => {
     if (pendingOpen !== pending) return;
@@ -312,11 +419,36 @@ function beginPendingOpen(token: number): void {
   pendingOpen = pending;
 }
 
+/**
+ * The selection a waiting open holds, so the response it replaces (a popup, the
+ * panel-foot card) sees a newer subject on its close and the place stays lit.
+ * The runtime's or the unavailable render's own selection replaces it.
+ */
+let pendingSelection: PlaceSelection | null = null;
+
+function releasePendingSelection(): void {
+  if (pendingSelection !== null && getPlaceSelection() === pendingSelection) setPlaceSelection(null);
+  pendingSelection = null;
+}
+
+const closeListeners = new Set<() => void>();
+
+/**
+ * Hear every briefing close, whatever the selection does: a "Back to map"
+ * keeps the place selected, so a selection listener alone would miss it. A
+ * no-place open supersedes the briefing the same way and is heard too.
+ */
+export function onImpactPanelClose(fn: () => void): void {
+  closeListeners.add(fn);
+}
+
 function invalidatePendingIntent(): void {
   briefingIntentSeq++;
   openToken++;
   currentRuntimeToken = null;
   finishPendingOpen();
+  releasePendingSelection();
+  for (const fn of closeListeners) fn();
 }
 
 function loadRuntime(): Promise<ImpactPanelRuntime> {
@@ -340,15 +472,53 @@ function loadRuntime(): Promise<ImpactPanelRuntime> {
   return runtimePromise;
 }
 
-function unavailableHorizon(
-  key: Horizon['key'],
-  title: string,
-  subtitle: string
-): Horizon {
+/**
+ * The four cells of one horizon, every one of them unavailable for the single
+ * reason this presentation exists: the briefing module did not load.
+ *
+ * Built here rather than through `src/impact/matrix.ts` on purpose. This
+ * facade is eager, and the matrix module carries the per-cell absence prose
+ * that only the lazy runtime can act on; importing it here put a kilobyte of
+ * text the module-failure path never renders into the entry chunk. The
+ * `Record<HazardKey, HazardCell>` return type keeps the four rows exhaustive,
+ * so a fifth hazard cannot be added to the model without this compiling.
+ */
+function unavailableCells(
+  horizon: HorizonKey
+): Record<HazardKey, HazardCell> {
+  const cell = (hazard: HazardKey, label: string): HazardCell => ({
+    hazard,
+    horizon,
+    label,
+    claims: [],
+    status: 'unavailable',
+    note: UNAVAILABLE_NOTE
+  });
+  return {
+    drought: cell('drought', 'Drought'),
+    fire: cell('fire', 'Fire'),
+    heat: cell('heat', 'Heat'),
+    enso: cell('enso', 'ENSO')
+  };
+}
+
+/**
+ * The heading comes from `HORIZON_CHROME`, the same table the lazy composer
+ * reads, so the module-failure presentation shows each horizon under exactly
+ * the title and subtitle the live briefing would. That table is three constants
+ * with a type-only import, which is why it can ride the eager entry when the
+ * composer (`src/impact/briefing.ts`) and the matrix module must not.
+ */
+function unavailableHorizon(key: HorizonKey): Horizon {
+  const chrome = HORIZON_CHROME[key];
   return {
     key,
-    title,
-    subtitle,
+    title: chrome.title,
+    subtitle: chrome.subtitle,
+    // Every cell says the one true thing about this briefing: the module that
+    // would fill it did not load. No cell is blank, and none of them inherits
+    // another hazard's state.
+    cells: unavailableCells(key),
     claims: [],
     status: 'unavailable',
     note: UNAVAILABLE_NOTE
@@ -417,24 +587,100 @@ function unavailableBriefing(
       note: UNAVAILABLE_NOTE
     },
     horizons: {
-      current: unavailableHorizon('current', 'Current conditions', 'now'),
-      nearTerm: unavailableHorizon('nearTerm', 'Near-term outlook', 'days to weeks'),
-      longRange: unavailableHorizon('longRange', 'Long-range outlook', 'months')
+      current: unavailableHorizon('current'),
+      nearTerm: unavailableHorizon('nearTerm'),
+      longRange: unavailableHorizon('longRange')
     },
     resources: []
   };
 }
 
-function clearUnavailableState(): void {
+function clearUnavailableState(keepSelection = false): void {
   unavailableOpen = false;
   setSheetBriefing(null);
   if (
+    !keepSelection &&
     unavailableSelection !== null &&
     getPlaceSelection() === unavailableSelection
   ) {
     setPlaceSelection(null);
   }
   unavailableSelection = null;
+}
+
+/**
+ * The briefing place's two-letter state postal code, or null when the place
+ * is not a state. Gated on `context.kind` first (never inferred for a
+ * Tribal Nation, an ecoregion or a watershed from `containing.state`, which
+ * answers a different question): the typed briefing place carries a
+ * shareable `select=` token only for a state (src/state/typed-place.ts,
+ * src/state/url.ts's `SelectParam`).
+ */
+function briefingStateCode(context: BoundarySelectionContext): string | null {
+  if (context.kind !== 'state') return null;
+  return postalCodeFromProperties(context.properties) ?? context.containing.state;
+}
+
+/**
+ * Build the Email control's `mailto:` href from a briefing's title and
+ * place (owner-1o, D1 M21): the subject is the title verbatim; the body is
+ * the title, a blank line, then the share link (the CURRENT view's URL, as
+ * Share copies it, read fresh by `buildShareLink` at call time, plus
+ * `select=state:XX` only for a state place; every other place kind carries
+ * no place token and the title already names the place in words).
+ */
+function buildMailHref(
+  title: string,
+  context: BoundarySelectionContext | null
+): string {
+  const stateCode = context ? briefingStateCode(context) : null;
+  const link = buildShareLink(
+    stateCode ? { kind: 'state', id: stateCode } : undefined
+  );
+  const body = `${title}\n\n${link}`;
+  return `mailto:?subject=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+}
+
+/**
+ * Rebuild and apply the Email control's href, and remember the title and
+ * context it was built from. Called on every open, refresh and unavailable
+ * render (found-098): a render is not the only moment the URL can change
+ * while the briefing stays open, so this alone does not keep the link
+ * current; `rearmMailHref` covers the gap by rebuilding it again, from the
+ * same stored title and context, just before the control is activated.
+ */
+export function refreshBriefingActions(
+  title: string,
+  context: BoundarySelectionContext | null
+): void {
+  lastBriefingTitle = title;
+  lastBriefingContext = context;
+  const mail = shell?.panel.querySelector<HTMLAnchorElement>(
+    '.impact-panel-action-mail'
+  );
+  if (!mail) return;
+  mail.href = buildMailHref(title, context);
+}
+
+/**
+ * Rebuild the Email href from the last briefing's title and context,
+ * right before the control is read (found-098): a durable URL key can
+ * change after the briefing settles without any repaint (a sidebar
+ * collapse, a horizon switch), so the href `refreshBriefingActions` last
+ * baked can be stale by the time the control is activated. A no-op while
+ * no briefing has ever rendered (both stay null until the first render),
+ * and while the control is disabled: the acknowledgements-only
+ * presentation (S30D D1 M22, `setMailActionEnabled(false)`) has no
+ * briefing to send, so it must never re-arm the previous briefing's link.
+ */
+function rearmMailHref(): void {
+  if (lastBriefingTitle === null) return;
+  const mail = shell?.panel.querySelector<HTMLAnchorElement>(
+    '.impact-panel-action-mail'
+  );
+  if (!mail) return;
+  if (mail.getAttribute('aria-disabled') === 'true') return;
+  mail.href = buildMailHref(lastBriefingTitle, lastBriefingContext);
 }
 
 function renderUnavailable(
@@ -444,11 +690,23 @@ function renderUnavailable(
   const current = ensureImpactPanelShell();
   current.title.textContent = context.title;
   current.kind.textContent = 'Boundary briefing';
+  setMailActionEnabled(true);
+  refreshBriefingActions(context.title, context);
+  // Every Impact Briefing ends in the Acknowledgements section (found-108;
+  // D1 M22, DR-159, DR-161 to DR-166). When the lazy runtime has already
+  // loaded (the acknowledgements-only view loaded it, then a later open's
+  // containing-state chunk failed), this fallback appends the same shared
+  // section the runtime's own body appends, read from the runtime, so the
+  // credits table never enters this eager facade. With no runtime loaded
+  // the fallback stays as it was: loading one here is the very import this
+  // path must not make.
+  const acknowledgements = runtime?.briefingAcknowledgementsHtml() ?? '';
   current.body.innerHTML = `
     <section class="impact-capability-unavailable" aria-label="Drought impact unavailable">
       <h3 class="impact-section-title">Drought impact unavailable</h3>
       <p class="impact-horizon-note">${UNAVAILABLE_NOTE}</p>
     </section>
+    ${acknowledgements}
   `;
 
   unavailableOpen = true;
@@ -477,27 +735,72 @@ export function openImpactPanel(context: BoundarySelectionContext): number {
   const intent = ++briefingIntentSeq;
   const token = ++openToken;
 
-  if (runtime) {
+  const needsStateEnrichment = context.containing.basis === 'none';
+
+  if (runtime && !needsStateEnrichment) {
     currentRuntimeToken = runtime.openImpactPanel(context, active);
     return token;
   }
 
-  beginPendingOpen(token);
-  void loadRuntime().then(
-    (loaded) => {
+  // Either the lazy runtime is still loading, or this context needs its
+  // containing state resolved from the point (or both); either way the
+  // runtime opens the panel from a `.then()` below instead of synchronously.
+  // The enrichment itself lives in a lazy module (`src/impact/containing-state.ts`,
+  // its own doc comment explains why), reached through a dynamic import here
+  // rather than a static one, exactly like the panel runtime below: a static
+  // import would hoist `location-identity.ts` (and its point-in-polygon
+  // fallback) into this eager facade's own bundle, which the activation gate
+  // forbids (DR-085 budgets; the impact briefing cluster is a first-use cost).
+  const abortController = needsStateEnrichment ? new AbortController() : null;
+  beginPendingOpen(token, abortController);
+
+  let contextReady: Promise<BoundarySelectionContext>;
+  if (abortController) {
+    const signal = abortController.signal;
+    contextReady = import('../impact/containing-state').then((mod) =>
+      mod.enrichContainingState(context, signal)
+    );
+  } else {
+    contextReady = Promise.resolve(context);
+  }
+
+  const held: PlaceSelection = { label: context.title, context };
+  pendingSelection = held;
+  setPlaceSelection(held);
+  const stale = (): boolean => {
+    if (intent === briefingIntentSeq && token === openToken) return false;
+    if (pendingSelection === held) releasePendingSelection();
+    return true;
+  };
+
+  void Promise.all([loadRuntime(), contextReady]).then(
+    ([loaded, resolvedContext]) => {
       finishPendingOpen(token);
-      if (intent !== briefingIntentSeq || token !== openToken) return;
-      currentRuntimeToken = loaded.openImpactPanel(context, active);
+      if (stale()) return;
+      currentRuntimeToken = loaded.openImpactPanel(resolvedContext, active);
     },
     () => {
       finishPendingOpen(token);
-      if (intent !== briefingIntentSeq || token !== openToken) return;
+      if (stale()) return;
       currentRuntimeToken = null;
       renderUnavailable(context, active);
     }
   );
   return token;
 }
+
+// The phone sheet's at-hand door opens the briefing of a place that is
+// selected with none read yet (owner direction 2026-11-09 (sprint),
+// DR-pending). Registered here because this module imports the sheet's; the
+// sheet importing this one would close a cycle.
+setSheetBriefingOpener((selection) => {
+  openImpactPanel(selection.context);
+});
+// A briefing left behind a closed phone window closes, place kept lit, when
+// the layout turns to desktop. Only an open one: a pending open is not undone.
+setSheetBriefingCloser(() => {
+  if (isImpactPanelShellOpen()) closeImpactPanel(true);
+});
 
 /** Report an unavailable briefing when a prerequisite lazy module failed. */
 export function openImpactPanelUnavailable(
@@ -520,6 +823,81 @@ export function openImpactPanelUnavailable(
   return token;
 }
 
+/**
+ * The Email control has no briefing to send in the acknowledgements-only
+ * presentation (design record acknowledgements-table.md section 1.4), so
+ * the runtime disables it there; every later briefing render re-enables it
+ * on the one shared shell: the runtime's paint and close, and the facade's
+ * unavailable render (a reused shell must never keep a disabled Mail).
+ * `refreshBriefingActions` rebuilds its href on every briefing render.
+ */
+export function setMailActionEnabled(enabled: boolean): void {
+  const mail = shell?.panel.querySelector<HTMLAnchorElement>('.impact-panel-action-mail');
+  if (!mail) return;
+  if (enabled) {
+    mail.removeAttribute('aria-disabled');
+    if (!mail.hasAttribute('href')) mail.setAttribute('href', 'mailto:');
+  } else {
+    mail.setAttribute('aria-disabled', 'true');
+    mail.removeAttribute('href');
+  }
+}
+
+/**
+ * Open the acknowledgements section (S30D D1 M22, DDM-P7-T11; the
+ * map-information pointer's target): the lazy runtime opens the shared
+ * shell in the acknowledgements-only presentation (design record
+ * acknowledgements-table.md section 1.4, ruling R-E a), an explicit user
+ * act that shows no place and starts no hydration. It declares a new
+ * briefing intent first, the way a place open does, so a later place open
+ * wins and an earlier pending one yields. If the runtime chunk fails to
+ * load, the shell names the failure instead of failing silently. `opener`
+ * takes focus back on close.
+ */
+export function openAcknowledgements(opener: HTMLElement | null): void {
+  openNoPlace('acknowledgements', opener);
+}
+
+/** The door of a popup with nothing to brief, and the map key's link (the owner's call 1). */
+export function openTechnicalInformation(opener: HTMLElement | null): void {
+  openNoPlace('technical', opener);
+}
+
+/** The heads of the two presentations that open with no place. */
+export const NO_PLACE_HEADS = {
+  // DRAFT wording (DR-177): source-directory description pending owner read.
+  acknowledgements: { title: 'Acknowledgements', kind: 'Every data source this map can show' },
+  // DRAFT wording (DR-177): the owner's call 1, the notes with no place selected.
+  technical: { title: 'Technical information', kind: 'Notes on the layers this map can show' }
+} as const;
+export type NoPlaceSection = keyof typeof NO_PLACE_HEADS;
+
+function openNoPlace(section: NoPlaceSection, opener: HTMLElement | null): void {
+  if (unavailableOpen) {
+    clearUnavailableState();
+    closeImpactPanelShell(false);
+  }
+  invalidatePendingIntent();
+  const intent = briefingIntentSeq;
+  void loadRuntime().then(
+    (loaded) => {
+      if (intent !== briefingIntentSeq) return;
+      loaded.openNoPlacePanel(section, opener);
+    },
+    () => {
+      if (intent !== briefingIntentSeq) return;
+      const current = ensureImpactPanelShell();
+      current.title.textContent = NO_PLACE_HEADS[section].title;
+      current.kind.textContent = NO_PLACE_HEADS[section].kind;
+      current.body.innerHTML = `<p class="impact-horizon-note">${UNAVAILABLE_NOTE}</p>`;
+      setMailActionEnabled(false);
+      unavailableOpen = true;
+      unavailableSelection = null;
+      openImpactPanelShell(closeImpactPanel, opener);
+    }
+  );
+}
+
 /** Whether `token` is still the active facade open. */
 export function isCurrentBriefing(token: number): boolean {
   if (token !== openToken) return false;
@@ -537,6 +915,8 @@ export function isCurrentBriefing(token: number): boolean {
  */
 export function nextBriefingIntent(): number {
   finishPendingOpen();
+  // Given back now, not when the superseded open lands: that late null write would abort the newer opener's own fetch.
+  releasePendingSelection();
   return ++briefingIntentSeq;
 }
 
@@ -563,16 +943,16 @@ export function refreshOpenBriefing(token: number): void {
   runtime.refreshOpenBriefing(currentRuntimeToken);
 }
 
-/** Close the panel and invalidate an in-flight lazy open. */
-export function closeImpactPanel(): void {
+/** Close the panel and invalidate an in-flight lazy open; `keepSelection` leaves the place lit. */
+export function closeImpactPanel(keepSelection = false): void {
   if (unavailableOpen) {
     invalidatePendingIntent();
-    clearUnavailableState();
+    clearUnavailableState(keepSelection);
     closeImpactPanelShell();
     return;
   }
   if (runtime) {
-    runtime.closeImpactPanel();
+    runtime.closeImpactPanel(keepSelection);
     return;
   }
   invalidatePendingIntent();

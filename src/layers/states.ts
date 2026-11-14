@@ -1,10 +1,20 @@
 /**
  * United States state-boundary layer (E1, national framing).
  *
- * Renders the bundled Census Bureau cartographic boundary file
- * (public/data/us-states.geojson, baked by scripts/build-states.mjs at
- * 1:20,000,000 generalization) as a quiet slate outline with a fully
- * transparent fill that serves as the click target. States are the fourth
+ * Draws the state lines and the national border from the base map's own
+ * archive (source `base`, layer `boundary`, kinds `state` and `country`: the
+ * Census 1:500,000 inner lines and the U.S./Canada and U.S./Mexico lines baked
+ * by scripts/build-base-tiles.mjs, so they meet the coast and each other at the
+ * base map's scale) as a quiet slate line on a dark casing, the national border
+ * the same as a state line, and the coast beside them (the archive has no
+ * coastline: the land edge, and the Great Lakes' water edge, are drawn).
+ * They sit in the reference band above the condition fills, so the border and
+ * the coast stay legible over the Drought fill; the
+ * hairline `base-country` under every fill (src/map/style.ts) remains the
+ * fallback when States is off. The bundled Census
+ * cartographic boundary file (public/data/us-states.geojson, 1:20,000,000,
+ * scripts/build-states.mjs) stays the fully transparent click target and
+ * carries the selected-state tint and outline. States are the fourth
  * selectable space alongside the Tribal, Treaty / BIA, and ecoregion
  * boundaries: clicking a state opens the impact briefing with the resource
  * routing resolved to that state.
@@ -16,9 +26,13 @@
  * resource list (Tribe's-own slot first) applies to every briefing.
  *
  * Cancellation (the cancellation invariant): the bundled-file fetch goes
- * through `fetchWithBudget` with a per-call timeout and a master abort signal
- * that fires on `deactivate` or a superseding `activate`, matching the
- * hardened usdm / nifc-fires / bia-reservations pattern.
+ * through `fetchSharedJsonWithBudget` (DDM-P14-T06: the file is read by six
+ * other consumers this session, so the transport is page-lifetime shared
+ * under `US_STATES_SHARED_KEY`) with a per-call timeout and this module's own
+ * master abort signal that fires on `deactivate` or a superseding `activate`,
+ * matching the hardened usdm / nifc-fires / bia-reservations pattern; only
+ * this module's own wait is cancelled, never the shared transport while
+ * another consumer still needs it.
  */
 
 import type * as maplibregl from 'maplibre-gl';
@@ -26,10 +40,12 @@ import type { FeatureCollection, GeoJsonProperties } from 'geojson';
 
 import { URLS } from '../config/urls';
 import { STATE_OUTLINE_COLOR } from '../config/palette';
-import { buildStatePopupHtml } from '../ui/popups';
+import { MAP_GROUND_COLOR } from '../config/interface-tokens';
+import { buildStatePopupModel } from '../ui/popups';
+import { buildPlaceConditionsHtml } from '../ui/popup-conditions';
 import { buildBoundaryContext, resolveBoundaryTitle } from '../impact/context';
 import { registerClickTarget } from '../map/interaction-coordinator';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchSharedJsonWithBudget, US_STATES_SHARED_KEY } from '../util/fetch';
 import { registry } from '../state/registry';
 
 const LAYER_KEY = 'states';
@@ -37,12 +53,47 @@ const SOURCE_ID = 'us-states';
 const FILL_LAYER_ID = 'us-states-fill';
 const CASING_LAYER_ID = 'us-states-casing';
 const OUTLINE_LAYER_ID = 'us-states-outline';
+const SELECTED_LAYER_ID = 'us-states-selected';
+/**
+ * The base map's North America archive (src/map/style.ts): its state lines and every national border it
+ * holds (the U.S. with Canada and with Mexico, and Natural Earth's other borders inside the archive's box,
+ * such as Mexico with Guatemala), all kind `state` or `country` in its `boundary` layer.
+ */
+const BASE_SOURCE_ID = 'base';
+const STATE_LINES = {
+  source: BASE_SOURCE_ID,
+  'source-layer': 'boundary',
+  filter: ['match', ['get', 'kind'], ['state', 'country'], true, false] as maplibregl.FilterSpecification
+};
+
+/**
+ * The coast: the archive holds no coastline, so the edge of its `land` polygons is the coast (the line sits on
+ * the land fill's own edge). The Atlas of Canada landmass takes in the Canadian Great Lakes while the Census
+ * land leaves them out, so the five Great Lakes and Georgian Bay also get their own `water` polygon edge: it
+ * lies on the land edge wherever one exists (within half a pixel at zoom 8) and fills in the Canadian shores.
+ * Every other lake keeps no line. The box clip at 14N, 84N and 50W also leaves an edge there (far from the U.S.).
+ * Tile clip edges are not drawn: the archive buffers 64 of 4096 units and MapLibre clips each tile's lines to it.
+ */
+const GREAT_LAKES = ['Lake Superior', 'Lake Michigan', 'Lake Huron', 'Lake Erie', 'Lake Ontario', 'Georgian Bay'];
+const COASTS = [
+  { id: 'us-coast', source: BASE_SOURCE_ID, 'source-layer': 'land' },
+  {
+    id: 'us-coast-lakes',
+    source: BASE_SOURCE_ID,
+    'source-layer': 'water',
+    filter: ['all', ['==', ['get', 'kind'], 'lake'], ['match', ['get', 'name'], GREAT_LAKES, true, false]] as maplibregl.FilterSpecification
+  }
+] as const;
+const coastCasingId = (id: string): string => `${id}-casing`;
+const coastOutlineId = (id: string): string => `${id}-outline`;
 
 /** Fade targets for the sidebar's toggle transitions (LayerModule contract). */
 export const fadeLayerIds = [
   FILL_LAYER_ID,
   CASING_LAYER_ID,
-  OUTLINE_LAYER_ID
+  OUTLINE_LAYER_ID,
+  SELECTED_LAYER_ID,
+  ...COASTS.flatMap(({ id }) => [coastCasingId(id), coastOutlineId(id)])
 ] as const;
 
 /**
@@ -65,8 +116,28 @@ const OUTLINE_WIDTH_NATIONAL = 0.4;
 const OUTLINE_WIDTH_REGIONAL = 1.5;
 const OUTLINE_WIDTH_SELECTED = 2.4;
 const OUTLINE_OPACITY_NATIONAL = 0.5;
-const OUTLINE_OPACITY_REGIONAL = 0.7;
-const CASING_COLOR = '#07111f';
+// Above every state highway and under the interstates at regional zoom (design pass 2026-11-13).
+const OUTLINE_OPACITY_REGIONAL = 0.8;
+const CASING_COLOR = MAP_GROUND_COLOR;
+
+/**
+ * One look for every line this module draws from the base archive: state lines, national borders (owner,
+ * 2026-11-13: the same colour and weight as the state lines) and the coast. ["zoom"] stays the top-level input.
+ */
+type LinePaint = NonNullable<maplibregl.LineLayerSpecification['paint']>;
+const CASING_PAINT: LinePaint = {
+  'line-color': CASING_COLOR,
+  'line-width': ['interpolate', ['linear'], ['zoom'], 3, 1.4, 8, 2.8],
+  'line-opacity': ['interpolate', ['linear'], ['zoom'], 3, 0.72, 8, 0.84]
+};
+// U4c chrome weights (headroom A5): with states default-on, the line must stay a quiet reference frame at
+// EVERY zoom: hairline at the whole-US framing, a touch heavier once a region fills the view (E1: about half
+// strength at the national framing).
+const OUTLINE_PAINT: LinePaint = {
+  'line-color': STATE_OUTLINE_COLOR,
+  'line-width': ['interpolate', ['linear'], ['zoom'], 3, OUTLINE_WIDTH_NATIONAL, 8, OUTLINE_WIDTH_REGIONAL],
+  'line-opacity': ['interpolate', ['linear'], ['zoom'], 3, OUTLINE_OPACITY_NATIONAL, 8, OUTLINE_OPACITY_REGIONAL]
+};
 
 type Status = 'loading' | 'ready' | 'error' | 'no-data';
 
@@ -106,16 +177,18 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 
   let geojson: FeatureCollection;
   try {
-    const response = await fetchWithBudget(
+    // Shared, page-lifetime: this call either starts the one transport this
+    // session, or joins one another consumer already started. The parsed
+    // value below is read-only here (handed straight to `map.addSource`,
+    // never sorted, pushed, or written to), so sharing the reference is
+    // safe.
+    geojson = (await fetchSharedJsonWithBudget(
+      US_STATES_SHARED_KEY,
       URLS.usStatesLocal,
       null,
       signal,
       FETCH_TIMEOUT_MS
-    );
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-    geojson = (await response.json()) as FeatureCollection;
+    )) as FeatureCollection;
   } catch (err) {
     // Aborted means superseded or deactivated; drop silently per invariant 5.
     if (signal.aborted) return;
@@ -154,28 +227,8 @@ export async function activate(map: maplibregl.Map): Promise<void> {
     {
       id: CASING_LAYER_ID,
       type: 'line',
-      source: SOURCE_ID,
-      paint: {
-        'line-color': CASING_COLOR,
-        'line-width': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          3,
-          1.4,
-          8,
-          2.8
-        ],
-        'line-opacity': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          3,
-          0.72,
-          8,
-          0.84
-        ]
-      }
+      ...STATE_LINES,
+      paint: CASING_PAINT
     },
     beforeId
   );
@@ -205,59 +258,42 @@ export async function activate(map: maplibregl.Map): Promise<void> {
     {
       id: OUTLINE_LAYER_ID,
       type: 'line',
+      ...STATE_LINES,
+      paint: OUTLINE_PAINT
+    },
+    beforeId
+  );
+
+  // The coast, in the state lines' own grey on the same casing, in the same reference band above the fills.
+  for (const { id, ...spec } of COASTS) {
+    const line = (lineId: string, paint: LinePaint): maplibregl.LineLayerSpecification =>
+      ({ id: lineId, type: 'line', ...spec, layout: { 'line-join': 'round' }, paint });
+    map.addLayer(line(coastCasingId(id), CASING_PAINT), beforeId);
+    map.addLayer(line(coastOutlineId(id), OUTLINE_PAINT), beforeId);
+  }
+
+  // The selected state's outline, on the coarse click shape. STRUCTURE
+  // MATTERS: MapLibre only accepts ["zoom"] as input to a TOP-LEVEL
+  // step/interpolate, so the zoom curve wraps the feature-state case (the
+  // inverted form validates but logs a style error; the 2026-07-12 console
+  // inspection). It fades out by zoom 9, where the 1:20,000,000 shape strays
+  // visibly from the drawn line; the selected tint stays.
+  map.addLayer(
+    {
+      id: SELECTED_LAYER_ID,
+      type: 'line',
       source: SOURCE_ID,
       paint: {
         'line-color': STATE_OUTLINE_COLOR,
-        // U4c chrome weights (headroom A5): with states default-on, the
-        // outline must stay a quiet reference frame at EVERY zoom: hairline
-        // at the whole-US framing, a touch heavier once a region fills the
-        // view. The selected boost stays a constant that reads against the
-        // interpolated base at any zoom. STRUCTURE MATTERS: MapLibre only
-        // accepts ["zoom"] as input to a TOP-LEVEL step/interpolate, so the
-        // zoom curve wraps the feature-state case, not the other way around
-        // (the inverted form validates but logs a style error and falls
-        // back to the default width; caught by the 2026-07-12 console
-        // inspection).
-        'line-width': [
-          'interpolate',
-          ['linear'],
-          ['zoom'],
-          3,
-          [
-            'case',
-            ['boolean', ['feature-state', 'selected'], false],
-            OUTLINE_WIDTH_SELECTED,
-            OUTLINE_WIDTH_NATIONAL
-          ],
-          8,
-          [
-            'case',
-            ['boolean', ['feature-state', 'selected'], false],
-            OUTLINE_WIDTH_SELECTED,
-            OUTLINE_WIDTH_REGIONAL
-          ]
-        ],
-        // Same zoom-curve-wraps-the-case structure as the width above (the
-        // inverted form logs a style error; see the width comment). E1 quiets
-        // the hairline to roughly half strength at the national framing.
+        'line-width': OUTLINE_WIDTH_SELECTED,
         'line-opacity': [
           'interpolate',
           ['linear'],
           ['zoom'],
-          3,
-          [
-            'case',
-            ['boolean', ['feature-state', 'selected'], false],
-            1,
-            OUTLINE_OPACITY_NATIONAL
-          ],
-          8,
-          [
-            'case',
-            ['boolean', ['feature-state', 'selected'], false],
-            1,
-            OUTLINE_OPACITY_REGIONAL
-          ]
+          7,
+          ['case', ['boolean', ['feature-state', 'selected'], false], 1, 0],
+          9,
+          0
         ]
       }
     },
@@ -278,8 +314,12 @@ export function deactivate(map: maplibregl.Map): void {
     masterController = null;
   }
   if (map.getLayer(FILL_LAYER_ID)) map.removeLayer(FILL_LAYER_ID);
+  if (map.getLayer(SELECTED_LAYER_ID)) map.removeLayer(SELECTED_LAYER_ID);
   if (map.getLayer(OUTLINE_LAYER_ID)) map.removeLayer(OUTLINE_LAYER_ID);
   if (map.getLayer(CASING_LAYER_ID)) map.removeLayer(CASING_LAYER_ID);
+  for (const { id } of COASTS) {
+    for (const layerId of [coastOutlineId(id), coastCasingId(id)]) if (map.getLayer(layerId)) map.removeLayer(layerId);
+  }
   if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
 }
 
@@ -293,10 +333,10 @@ export function bindPopups(map: maplibregl.Map): void {
     kind: 'state-boundary',
     layerIds: [FILL_LAYER_ID],
     label: (feature) => resolveBoundaryTitle('state', feature.properties ?? null),
-    respond: (feature, click) => {
+    respond: (feature, click, map) => {
       const props: GeoJsonProperties = feature.properties ?? null;
       return {
-        content: buildStatePopupHtml(props),
+        model: buildStatePopupModel(props, buildPlaceConditionsHtml(map, click.point, feature)),
         selection: buildBoundaryContext('state', props, feature.geometry, click.lngLat),
         // An id-less feature clears any prior emphasis (the old
         // emphasizePlace contract) rather than lighting an unknown one.

@@ -1,22 +1,34 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 
+import { HEAT_FIRE_ALERTS } from '../src/config/clusters';
 import {
   HEATRISK_CATEGORIES,
-  NWS_ALERT_COLORS
+  NWS_ALERT_LEGEND
 } from '../src/config/palette';
-import { TEMPORAL_HORIZON_LABELS } from '../src/config/clusters';
-import { fillHorizon } from '../src/impact/heat-horizon';
-import type { Horizon } from '../src/impact/types';
+import { makeClaim } from '../src/impact/evidence';
+import { HORIZON_CHROME } from '../src/impact/horizon-chrome';
+import { fillCell } from '../src/impact/matrix';
+import type { MatrixLaneKey, MatrixLaneResult } from '../src/impact/matrix';
+import type { HazardCell } from '../src/impact/types';
 import { createHeatRiskSequenceLoader } from '../src/ui/heatrisk-sequence-loader';
 import {
   gotoApp,
   layerCheckbox,
   layerPill,
-  search
+  search,
+  backToMap
 } from './helpers';
 
 const HEATRISK_PATH =
   '/experimental/rest/services/NWS_HeatRisk/ImageServer';
+
+async function openHeatKey(page: Page): Promise<void> {
+  await backToMap(page);
+  const toggle = page.locator('#map-key-details-toggle');
+  await expect(toggle).toBeVisible();
+  if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+  await expect(page.locator('#map-key-content')).toBeVisible();
+}
 const WWA_PATH =
   '/eventdriven/rest/services/WWA/watch_warn_adv/MapServer/1/query';
 const TIMES = [
@@ -88,13 +100,6 @@ async function stubHeatH1(
     options.metadataExtent ??
     ([catalogTimes[0]!, catalogTimes.at(-1)!] as const);
 
-  await page.route('https://tile.openstreetmap.org/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'image/png',
-      body: ONE_PIXEL_PNG
-    })
-  );
 
   await page.route(
     (url) => url.pathname.startsWith(HEATRISK_PATH),
@@ -290,6 +295,9 @@ async function setLayerChecked(
   checked: boolean
 ): Promise<void> {
   await layerCheckbox(page, key).evaluate((element, next) => {
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error('layerCheckbox did not resolve to an <input>');
+    }
     element.checked = next;
     element.dispatchEvent(new Event('change', { bubbles: true }));
   }, checked);
@@ -307,13 +315,19 @@ function boxesOverlap(
   );
 }
 
-test('the issuer HeatRisk table and next-seven-days label are exact and centralized', () => {
+// DDM-P8-T03 (R2, 2026-09-07): the second half of this test used to pin
+// TEMPORAL_HORIZON_LABELS['weeks-ahead'] to 'next seven days'. That table
+// had zero production consumers and was removed under R1 (horizon-chrome.ts
+// is now the single horizon-name source for the whole interface); this pin
+// is re-pointed at HORIZON_CHROME, the new source, at the same strength
+// (exact string equality) rather than dropped.
+test('the issuer HeatRisk table and the near-term horizon heading are exact and centralized', () => {
   expect(HEATRISK_CATEGORIES).toEqual([
     {
       value: 0,
-      label: 'Little to no risk',
+      label: 'Little to None',
       color: '#E8F9E7',
-      meaning: 'Little to no risk from expected heat.'
+      meaning: 'This level of heat poses little to no risk from expected heat.'
     },
     {
       value: 1,
@@ -344,15 +358,70 @@ test('the issuer HeatRisk table and next-seven-days label are exact and centrali
         'This level of rare and/or long-duration extreme heat with little to no overnight relief affects anyone without effective cooling and/or adequate hydration. Impacts likely in most health systems, heat-sensitive industries and infrastructure.'
     }
   ]);
-  expect(TEMPORAL_HORIZON_LABELS['weeks-ahead']).toBe('next seven days');
+  expect(HORIZON_CHROME.nearTerm.subtitle).toBe('days to weeks');
 });
 
 test.describe('selected-place HeatRisk sequence and briefing', () => {
+  test('D3 desktop HeatRisk read-glass preserves issuer rows with allowed neutral text', async ({ page }) => {
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await stubHeatH1(page);
+    await gotoApp(page, '?view=console&layers=heatrisk,nws-alerts&heatday=3&select=state:WA&flow=off');
+    await expect(layerPill(page, 'heatrisk')).toHaveText('live');
+    await openHeatKey(page);
+    const key = page.locator('#map-key');
+    await expect(key).toHaveCSS('background-color', 'rgba(1, 11, 19, 0.72)');
+    await expect(key).toHaveCSS('border-top-color', 'rgb(198, 203, 212)');
+    const rows = key.locator('[data-heatrisk-scale] .map-key-item');
+    await expect(rows).toHaveCount(5);
+    for (const [index, category] of HEATRISK_CATEGORIES.entries()) {
+      const row = rows.nth(index);
+      await expect(row).toHaveCSS('color', 'rgb(198, 203, 212)');
+      await expect(row).toContainText(String(category.value));
+      await expect(row.locator('.map-key-swatch')).toHaveAttribute(
+        'style',
+        category.value === 0 ? 'background:transparent' : `background:${category.color}`
+      );
+    }
+  });
   test.use({ viewport: { width: 400, height: 600 } });
 
   test('uses exact-time identify, redundant values, keyboard selection, and a classified claim', async ({
     page
   }) => {
+    // Observe the actual map as in fire3d-mode's animated ribbon case.
+    // This leaves the renderer and application methods intact.
+    type ClassMap = {
+      getContainer(): HTMLElement;
+      getPaintProperty(layer: string, property: string): unknown;
+      getLayer(layer: string): { source: string } | undefined;
+      getSource(source: string): { roundZoom: boolean } | undefined;
+    };
+    type ClassWindow = Window & { __classMaps: ClassMap[] };
+    await page.addInitScript(() => {
+      const maps: ClassMap[] = [];
+      (window as unknown as ClassWindow).__classMaps = maps;
+      Object.defineProperty(Object.prototype, '_onWindowOnline', {
+        configurable: true,
+        set(this: ClassMap, value: unknown) {
+          Object.defineProperty(this, '_onWindowOnline', {
+            configurable: true, enumerable: true, writable: true, value
+          });
+          maps.push(this);
+        }
+      });
+    });
+    const expectDisplaySampling = async (): Promise<void> => {
+      expect(await page.evaluate(() => {
+        const map = (window as unknown as ClassWindow).__classMaps.find(
+          (candidate) => candidate.getContainer().id === 'map'
+        );
+        const layer = map?.getLayer('heatrisk');
+        return {
+          sampling: map?.getPaintProperty('heatrisk', 'raster-resampling'),
+          roundZoom: layer ? map?.getSource(layer.source)?.roundZoom : undefined
+        };
+      })).toEqual({ sampling: 'linear', roundZoom: false });
+    };
     await page.emulateMedia({ reducedMotion: 'reduce' });
     const receipt = await stubHeatH1(page);
     await gotoApp(
@@ -361,6 +430,7 @@ test.describe('selected-place HeatRisk sequence and briefing', () => {
     );
 
     await expect(layerPill(page, 'heatrisk')).toHaveText('live');
+    await expectDisplaySampling();
     const sequence = page.locator('#heatrisk-sequence');
     await expect(sequence).toBeVisible();
     const cells = sequence.locator('[data-heatrisk-sequence-day]');
@@ -384,6 +454,12 @@ test.describe('selected-place HeatRisk sequence and briefing', () => {
     await expect(cells.nth(2)).toContainText('2');
     await expect(cells.nth(3)).toContainText('3');
     await expect(cells.nth(4)).toContainText('4');
+    for (const index of [0, 1, 2, 3, 4]) {
+      const value = cells.nth(index).locator('.heatrisk-sequence-value');
+      await expect(value).toHaveText(String(index));
+      await expect(value).toHaveCSS('font-family', /^"?DDM Heros"?,/);
+      await expect(value).toHaveCSS('font-variant-numeric', /^(?:lining-nums tabular-nums|tabular-nums lining-nums)$/);
+    }
     await expect(cells.nth(5)).toContainText('ND');
     await expect(cells.nth(5)).toHaveAttribute('data-value', 'no-data');
     await expect(cells.nth(2)).toHaveAttribute('aria-pressed', 'true');
@@ -419,15 +495,17 @@ test.describe('selected-place HeatRisk sequence and briefing', () => {
       );
       await expect(row.locator('.map-key-swatch')).toHaveAttribute(
         'style',
-        `background:${category.color}`
+        category.value === 0 ? 'background:transparent' : `background:${category.color}`
       );
     }
 
     const productKey = page.locator('#map-key [data-nws-products-key]');
-    await expect(productKey).toBeVisible();
-    for (const product of Object.keys(NWS_ALERT_COLORS)) {
-      await expect(productKey).toContainText(product);
+    // The key rows of the products this view asks for (HazardClusterDef.alerts), never another mode's.
+    for (const { label } of NWS_ALERT_LEGEND.filter((row) => HEAT_FIRE_ALERTS.events.includes(row.label))) {
+      await expect(productKey).toContainText(label);
     }
+    await expect(productKey).not.toContainText('Excessive');
+    await expect(productKey).not.toContainText('Flood Warning');
 
     const selectedCell = cells.nth(2);
     await selectedCell.focus();
@@ -468,12 +546,18 @@ test.describe('selected-place HeatRisk sequence and briefing', () => {
     const selector = page.locator(
       '#map-key select[data-heatrisk-day]'
     );
-    await selector.focus();
+    // The selected-point sequence and the key share the same day state.
+    // Exercise the sequence keyboard before inspecting the disclosed key.
+    await cells.nth(3).focus();
     await page.keyboard.press('End');
     await expect(selector).toHaveValue('7');
-    await selector.focus();
-    await page.keyboard.press('ArrowUp');
+    // No refocus: the redraw for the chosen day hands focus back to its cell.
+    await expect(cells.nth(6)).toBeFocused();
+    await page.keyboard.press('ArrowLeft');
     await expect(selector).toHaveValue('6');
+    await expect(cells.nth(5)).toBeFocused();
+    await expect(layerPill(page, 'heatrisk')).toHaveText('live');
+    await expectDisplaySampling();
     await expect(selectedRead).toContainText('no data');
     await expect(selectedRead).toContainText(
       'The National Weather Service returned no HeatRisk value'
@@ -482,6 +566,20 @@ test.describe('selected-place HeatRisk sequence and briefing', () => {
       'no data at the selected point for Washington for the selected frame'
     );
     expect(receipt.identifyCalls).toHaveLength(7);
+
+    // The key's native date selector remains independently operable after
+    // leaving the briefing, including End and ArrowUp keyboard selection.
+    await page.locator('#impact-panel .impact-panel-close').click();
+    await expect(page.locator('#impact-panel')).toBeHidden();
+    await openHeatKey(page);
+    await expect(productKey).toBeVisible();
+    await selector.focus();
+    await page.keyboard.press('End');
+    await expect(selector).toHaveValue('7');
+    await selector.focus();
+    await page.keyboard.press('ArrowUp');
+    await expect(selector).toHaveValue('6');
+    await expect.poll(async () => new URLSearchParams(await search(page)).get('heatday')).toBe('6');
   });
 
   test('rejects a non-null identify value whose returned catalog time differs', async ({
@@ -543,12 +641,24 @@ test.describe('review regressions for HeatRisk honesty and lifecycle', () => {
       'value 2, Moderate, at the selected point for Washington'
     );
 
-    await page
-      .locator('#map-key select[data-heatrisk-day]')
-      .selectOption('6');
+    // At this embed size the briefing covers the map controls. Read the
+    // no-data selection through its shared URL instead of clicking through
+    // the modal; the separate keyboard case covers in-place day changes.
+    await gotoApp(
+      page,
+      '?embed=true&view=console&layers=heatrisk&heatday=6&select=state:WA'
+    );
+    await expect(sequence.locator('.heatrisk-sequence-heading')).toContainText(
+      'HeatRisk at the selected point for Washington'
+    );
+    await expect(sequence.locator('[data-heatrisk-selected-read]')).toContainText('no data');
     await expect(heatClaim).toContainText(
       'no data at the selected point for Washington for the selected frame'
     );
+    await expect.poll(() => receipt.identifyCalls.length).toBe(14);
+    for (const call of receipt.identifyCalls) {
+      expect(call.geometry).toEqual(WA_BBOX_CENTER);
+    }
   });
 
   test('review regression: files the selected Day 7 classification under near-term', async ({
@@ -570,7 +680,12 @@ test.describe('review regressions for HeatRisk honesty and lifecycle', () => {
       'HeatRisk (Experimental) value 2, Moderate'
     );
     await expect(nearTerm).toContainText('Valid Aug 3, 2026, 12:00 UTC');
-    await expect(current).not.toContainText('HeatRisk (Experimental)');
+    // The current horizon also hosts the cross-source Heat synthesis. Its
+    // dated companion read may name HeatRisk; the current hazard claims
+    // must never refile the selected classification as a current product.
+    await expect(current.locator('.impact-hazard[data-hazard="heat"]')).not.toContainText(
+      'HeatRisk (Experimental)'
+    );
   });
 
   test('review regression: discards an initial HeatRisk read superseded while current hydration waits', async ({
@@ -593,7 +708,12 @@ test.describe('review regressions for HeatRisk honesty and lifecycle', () => {
     await expect(day4).toBeAttached();
     // Keep this as a native, no-retry click. A redundant status event must
     // not replace the live cell before its delegated click reaches the host.
-    await day4.evaluate((element) => element.click());
+    await day4.evaluate((element) => {
+      if (!(element instanceof HTMLElement)) {
+        throw new Error('day4 sequence cell is not an HTMLElement');
+      }
+      element.click();
+    });
     await expect
       .poll(async () => new URLSearchParams(await search(page)).get('heatday'))
       .toBe('4');
@@ -729,28 +849,50 @@ test.describe('review regressions for HeatRisk honesty and lifecycle', () => {
     });
   }
 
+  // The note this case guards moved from the horizon to the Heat near-term
+  // cell when the briefing became a four-hazard by three-horizon matrix
+  // (DDM-P7-T02): a HeatRisk failure is the Heat row's business and no longer
+  // speaks for the drought row beside it.
   test('review regression: clears the prior source failure note after a successful recomputation', () => {
-    const horizon: Horizon = {
-      key: 'nearTerm',
-      title: 'Near-term outlook',
-      subtitle: 'days to a season',
+    const cell: HazardCell = {
+      hazard: 'heat',
+      horizon: 'nearTerm',
+      label: 'Heat',
       status: 'loading',
       claims: []
     };
-    fillHorizon(horizon, [
-      {
-        ok: false,
-        claims: [],
-        note:
-          'The National Weather Service HeatRisk classification did not respond.'
-      }
-    ]);
-    expect(horizon.note).toBe(
+    const failure: MatrixLaneResult = {
+      ok: false,
+      claims: [],
+      note:
+        'The National Weather Service HeatRisk classification did not respond.'
+    };
+    fillCell(cell, new Map<MatrixLaneKey, MatrixLaneResult>([['heatRisk', failure]]));
+    expect(cell.note).toBe(
       'The National Weather Service HeatRisk classification did not respond.'
     );
 
-    fillHorizon(horizon, [{ ok: true, claims: [] }]);
-    expect(horizon.note).toBeUndefined();
+    const answered: MatrixLaneResult = {
+      ok: true,
+      claims: [
+        makeClaim({
+          text: 'HeatRisk (Experimental) value 2, Moderate, at the selected point.',
+          source: 'National Weather Service HeatRisk (Experimental)',
+          product: 'heatrisk',
+          evidence: 'classified',
+          dates: { valid: '2026-08-03' }
+        })
+      ]
+    };
+    fillCell(
+      cell,
+      new Map<MatrixLaneKey, MatrixLaneResult>([
+        ['heatRisk', answered],
+        ['nwsForecast', { ok: true, claims: [] }]
+      ])
+    );
+    expect(cell.note).toBeUndefined();
+    expect(cell.status).toBe('ready');
   });
 });
 
@@ -773,6 +915,7 @@ for (const viewport of [
 
     const key = page.locator('#map-key');
     await expect(key).toBeVisible();
+    await openHeatKey(page);
     await expect(key.locator('[data-heatrisk-scale]')).toBeVisible();
     await expect(key.locator('[data-nws-products-key]')).toBeVisible();
     const metrics = await key.evaluate((element) => {
@@ -814,39 +957,18 @@ for (const viewport of [
       expect(item.fontSize).toBeGreaterThanOrEqual(9.5);
     }
 
-    // W2-D4: an oversized key collapses to the shared capacity behind the
-    // measured chevron instead of consuming the iframe. Without overflow
-    // the old full-containment contract holds unchanged; with it, every
-    // item is reachable through the bounded expansion's scroll.
-    const expander = page.locator('#map-key-expand');
-    if (await expander.isHidden()) {
-      for (const item of metrics.itemBoxes) {
-        expect(item.bottom).toBeLessThanOrEqual(metrics.bottom + 1);
-      }
-    } else {
-      const content = page.locator('#map-key-content');
-      const collapsedHeight = await content.evaluate(
-        (element) => element.getBoundingClientRect().height
-      );
-      expect(collapsedHeight).toBeLessThanOrEqual(225);
-      await expander.click();
-      await expect(expander).toHaveAttribute('aria-expanded', 'true');
-      const expandedBox = await key.boundingBox();
-      expect(expandedBox).not.toBeNull();
-      expect(expandedBox!.y).toBeGreaterThanOrEqual(0);
-      expect(expandedBox!.y + expandedBox!.height).toBeLessThanOrEqual(
-        viewport.height
-      );
-      const reachedEnd = await content.evaluate((element) => {
-        element.scrollTop = element.scrollHeight;
-        return element.scrollTop + element.clientHeight >= element.scrollHeight - 1;
-      });
-      expect(reachedEnd, 'the expanded key content cannot scroll to its end').toBe(
-        true
-      );
-      await expander.click();
-      await expect(expander).toHaveAttribute('aria-expanded', 'false');
-    }
+    // The one header opens a bounded scrolling key. Every item remains
+    // reachable without a second expansion control or growing the iframe.
+    const content = page.locator('#map-key-content');
+    const reachedEnd = await content.evaluate((element) => {
+      element.scrollTop = element.scrollHeight;
+      return element.scrollTop + element.clientHeight >= element.scrollHeight - 1;
+    });
+    expect(reachedEnd, 'the opened key content cannot scroll to its end').toBe(true);
+    const toggle = key.locator('#map-key-details-toggle');
+    await toggle.click();
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(content).toBeHidden();
 
     const keyBox = await key.boundingBox();
     const brandBox = await page.locator('.embed-brand').boundingBox();

@@ -28,12 +28,12 @@
  */
 
 import { URLS } from '../config/urls';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchSharedJsonWithBudget, ENSO_INDICES_SHARED_KEY } from '../util/fetch';
 import { isObject } from '../util/guards';
-import { oniLineSvg, ensoPlumeSvg, type OniPoint, type EnsoPlumePoint } from '../ui/charts';
+import { oniLineSvg, type OniPoint } from '../ui/charts';
 import { makeClaim } from './evidence';
 import type { SourceResult } from './sources';
-import type { BoundarySelectionContext } from './types';
+import type { BoundarySelectionContext, EnsoIndexReading } from './types';
 
 type EnsoPhase = 'el-nino' | 'la-nina' | 'neutral';
 
@@ -90,6 +90,27 @@ interface Nino34Series {
   readonly values: Nino34Point[];
 }
 
+/**
+ * One weekly Nino 3.4 observation (DR-031 a). Like `Nino34Point` with a day and
+ * without `climAdjust`: the weekly CPC file publishes sea surface temperature
+ * and anomaly only. The date is the CENTRE of its week, which the file states
+ * on its own first line, so no code here may call it a week start.
+ */
+interface Nino34WeeklyPoint {
+  readonly year: number;
+  readonly month: number;
+  readonly day: number;
+  readonly total: number;
+  readonly anom: number;
+}
+
+interface Nino34WeeklySeries {
+  readonly sourceUrl: string;
+  readonly published?: string;
+  readonly latest: Nino34WeeklyPoint;
+  readonly values: Nino34WeeklyPoint[];
+}
+
 interface SoiPoint {
   readonly year: number;
   readonly month: number;
@@ -108,24 +129,15 @@ interface SoiSeries {
   readonly values: SoiPoint[];
 }
 
-/** The optional probabilities block. The CPC Hypertext Markup Language (HTML)
- * scrape that once produced it was removed 2026-07-21 (T-P0-1), so current
- * snapshots never carry it; absent is the honest no-plume state, never an
- * error. The shape is retained only for a future documented machine feed. */
-interface EnsoProbabilities {
-  readonly sourceUrl: string;
-  readonly issued: string | null;
-  readonly baseline: string;
-  readonly seasons: EnsoPlumePoint[];
-}
-
+/** No probabilities block: no issuer machine feed exists (DDM-D06), so a
+ * snapshot that carried one is ignored here, never drawn (DDM-P4-T07). */
 interface EnsoSnapshot {
   readonly retrieved: string;
   readonly oni: IndexSeries;
   readonly roni: IndexSeries;
   readonly nino34?: Nino34Series;
+  readonly nino34Weekly?: Nino34WeeklySeries;
   readonly soi?: SoiSeries;
-  readonly probabilities?: EnsoProbabilities;
 }
 
 /** A label-only read of the bundled snapshot's operational RONI state. */
@@ -146,6 +158,8 @@ export interface EnsoPhaseLabel {
   readonly emerging: boolean;
   /** The RONI season the state is read from, for example 'MJJ'. */
   readonly season: string;
+  /** The snapshot's retrieved date when it is past HARD_STALE_DAYS (the briefing's dated past-tense rule), else null. */
+  readonly staleAsOf: string | null;
   /** The calendar year that season ends in. */
   readonly year: number;
 }
@@ -166,12 +180,14 @@ export async function readEnsoPhaseLabel(
   try {
     const snap = await loadEnsoSnapshot(signal);
     const state = readState(snap.roni);
+    const age = snapshotAge(snap);
     return {
       conditionsName: PHASE_NAME[state.conditions],
       phaseName: PHASE_NAME[state.episode],
       emerging: state.emerging,
       season: snap.roni.latest.seas,
-      year: snap.roni.latest.year
+      year: snap.roni.latest.year,
+      staleAsOf: age !== null && age.days > HARD_STALE_DAYS ? snap.retrieved : null
     };
   } catch {
     return null;
@@ -184,8 +200,36 @@ export async function readEnsoPhaseLabel(
 // here; the full-suite run caught it through tests/evidence-contract.spec.ts,
 // which was outside that lane's fence and outside both review rounds.
 const SOURCE = 'NOAA CPC Relative Oceanic Nino Index (RONI) and observed ENSO indices';
-const MODULATORS = // vocab-allow: honesty disclaimer, denies being a forecast
-  'This is a shift in the odds, not a forecast: the Pacific Decadal Oscillation, the event strength and timing, and intraseasonal variability can reinforce or mute the signal.';
+/**
+ * The lead clause of `MODULATORS`, held on its own so a surface that shows it
+ * alone (the ENSO chain's disclosure summary) shows the same words, never a
+ * cut of the sentence.
+ */
+// vocab-allow: honesty disclaimer, denies being a forecast
+const ODDS_LEAD = 'This is a shift in the odds, not a forecast';
+const MODULATORS = `${ODDS_LEAD}: the Pacific Decadal Oscillation, the event strength and timing, and intraseasonal variability can reinforce or mute the signal.`;
+
+/**
+ * The nested truth of every ENSO surface, in this module's governed words
+ * (owner direction 2026-11-09 (sprint), DR-pending): the ENSO mode's chain
+ * (src/ui/enso-chain.ts) keeps these one tap from every link, so a picture of
+ * the ocean beside a place can never be read as a cause.
+ *
+ * `odds` is `MODULATORS` itself, the sentence every regional tendency claim
+ * below already ends with, and `lead` is its lead clause. `events` is NOAA CPC's own sentence on single
+ * storms, verbatim, as the technical section already quotes it
+ * (src/ui/map-technical-information.ts, the ENSO notes, with the same link);
+ * tests/enso-chain.test.mjs holds the two copies equal, so the quotation
+ * cannot drift from the one the briefing shows.
+ */
+export const ENSO_NESTED_TRUTH = {
+  lead: ODDS_LEAD,
+  odds: MODULATORS,
+  events:
+    'It is inaccurate to label individual storms or events as a La Niña or El Niño event. Rather, these climate extremes affect the position and intensity of the jet streams, and the normal regions of high and low pressure, which in turn affect the average intensity and track of storms.',
+  eventsSource: 'NOAA Climate Prediction Center, ENSO FAQ',
+  eventsUrl: 'https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/ensostuff/ensofaq.shtml'
+} as const;
 
 /**
  * The CPC and regional pages this module cites, with the date each link and
@@ -194,8 +238,15 @@ const MODULATORS = // vocab-allow: honesty disclaimer, denies being a forecast
  * Verified 2026-09-02 by research worker 13's live fetches and re-checked
  * the same day, HTTP 200 each. Re-stamp `CITATIONS_VERIFIED` whenever these
  * are re-read; do not extend a statement past what its page says.
+ *
+ * Re-read 2026-09-07 (DDM-P12-T03, DR-030): every URL below answered HTTP 200
+ * and each tendency sentence was checked clause by clause against its page's
+ * own words. Three narrowing edits, covering eight clause-level verdicts, moved
+ * text to the strength its page states and no further;
+ * the two lineage entries that carried no link gained one. The clause-level
+ * verdicts live in `planning/references/register.yaml` and the S11 handoff.
  */
-const CITATIONS_VERIFIED = '2026-09-02';
+const CITATIONS_VERIFIED = '2026-09-07';
 const CPC_STATUS_URL =
   'https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/enso_advisory/ensodisc.shtml';
 const RONI_PRODUCT_URL =
@@ -217,6 +268,24 @@ const THRESHOLD = 0.5;
 const RUN_LENGTH = 5;
 const DIRECTION_BAND = 0.2;
 const DIRECTION_SPAN = 3;
+/**
+ * How many weekly observations back the weekly trajectory is measured across.
+ * Four is about a month, the weekly analogue of the three-season
+ * `DIRECTION_SPAN`, and like `DIRECTION_BAND` it is this application's own
+ * choice and not a CPC rule. Stated here so it is auditable, and named in the
+ * claim text so a reader is never shown it as an issuer threshold.
+ */
+const WEEKLY_DIRECTION_SPAN = 4;
+
+/**
+ * The contract's `directionOf`: the change is rounded to the data's
+ * two-decimal precision first, so a printed +0.20 is never judged inside the
+ * band (3.4 - 3.2 is 0.19999999999999973).
+ */
+function directionOf(change: number): EnsoDirection {
+  const rounded = Math.round(change * 100) / 100;
+  return rounded >= DIRECTION_BAND ? 'strengthening' : rounded <= -DIRECTION_BAND ? 'weakening' : 'steady';
+}
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_NAMES = [
   'January',
@@ -251,9 +320,11 @@ function snapshotAgeDays(retrieved: string): number | null {
  * How old this read really is (ENSO-05). `retrieved` is rewritten on every
  * scheduled build whether or not CPC published anything, so retrieval age
  * alone can never notice a frozen upstream. The hedges therefore key on the
- * LARGER of the retrieval age and the age of the oldest captured CPC
+ * LARGER of the retrieval age and the age of the older headline (RONI or ONI)
  * publication date, and `basis` records which one is speaking so the prose
- * never attributes a publication age to the snapshot file.
+ * never attributes a publication age to the snapshot file. A companion file
+ * (monthly and weekly Nino 3.4, SOI) is withheld on its own age instead
+ * (`companionFresh`), so one frozen companion cannot date the headline.
  */
 interface SnapshotAge {
   readonly days: number;
@@ -263,12 +334,7 @@ interface SnapshotAge {
 function snapshotAge(snap: EnsoSnapshot): SnapshotAge | null {
   const retrievedAge = snapshotAgeDays(snap.retrieved);
   if (retrievedAge === null) return null;
-  const publishedAges = [
-    snap.roni.published,
-    snap.oni.published,
-    snap.nino34?.published,
-    snap.soi?.published
-  ]
+  const publishedAges = [snap.roni.published, snap.oni.published]
     .map((day) => (day === undefined ? null : snapshotAgeDays(day)))
     .filter((age): age is number => age !== null);
   const oldestPublishedAge =
@@ -279,12 +345,36 @@ function snapshotAge(snap: EnsoSnapshot): SnapshotAge | null {
   return { days: retrievedAge, basis: 'retrieval' };
 }
 
+/** A companion file is shown only while its own CPC publication date is inside `limit` days. */
+function companionFresh(published: string | undefined, limit = HARD_STALE_DAYS): boolean {
+  const age = published === undefined ? null : snapshotAgeDays(published);
+  return age === null || age <= limit;
+}
+
+/**
+ * U+00A0 between "published" and its date (S30D D1 M27, DDM-P10-T12), so a
+ * date never stands alone on the last line of the provenance sentence. Kept
+ * module-local rather than imported from src/util/text-tokens.ts, so this
+ * module's closure takes no new import.
+ */
+const TIE = '\u00a0';
+
+/**
+ * Each hyphen of the date held between U+2060 WORD JOINERs: Chromium breaks
+ * a prose date after its hyphen ("2026-" / "09-04."), so the tie alone could
+ * still leave a date fragment alone on the last line. The hyphen stays the
+ * ASCII one, drawn by Lexend (which has no U+2011 glyph); the joiners are
+ * invisible, and a copy of the sentence carries them.
+ */
+const nbDate = (d: string): string => d.replace(/-/g, '\u2060-\u2060');
+
 function publishedParts(snap: EnsoSnapshot): string[] {
   return [
-    snap.roni.published ? `RONI published ${snap.roni.published}` : null,
-    snap.oni.published ? `ONI published ${snap.oni.published}` : null,
-    snap.nino34?.published ? `analyzed monthly Nino 3.4 published ${snap.nino34.published}` : null,
-    snap.soi?.published ? `standardized SOI published ${snap.soi.published}` : null
+    snap.roni.published ? `RONI published${TIE}${nbDate(snap.roni.published)}` : null,
+    snap.oni.published ? `ONI published${TIE}${nbDate(snap.oni.published)}` : null,
+    snap.nino34?.published ? `analyzed monthly Nino 3.4 published${TIE}${nbDate(snap.nino34.published)}` : null,
+    snap.nino34Weekly?.published ? `weekly Nino 3.4 published${TIE}${nbDate(snap.nino34Weekly.published)}` : null,
+    snap.soi?.published ? `standardized SOI published${TIE}${nbDate(snap.soi.published)}` : null
   ].filter((part): part is string => part !== null);
 }
 
@@ -304,7 +394,8 @@ function snapshotProvenance(snap: EnsoSnapshot): string {
   if (age.days > 45) {
     const weeks = Math.round(age.days / 7);
     return age.basis === 'publication'
-      ? ` This ENSO read is from the CPC index snapshot retrieved ${snap.retrieved}, but its oldest captured CPC publication date is now about ${weeks} weeks old, so the indices themselves are possibly out of date; check CPC for a newer issue.${publishedText}`
+      ? // DRAFT wording: "oldest captured CPC publication date" narrowed to the RONI and ONI dates this age is measured from (audit round 2).
+        ` This ENSO read is from the CPC index snapshot retrieved ${snap.retrieved}, but its older RONI or ONI publication date is now about ${weeks} weeks old, so the indices themselves are possibly out of date; check CPC for a newer issue.${publishedText}`
       : ` This ENSO read is from the CPC index snapshot retrieved ${snap.retrieved}, now about ${weeks} weeks old and possibly out of date; refresh the snapshot for the current state.${publishedText}`;
   }
   return ` This ENSO read is from the CPC index snapshot retrieved ${snap.retrieved}.${publishedText}`;
@@ -345,17 +436,10 @@ function readState(series: IndexSeries): IndexState {
         ? 'la-nina'
         : 'neutral';
   const previous = values[values.length - DIRECTION_SPAN];
-  const change = previous === undefined ? 0 : anom - previous.anom;
-  const direction: EnsoDirection =
-    change >= DIRECTION_BAND
-      ? 'strengthening'
-      : change <= -DIRECTION_BAND
-        ? 'weakening'
-        : 'steady';
   return {
     conditions,
     episode,
-    direction,
+    direction: directionOf(previous === undefined ? 0 : anom - previous.anom),
     emerging: conditions !== 'neutral' && episode === 'neutral',
     threshold: THRESHOLD,
     conditionsRule: RONI_PRODUCT_URL,
@@ -390,11 +474,19 @@ function conditionsSentence(state: IndexState, latest: SeasonalIndexPoint): stri
   const roni = latestStr(latest);
   const threshold = state.threshold.toFixed(1);
   if (state.conditions === 'neutral') {
-    return `ENSO conditions are neutral${NEUTRAL_TREND[state.direction]}: the newest operational RONI season is ${roni}, inside the CPC onset thresholds of plus or minus ${threshold} degrees Celsius.`;
+    return `ENSO conditions are neutral${NEUTRAL_TREND[state.direction]}: the newest operational RONI season is ${roni}, inside the CPC thresholds of plus or minus ${threshold} degrees Celsius.`;
   }
   const side = state.conditions === 'el-nino' ? 'above' : 'below';
   const sign = state.conditions === 'el-nino' ? 'plus' : 'minus';
-  return `${PHASE_NAME[state.conditions]} conditions are present${EVENT_TREND[state.direction]}: the newest operational RONI season is ${roni}, ${side} the CPC onset threshold of ${sign} ${threshold} degrees Celsius for a single three-month season.`;
+  // `direction` is the raw sign of the change. In CPC's usage a La Nina
+  // strengthens as the anomaly grows more negative and weakens as it rises
+  // toward zero, so the event word flips for La Nina.
+  // DRAFT wording: the La Nina trend word now follows CPC's sense (audit round 2).
+  const trend =
+    state.conditions === 'la-nina'
+      ? ({ strengthening: 'weakening', weakening: 'strengthening', steady: 'steady' } as const)[state.direction]
+      : state.direction;
+  return `${PHASE_NAME[state.conditions]} conditions are present${EVENT_TREND[trend]}: the newest operational RONI season is ${roni}, ${side} the CPC threshold of ${sign} ${threshold} degrees Celsius for a single three-month season.`;
 }
 
 /**
@@ -431,12 +523,13 @@ function observedStateText(
     // age is never reported as the age of the snapshot file (ENSO-05).
     const ageClause =
       age.basis === 'publication'
-        ? `its oldest captured CPC publication date is about ${weeks} weeks old, so a new RONI season has likely posted and the state may have changed`
+        ? // DRAFT wording: narrowed from "oldest captured CPC publication date" (audit round 2).
+          `its older RONI or ONI publication date is about ${weeks} weeks old, so a new RONI season has likely posted and the state may have changed`
         : `about ${weeks} weeks old, so a new RONI season has likely posted and the state may have changed`;
     const wasConditions =
       state.conditions === 'neutral'
-        ? 'inside the CPC onset thresholds'
-        : `past the CPC onset threshold for ${PHASE_NAME[state.conditions]} conditions`;
+        ? 'inside the CPC thresholds'
+        : `past the CPC threshold for ${PHASE_NAME[state.conditions]} conditions`;
     return `As of the CPC snapshot dated ${retrieved} (${ageClause}), the newest operational RONI season was ${latestStr(latest)}, ${wasConditions}, and the historical five-season episode classification read ${PHASE_NAME[state.episode]}. Refresh the snapshot for the current state, and read the CPC ENSO Diagnostic Discussion for the official status.`;
   }
   return `${conditionsSentence(state, latest)} ${episodeSentence(state)}`;
@@ -456,8 +549,19 @@ interface TendencyRead {
 }
 
 const NW_HUB_LINEAGE = 'USDA Northwest Climate Hub ENSO regional tendency summary';
+/**
+ * The issuer's own product title, verbatim from the page's `<title>`:
+ * "Climate Prediction Center - ENSO Temperature and Precipitation Composites".
+ * It named a third variable, snow, until 2026-09-07. The snow composites do
+ * exist ("El Nino Snow", "La Nina Snow" are two of the page's six links), so
+ * the old label was not false, but it presented a three-variable name as the
+ * issuer's, which the issuer does not use. Naming a product means naming it
+ * as its issuer does (DDM-P12-T03, DR-030).
+ */
 const CPC_COMPOSITE_LINEAGE =
-  'NOAA CPC ENSO temperature, precipitation and snow composites';
+  'NOAA CPC ENSO Temperature and Precipitation Composites';
+// Source page for the El Nino snowpack counter-evidence (UW College of the Environment article quoting the Deputy State Climatologist):
+// https://environment.uw.edu/news/2026/08/what-to-expect-from-a-very-strong-el-nino-in-the-pacific-northwest/
 const WA_CLIMATE_OFFICE_LINEAGE =
   'Washington State Climate Office, University of Washington College of the Environment';
 
@@ -470,13 +574,40 @@ const WA_CLIMATE_OFFICE_LINEAGE =
  * record each produced near-normal Washington snowpack. The former La Nina
  * fine-fuels sentence is gone rather than softened; no issuer states it as
  * an ENSO teleconnection (report 13, ENSOSCI-09, UNVERIFIED).
+ *
+ * Re-verified clause by clause against the live pages 2026-09-07
+ * (DDM-P12-T03, DR-030). Three narrowings, each to the strength its page
+ * states and no further:
+ *   - El Nino: the rain-over-snow clause is the Hub's WINTER finding, not a
+ *     fall-and-winter one, and the runoff, water and wildfire chain is hedged
+ *     twice on the page ("can lead to" then "can contribute to") with drought
+ *     as the intermediate link. The flat list that dropped both hedges is gone.
+ *   - El Nino: "on record" gained the issuer's own bound, "in the modern era".
+ *     The Office's site puts the same bound as "on record (since 1950)".
+ *   - La Nina: the deeper-snowpack consequences read "can lead to", the page's
+ *     modal, not the settled "has been associated with" they carried.
+ * The La Nina and neutral pages support every other clause, and the neutral
+ * branch's redirection is carried by its lineage rather than by the composites
+ * page, which states nothing about it.
+ *
+ * A fourth edit, the framing sentence that introduces the snowpack
+ * counter-evidence, by owner ruling 2026-09-07 after it was reported as a stop
+ * rather than narrowed. It read "Snowpack is the least reliable part of the
+ * tendency", which RANKED snowpack against the tendency's other parts, and no
+ * issuer page makes that comparison. It now makes a bounded claim about one
+ * component in one class of event, which the page does support ("During past
+ * 'very strong' El Nino years, though, things have looked a little different"),
+ * and it carries the Office's own caveat, that it is hard to say whether three
+ * events are a real pattern or a small sample. That caveat is the article's
+ * narration rather than a quotation from the Deputy State Climatologist, so it
+ * is reported here as indirect speech and never as a quote.
  */
 function tendency(state: IndexState): TendencyRead {
   switch (state.conditions) {
     case 'el-nino':
       return {
         text:
-          'With El Nino conditions present, the Pacific Northwest read rests on what past El Nino events did. Across those events, fall and winter in Idaho, Oregon and Washington have tended to run warmer and drier, with more precipitation falling as rain than snow; the USDA Northwest Climate Hub associates that combination with decreased runoff, less summer water availability, and increased wildfire risk. Snowpack is the least reliable part of the tendency: the Washington State Climate Office notes that the three strongest El Ninos on record (1982-83, 1997-98 and 2015-16) each produced near-normal Washington snowpack. ' +
+          'With El Nino conditions present, the Pacific Northwest read rests on what past El Nino events did. Across those events, fall and winter in Idaho, Oregon and Washington have tended to run warmer and drier, and the USDA Northwest Climate Hub states that a drier, warmer winter results in more precipitation falling as rain than snow, which can lead to decreased runoff and less summer water availability, and can in turn contribute to drought and increased wildfire risk. That tendency has not held for snowpack in the strongest events: the Washington State Climate Office notes that the three strongest El Ninos on record in the modern era (1982-83, 1997-98 and 2015-16) each produced near-normal Washington snowpack, and the University of Washington College of the Environment report of that finding adds that it is hard to say whether it is a real pattern or a small sample. ' +
           MODULATORS,
         source: 'USDA Northwest Climate Hub, El Nino in the Northwest',
         sourceUrl: NW_HUB_EL_NINO_URL,
@@ -485,7 +616,7 @@ function tendency(state: IndexState): TendencyRead {
     case 'la-nina':
       return {
         text:
-          'With La Nina conditions present, the Pacific Northwest read rests on what past La Nina events did. Across those events, winter in Idaho, Oregon and Washington has usually run cooler, and some events brought above-normal precipitation, though the USDA Northwest Climate Hub states the precipitation association is not as strong as the temperature one. A deeper snowpack has been associated with increased runoff, more reliable summer water availability, and reduced drought severity. ' +
+          'With La Nina conditions present, the Pacific Northwest read rests on what past La Nina events did. Across those events, winter in Idaho, Oregon and Washington has usually run cooler, and some events brought above-normal precipitation, though the USDA Northwest Climate Hub states the precipitation association is not as strong as the temperature one. A deeper snowpack can lead to increased runoff, more reliable summer water availability, and reduced drought severity. ' +
           MODULATORS,
         source: 'USDA Northwest Climate Hub, La Nina in the Northwest',
         sourceUrl: NW_HUB_LA_NINA_URL,
@@ -496,7 +627,7 @@ function tendency(state: IndexState): TendencyRead {
         text:
           'With neither El Nino nor La Nina conditions present, there is no warm-phase or cool-phase composite to lean on: CPC publishes composites describing the tendencies of each phase, and with neither in place the seasonal read rests on the CPC Seasonal Drought Outlook and on current conditions (snowpack, soil moisture, the U.S. Drought Monitor). ' +
           MODULATORS,
-        source: 'NOAA CPC ENSO temperature, precipitation and snow composites',
+        source: 'NOAA CPC ENSO Temperature and Precipitation Composites',
         sourceUrl: CPC_COMPOSITES_URL,
         lineage: [CPC_COMPOSITE_LINEAGE, 'NOAA CPC Seasonal Drought Outlook']
       };
@@ -579,6 +710,44 @@ function nino34Text(series: Nino34Series, retrieved: string): string {
       ? ''
       : `, ${gap} ${gap === 1 ? 'month' : 'months'} behind the snapshot retrieval`;
   return `The analyzed monthly Nino 3.4 sea surface temperature was ${latest.total.toFixed(2)} degrees Celsius against the CPC climatological adjustment of ${latest.climAdjust.toFixed(2)} degrees Celsius, an anomaly of ${signed(latest.anom)} degrees Celsius (${monthYear(latest.year, latest.month)}, the most recent analyzed month${gapText}). It is the fast-moving monthly companion, not an ENSO phase declaration on its own.`;
+}
+
+/**
+ * The trajectory word for the weekly series. Past tense only: it reports what
+ * the anomaly HAS done across observations already published, and the band it
+ * is measured against is named in the sentence so the word is auditable.
+ */
+const WEEKLY_TREND: Record<EnsoDirection, string> = {
+  strengthening: 'warming',
+  weakening: 'cooling',
+  steady: 'little changed'
+};
+
+function weeklyDayText(point: Nino34WeeklyPoint): string {
+  return `${point.day} ${MONTH_NAMES[point.month - 1]} ${point.year}`;
+}
+
+/**
+ * The observed weekly trajectory (DR-031 a). Every clause is about weeks that
+ * have already been published: how many observations, the value at each end,
+ * the arithmetic change, and the band that change is judged against. It states
+ * no expectation about any week that has not happened.
+ *
+ * DR-031's own recorded risk is that a weekly observation sitting in a column
+ * named for the near term reads as an outlook unless the text says otherwise,
+ * so the denial is part of the claim rather than a caption around it.
+ */
+function nino34WeeklyText(series: Nino34WeeklySeries): string {
+  const latest = series.latest;
+  const span = Math.min(WEEKLY_DIRECTION_SPAN, series.values.length);
+  const earlier = series.values[series.values.length - span]!;
+  const change = latest.anom - earlier.anom;
+  const direction = directionOf(change);
+  return (
+    `Across the last ${span} weekly observations the Nino 3.4 sea surface temperature anomaly went from ${signed(earlier.anom, 1)} to ${signed(latest.anom, 1)} degrees Celsius, a change of ${signed(change, 2)} degrees Celsius measured against this application's own ${DIRECTION_BAND.toFixed(1)} degree band for calling a trajectory rather than noise, so across those weeks it is ${WEEKLY_TREND[direction]} (week centred ${weeklyDayText(latest)}, the newest week CPC has posted; this file dates each week at its centre). ` +
+    // vocab-allow: honesty disclaimer, denies being a forecast
+    'These are observations of what the ocean surface has already done. They do not declare an ENSO phase, which CPC declares from three-month averages and not from single weeks, and they are not a forecast: they say nothing about the weeks ahead.'
+  );
 }
 
 function soiAgreementText(roni: IndexSeries, soi: SoiSeries): string {
@@ -687,6 +856,42 @@ function isNino34Series(value: unknown): value is Nino34Series {
   );
 }
 
+function isNino34WeeklyPoint(value: unknown): value is Nino34WeeklyPoint {
+  return (
+    isObject(value) &&
+    Number.isInteger(value.year) &&
+    typeof value.month === 'number' &&
+    Number.isInteger(value.month) &&
+    value.month >= 1 &&
+    value.month <= 12 &&
+    typeof value.day === 'number' &&
+    Number.isInteger(value.day) &&
+    value.day >= 1 &&
+    value.day <= 31 &&
+    typeof value.total === 'number' &&
+    Number.isFinite(value.total) &&
+    typeof value.anom === 'number' &&
+    Number.isFinite(value.anom)
+  );
+}
+
+/**
+ * At least two observations, because the claim built from this block is a
+ * trajectory between two of them. One point is a malformed block, not a short
+ * one, and is dropped rather than described.
+ */
+function isNino34WeeklySeries(value: unknown): value is Nino34WeeklySeries {
+  return (
+    isObject(value) &&
+    typeof value.sourceUrl === 'string' &&
+    hasValidPublished(value) &&
+    isNino34WeeklyPoint(value.latest) &&
+    Array.isArray(value.values) &&
+    value.values.length >= 2 &&
+    value.values.every(isNino34WeeklyPoint)
+  );
+}
+
 function isSoiPoint(value: unknown): value is SoiPoint {
   return (
     isObject(value) &&
@@ -719,54 +924,24 @@ function isSoiSeries(value: unknown): value is SoiSeries {
   );
 }
 
-function isPlumePoint(value: unknown): value is EnsoPlumePoint {
-  return (
-    isObject(value) &&
-    typeof value.seas === 'string' &&
-    typeof value.laNina === 'number' &&
-    typeof value.neutral === 'number' &&
-    typeof value.elNino === 'number'
-  );
-}
-
-function isProbabilities(value: unknown): value is EnsoProbabilities {
-  return (
-    isObject(value) &&
-    typeof value.sourceUrl === 'string' &&
-    typeof value.baseline === 'string' &&
-    (typeof value.issued === 'string' || value.issued === null) &&
-    Array.isArray(value.seasons) &&
-    value.seasons.length >= 2 &&
-    value.seasons.every(isPlumePoint)
-  );
-}
-
-function plumeHeadline(probabilities: EnsoProbabilities): string {
-  const far = probabilities.seasons[probabilities.seasons.length - 1]!;
-  const categories = [
-    { name: 'El Nino', pct: far.elNino },
-    { name: 'ENSO-neutral', pct: far.neutral },
-    { name: 'La Nina', pct: far.laNina }
-  ].sort((a, b) => b.pct - a.pct);
-  const lead = categories[0]!;
-  const issued = probabilities.issued ? ` (issued ${probabilities.issued})` : '';
-  return `The official CPC probabilistic outlook${issued} puts the ${far.seas} odds at ${lead.pct}% ${lead.name}.`;
-}
-
 /**
  * Load and validate the bundled snapshot. RONI and ONI are required. The new
  * Nino 3.4 and SOI blocks are optional and are dropped independently when
  * malformed, so the observed seasonal indices still render.
  */
 async function loadEnsoSnapshot(signal: AbortSignal): Promise<EnsoSnapshot> {
-  const resp = await fetchWithBudget(
+  // Shared, page-lifetime transport (DDM-P14-T06): the ENSO minimap label
+  // (`readEnsoPhaseLabel`) and the briefing claims (`fetchEnsoClaims`) below
+  // both call this loader independently; this collapses their two fetches
+  // into one. The blocks pulled off `json` below are read, not written, so
+  // sharing the parsed value is safe.
+  const json = await fetchSharedJsonWithBudget(
+    ENSO_INDICES_SHARED_KEY,
     URLS.ensoIndicesLocal,
     { headers: { Accept: 'application/json' } },
     signal,
     6000
   );
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const json: unknown = await resp.json();
   if (
     !isObject(json) ||
     !isIsoDay(json.retrieved) ||
@@ -786,6 +961,16 @@ async function loadEnsoSnapshot(signal: AbortSignal): Promise<EnsoSnapshot> {
     console.warn('[enso] malformed Nino 3.4 block in snapshot; seasonal indices still render.');
   }
 
+  const nino34Weekly =
+    json.nino34Weekly === undefined
+      ? undefined
+      : isNino34WeeklySeries(json.nino34Weekly)
+        ? json.nino34Weekly
+        : null;
+  if (nino34Weekly === null) {
+    console.warn('[enso] malformed weekly Nino 3.4 block in snapshot; seasonal indices still render.');
+  }
+
   const soi =
     json.soi === undefined
       ? undefined
@@ -796,23 +981,13 @@ async function loadEnsoSnapshot(signal: AbortSignal): Promise<EnsoSnapshot> {
     console.warn('[enso] malformed SOI block in snapshot; seasonal indices still render.');
   }
 
-  const probabilities =
-    json.probabilities === undefined
-      ? undefined
-      : isProbabilities(json.probabilities)
-        ? json.probabilities
-        : null;
-  if (probabilities === null) {
-    console.warn('[enso] malformed probabilities block in snapshot; plume omitted.');
-  }
-
   return {
     retrieved: json.retrieved,
     oni: json.oni,
     roni: json.roni,
     ...(nino34 ? { nino34 } : {}),
-    ...(soi ? { soi } : {}),
-    ...(probabilities ? { probabilities } : {})
+    ...(nino34Weekly ? { nino34Weekly } : {}),
+    ...(soi ? { soi } : {})
   };
 }
 
@@ -823,10 +998,21 @@ function claimDates(retrieved: string, published?: string): {
   return { retrieved, ...(published ? { published } : {}) };
 }
 
-export async function fetchEnsoClaims(
+export function fetchEnsoClaims(
   _context: BoundarySelectionContext,
   signal: AbortSignal
 ): Promise<SourceResult> {
+  return readEnsoClaims(signal);
+}
+
+/**
+ * The same claims with no place in hand. The read never used its selection
+ * (every claim here is about the tropical Pacific index or the regional
+ * tendency this module cites), so the ENSO mode's chain (src/ui/enso-chain.ts)
+ * reads through this door, and the briefing's lane keeps `fetchEnsoClaims`.
+ * One body, so the two surfaces cannot state different claims.
+ */
+export async function readEnsoClaims(signal: AbortSignal): Promise<SourceResult> {
   try {
     const snap = await loadEnsoSnapshot(signal);
     if (signal.aborted) return { claims: [], ok: false };
@@ -834,15 +1020,21 @@ export async function fetchEnsoClaims(
     const age = snapshotAge(snap);
     const state = readState(snap.roni);
     const stale = age !== null && age.days > HARD_STALE_DAYS;
+    // Past the cutoff the state sentence is dated past tense, so the present
+    // tense continuity and agreement sentences are dropped with it.
     const text =
-      `${observedStateText(state, snap.roni.latest, snap.retrieved, age)} ${oniContinuity(snap.roni, snap.oni)}` +
-      (snap.soi ? ` ${soiAgreementText(snap.roni, snap.soi)}` : '') +
+      observedStateText(state, snap.roni.latest, snap.retrieved, age) +
+      (stale ? '' : ` ${oniContinuity(snap.roni, snap.oni)}`) +
+      (snap.soi && !stale && companionFresh(snap.soi.published)
+        ? ` ${soiAgreementText(snap.roni, snap.soi)}`
+        : '') +
       snapshotProvenance(snap);
 
     const chartSvg = oniLineSvg(snap.roni.values, {
       title: 'Observed operational RONI and historical-continuity ONI over recent seasons',
       source: `NOAA CPC RONI and ONI, retrieved ${snap.retrieved}`,
       primaryLabel: 'RONI',
+      guideSource: 'RONI',
       compare: { values: snap.oni.values, label: 'ONI' }
     });
 
@@ -870,8 +1062,11 @@ export async function fetchEnsoClaims(
             text: AUTHORITY_TEXT,
             source: 'NOAA CPC ENSO Diagnostic Discussion',
             sourceUrl: CPC_STATUS_URL,
+            product: 'ensoAuthority',
             evidence: 'analyzed',
-            dates: { retrieved: CITATIONS_VERIFIED }
+            dates: { retrieved: CITATIONS_VERIFIED },
+            // Where CPC states the status that holds now.
+            horizon: 'current'
           })
         ];
 
@@ -886,6 +1081,7 @@ export async function fetchEnsoClaims(
             text: tendencyRead.text,
             source: tendencyRead.source,
             sourceUrl: tendencyRead.sourceUrl,
+            product: 'ensoTendency',
             evidence: 'derived',
             dates: { retrieved: CITATIONS_VERIFIED },
             lineage: tendencyRead.lineage,
@@ -893,58 +1089,80 @@ export async function fetchEnsoClaims(
               kind: 'typical',
               text: // vocab-allow: honesty disclaimer, denies being a forecast
                 'a tendency across past events of this phase, not a forecast of outcomes; the named modulators can reinforce or mute the signal'
-            }
+            },
+            // A tendency across a season, so it stands under the long-range
+            // horizon rather than beside the index state that holds now.
+            horizon: 'longRange'
           })
         ];
 
-    const observedCompanionClaims = snap.nino34
+    // The monthly file posts about every 30 days, so 60 days means CPC skipped an issue and it is no longer the most recent month.
+    const observedCompanionClaims = snap.nino34 && !stale && companionFresh(snap.nino34.published, 60)
       ? [
           makeClaim({
             text: nino34Text(snap.nino34, snap.retrieved),
             source: 'NOAA CPC analyzed monthly Nino 3.4 sea surface temperature anomaly',
             sourceUrl: snap.nino34.sourceUrl,
+            product: 'ensoNino34Monthly',
             evidence: 'analyzed',
             dates: claimDates(snap.retrieved, snap.nino34.published),
             uncertainty: {
               kind: 'typical',
               text: 'the newest analyzed Extended Reconstructed Sea Surface Temperature inputs can revise for up to two months; this monthly companion does not declare an ENSO phase'
-            }
+            },
+            // An analyzed monthly anomaly: a current read, not a season ahead.
+            horizon: 'current'
           })
         ]
       : [];
 
-    // The forward plume remains absent unless a future snapshot carries a
-    // probabilities block from a documented machine source.
-    const plumeClaims = [];
-    if (snap.probabilities) {
-      const probabilities = snap.probabilities;
-      const plumeSvg = ensoPlumeSvg(probabilities.seasons, {
-        title: 'Official CPC odds of El Nino, neutral, and La Nina by season',
-        source: `NOAA CPC probabilistic ENSO outlook${probabilities.issued ? `, issued ${probabilities.issued}` : ''}`
-      });
-      if (plumeSvg) {
-        plumeClaims.push(
-          makeClaim({
-            text: // vocab-allow: honesty disclaimer, denies being a forecast
-              `${plumeHeadline(probabilities)} These are odds across overlapping three-month seasons, not a forecast of outcomes; ` +
-              `the categories are defined against the ${probabilities.baseline}.`,
-            source: 'NOAA CPC official probabilistic ENSO outlook (CPC/IRI consensus)',
-            sourceUrl: probabilities.sourceUrl,
-            evidence: 'outlook',
-            dates: {
-              retrieved: snap.retrieved,
-              ...(probabilities.issued ? { issued: probabilities.issued } : {})
-            },
-            uncertainty: {
-              kind: 'categorical',
-              text: // vocab-allow: honesty disclaimer, denies being a forecast
-                'category odds by overlapping three-month season, not a forecast of outcomes'
-            },
-            ...(plumeSvg ? { chartSvg: plumeSvg } : {})
-          })
-        );
-      }
-    }
+    // DR-031 (a): the weekly Nino 3.4 observation, under the near-term horizon
+    // and labelled an observation rather than an outlook. Withheld past the
+    // hard staleness cutoff for the same reason the tendency claim is: a
+    // trajectory read on weeks that may long since have been superseded is
+    // worse than the named absence the cell falls back to.
+    const weeklyObservationClaims =
+      // The weekly file posts weekly, so 45 days (the soft hedge) means CPC froze it (wksst8110 once sat frozen at HTTP 200).
+      snap.nino34Weekly && !stale && companionFresh(snap.nino34Weekly.published, 45)
+        ? [
+            makeClaim({
+              text: nino34WeeklyText(snap.nino34Weekly),
+              source: 'NOAA CPC weekly Nino 3.4 sea surface temperature anomaly',
+              sourceUrl: snap.nino34Weekly.sourceUrl,
+              product: 'ensoNino34Weekly',
+              evidence: 'analyzed',
+              dates: claimDates(snap.retrieved, snap.nino34Weekly.published),
+              lineage: [
+                'NOAA CPC weekly Nino-region sea surface temperature file (1991-2020 base period)'
+              ],
+              uncertainty: {
+                kind: 'typical',
+                text: 'a weekly observation of the ocean surface, not an index CPC declares a phase from; a single week moves more than the three-month averages the phase rules use, and CPC publishes these values to one decimal place, so a one-tick move sits at the limit of what the file can resolve'
+              },
+              // Observations of the weeks just past, which is what this column
+              // can honestly hold: the app has no ENSO product for the weeks
+              // ahead, and DR-031 (a) chose the observation over an empty cell.
+              horizon: 'nearTerm'
+            })
+          ]
+        : [];
+
+    // The index state as data, beside the sentence (types.ts `ClaimReading`):
+    // the same validated `roni.latest` point and the same resolved state the
+    // sentence above was built from, for the surfaces that draw the index on
+    // its own scale (the priority briefing and the ENSO chain). Withheld past
+    // the hard staleness cutoff, where the sentence itself has degraded to a
+    // dated past-tense read and a gauge would still look current.
+    const reading: EnsoIndexReading = {
+      kind: 'enso-index',
+      index: 'RONI',
+      value: snap.roni.latest.anom,
+      season: snap.roni.latest.seas,
+      year: snap.roni.latest.year,
+      preliminary: snap.roni.latest.preliminary,
+      conditions: state.conditions,
+      threshold: state.threshold
+    };
 
     return {
       ok: true,
@@ -958,6 +1176,7 @@ export async function fetchEnsoClaims(
           // window this sentence rests on. The index file itself is named in
           // the lineage below (report 13, ENSOSCI-09).
           sourceUrl: RONI_PRODUCT_URL,
+          product: 'ensoIndex',
           evidence: 'derived',
           dates: claimDates(snap.retrieved, snap.roni.published),
           lineage,
@@ -970,12 +1189,17 @@ export async function fetchEnsoClaims(
             kind: 'typical',
             text: 'the newest seasons are preliminary: CPC states that RONI values may change up to two months after the initial real-time value is posted, because of the high frequency filter applied to the ERSSTv6 data'
           },
+          // An index-state read of the season now in progress, so it belongs
+          // under the current horizon; the tendency built from the same
+          // snapshot stands under the long-range horizon.
+          horizon: 'current',
+          ...(stale ? {} : { reading }),
           ...(chartSvg ? { chartSvg } : {})
         }),
         ...authorityClaims,
         ...tendencyClaims,
         ...observedCompanionClaims,
-        ...plumeClaims
+        ...weeklyObservationClaims
       ]
     };
   } catch (err) {

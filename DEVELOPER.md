@@ -1,8 +1,9 @@
 # DDM developer guide
 
-This guide explains how to set up, understand, change, verify, and publish the
-Dynamic Drought Module. It is intended for maintainers and contributors who
-need more implementation detail than the product README.
+This guide is for maintainers and contributors who need to set up, understand,
+change, verify, and publish the Dynamic Drought Module. The implementation
+detail here matters because each deployer builds this application once and
+owns its own copy, its own data, and its own deployment.
 
 DDM is a static TypeScript application built with Vite and MapLibre GL JS. It
 has no application backend. An optional Cloudflare Worker provides only an
@@ -14,7 +15,7 @@ set of public upstream services.
 - Node.js 24 (Active LTS); `.nvmrc` pins the exact patch, 24.20.0
 - npm, using the committed `package-lock.json`
 - A browser supported by Playwright for browser testing
-- Python only for the offline landscape and Overture structures pipelines
+- Python only for the offline landscape and USA Structures pipelines
 
 Install and start the development server:
 
@@ -31,6 +32,10 @@ npm run build
 npm run preview
 ```
 
+For an introduction to npm, Vite, and Pages, read the
+[tooling walkthrough](docs/tooling/EXPLAIN_NPM.md) or its
+[slides](docs/tooling/EXPLAIN_NPM.html) ([Quarto source](docs/tooling/EXPLAIN_NPM.qmd)).
+
 The production build is written to `dist/`. Vite uses relative asset paths so
 the same output works at a domain root, under the historical
 `/dynamic-drought-module/` subpath, and inside an iframe.
@@ -41,9 +46,36 @@ graphics floor are stated once, in README's "Browser support" section, and
 `npm run check:renderer` proves that the pin, the lockfile, the installed tree,
 and the build target in `vite.config.ts` still agree with it.
 
+### Dependency overrides
+
+`package.json` pins two `overrides` to remove vulnerable dependencies from
+the dev-only `mapshaper` chain. Run `npm audit` for the current status;
+these overrides do not establish that the full dependency tree is clean.
+The chain is used exclusively by four offline maintainer-run
+artifact builders (`scripts/build-states.mjs`,
+`scripts/build-minimap-geometry.mjs`, `scripts/build-cdm-snapshot.mjs`,
+`scripts/build-ecoregion-tiles.mjs`) and never ships in the bundle.
+
+- `adm-zip: ^0.6.0` lifts mapshaper's zip helper past
+  GHSA-xcpc-8h2w-3j85; 0.6.0 keeps the `.zip` read/write export shape.
+  Both directions are exercised by regenerating the committed minimap
+  artifact after any mapshaper upgrade.
+- `@ngageoint/geopackage: npm:noop2@^2.0.0` replaces the GeoPackage
+  subtree with an empty module. That subtree pins `image-size` 0.8.x
+  (GHSA-w3rx-r6r6-pgpr, GHSA-5p2g-fcmc-qvqq, no fixed release exists)
+  and a vulnerable `file-type`, so the only honest fix is removing it.
+  mapshaper requires it lazily for `.gpkg` I/O only (guarded require
+  sites in `mapshaper.js`: `importGeoPackage` and `exportGeoPackage`),
+  and every pipeline here feeds mapshaper GeoJSON buffers or
+  fflate-unzipped shapefile members, never `.gpkg`. A `.gpkg` request
+  now stops with mapshaper's own "GeoPackage library is not loaded"
+  message. Drop this override if a pipeline ever needs GeoPackage I/O
+  and the upstream chain has a patched `image-size`.
+
 ## Product and planning authority
 
-Read these sources in order when they disagree:
+Six sources carry authority in this project. Read them in this order when
+they disagree:
 
 1. Current owner direction defines product intent for the requested work.
 2. Runtime code, especially `src/config/layers.ts`, defines implemented
@@ -51,14 +83,16 @@ Read these sources in order when they disagree:
 3. Tests define asserted behavior and provide regression evidence.
 4. [`docs/design/README.md`](docs/design/README.md) defines durable design and
    interaction doctrine.
-5. [`docs/ROADMAP.yaml`](docs/ROADMAP.yaml) defines future scope,
-   dependencies, decisions, and acceptance evidence.
+5. The ATNI Climate planning record (private; not in this repository) defines
+   future scope, dependencies, decisions, and acceptance evidence. Task and
+   decision ids cited in comments and test docblocks (`DDM-P<n>-T<m>`,
+   `DR-<nnn>`, `FE-<nn>`) refer to it.
 6. [`docs/RELEASE_NOTES.md`](docs/RELEASE_NOTES.md) records merged product
    history.
 
-Asana owns mutable execution state such as status, assignee, and due date. The
-roadmap YAML intentionally omits those fields so the repository does not
-maintain a competing clock.
+Asana tracks status, assignee, and due date because those fields change
+during execution. The planning record intentionally omits those fields so the
+repository does not maintain a competing clock.
 
 ## Architecture
 
@@ -83,6 +117,78 @@ The layer registry is the source of truth for active layers. The URL is a
 public state contract, not an export added after the fact. A change to view,
 layer, region, basemap, selected place, horizon, or Fire 3D behavior must be
 checked against share, reset, reload, browser history, and embed operation.
+
+### Architecture invariants
+
+Architecture encodes values. These seven commitments govern how the code
+behaves, so a person reading the interface can trust what it says and a
+deployer keeps control of the deployment.
+
+- **No backend.** The `dist/` folder is the entire deployment; the optional
+  Worker is a CORS shim, not application logic.
+- **URL-as-state.** Region, active layers, selection, and the embed flag
+  round-trip through the URL.
+- **One surface at a time.** Condition surfaces are mutually exclusive by
+  construction; place, events, and stations stack over the active surface.
+- **Lazy loading with honest status.** Layers load on first toggle-on; a
+  data failure keeps the layer checked with an honest pill (a shared link
+  never silently loses a layer), and a truncated response reads
+  `live (partial)`, never an unqualified `live`.
+- **Cancellable network operations.** Master abort signal plus per-call
+  timeout on every non-trivial fetch; late responses to superseded
+  operations are dropped, not rendered.
+- **Live-fetch stewardship.** Tribal boundaries are public data (T0), read
+  live from their public sources each session; the two operator slots ship
+  empty.
+- **Mobile and accessibility.** Controls retain 44-pixel targets, accessible names,
+  keyboard focus, safe-area seating, reduced-motion behavior, and arrow-key
+  region navigation; status changes announce through a polite live region;
+  embed semantics remain owned by the separate embed shell.
+
+## Customization quick reference
+
+| Want to change... | Edit in |
+| ----------------- | ------- |
+| Region bounds or names | `src/config/regions.ts` (`REGIONS`) |
+| Layer registry and default-on set | `src/config/layers.ts` (`LAYER_DEFS`) |
+| Phone hazard rail | `src/config/presets.ts` (`MOBILE_HAZARD_PRESETS`) |
+| Colors and palettes | `src/config/palette.ts` |
+| Telemetry stations | `src/config/telemetry.ts` |
+| Endpoint URLs and the Worker base | `src/config/urls.ts` |
+| Brand text and styles | `index.html` header, `src/styles/app.css` |
+
+## URL parameters (URL-as-state)
+
+The application reads `window.location.search` on load, both for direct
+visits and for embedded iframes. The **Share view** button copies the
+current URL.
+
+| Param | Values | Default |
+| ----- | ------ | ------- |
+| `region` | `washington_state`, `columbia_snake_basin`, `cascades`, `central_oregon`, `southwest_washington`, `south_puget_sound`, `national`, `alaska`, `hawaii`, `british_columbia` | `national` (add `region=washington_state&view=brief` to keep the prior Washington framing) |
+| `layers` | comma-separated keys from the [layer table](README.md#layers-and-data-sources) | `hillshade,nadm-drought,aiannh,bia-reservations,states` |
+| `framing` | one of the nine ATNI-authored editorial framing keys, or `all` | none; `region` remains in control |
+| `cluster` | `wildfire`, `heat`, or `enso`; an explicit `layers` list outranks it unless the list matches that mode's recipe at the selected horizon, including any enabled optional layers (such as Wildfire with Fuel risk) | Drought, encoded by absence |
+| `ocean` | `pacific`, `arctic`, or `atlantic`, only with `cluster=enso` | none |
+| `select` | `state:<postal code>` (for example `state:WA`): opens the map focused on that boundary with its impact briefing open; applied once, then dropped from the URL | none |
+| `embed` | `true` or `1` (hides the sidebar for clean iframe presentation) | `false` |
+| `view` | `brief` or `console` | `brief`; only `view=console` opens Console (an embed naming `layers`, `region`, `cluster`, `ocean` or `framing` without `select` still opens Console) |
+| `horizon` | `weeks-ahead` or `season-ahead` | current |
+| `basemap` | `default` explicitly turns recent satellite imagery off; the legacy `satellite` token remains valid | recent satellite imagery, encoded by absence |
+| `studio` | `layers` or `place` | none |
+| `hazard` | a mode token (`wildfire`, `heat`, `enso`), written only beside `layers` with no `cluster`: the hazard a custom layer set was made from (its alert products, key and strip); it never changes the display | the cluster, encoded by absence |
+| `fire3d` | exact token `true`; entry requires the committed Wildfire cluster and a shell that can present the scene (a desktop viewport, or a phone at least 360px wide and 600px tall, which enters through the 3D cell in its right-edge column), while an active scene may remain through a custom layer stack as long as a Fire event layer remains, or while the PLACE studio holds the display (its clean display sets the Fire layers aside and puts them back) | `false`, encoded by absence |
+| `spi` | Gridded Drought Index accumulation window in days: `30`, `60`, `180`, or `365`; applies when the `gridded-index` layer is on | `90` day window, encoded by absence |
+
+Temporal display parameters also round-trip (`week` for the USDM archive,
+`dmode`, `sst`, `outlook`, and `heatday`). The authoritative grammar is
+in `src/state/url.ts`, pinned by the URL-state and legacy-link browser
+tests. Old shared links keep working: `tribal` is still a valid key (now
+the deployer-data slot, off by default; naming it in `layers` turns it
+on), and legacy layer lists resolve deterministically.
+
+Because condition surfaces render one at a time, a `layers` list naming
+several surfaces resolves deterministically to the first surface named.
 
 ## Layer contract
 
@@ -129,19 +235,30 @@ happened.
 
 ## Data and stewardship
 
-DDM serves public agency data and deployer-owned placeholders. The empty
-`public/data/tribal-lands.geojson` and `public/data/treaty-areas.geojson`
-files must remain empty unless the relevant sovereign authority authorizes
-data for that deployment. Do not copy Tribal, Treaty, or other
-sovereign-jurisdiction polygons into the repository.
+Every decision about what data enters this repository is a governance
+decision. DDM serves public agency data and deployer-owned placeholders. The
+empty `public/data/tribal-lands.geojson` and
+`public/data/treaty-areas.geojson` files must remain empty unless the
+relevant sovereign authority authorizes data for that deployment. Do not copy
+Tribal, Treaty, or other sovereign-jurisdiction polygons into the repository.
+The Tribal boundaries the map shows are public data, T0 under the Tiered
+Sovereignty Data Framework, from the Census AIANNH service, the Bureau of
+Indian Affairs AIAN-LAR service, and the Bureau's Federal Register roster of
+federally recognized Tribes. They are read live so the source stays the
+authority and no copy goes stale; the instruction not to copy them exists for
+provenance and currency, and because the two operator slots are for an
+operator's own data.
 
 Capitalize Tribe, Tribal, and Treaty when referring to Tribal Nations or
-Treaty rights. Agency boundary products are representations, not definitive
-jurisdictional truth, and must retain the existing caveats.
+Treaty rights. This is accuracy, not courtesy. Agency boundary products are
+representations, not definitive jurisdictional truth, and must retain the
+existing caveats.
 
 Do not add proprietary tile services, credentials, tracking, analytics, or
 telemetry. Public upstream invocation logs can contain full query URLs, so
-provider logging policy is also a privacy decision.
+provider logging policy is also a privacy decision. A maintainer adding an
+upstream is responsible for knowing what that provider logs and who can
+read it.
 
 The inventory and rebuild notes for committed data are in
 [`public/data/README.md`](public/data/README.md). Builders must preserve
@@ -172,6 +289,124 @@ Some builders fetch large upstream datasets or require a local Python
 environment. Read the script header, source terms, expected cache paths, and
 hard-fail checks before running one. Never assume a successful download proves
 the artifact's semantics.
+
+### Framing minimap and Nunavut proxy
+
+The framing minimap derives its colors from the current monthly
+[North American Drought Monitor](https://www.drought.gov/data-maps-tools/north-american-drought-monitor-nadm).
+Each authored framing computes an approximate cosine-latitude-weighted
+ordinal mean of assessed land, from white `None` through dark-red `D4`,
+for its fill; a separate outline carries the total D1-D4 share so the
+mean cannot hide material drought extent. NADM does not publish its exact
+analyzed-area mask, so the minimap excludes Nunavut using a Statistics
+Canada 2021 Digital Boundary File as an analysis-mask proxy and reports
+the northern framing as `live (partial)`. The proxy is used only for
+calculation, never rendered as boundary or jurisdictional geometry.
+
+Nunavut proxy source: Government of Canada; Statistics Canada; Statistical
+Geomatics Centre, 2021 Digital Boundary Files, reference date January 1,
+2021. Contains information licensed under the
+[Open Government Licence - Canada](https://open.canada.ca/en/open-government-licence-canada).
+Adapted for DDM; no endorsement is implied.
+
+Every live endpoint in `src/config/urls.ts` carries a verification
+metadata block (HTTP status, content type, CORS posture, response-shape
+caveats, verification date). Read it before touching a fetcher.
+
+### About the basemap and hydrography
+
+The product-default basemap shows recent satellite imagery from
+[NOAA NESDIS merged GOES East and West GeoColor](https://www.nesdis.noaa.gov/imagery/satellite-maps)
+and its rolling 24-hour archive. The lifecycle selects the newest frame
+passing a known-data image probe, pins all tiles to it, displays the exact
+UTC observation range, and checks every 10 minutes. A failed refresh keeps
+the last good frame; if initial activation fails, the URL reverts honestly
+to `default`. The probe and every drawn tile also reject the service's
+black and white placeholder image, which NOAA has served for valid pinned
+requests (src/map/satellite-guard.ts): a placeholder tile is drawn
+transparent and drops its frame, so the previous good frame or the plain
+map shows instead, and the Satellite control reads unavailable.
+The Satellite control turns imagery on and off;
+`basemap=default` records the satellite-off choice, showing DDM's own
+ground. That ground also remains underneath because GOES coverage ends near
+76 degrees north and imagery can contain clouds or gaps. GeoColor is context only: daytime areas approximate true color,
+nighttime areas use infrared and static reference lights.
+
+Explicit Fire and Wildfire controls may request recent GeoColor as part of
+their governed scene, but unrelated layer or horizon changes do not
+override a visitor's manual basemap choice. Future satellite-derived
+products belong in separately named layers with their own status,
+timestamp, caveat, and legend; recoloring an existing layer would let a
+display claim what its source does not.
+
+DDM's basemap is three same-origin PMTiles vector archives in `public/data/`
+built by `scripts/build-base-tiles.mjs` (run with
+`node --max-old-space-size=16000`; about 810 MB of public downloads cached
+outside the repository, every input pinned by SHA-256 in
+`scripts/data/base-tiles-inputs.json`, a changed input refused unless
+`DDM_BASE_REPIN=1`). North America is stored to zoom 8 and the world to zoom
+5; the map overzooms both, so the basemap stays regional in scale. The
+highways ride their own archive so each file stays under the 20 MB
+public-tree line. Each feature group is stored only from the zoom that first
+shows it (`bands` in the build), which keeps the opening view light. The
+ground fills draw under satellite imagery and the lines and names above it
+(`src/map/layer-order.ts`). The Hydrography layer draws the same archive's
+rivers and water bodies brighter and makes no request. Inside Census-defined
+Tribal areas, `src/layers/tribal-streets.ts` (started by the Tribal Lands
+layer) reads TIGERweb Local Roads live from zoom 12 and draws the streets
+with their names only within those areas. No Tribal or Treaty boundary is
+written into an archive.
+
+### The desktop 3D Fire view
+
+The Fire view offers a 3D toggle on desktop widths: terrain relief from
+the bundled Pacific Northwest USGS 3DEP archive under a pitched camera,
+NOAA HMS smoke plumes re-presented as a stylized volume (vertical extent
+encodes the issuer's density class, never measured plume height), and
+issuer-published landscape context draped over the relief. When the NIFC
+perimeter layer is live, each wildfire perimeter stands as a low ribbon
+along its edge (constant on-screen height, not flame height or intensity;
+centered on the published edge, neither enlarging nor shrinking the mapped
+perimeter), pulsing in step with the flat outline. The first context layer
+is USFS Wildfire Hazard Potential 2023, baked with the issuer's categorical
+colors and nearest-neighbor sampling so class boundaries never acquire
+invented colors. It is a long-term hazard context, not an incident
+forecast.
+
+Power infrastructure is a separate, default-off catalog layer usable in
+flat or 3D views, not activated automatically by Fire 3D. Its transmission
+lines come from the ARCHIVED federal HIFLD dataset (baked once, last data
+update 2024-09-30, with that currency caveat always in the legend), and
+its live power plants come from the U.S. Energy Information
+Administration, labeled with the issuer's own reporting period. Substations
+and distribution lines are absent: substation locations are withheld by
+publishing agencies for security reasons, and no authoritative public
+national distribution-circuit dataset exists.
+
+Building footprints come from USA Structures, 2023 edition (Oak Ridge
+National Laboratory for the FEMA Geospatial Response Office, CC0 on Figshare,
+DR-126), extruded over the terrain from zoom 13 at one stated 4 m height in
+one tone, because the edition publishes no height in this box. The committed
+bake covers the central Oregon region framing only (see `public/data/README.md`).
+
+On a phone the same scene is entered from a 3D cell in the right-edge
+column, present only in the Fire view on a phone that passes the WebGL 2
+probe and is at least 360px wide and 600px tall. The two always-visible
+notes stand on the map in one card for as long as the scene is asked for,
+and a camera pad beside the column tilts, turns and resets the view with
+one thumb. The cell and its decision are in the entry chunk; the scene and
+the phone's card and pad load on the first press or an eligible
+`fire3d=true` link. `docs/design/mobile-map-chrome.md` ("3D on phones")
+records the contract.
+
+The view is a 3D context view, deliberately not a "digital twin": that
+phrase names systems bundling physics-based fire simulation with rendering,
+and this module runs no simulation. The control carries two always-visible
+notes: the terrain coverage statement, and a non-prediction disclosure
+stating that nothing in the view shows or implies fire spread, ignition,
+or an all-clear. Wildland fire science context for reading terrain is
+published in NWCG's *Introduction to Wildland Fire Behavior* (S-190); the
+module states no such inference about any specific incident.
 
 ## Interface and responsive behavior
 
@@ -206,7 +441,7 @@ npm run verify:live -- --expect-sha <sha> --expect-nonce <run id>
 ```
 
 `check:drift` probes every upstream and, for each ArcGIS layer path in
-`ARCGIS_FIELD_PROBES` (nineteen today), fetches the layer schema and fails
+`ARCGIS_FIELD_PROBES`, fetches the layer schema and fails
 on a field missing from the `outFields` list read from the module source;
 lists passed as positional function arguments are not extracted and are
 recorded with their reason in `OUT_FIELDS_SENDERS_COVERED_ELSEWHERE`, which
@@ -214,8 +449,8 @@ a test keeps in step with `src/`. `check:source-health` boots a served
 build (start `npm run preview` first) once as a control and once per
 catalog layer at the default camera and records the requests the runtime
 issues, with basemap tiles stubbed and the ambient boot requests replayed
-from the control capture; the daily `source-health` workflow runs it on
-`main`. `verify:live` is the post-deploy proof the Pages workflow runs; by
+from the control capture; the manual `source-health` workflow runs it on
+`main` (its daily schedule is currently disabled). `verify:live` is the post-deploy proof the Pages workflow runs; by
 hand it needs the expected commit and run id and defaults to the public
 site.
 
@@ -223,45 +458,41 @@ The Worker-health row of `check:drift` now compares the live `/healthz`
 revision to the `WORKER_REVISION` constant read from
 `workers/proxy/src/index.ts`, not a hand-pinned string, so drift is
 source-vs-live rather than live-vs-live. Between a reviewed source revision
-bump and the owner's publish, the daily `upstream-monitor` run opens exactly
+bump and the owner's publish, a manually dispatched `upstream-monitor` run opens exactly
 one `upstream-drift` issue naming the mismatch, which is the design working
 as intended, and it closes automatically on the first run after the publish.
+Its daily schedule is currently disabled.
 
-Run the cross-cutting gate after application, configuration, build, generated
-data, or broadly shared documentation changes:
+Choose checks using the [local verification ladder](tests/README.md#the-local-verification-ladder).
+Run the smallest source or browser checks that cover each coherent change.
+Use `npm run gate` when build or cross-cutting configuration changes need it;
+reuse its CI evidence instead of adding a duplicate local gate.
+`npm run verify:smoke` is GitHub's, not a local step.
 
-```powershell
-npm run gate
-```
+The full browser suite runs on GitHub in the `Validate` workflow. When integration
+is needed and no matching run exists, start it on a branch without an open pull
+request with `gh workflow run validate.yml --ref <branch>`. That full run supplies
+application integration evidence. Partway through a block, a
+targeted run of the block's own specs (`npm run spec:impact -- --dispatch`
+after a push; it refuses an empty list, which would be the full run) answers
+in about five minutes and its run name says it is not a landing run. Before
+the full dispatch, `npm run spec:impact` must show no spec still naming text
+the block deleted everywhere (it does not catch text moved or reworded; its
+fixed cross-cutting specs for shared style, key, dock, minimap and test-seam
+changes are a guess at ownership, not a dependency graph). Choose a focused local
+`npm run test:touched` or targeted GitHub run when needed; reuse passing evidence
+instead of requiring both before integration. The testing guide's "Iteration and
+session closeout" explains the choices. Proxy-only pull requests run the proxy
+typecheck, audit and client-contract/receipt tests; docs outside the artifact
+report Validate without application jobs. Named browser dispatches skip the
+unrelated gate and landscape suite. A local `npm run test:serial` is not a local
+step. Ending a session does not trigger another full suite.
+Documentation-only and verification-tooling checks are scoped in the same
+ladder. Report exactly what ran and what remains unverified.
 
-Run a targeted Playwright file before the full serial suite:
-
-```powershell
-npx playwright test tests/boot.spec.ts --workers=1
-npm run test:serial
-```
-
-The verification ladder is three commands a person types (measured durations on
-the owner's machine):
-
-```powershell
-npm run verify:quick    # typecheck, em-dash scan, vocabulary, coverage: about 5 s
-npm run verify:smoke    # gate plus twelve smoke specs, serial: about 6 min
-npm run test:serial     # the whole suite, one worker: 50 to 55 min
-```
-
-Two underlying checks sit beneath them, run directly when you want just the
-deterministic backbone:
-
-```powershell
-npm run gate            # build, bundle and activation budgets, then check:all: about 40 s
-npm run gate:nobuild    # typecheck plus check:all, the steps that need no dist/: about 20 s
-```
-
-`check:all` is the shared step list both gates run, so the list exists once.
-`gate` adds `build`, `check:bundle` and `check:activation`, the only steps that
-read `dist/`; `gate:nobuild` swaps `build` for `tsc --noEmit` and is what a
-worker on a shared tree runs.
+`check:all` is the source-check list shared by `gate` and `gate:nobuild`.
+`gate` adds the build, bundle and activation checks. `gate:nobuild` runs
+typechecking and source checks without certifying a production artifact.
 
 `npm run lint` is the one lint command, and `check:all` runs it, so both gates
 name it. It is Biome (`biome.jsonc`) over `src/**/*.ts` and `src/styles/app.css`:
@@ -296,7 +527,9 @@ Stop-Process -Id <pid> -Force
 workflow; run it by hand when documentation links change.
 
 Shared navigation, map lifecycle, state, responsive behavior, and release
-readiness changes require the serial suite. A narrow documentation-only change
+readiness changes require full integration on GitHub at the landing boundary.
+Use local or remote focused checks during development; a local browser run is
+not a prerequisite for that integration. A narrow documentation-only change
 normally needs documentation checks, YAML validation when applicable, the
 public-tree gate, and a clean Git diff rather than the full browser suite.
 
@@ -322,6 +555,16 @@ reports for actionable CI failures.
 
 ## Optional Worker
 
+Most sources serve the browser directly. The Worker in `workers/proxy/` is
+a CORS shim with a strict allow-list (the authoritative set is in
+`workers/proxy/src/index.ts`, mirrored in the `wrangler.toml` header): it
+permits only the exact AWDB, AgriMet, Hydromet, NWRFC, USFS Wildfire
+Hazard Potential, US Drought Monitor DSCI, and `api.weather.gov` reads
+used by the application, returning upstream bytes unchanged with
+browser-facing CORS headers. Deploy with `wrangler` and set
+`URLS.workerProxy` to enable those sources; without it, the module still
+runs and reports those values honestly as unavailable.
+
 The Worker source is in `workers/proxy/` and has its own package metadata. It
 may relay only exact reviewed routes over HTTPS, using the configured method,
 request headers, response checks, byte limits, and deadline. It must not become
@@ -336,9 +579,10 @@ refusals keep their Cross-Origin Resource Sharing headers for non-browser
 callers and for debugging, not for page script: a browser whose preflight is
 refused raises a generic network error and never exposes the status or the
 body. `/healthz` answers GET and its own preflight, advertising `GET, OPTIONS`
-on every response including its 405. Revision `2026-08-29-options-policy-v4`
-is the published revision (2026-08-29, Cloudflare version
-`10af1660-5b74-4520-80a1-32c80108fc48`); the daily upstream monitor derives
+on every response including its 405. This guide names no revision, because a
+copied one goes stale at the next publish: the reviewed source revision is
+the `WORKER_REVISION` constant in `workers/proxy/src/index.ts`, and the
+published one is whatever the live `/healthz` answers. The daily upstream monitor derives
 the expected revision from this source file through
 `scripts/lib/worker-revision.mjs`, so a published Worker older than reviewed
 source fails that monitor by design until the deployer runs the two-phase
@@ -348,15 +592,18 @@ Typecheck Worker changes from its directory. Publishing the Worker is a
 separate external operation and should include pre-deploy and post-deploy
 revision, route-rejection, body-hash, CORS, deadline, and rate-limit checks.
 
-`wrangler.toml` now also pins `compatibility_flags = ["no_nodejs_compat"]`
-(DR-010 a, 2026-09-02 decision register), a config-only change not yet
-published. Publishing it needs the owner's say. When it is published, the
-rollback handle is the version live before that publish: today that is
-revision `2026-08-29-options-policy-v4`, Cloudflare version
-`10af1660-5b74-4520-80a1-32c80108fc48` (the two paragraphs above), published
-2026-08-29 23:15 UTC from `f0a9092`. If a later, unrecorded publish happens
-before this flag ships, treat that later version as the rollback handle
-instead and update this paragraph at publish time.
+`wrangler.toml` now also pins `compatibility_flags = ["no_nodejs_compat",
+"no_nodejs_compat_v2"]` (DR-010 a, 2026-09-02 decision register; the second
+flag added 2026-10-09, because Cloudflare requires both to turn Node.js
+compatibility off). The compatibility date `2026-05-09` predates the
+2026-08-04 default, so the flags change nothing today: they guard a future
+date bump, and a dry-run build is byte-identical with or without them. A
+config-only change: it reaches the edge only through a Worker publish, which
+needs the owner's say. The rollback handle for any publish is the version live just
+before it: read its revision from the live `/healthz` and its Cloudflare
+version id from the dashboard at publish time, and record both in that
+publish's release note, not here. Rolling back to anything older drops the
+hardening every later publish added.
 
 `verify:worker` is the instrument for those edge checks. It is read-only
 against the public Worker and writes a receipt:
@@ -375,7 +622,7 @@ for an allow-listed target; an unknown path, an off-route path of an allowed
 host, a host that was never allow-listed, and a host the reviewed revision
 removed are all refused; a POST is refused by the method gate; the request
 bounds hold; and the relay hands back upstream bytes unchanged on one
-static, cache-busted endpoint.
+static endpoint.
 
 Two design points are load-bearing. Each row asserts the HTTP status AND the
 Worker's own JSON error code, because a 403 that arrives from somewhere
@@ -383,9 +630,10 @@ further along is not the same answer as a 403 the route policy produced, and
 a receipt that read only the status would score that as a pass. And byte
 transparency is proved across the whole table before publishing, on
 synthetic bytes in `tests/worker-proxy-policy.spec.ts`; live it is one
-static endpoint with a fresh cache-busting query on both legs, because a
-direct-versus-relay hash false-fails on a dynamic upstream or on a response
-held in the Worker's 60-second edge cache.
+static endpoint fetched at its bare URL on both legs (the Worker pins that
+route to no query names and refuses a cache-busting nonce), because a
+direct-versus-relay hash false-fails on a dynamic upstream; a response held in
+the Worker's 60-second edge cache is a byte copy, so it is still comparable.
 
 Exit 0 when every row passed, 1 when any failed, 2 on a usage error. The
 receipt holds statuses, header values, byte counts, digests, and
@@ -452,16 +700,51 @@ weekly `refresh-snapshots` cron was never snoozed. Until the restore, a
 deploy that fails or is cancelled goes unnoticed by CI; GitHub still emails
 the owner about the red run.
 
-Integration-branch workflow (September 2026 window): product work lands on
-one long-lived branch, `integration/2026-09`, which is pushed to origin with
-NO pull request open, because `validate.yml` is `on: pull_request` and a
-branch without one runs zero CI on every push (a draft pull request still
-triggers the event, so a draft is not the escape hatch). Verification is
-local-first: `npm run typecheck` per edit, the narrowest Playwright spec plus
-`npm run gate` per session, and `npm run test:serial` before landing. When
-the owner says go, rebase on `origin/main`, re-run the gate, and open ONE
-pull request; `Validate` is the only check that must be green, and `deploy`
-and `verify-live` are consequences of the merge rather than gates on it.
+Branch workflow: use the repository's primary checkout on local `main` for everyday
+edits and iteration commits, with one writer. Keep that checkout across sessions;
+do not create or switch branches/worktrees merely because a session starts. Inspect
+dirty work, ancestry and remote movement before writing. Exceptional isolation needs
+a purpose and a return target of the primary checkout on main. Preserve implemented
+features and automated data when reconciling changes.
+Local commits are not yet delivered: compare pending work with freshly fetched
+`origin/main`, not local main itself or an older feature tracking branch's ahead count.
+Updating remote main requires an authorized push or merge; the live receipt identifies
+what was actually published. A review branch, when needed, does not replace the daily
+checkout. An already integrated, revision-verified candidate needs no new release.
+`validate.yml` is `on: pull_request`, so a branch without an open pull request
+runs no CI on push; start it by hand with `gh workflow run validate.yml --ref
+<branch>` when full integration is needed. While developing, run the focused
+checks for the change. Commit and push pieces without repeating checks that
+already passed. Inspect changed interface modes once per coherent feature;
+GitHub's integration run supplies the gate, without a mandatory local duplicate.
+A finished feature block needs a clear delivery state; it does not automatically
+require a full suite, fresh review, version bump, data rebuild or publication.
+Carry out an already-authorized landing or record the candidate as ready with its
+next action before stacking unrelated work. Full integration belongs at a real
+integration/release boundary or a specific broad regression risk. Explain its scope
+first. The full browser suite runs on GitHub in fourteen shards for that candidate.
+Reuse passing evidence when source, dependencies, configuration, relevant inputs and
+main base match; do not dispatch a duplicate. An open PR, including a draft,
+already triggers validation on pushes, so inspect existing runs first; a
+targeted run of the block's own specs may come partway through a block, and it
+never counts for a landing. Application, shared configuration and unknown changes
+need full integration. Documentation and proxy-only changes need their selected
+scope and final Validate status. For a PR run, confirm its tested merge tree equals
+the candidate tree with the current main base; a green name alone is insufficient.
+Reuse independent review coverage and review material uncovered changes once.
+A maintainer may explicitly authorize focused local checks and a direct main push
+for a specific candidate, subject to repository protection. Record that narrower
+coverage and remaining risk; focused checks are not full integration. A publication-eligible
+direct push to main starts publication, not Validate. `Validate` is the intended required PR
+status; inspect actual protection settings rather than assuming it is enforced, and
+`deploy` and `verify-live` are consequences of the merge rather than gates on
+it. Deployment builds and checks the publication artifact, then publishes it without
+repeating the browser suite. The live proof follows immediately after the deploy
+workflow succeeds; the weekly browser suite remains enabled. Read its receipt to
+confirm the expected source SHA, deploy nonce, completeness and asset/boot results.
+Report upstream source health separately from delivery: a green workflow conclusion
+alone does not establish that every source probe passed. A source outage alone does
+not justify another publication or full browser run.
 
 `scripts/resolve-live-expectation.mjs`, whose
 judgment is the pure `resolveLiveExpectation` in
@@ -494,22 +777,20 @@ the snapshot has not seen. It returns one of three verdicts:
 Two envelopes, because "how long may a commit go undeployed" and "how long
 may one deploy run take" are different questions:
 
-- head grace, 30 minutes from the commit (`LIVE_COMPARE_GRACE_MS`): a normal
-  green push takes about 15 minutes through the gate, the sharded browser
-  suite, and `deploy-pages`, and this leaves room for a slow runner. The
+- head grace, 30 minutes from the commit (`LIVE_COMPARE_GRACE_MS`): this
+  leaves room for the publication gate, Pages deployment and runner queues. The
   head's age is floored by its OLDEST deploy run's start, so a backdated
   committer date cannot skip the grace and a retry cannot reset a clock the
   head has already spent.
 - in-flight bound, 60 minutes from the deploy run's creation
-  (`LIVE_INFLIGHT_STUCK_MS`): the deploy's own envelope is longer than the
-  head grace, since `browser-suite.yml` budgets 40 minutes per shard and
-  `deploy.yml` adds a 15 minute gate before it. A run 45 minutes in is late,
-  not stuck. Past the bound, a deploy parked in `queued` or `waiting`
+  (`LIVE_INFLIGHT_STUCK_MS`): this conservative allowance includes the
+  publication gate, Pages and runner queues. Past the bound, a deploy parked
+  in `queued` or `waiting`
   escalates rather than keeping the compare green forever.
 
 Both are inputs the workflow passes, not constants buried in the library, and
-`verify-live.yml` gives the job 50 minutes so a cache-miss Chromium provision
-(up to 10), the bounded propagation poll (up to 12), the 16 minute verifier,
+`verify-live.yml` gives the job 45 minutes so a cache-miss Chromium provision
+(up to 10), the bounded propagation poll (up to 7), the 16 minute verifier,
 and the issue steps all fit inside it.
 
 Every issue mutation, not only the close, refetches `main` immediately before
@@ -532,7 +813,7 @@ bytes. That is acceptable for a hand check because `source-health` boots the
 application against every catalog source and opens its own issues.
 
 Only the BYTES make a verification red. Before any verdict, the workflow
-polls the live site for the deployed sha for up to 10 minutes, so a slow CDN
+polls the live site for the deployed sha for up to 5 minutes, so a slow CDN
 edge cannot be reported as a divergence. After that, the run fails only for
 a `stamp:`, `propagation:`, or `seat:` finding, or a poll that never saw the
 sha. A product finding (a layer, an embed corner, a page error, a range)
@@ -616,7 +897,7 @@ The seams a local full-service server would replace:
 4. **Large archives ride the code deploy.** The PMTiles archives are committed
    under `public/data/` and republished with the site on every deploy:
    hillshade 35,252,210 bytes, Wildfire Hazard Potential 13.6 MB, structures
-   7.9 MB, power lines 3.8 MB, ecoregions 2.5 MB. The host's limits already
+   5.2 MB, power lines 3.8 MB, ecoregions 2.5 MB. The host's limits already
    shape the product. The z9 hillshade build is a reproducible artifact that is
    deliberately not shipped, the full Pacific Northwest structures bake was
    projected at 240 to 380 MB and rejected, and the retired fuel-model drape
@@ -661,6 +942,29 @@ benchmarked before hosting moves. Cloudflare Pages is not a direct replacement
 while an artifact exceeds its per-file limit, and moving large archives to R2
 would introduce a new service, state, cost, and governance decision.
 
+**That governance decision was taken on 2026-09-10 (DR-079), for the terrain
+archive only.** The paragraph above stays true about what such a move costs;
+what changed is that the project has now paid it once, deliberately and in a
+bounded way. The 3D Fire scene's terrain needs about 27 m per pixel to answer
+the question it exists to answer, a fire at the foot of a mountain, and the
+bundled zoom 8 archive resolves about 212 m per pixel: measured in the running
+scene, it reads the Mount Jefferson summit 931 m low while reading the Bend
+valley floor within 19 m, because a coarse elevation model does not lower a
+landscape, it flattens it. The same box at zoom 11 is over 1.1 GB, past the
+GitHub Pages 1 GB site cap, and Git LFS is not usable with Pages, so no GitHub
+plan reaches it. A deep archive therefore lives in a Cloudflare R2 bucket
+behind a NEW Worker, `ddm-terrain`, never a widened route on `ddm-proxy`.
+
+Three things bound that move and are not to be widened quietly. The bundled
+zoom 8 archive stays shipped and stays the fallback the client probes down to,
+so a static deployer is still self-contained and nothing new ships in `dist`.
+Workers Logs stay off (DDM-D07) and R2 Data Access Logs stay off on the bucket,
+because this tool serves Tribal Nations and request logging would be a
+stewardship failure rather than a configuration detail. And the work stops at
+the free tiers: R2 storage and egress are $0 inside 10 GB, and the Workers free
+tier is 100,000 requests per day account-wide, shared with `ddm-proxy`; needing
+Workers Paid is a reason to stop and ask, not a step to take.
+
 **Production source maps.** Production builds publish no source maps while
 GitHub Pages is the host (owner ruling DR-069, 2026-09-03: the second clause of
 gate DDM-D10, which DR-006 does not answer). The repository being public is an
@@ -694,9 +998,8 @@ Keep public documents factual and durable:
 
 - update `README.md` for current user-visible behavior;
 - update `DEVELOPER.md` for stable maintainer practice;
-- update `docs/ROADMAP.yaml` for planned scope or dependencies, without
-  adding live status fields;
-- update `ROADMAP.md` only when its human-readable phase projection changes;
+- keep planned scope, dependencies, decisions and session records in the
+  private planning record, never in this repository;
 - update `docs/design/` for durable design doctrine;
 - update `docs/RELEASE_NOTES.md` for merged history and observed deployment
   facts; and
@@ -706,6 +1009,24 @@ Keep public documents factual and durable:
 Never publish credentials, workstation paths, private notes, research prompts,
 or session records. Keep implementation claims tied to runtime and tests, and
 keep release claims tied to observed workflow and live-build evidence.
+
+## Commit messages
+
+Authorship is recorded in git's author field and nowhere else. A commit message
+carries a subject and, when useful, a body; it carries no `Co-Authored-By:`
+trailer, no `*-Session:` link, and no "Generated with" line. The tracked hook in
+`.githooks/commit-msg` rejects those lines. Enable it once per clone:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+Do not bypass it with `--no-verify`.
+
+AI assistants and automation tools are not named as project contributors in
+public credits, commit trailers, or pull-request text. Preserve the license's
+required human and organizational attribution and all data-source credits.
+Do not rewrite existing history or relabel bot commits as human work.
 
 ## Contribution scope
 

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import {
@@ -19,6 +20,18 @@ import {
 
 const LIVE_REVISION = '2026-07-29-nws-point-heat-v2';
 const CANDIDATE_REVISION = '2026-08-29-options-policy-v4';
+
+test('the live receipt driver sends the deployed page Origin', () => {
+  const driver = new URL('../scripts/verify-worker.mjs', import.meta.url).href;
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    globalThis.fetch = async (_url, init) => {
+      process.exit(init.headers.Origin === 'https://atniclimate.github.io' ? 0 : 2);
+    };
+    process.argv = ['node', 'verify-worker.mjs', '--expect-revision', 'test'];
+    await import(${JSON.stringify(driver)});
+  `], { encoding: 'utf8', timeout: 10_000 });
+  assert.equal(result.status, 0, result.stderr || String(result.error ?? ''));
+});
 
 /**
  * The CORS advertisement the live 2026-07-29 Worker injects, and the one the
@@ -305,6 +318,15 @@ test('evaluateProbe records an upstream outage as a warning but never masks a Wo
   const refusalOn200 = evaluateProbe(row({ status: 200, error: 'route_not_allowed', headers: CANDIDATE_CORS }), relayExpect);
   assert.equal(refusalOn200.ok, false);
   assert.ok(refusalOn200.reasons.some((r) => r.includes('refused with "route_not_allowed"')));
+
+  // The Worker's own limiter answers 429 rate_limited: the relay refusing the
+  // caller, not an agency outage. A bare upstream 429 stays tolerated.
+  const limited = evaluateProbe(row({ status: 429, error: 'rate_limited', headers: CANDIDATE_CORS }), relayExpect);
+  assert.equal(limited.ok, false);
+  assert.ok(limited.reasons.some((r) => r.includes('status 429')));
+  const agency429 = evaluateProbe(row({ status: 429, error: null, headers: CANDIDATE_CORS }), relayExpect);
+  assert.equal(agency429.ok, true);
+  assert.ok(agency429.warnings.some((w) => w.includes('upstream unavailable')));
 });
 
 test('evaluateProbe warns past the upstream deadline and fails a dead request', () => {
@@ -376,6 +398,16 @@ test('evaluateTransparency passes byte-identical legs and fails a changed body',
   assert.ok(truncated.reasons.some((r) => r.includes('relayed 12 bytes')));
 });
 
+test('the transparency pair relays the bare upstream URL, which the Worker route pin allows', async () => {
+  const { isAllowedRoute } = await import('../workers/proxy/src/index.ts');
+  const relayed = new URL(probeUrl('https://worker.example', { path: '/proxy', upstream: TRANSPARENCY_UPSTREAM }));
+  assert.equal(relayed.searchParams.get('url'), TRANSPARENCY_UPSTREAM);
+  assert.equal(new URL(TRANSPARENCY_UPSTREAM).search, '');
+  assert.equal(isAllowedRoute(new URL(TRANSPARENCY_UPSTREAM)), true);
+  // The old nonce is what the route pin refuses.
+  assert.equal(isAllowedRoute(new URL(`${TRANSPARENCY_UPSTREAM}?ddm_cache_bust=x`)), false);
+});
+
 test('evaluateTransparency calls a non-200 direct leg inconclusive and warns when an edge copy answered', () => {
   // An agency having a bad minute leaves the question unanswered. It is
   // recorded, not failed: a receipt that exits 1 on upstream weather would
@@ -402,6 +434,12 @@ test('evaluateTransparency calls a non-200 direct leg inconclusive and warns whe
   });
   assert.equal(refused.ok, false);
   assert.ok(refused.reasons.some((r) => r.includes('relayed leg answered 403')));
+  const limited = evaluateTransparency({
+    direct: row({ status: 200, bytes: 1, sha256: HASH }),
+    proxied: row({ status: 429, error: 'rate_limited' }),
+  });
+  assert.equal(limited.ok, false);
+  assert.ok(limited.reasons.some((r) => r.includes('relayed leg answered 429')));
 
   // Two 200 legs that disagree is the failure this row exists to catch.
   const breach = evaluateTransparency({

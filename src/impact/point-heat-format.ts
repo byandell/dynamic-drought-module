@@ -21,6 +21,8 @@ interface TimeFormatOptions {
    * browser at runtime). Tests pass an explicit zone for determinism.
    */
   readonly timeZone?: string;
+  /** Add the year ("Nov 10, 2025, 3:00 PM PST"), for a reading that may be months old. */
+  readonly year?: boolean;
 }
 
 /** "90 °F (32 °C)" for temperatures; "48%" for percents; rounded otherwise. */
@@ -48,6 +50,31 @@ export function formatDistanceKm(distanceKm: number): string {
 }
 
 /**
+ * Where a point read is made, as the reader is told: the place the selection
+ * names (`readAt`, a Nation's headquarters town) or else the selected point.
+ */
+export function pointReadPlace(context: { readonly readAt?: string } | null | undefined): string {
+  return context?.readAt ?? 'the selected point';
+}
+
+/** The point-heat card's heading; a headquarters town is named, a click keeps the short heading. */
+export function pointHeatHeading(context: { readonly readAt?: string } | null | undefined): string {
+  return context?.readAt ? `Heat at ${context.readAt}` : 'Heat at selected point';
+}
+
+/** The point-heat card's scope line; a selection with no boundary (a headquarters town) has no boundary to disclaim. */
+export function pointHeatScope(context: { readonly readAt?: string } | null | undefined): string {
+  return context?.readAt
+    ? 'Values describe this coordinate and nearby station.'
+    : 'Values describe this coordinate and nearby station, not the complete selected boundary or jurisdiction.';
+}
+
+/** The ENSO chain's seasonal outlook link title, read at the headquarters town when the selection names one. */
+export function seasonalOutlookTitle(context: { readonly readAt?: string } | null | undefined): string {
+  return context?.readAt ? `Seasonal outlook at ${context.readAt}` : 'Seasonal outlook at this point';
+}
+
+/**
  * Newer ICU builds separate "1:57" and "PM" with U+202F (narrow no-break
  * space), and which build renders varies by browser and Node version.
  * Normalize to a plain space so the interface and its tests read one way
@@ -57,10 +84,11 @@ function plainSpaces(text: string): string {
   return text.replace(/[\u202f\u2009]/g, ' ');
 }
 
-function dateFormatter(timeZone?: string): Intl.DateTimeFormat {
+function dateFormatter(timeZone?: string, year = false): Intl.DateTimeFormat {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',
+    ...(year ? { year: 'numeric' } : {}),
     ...(timeZone ? { timeZone } : {})
   });
 }
@@ -85,7 +113,7 @@ export function formatPointHeatTimestamp(
   const parsed = Date.parse(iso);
   if (!Number.isFinite(parsed)) return iso;
   const date = new Date(parsed);
-  const day = dateFormatter(options.timeZone).format(date);
+  const day = dateFormatter(options.timeZone, options.year).format(date);
   const time = timeFormatter(options.timeZone, true).format(date);
   return plainSpaces(`${day}, ${time}`);
 }

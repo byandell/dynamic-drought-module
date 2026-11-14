@@ -1,5 +1,11 @@
 import { defineConfig } from 'vite';
 import { execSync } from 'node:child_process';
+// found-028 / DDM-P0-T14: the sidebar footer's displayed version is a
+// build-time constant read from package.json's own field, the same way the
+// build SHA above is resolved once here and stamped by src/main.ts's boot();
+// never a runtime fetch of package.json and never a second, hand-maintained
+// literal (resolveJsonModule is on in tsconfig.json).
+import pkg from './package.json';
 
 /**
  * The source commit this build was produced from, embedded so a browser
@@ -44,6 +50,9 @@ export default defineConfig({
     // so a release verifier can inject a fresh random nonce per run and
     // assert both values. Local builds use 'dev'.
     __DDM_BUILD_NONCE__: JSON.stringify(process.env.DDM_BUILD_NONCE ?? 'dev'),
+    // found-028 / DDM-P0-T14: the footer version, from package.json, not a
+    // hand-maintained literal in index.html.
+    __DDM_VERSION__: JSON.stringify(pkg.version),
   },
 
   build: {
@@ -119,18 +128,6 @@ export default defineConfig({
     // Local dev port. Vite picks the next available port if 5173 is
     // taken, so this mostly matters for documentation.
     port: 5173,
-
-    // Uncomment to proxy Cloudflare Worker requests during local dev,
-    // assuming `wrangler dev` is running on localhost:8787. This lets
-    // the same /proxy URLs work in both dev and production without a
-    // build-time conditional.
-    //
-    // proxy: {
-    //   '/proxy': {
-    //     target: 'http://localhost:8787',
-    //     changeOrigin: true,
-    //   },
-    // },
   },
 
   preview: {
@@ -141,19 +138,4 @@ export default defineConfig({
     port: 4173,
     strictPort: true,
   },
-
-  // Path aliases are commented out. To enable, uncomment below AND add
-  // a matching "paths" entry under "compilerOptions" in tsconfig.json:
-  //
-  //   "baseUrl": ".",
-  //   "paths": { "@/*": ["src/*"] }
-  //
-  // Without both sides matching, TypeScript will complain about imports
-  // that Vite happily resolves at build time.
-  //
-  // resolve: {
-  //   alias: {
-  //     '@': '/src',
-  //   },
-  // },
 });

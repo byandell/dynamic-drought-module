@@ -24,12 +24,14 @@
  * session cache below and the MapLibre source, and nowhere else: never
  * committed, never emitted by the default build, never written to disk, and
  * never copied into a test fixture. Live-fetch of a public federal product is
- * not redistribution (the 2026-07-15 tier assessment).
+ * not redistribution (the 2026-07-15 tier assessment). These boundaries are
+ * public data at T0 from a public federal source; the guard is about
+ * provenance and currency, not secrecy.
  *
  * Source: `URLS.censusAiannhMapServer` layer 47 (verified 2026-07-15; see
  * urls.ts for the full provenance receipt). CORS is reflected-origin; no
  * proxy. The query is viewport-clipped with an Environmental Systems Research
- * Institute (ESRI) envelope, overscanned by OVERSCAN_FACTOR, with
+ * Institute (ESRI) envelope, overscanned (src/util/bbox.ts), with
  * `maxAllowableOffset` and `geometryPrecision` keyed to the current zoom so
  * the multi-megabyte full-precision geometries (an Oklahoma OTSA is 4.18 MB
  * raw) arrive generalized for display. The tolerance is deliberately
@@ -45,7 +47,7 @@
  * behave as peers under the Tribal Nations umbrella.
  *
  * Cancellation (the cancellation invariant): every fetch goes through
- * `fetchWithBudget` with a per-call timeout and a master abort signal that
+ * `fetchBufferedWithBudget` with a per-call timeout and a master abort signal that
  * fires on `deactivate` or on a superseding fetch. Late responses to
  * superseded requests are dropped, not rendered. A cache hit renders
  * synchronously and never touches the abort signal.
@@ -56,15 +58,34 @@
  */
 
 import type * as maplibregl from 'maplibre-gl';
-import type { FeatureCollection, GeoJsonProperties } from 'geojson';
+import type { Feature, FeatureCollection, GeoJsonProperties, Point } from 'geojson';
 
 import { URLS } from '../config/urls';
-import { AIANNH_FILL_COLOR, AIANNH_OUTLINE_COLOR } from '../config/palette';
-import { buildAiannhPopupHtml } from '../ui/popups';
-import { buildBoundaryContext, resolveBoundaryTitle } from '../impact/context';
+import { MAP_GROUND_COLOR, NATION_NAME_FONT } from '../config/interface-tokens';
+import { AIANNH_FILL_COLOR, AIANNH_OUTLINE_COLOR, TRIBAL_LABEL_COLOR } from '../config/palette';
+import { buildAiannhPopupModel } from '../ui/popups';
+import { buildPlaceConditionsHtml } from '../ui/popup-conditions';
+import {
+  buildBoundaryContext,
+  censusNationNames,
+  loadCensusLabelNames,
+  loadCensusNationNames,
+  resolveBoundaryTitle
+} from '../impact/context';
 import { registerClickTarget } from '../map/interaction-coordinator';
-import { fetchWithBudget } from '../util/fetch';
+import type { LayerActivation } from '../config/layers';
+import { fetchBufferedWithBudget, linkAbort } from '../util/fetch';
+import { buildQueryEnvelope, envelopeCovers, toCoverageEnvelope } from '../util/bbox';
+import { assertFeatureCollection, isTruncated } from '../util/geojson-checks';
 import { registry } from '../state/registry';
+import { loadTribalLabelAreas, loadTribalLabelNames, type TribalLabelNames } from '../state/tribal-roster';
+import {
+  TRIBAL_DETAIL_LAYER_IDS,
+  cancelTribalStreets,
+  setTribalStreetAreas,
+  startTribalStreets,
+  stopTribalStreets
+} from './tribal-streets';
 
 const LAYER_KEY = 'aiannh';
 const SOURCE_ID = 'aiannh';
@@ -74,22 +95,164 @@ const SOURCE_ID = 'aiannh';
  */
 const FILL_LAYER_ID = 'aiannh-fill';
 const OUTLINE_LAYER_ID = 'aiannh-outline';
+/** The Nations' names (owner, 2026-11-12): one point per area at its Census internal point. */
+const LABEL_SOURCE_ID = 'aiannh-nation-labels';
+const LABEL_LAYER_ID = 'aiannh-nation-labels';
 
-/** Fade targets for the sidebar's toggle transitions (LayerModule contract). */
-export const fadeLayerIds = [FILL_LAYER_ID, OUTLINE_LAYER_ID] as const;
+/**
+ * Fade targets for the sidebar's toggle transitions (LayerModule contract):
+ * the boundary, the Nations' names, and the street-zoom detail drawn inside
+ * the areas, so it eases out with the boundary instead of popping off.
+ */
+export const fadeLayerIds = [FILL_LAYER_ID, OUTLINE_LAYER_ID, LABEL_LAYER_ID, ...TRIBAL_DETAIL_LAYER_IDS] as const;
+
+/**
+ * The label ladder (methods log M-092): a Nation's name appears from the zoom
+ * its area is about 35 to 40 pixels across, by Census land area (floors in
+ * km2, largest first), and a statistical area (OTSA, TDSA, ANVSA) one step
+ * later because its names stack taller.
+ */
+const LADDER_FLOORS_KM2 = [5000, 1000, 200, 50, 0] as const;
+// The smallest areas from zoom 9 (design pass 2026-11-13: the Kitsap and Puget Sound Nations were unnamed at 8.5).
+const LADDER_ZOOMS = [5, 6, 7, 8, 9, 10] as const;
+const STATISTICAL_CLASSES: ReadonlySet<string> = new Set(['D6', 'E1']);
+/** The federal classes a Nation's name may label; joint-use, state and Hawaiian Home Land areas never. */
+const LABELLED_CLASSES: ReadonlySet<string> = new Set(['D1', 'D2', 'D3', 'D6', 'E1']);
+
+/** The zoom an area's label appears from, given AREALAND (square metres) and AIANNHCC. */
+export function labelMinZoom(areaLand: number, cls: string): number {
+  const step = LADDER_FLOORS_KM2.findIndex((floor) => areaLand / 1e6 >= floor);
+  return LADDER_ZOOMS[(step === -1 ? LADDER_FLOORS_KM2.length - 1 : step) + (STATISTICAL_CLASSES.has(cls) ? 1 : 0)] ?? 9.5;
+}
+
+/**
+ * One label point per area the label map names, at the Census internal point
+ * (INTPTLAT, INTPTLON). A Nation is drawn by the shorter name it is generally
+ * known by where one is curated (owner, 2026-11-13; the Impact Briefing a click
+ * opens carries the full Federal Register name), or on one band's, place's or
+ * community's own area by that area's curated label (`area`, by Census code),
+ * otherwise by its full name,
+ * never cut. A blank line sets each Nation apart: a long name wraps, and
+ * wrapped lines alone do not say where one Nation's name ends (look of
+ * 2026-11-13, the Kiowa-Comanche-Apache-Fort Sill Apache area).
+ */
+export function nationLabelPoints(
+  geojson: FeatureCollection,
+  labels: ReadonlyMap<string, readonly string[]> | null,
+  curated: TribalLabelNames | null = null
+): FeatureCollection<Point> {
+  const features: Feature<Point>[] = [];
+  for (const f of geojson.features ?? []) {
+    const p = f.properties ?? {};
+    const cls = String(p['AIANNHCC'] ?? '');
+    const names = LABELLED_CLASSES.has(cls) ? labels?.get(String(p['AIANNH'] ?? '')) : undefined;
+    const lat = parseFloat(String(p['INTPTLAT']));
+    const lng = parseFloat(String(p['INTPTLON']));
+    if (!names?.length || !Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+    const areaLand = parseFloat(String(p['AREALAND']));
+    // One band's, place's or community's own area label, only where the area names one Nation.
+    const areaLabel = names.length === 1 ? curated?.area.get(String(p['AIANNH'] ?? '')) : undefined;
+    const shown = (name: string): string => areaLabel ?? curated?.short.get(name) ?? name;
+    const own = (name: string): string | undefined => curated?.own.get(name);
+    // `text` is the whole label as read; en0, own0, en1, ... are the slots nationTextField draws;
+    // AIANNH and NAME let a click on the name answer for its area (bindPopups).
+    const properties: Record<string, string | number> = {
+      AIANNH: String(p['AIANNH'] ?? ''),
+      NAME: String(p['NAME'] ?? ''),
+      text: names.map((name) => [own(name), shown(name)].filter(Boolean).join('\n')).join('\n\n'),
+      km2: areaLand / 1e6 || 0,
+      minzoom: labelMinZoom(areaLand, cls)
+    };
+    names.forEach((name, i) => {
+      properties[`en${i}`] = shown(name);
+      const ownName = own(name);
+      if (ownName) properties[`own${i}`] = ownName;
+    });
+    features.push({ type: 'Feature', geometry: { type: 'Point', coordinates: [lng, lat] }, properties });
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+/** The English name's size beside the own-language name above it (11.25 px at the label's smallest). */
+const ENGLISH_UNDER_OWN_SCALE = 0.9;
+
+/**
+ * The label's text. Per Nation: its name in its own language, where its row is
+ * curated (DR-247), in the Nation-name face, above its English name; a blank
+ * line between Nations. One slot per Nation, `slots` being the most Nations
+ * any one area holds: a format expression cannot loop.
+ */
+export function nationTextField(slots: number): maplibregl.ExpressionSpecification {
+  const sections: unknown[] = [];
+  for (let i = 0; i < slots; i++) {
+    if (i) sections.push(['case', ['has', `en${i}`], '\n\n', ''], {});
+    sections.push(
+      ['case', ['has', `own${i}`], ['concat', ['get', `own${i}`], '\n'], ''],
+      { 'text-font': ['literal', [NATION_NAME_FONT]] },
+      ['coalesce', ['get', `en${i}`], ''],
+      { 'font-scale': ['case', ['has', `own${i}`], ENGLISH_UNDER_OWN_SCALE, 1] }
+    );
+  }
+  return ['format', ...sections] as maplibregl.ExpressionSpecification;
+}
+
+/** The roster's label map (Census AIANNH code to the Nations' names) once read; null before. */
+let nationLabels: ReadonlyMap<string, readonly string[]> | null = null;
+let nationLabelsLoad: Promise<void> | null = null;
+/** The curated label names (own-language and shorter names, by Federal Register name) once read; null before. */
+let curatedNames: TribalLabelNames | null = null;
+let curatedNamesLoad: Promise<void> | null = null;
+
+/** The most Nations any one labelled area holds (one before the label map is read). */
+function labelSlots(): number {
+  let most = 1;
+  for (const names of nationLabels?.values() ?? []) most = Math.max(most, names.length);
+  return most;
+}
+
+/**
+ * Read the label map once, from the roster's one shared load, and the curated
+ * label names beside it. A failure of either is retried by the next
+ * activation, never by a pan; the Federal Register names never wait for the
+ * curated ones, which replace them when they arrive.
+ */
+function loadNationLabels(map: maplibregl.Map): void {
+  if (!nationLabels && !nationLabelsLoad) {
+    nationLabelsLoad = loadTribalLabelAreas()
+      .then((labels) => {
+        nationLabels = labels;
+        if (map.getLayer(LABEL_LAYER_ID)) map.setLayoutProperty(LABEL_LAYER_ID, 'text-field', nationTextField(labelSlots()));
+        if (appliedData) setLabelData(map, appliedData);
+      })
+      .catch((err: unknown) => console.warn('[aiannh] Tribal name labels unavailable: the roster did not load.', err))
+      .finally(() => {
+        nationLabelsLoad = null;
+      });
+  }
+  if (!curatedNames && !curatedNamesLoad) {
+    curatedNamesLoad = loadTribalLabelNames()
+      .then((names) => {
+        curatedNames = names;
+        if (appliedData) setLabelData(map, appliedData);
+      })
+      .catch((err: unknown) => console.warn('[aiannh] Curated Nation label names unavailable: their file did not load.', err))
+      .finally(() => {
+        curatedNamesLoad = null;
+      });
+  }
+}
+
+/** Rebuild the label points from the areas the layer holds. */
+function setLabelData(map: maplibregl.Map, geojson: FeatureCollection): void {
+  const labels = map.getSource(LABEL_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  labels?.setData(nationLabelPoints(geojson, nationLabels, curatedNames));
+}
 
 /** Symbol anchor so the boundary stacks below basemap labels (shared idiom). */
 const BEFORE_ID = 'first-symbol';
 
 /** Per-call network budget for the AIANNH query. */
 const FETCH_TIMEOUT_MS = 15_000;
-
-/**
- * Overscan margin applied to the query envelope, as a fraction of the
- * viewport's width and height on each side, so small pans render correctly at
- * their edges and are more likely to hit the response cache.
- */
-const OVERSCAN_FACTOR = 0.25;
 
 /**
  * Cache-key bounds precision in decimal degrees (see bia-reservations.ts for
@@ -155,6 +318,16 @@ const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
 let masterController: AbortController | null = null;
 
 /**
+ * The controller-owned activation signal (DDM-P1-T02): handed in by
+ * `activate`, linked to every `masterController` this module creates, the
+ * initial load and each viewport refresh alike, so the layer controller's
+ * abort on deactivate or supersession reaches a held request at once,
+ * without waiting for the serialized teardown. Null when activated without
+ * the seam (a direct call), where `cancelActivation` alone does the job.
+ */
+let activationSignal: AbortSignal | null = null;
+
+/**
  * Request-identity token: each fetch takes `++requestSeq` and drops its
  * response if the module has moved on. Belt to the abort signal's braces; a
  * response that raced past the abort still cannot render superseded data.
@@ -168,6 +341,14 @@ let moveendHandler: (() => void) | null = null;
 let refreshTimer: number | null = null;
 
 /**
+ * The cache key and request token of the network fetch now in flight, or null.
+ * A `moveend` that lands on the same bucketed view while it runs (the boot
+ * camera settling) must not abort and repeat the slow national query; a token
+ * the module has moved past (cancel, teardown) no longer counts.
+ */
+let inFlight: { readonly key: string; readonly token: number } | null = null;
+
+/**
  * The status last reported for actually-rendered data (`ready` or
  * `no-data`), or null when nothing is rendered (never activated, or torn
  * down). Lets `cancelActivation` restore the honest status of what is still
@@ -176,6 +357,9 @@ let refreshTimer: number | null = null;
  * data stays rendered (Codex Unit B re-verify finding 1, second case).
  */
 let lastAppliedStatus: Extract<Status, 'ready' | 'no-data' | 'degraded'> | null = null;
+
+/** The collection the source currently holds; null when nothing is rendered. */
+let appliedData: FeatureCollection | null = null;
 
 /**
  * One cached response: the validated collection plus the COVERAGE envelope
@@ -189,6 +373,7 @@ let lastAppliedStatus: Extract<Status, 'ready' | 'no-data' | 'degraded'> | null 
 interface CachedResponse {
   readonly envelope: readonly [number, number, number, number];
   readonly geojson: FeatureCollection;
+  readonly zoomBucket: number;
 }
 
 /**
@@ -233,8 +418,8 @@ function resolveZoomBucket(map: maplibregl.Map): number {
  * Bucketed cache key for the current viewport. Includes the zoom bucket
  * because the query's generalization tolerance is zoom-keyed: a response
  * generalized for zoom 4 must not satisfy a zoom 9 view of the same bounds.
- * The key is a fast-path bucket only; a hit must ALSO pass the
- * `envelopeCovers` coverage check before it is served.
+ * It names an entry for storage, eviction and the in-flight check; lookup
+ * is by coverage (`findCoveringResponse`).
  */
 function buildCacheKey(map: maplibregl.Map, zoomBucket: number): string {
   const b = map.getBounds();
@@ -245,75 +430,35 @@ function buildCacheKey(map: maplibregl.Map, zoomBucket: number): string {
 }
 
 /**
- * Inverse of the five-decimal precision the query URL serializes envelope
- * coordinates at. The envelope is quantized OUTWARD to this grid (floor the
- * west/south edges, ceil the east/north edges) so the cached envelope and
- * the envelope actually sent to the service are the same numbers: a
- * coverage hit then proves the service was really asked for the whole
- * visible view, with no sliver between the raw and serialized edges (Codex
- * Unit B re-verify, finding 3 residual, 2026-07-15).
+ * The newest cached response of this zoom bucket whose coverage envelope
+ * contains the whole view, or undefined, so a pan inside the 25 percent
+ * overscan is served without a request (audit 10). A hit moves to the
+ * newest slot so the entry being panned inside is the last to be evicted.
  */
-const ENVELOPE_QUANTUM = 1e5;
-
-/** The overscanned query envelope for the current viewport, `[w, s, e, n]`. */
-function buildQueryEnvelope(map: maplibregl.Map): [number, number, number, number] {
-  const b = map.getBounds();
-  const west = b.getWest();
-  const south = b.getSouth();
-  const east = b.getEast();
-  const north = b.getNorth();
-  const marginX = (east - west) * OVERSCAN_FACTOR;
-  const marginY = (north - south) * OVERSCAN_FACTOR;
-  return [
-    Math.floor((west - marginX) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.floor((south - marginY) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.ceil((east + marginX) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.ceil((north + marginY) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM
-  ];
-}
-
-/** Whether a cached query envelope fully contains the current visible view. */
-function envelopeCovers(
-  envelope: readonly [number, number, number, number],
-  map: maplibregl.Map
-): boolean {
-  const b = map.getBounds();
-  return (
-    envelope[0] <= b.getWest() &&
-    envelope[1] <= b.getSouth() &&
-    envelope[2] >= b.getEast() &&
-    envelope[3] >= b.getNorth()
-  );
-}
-
-/**
- * Shrink a query envelope inward by one grid quantum to form the COVERAGE
- * envelope stored with the cached response. The binary64 value `k / 1e5` can
- * sit a sub-ULP outside the exact decimal the URL carried, so comparing
- * against the query envelope itself left an equality-edge false-positive
- * path (Codex Unit B second re-verify, LOW, 2026-07-15). One quantum
- * (about one meter) of lost cache reuse is an acceptable false negative; a
- * passing coverage check now can never claim area outside the service
- * request.
- */
-function toCoverageEnvelope(
-  envelope: readonly [number, number, number, number]
-): [number, number, number, number] {
-  const q = 1 / ENVELOPE_QUANTUM;
-  return [envelope[0] + q, envelope[1] + q, envelope[2] - q, envelope[3] - q];
+function findCoveringResponse(map: maplibregl.Map, zoomBucket: number): CachedResponse | undefined {
+  const view = map.getBounds();
+  for (const [key, entry] of [...responseCache].reverse()) {
+    if (entry.zoomBucket === zoomBucket && envelopeCovers(entry.envelope, view)) {
+      responseCache.delete(key);
+      responseCache.set(key, entry);
+      return entry;
+    }
+  }
+  return undefined;
 }
 
 /** Store a response in the cache, evicting the oldest entry if at capacity. */
 function cacheResponse(
   key: string,
   envelope: readonly [number, number, number, number],
-  geojson: FeatureCollection
+  geojson: FeatureCollection,
+  zoomBucket: number
 ): void {
   if (responseCache.size >= CACHE_MAX_ENTRIES && !responseCache.has(key)) {
     const oldestKey = responseCache.keys().next().value;
     if (oldestKey !== undefined) responseCache.delete(oldestKey);
   }
-  responseCache.set(key, { envelope: toCoverageEnvelope(envelope), geojson });
+  responseCache.set(key, { envelope: toCoverageEnvelope(envelope), geojson, zoomBucket });
 }
 
 /**
@@ -331,7 +476,9 @@ function resolveMaxAllowableOffset(zoomBucket: number): number {
  * the popup, identity, and briefing read. Geometry is generalized
  * server-side by the zoom-bucket-keyed `maxAllowableOffset` plus a fixed
  * `geometryPrecision`; note AREALAND/AREAWATER arrive STRING-typed (catalog
- * caveat), so any consumer doing area math must parse first.
+ * caveat), so any consumer doing area math must parse first. AIANNH and the
+ * internal point (INTPTLAT, INTPTLON) place the Nations' name labels from the
+ * same response.
  */
 function buildQueryUrl(
   envelope: readonly [number, number, number, number],
@@ -344,53 +491,13 @@ function buildQueryUrl(
     inSR: '4326',
     outSR: '4326',
     spatialRel: 'esriSpatialRelIntersects',
-    outFields: 'NAME,AIANNHCC,MTFCC,BASENAME,AIANNHNS,AREALAND,AREAWATER',
+    outFields: 'NAME,AIANNHCC,MTFCC,BASENAME,AIANNHNS,AREALAND,AREAWATER,AIANNH,INTPTLAT,INTPTLON',
     returnGeometry: 'true',
     geometryPrecision: String(GEOMETRY_PRECISION),
     maxAllowableOffset: resolveMaxAllowableOffset(zoomBucket).toFixed(6),
     f: 'geojson'
   });
   return `${URLS.censusAiannhMapServer}/47/query?${params.toString()}`;
-}
-
-/**
- * Validate that a parsed response is a genuine GeoJSON FeatureCollection and
- * not an ArcGIS error body or other malformed shape. Throws on failure so the
- * caller's catch block reports `'error'`. A response the service flags as
- * truncated (`exceededTransferLimit`) is logged, not silently complete.
- */
-function assertFeatureCollection(raw: unknown): FeatureCollection {
-  if (raw && typeof raw === 'object' && 'error' in raw) {
-    const err = (raw as { error?: { code?: number; message?: string } }).error;
-    throw new Error(
-      `ArcGIS error ${err?.code ?? '(unknown code)'}: ${err?.message ?? 'unknown error'}`
-    );
-  }
-  if (
-    !raw ||
-    typeof raw !== 'object' ||
-    (raw as { type?: string }).type !== 'FeatureCollection' ||
-    !Array.isArray((raw as { features?: unknown }).features)
-  ) {
-    throw new Error('AIANNH response was not a GeoJSON FeatureCollection.');
-  }
-  return raw as FeatureCollection;
-}
-
-/**
- * Whether the service flagged this response as truncated
- * (`exceededTransferLimit`). A truncated body renders (partial data beats
- * none) but reports `degraded` ("live (partial)") and is NEVER admitted to
- * the coverage-envelope cache: a cached envelope asserts "the service
- * answered this whole envelope", which a truncated response cannot claim
- * (R2-trio, the 2026-07-15 planning true-up, D-0.7.0-037).
- */
-function isTruncated(raw: unknown): boolean {
-  return Boolean(
-    raw &&
-      typeof raw === 'object' &&
-      (raw as { exceededTransferLimit?: boolean }).exceededTransferLimit
-  );
 }
 
 /**
@@ -401,7 +508,11 @@ function isTruncated(raw: unknown): boolean {
 function clearRenderedFeatures(map: maplibregl.Map): void {
   const existing = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
   if (existing) existing.setData(EMPTY_FEATURE_COLLECTION);
+  setLabelData(map, EMPTY_FEATURE_COLLECTION);
+  // The streets, water and community names drawn inside those areas go with them.
+  setTribalStreetAreas(EMPTY_FEATURE_COLLECTION);
   lastAppliedStatus = null;
+  appliedData = null;
 }
 
 /**
@@ -424,18 +535,20 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
 
   const zoomBucket = resolveZoomBucket(map);
   const cacheKey = buildCacheKey(map, zoomBucket);
-  const cached = responseCache.get(cacheKey);
-  if (cached && envelopeCovers(cached.envelope, map)) {
+  const cached = findCoveringResponse(map, zoomBucket);
+  if (cached) {
     applyFeatureCollection(map, cached.geojson);
     return;
   }
 
   masterController = new AbortController();
   const signal = masterController.signal;
+  const unlink = linkAbort(masterController, activationSignal);
+  inFlight = { key: cacheKey, token };
 
   reportStatus('loading');
 
-  const envelope = buildQueryEnvelope(map);
+  const envelope = buildQueryEnvelope(map.getBounds());
   let geojson: FeatureCollection;
   let truncated = false;
   try {
@@ -443,7 +556,7 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
     // transport level: the upstream sends max-age=0 + ETag (storable,
     // revalidate-on-use), so without this the browser HTTP cache may
     // persist sovereign-boundary responses across page loads.
-    const resp = await fetchWithBudget(
+    const resp = await fetchBufferedWithBudget(
       buildQueryUrl(envelope, zoomBucket),
       { cache: 'no-store' },
       signal,
@@ -453,20 +566,30 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
       throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
     }
     const raw: unknown = await resp.json();
-    geojson = assertFeatureCollection(raw);
+    geojson = assertFeatureCollection(raw, 'AIANNH');
     truncated = isTruncated(raw);
   } catch (err) {
-    // Aborted or superseded means a newer request owns the view; drop
-    // silently per invariant 5.
-    if (signal.aborted || token !== requestSeq) return;
+    unlink();
+    if (inFlight?.token === token) inFlight = null;
+    // Aborted or superseded means a newer request owns the view; drop it
+    // per invariant 5, saying so once at debug level and nowhere louder.
+    if (signal.aborted || token !== requestSeq) {
+      console.debug(`[aiannh] request ${token} dropped: aborted or superseded before it settled`);
+      return;
+    }
     console.warn('[aiannh] Census AIANNH fetch failed.', err);
     clearRenderedFeatures(map);
     reportStatus('error');
     return;
   }
 
+  unlink();
+  if (inFlight?.token === token) inFlight = null;
   // A late response to a superseded or torn-down request must not render.
-  if (signal.aborted || token !== requestSeq) return;
+  if (signal.aborted || token !== requestSeq) {
+    console.debug(`[aiannh] request ${token} dropped: a late response after intent changed`);
+    return;
+  }
 
   if (truncated) {
     console.warn(
@@ -475,7 +598,7 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
     applyFeatureCollection(map, geojson, { partial: true });
     return;
   }
-  cacheResponse(cacheKey, envelope, geojson);
+  cacheResponse(cacheKey, envelope, geojson, zoomBucket);
   applyFeatureCollection(map, geojson);
 }
 
@@ -494,11 +617,23 @@ function applyFeatureCollection(
   opts?: { partial?: boolean }
 ): void {
   const existing = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  if (existing && geojson === appliedData) {
+    // A pan inside the cached area: the source already holds this object.
+    // Only a status a cancelled fetch moved is put back.
+    if (lastAppliedStatus && registry.getStatus(LAYER_KEY) !== lastAppliedStatus) {
+      reportStatus(lastAppliedStatus);
+    }
+    return;
+  }
   if (existing) {
     existing.setData(geojson);
+    setLabelData(map, geojson);
   } else {
     addSourceAndLayers(map, geojson);
   }
+  appliedData = geojson;
+  // The street names inside these areas from zoom 12 (src/layers/tribal-streets.ts).
+  setTribalStreetAreas(geojson);
   lastAppliedStatus = opts?.partial
     ? 'degraded'
     : (geojson.features ?? []).length === 0
@@ -508,7 +643,8 @@ function applyFeatureCollection(
 }
 
 /**
- * Add the source and both style layers. Unlike the pre-umbrella BIA module,
+ * Add the source and both style layers, then the Nations' name labels and
+ * their point source. Unlike the pre-umbrella BIA module,
  * the layers are added even for an empty collection: the viewport refresh
  * swaps data into the existing source with `setData`, so a view that starts
  * empty (an ocean view, say) must still have layers ready for the features a
@@ -575,6 +711,29 @@ function addSourceAndLayers(map: maplibregl.Map, geojson: FeatureCollection): vo
     },
     beforeId
   );
+
+  map.addSource(LABEL_SOURCE_ID, { type: 'geojson', data: nationLabelPoints(geojson, nationLabels, curatedNames) });
+  // Added on top; reassertLabelOrder keeps it the topmost label (TOP_LABEL_IDS, src/map/layer-order.ts),
+  // which MapLibre places first, so a Nation's name wins a collision with a city name.
+  map.addLayer({
+    id: LABEL_LAYER_ID,
+    type: 'symbol',
+    source: LABEL_SOURCE_ID,
+    minzoom: LADDER_ZOOMS[0],
+    // The ladder per point. A filter reads the tile's whole zoom, so the 9.5 step shows from zoom 10.
+    filter: ['>=', ['zoom'], ['get', 'minzoom']],
+    layout: {
+      'text-field': nationTextField(labelSlots()),
+      'text-font': ['Noto Sans Regular'],
+      // Never smaller than the city names beside them (design pass 2026-11-13).
+      'text-size': ['interpolate', ['linear'], ['zoom'], 5, 12.5, 8, 14, 12, 15],
+      'text-max-width': 10,
+      'text-variable-anchor': ['center', 'top', 'bottom'],
+      'text-radial-offset': 0.5,
+      'symbol-sort-key': ['-', ['get', 'km2']]
+    },
+    paint: { 'text-color': TRIBAL_LABEL_COLOR, 'text-halo-color': MAP_GROUND_COLOR, 'text-halo-width': 1.4 }
+  });
 }
 
 /**
@@ -589,6 +748,14 @@ function attachRefresh(map: maplibregl.Map): void {
     if (refreshTimer !== null) window.clearTimeout(refreshTimer);
     refreshTimer = window.setTimeout(() => {
       refreshTimer = null;
+      // Same view as the fetch already running: let it finish, do not abort it.
+      if (
+        inFlight &&
+        inFlight.token === requestSeq &&
+        inFlight.key === buildCacheKey(map, resolveZoomBucket(map))
+      ) {
+        return;
+      }
       void fetchAndApply(map);
     }, REFRESH_DEBOUNCE_MS);
   };
@@ -613,8 +780,14 @@ function detachRefresh(map: maplibregl.Map): void {
  * already exists the call only (re)ensures the refresh handler, so the
  * URL-restore path cannot stack duplicates.
  */
-export async function activate(map: maplibregl.Map): Promise<void> {
+export async function activate(
+  map: maplibregl.Map,
+  activation?: LayerActivation
+): Promise<void> {
+  activationSignal = activation?.signal ?? null;
   attachRefresh(map);
+  startTribalStreets(map);
+  loadNationLabels(map);
   if (map.getSource(SOURCE_ID)) {
     return;
   }
@@ -639,6 +812,7 @@ export function cancelActivation(): void {
     masterController.abort();
     masterController = null;
   }
+  cancelTribalStreets();
   // Invalidate any response that already raced past its abort check.
   requestSeq++;
   // If rendered data survives this cancellation (a refresh was cancelled,
@@ -650,11 +824,12 @@ export function cancelActivation(): void {
 
 /**
  * Stop the viewport refresh, abort any in-flight fetch, and remove the fill,
- * outline, and source (layers before source, per MapLibre). Safe to call when
+ * outline, name labels and both sources (layers before sources, per MapLibre). Safe to call when
  * never activated.
  */
 export function deactivate(map: maplibregl.Map): void {
   detachRefresh(map);
+  activationSignal = null;
   if (masterController) {
     masterController.abort();
     masterController = null;
@@ -662,9 +837,13 @@ export function deactivate(map: maplibregl.Map): void {
   // Invalidate any response that already raced past its abort check.
   requestSeq++;
   lastAppliedStatus = null;
+  appliedData = null;
+  stopTribalStreets(map);
   if (map.getLayer(FILL_LAYER_ID)) map.removeLayer(FILL_LAYER_ID);
   if (map.getLayer(OUTLINE_LAYER_ID)) map.removeLayer(OUTLINE_LAYER_ID);
+  if (map.getLayer(LABEL_LAYER_ID)) map.removeLayer(LABEL_LAYER_ID);
   if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
+  if (map.getSource(LABEL_SOURCE_ID)) map.removeSource(LABEL_SOURCE_ID);
 }
 
 /**
@@ -673,28 +852,46 @@ export function deactivate(map: maplibregl.Map): void {
  * cursor affordance. Bound once on first activation.
  */
 export function bindPopups(map: maplibregl.Map): void {
+  // The search's name for each Census area, from the one map the briefing title
+  // shares (impact/context loadCensusNationNames, the roster's provenance gate).
+  // Until it loads, a popup titles the Census area as before; a failed read is
+  // retried by the next click's label, so the map is read at click time.
+  loadCensusNationNames().catch(() => {});
+  loadCensusLabelNames().catch(() => {});
   registerClickTarget({
     kind: 'tribal-lands',
-    layerIds: [FILL_LAYER_ID],
+    // The Nation's name answers too: it can stand outside its area (text-variable-anchor), and
+    // one registration keeps one hit when the name and the fill beneath it are both under the click.
+    layerIds: [FILL_LAYER_ID, LABEL_LAYER_ID],
     label: (feature) => resolveBoundaryTitle('aiannh', feature.properties ?? null),
-    respond: (feature, click) => {
-      const props: GeoJsonProperties = feature.properties ?? null;
+    respond: (feature, click, map) => {
+      // A click on a name answers for the whole area it names, from the data the layer holds.
+      const area = feature.layer.id === LABEL_LAYER_ID
+        ? appliedData?.features.find((f) => String(f.properties?.['AIANNH'] ?? '') === feature.properties?.['AIANNH'])
+        : undefined;
+      const props: GeoJsonProperties = (area ?? feature).properties ?? null;
+      const id = area ? props?.['AIANNHNS'] : feature.id;
       return {
-        content: buildAiannhPopupHtml(props),
-        selection: buildBoundaryContext('aiannh', props, feature.geometry, click.lngLat),
+        model: buildAiannhPopupModel(
+          props,
+          buildPlaceConditionsHtml(map, click.point, area ? area.geometry : feature),
+          censusNationNames(),
+          resolveBoundaryTitle('aiannh', props)
+        ),
+        selection: buildBoundaryContext('aiannh', props, (area ?? feature).geometry, click.lngLat),
         // An id-less feature clears any prior emphasis (the old
         // emphasizePlace contract) rather than lighting an unknown one.
-        emphasis: feature.id === undefined || feature.id === null
-          ? []
-          : [{ source: SOURCE_ID, id: feature.id }]
+        emphasis: id === undefined || id === null ? [] : [{ source: SOURCE_ID, id: id as string | number }]
       };
     }
   });
 
-  map.on('mouseenter', FILL_LAYER_ID, () => {
-    map.getCanvas().style.cursor = 'pointer';
-  });
-  map.on('mouseleave', FILL_LAYER_ID, () => {
-    map.getCanvas().style.cursor = '';
-  });
+  for (const layer of [FILL_LAYER_ID, LABEL_LAYER_ID]) {
+    map.on('mouseenter', layer, () => {
+      map.getCanvas().style.cursor = 'pointer';
+    });
+    map.on('mouseleave', layer, () => {
+      map.getCanvas().style.cursor = '';
+    });
+  }
 }

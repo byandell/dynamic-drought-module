@@ -1,5 +1,11 @@
-import { test, expect, type Page } from '@playwright/test';
-import { gotoApp, layerCheckbox, urlLayers, search } from './helpers';
+import { test, expect, type Page } from './offline-test';
+import { gotoApp, layerCheckbox, layerPill, PILL, urlLayers, search, DEFAULT_ON } from './helpers';
+import { TEMPORAL_HORIZON_KEYS } from '../src/config/clusters';
+import {
+  stubCpcDroughtOutlook,
+  cpcOutlookFixture,
+  CPC_OUTLOOK_TARGET
+} from './cpc-outlook-fixtures';
 
 /**
  * 0.5.0b temporal axis (critical-review Section 5): the honesty-of-time
@@ -13,6 +19,8 @@ import { gotoApp, layerCheckbox, urlLayers, search } from './helpers';
  *     changes instrument (register attribute, Issued stamp).
  *   - Temporal state round-trips through the URL and preserves embed=true
  *     (the URL-as-state invariant).
+ *   - A time change never leaves the map both surfaceless and silent
+ *     (DDM-P8-T05; the final describe block).
  */
 
 // Two consecutive stub weeks: the "current" release and the prior Tuesday.
@@ -107,6 +115,8 @@ test.describe('0.5.0b temporal axis', () => {
     // The observed stamp is a hard VALID date; no Play exists on an
     // authored product (the affordance is the lesson).
     await expect(bar.locator('.time-bar-stamp-headline')).toHaveText('Valid Jun 30, 2026');
+    await expect(bar.locator('.time-bar-stamp-headline')).toHaveCSS('font-family', /^"?DDM Heros"?,/);
+    await expect(bar.locator('.time-bar-stamp-headline')).toHaveCSS('font-variant-numeric', /^(?:lining-nums tabular-nums|tabular-nums lining-nums)$/);
     await expect(bar.locator('[data-play]')).toHaveCount(0);
 
     // Discrete rail: 52 real weekly stops, parked on the newest.
@@ -120,31 +130,41 @@ test.describe('0.5.0b temporal axis', () => {
     // Step one week back: the stamp, the URL, and the chip state follow.
     await bar.locator('[data-step="-1"]').click();
     await expect(bar.locator('.time-bar-stamp-headline')).toHaveText('Valid Jun 23, 2026');
+    await expect(bar.locator('.time-bar-stamp-headline')).toHaveCSS('font-family', /^"?DDM Heros"?,/);
+    await expect(bar.locator('.time-bar-stamp-headline')).toHaveCSS('font-variant-numeric', /^(?:lining-nums tabular-nums|tabular-nums lining-nums)$/);
     await expect.poll(async () => new URLSearchParams(await search(page)).get('week')).toBe('20260623');
     await expect(bar.locator('[data-mode="chg1"]')).toBeDisabled();
 
     // The conditions strip reads the scrubbed week as deliberate history,
     // never as a frozen feed.
     await expect(page.locator('#conditions-date')).toContainText('viewing week of Jun 23, 2026');
+    await expect(page.locator('#conditions-date')).toHaveCSS('font-family', /^"?DDM Heros"?,/);
+    await expect(page.locator('#conditions-date')).toHaveCSS('font-variant-numeric', /^(?:lining-nums tabular-nums|tabular-nums lining-nums)$/);
     await expect(page.locator('#conditions-date')).not.toHaveAttribute('data-stale', 'true');
   });
 
-  test('an embed keeps the honest valid-date stamp on the map and the embed flag survives (E2, D-0.7.0-058)', async ({
+  test('an embed hides the floating date while retaining date state and the embed flag', async ({
     page
   }) => {
     await stubUsdm(page);
-    // A shared historical week INSIDE an embed: the sidebar (and so the
-    // full time bar) does not exist there, so the on-map stamp is the
-    // honest temporal statement, mirrored from the same spec.
+    // The floating date is temporarily hidden by owner direction.
+    // Its mirrored state and the dated key remain available.
     await gotoApp(page, '?region=washington_state&layers=usdm&week=20260623&embed=true');
 
     const stamp = page.locator('#embed-date-stamp');
-    await expect(stamp).toBeVisible();
+    await expect(stamp).toBeHidden();
     await expect(stamp).toHaveText('Valid Jun 23, 2026');
     await expect(stamp).toHaveAttribute('data-register', 'observed');
 
     // The full bar stays sidebar-hosted and therefore out of the embed.
     await expect(page.locator('#time-bar')).toBeHidden();
+
+    // DDM-P8-T03: the on-map key mirrors the same register the embed
+    // stamp carries, and neither depends on the sidebar shell, which does
+    // not exist in embed (tests/s4-shell.spec.ts:657).
+    const key = page.locator('#map-key');
+    await expect(key).toBeVisible();
+    await expect(key).toHaveAttribute('data-register', 'observed');
 
     // Invariant 2: embed= and week= both survive the boot's canonical
     // URL writes.
@@ -313,5 +333,594 @@ test.describe('0.5.0b temporal axis', () => {
     const rail = bar.locator('.time-bar-rail');
     await expect(rail).toHaveAttribute('max', '6');
     await expect(rail).toHaveValue('2');
+  });
+});
+
+/**
+ * DDM-P8-T05: never leave a hazard surface blank across a horizon or day
+ * change.
+ *
+ * The acceptance sentence is a statement about EVERY instant of a
+ * transition, so these two tests do not read the interface once. They start
+ * a 20 ms in-page sampler before the change, hold the superseding fetch
+ * open, and then judge the whole recorded window at once. The judgement is
+ * one predicate applied to every sample:
+ *
+ *     the layer says `loading`  =>  the map says `loading` too
+ *
+ * The left half comes from the layer's own status pill; the right half from
+ * the on-map loading indicator and, for HeatRisk, the on-map key's
+ * qualification row. A sample where the pill reads `loading...` while the
+ * map shows neither is the defect: for that instant the person looking at
+ * the map has no surface and no explanation.
+ *
+ * Both tests fail on the pre-DDM-P8-T05 code, and for different reasons.
+ * The HeatRisk day change tore its raster down and then announced `ready`,
+ * so the map went blank while the key claimed a live scale. The drought
+ * horizon change kept the previous outlook polygons up (good) but said
+ * nothing about the fetch behind them, so a stale product read as current.
+ */
+
+const HEAT_SERVICE_PATH =
+  '/experimental/rest/services/NWS_HeatRisk/ImageServer';
+
+/** Seven consecutive advertised granules, the issuer's own contract. */
+const HEAT_TIMES = [
+  1785153600000,
+  1785240000000,
+  1785326400000,
+  1785412800000,
+  1785499200000,
+  1785585600000,
+  1785672000000
+] as const;
+
+const TRANSPARENT_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64'
+);
+
+/** One instant of the whole picture, recorded inside the page. */
+interface ContinuitySample {
+  readonly pill: string;
+  readonly indicator: boolean;
+  readonly indicatorText: string;
+  readonly keyLoading: boolean;
+  readonly stamp: string;
+}
+
+/**
+ * Stub the HeatRisk service: consistent time metadata, seven catalog
+ * granules, and a caller-supplied raster responder so a test can hold one
+ * frame's tiles open.
+ */
+async function stubHeatRisk(
+  page: Page,
+  raster: (
+    time: number,
+    route: import('./offline-test').Route
+  ) => Promise<void>
+): Promise<void> {
+  await page.route(
+    (url) => url.pathname.startsWith(HEAT_SERVICE_PATH),
+    async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname.endsWith('/query')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            features: HEAT_TIMES.map((validTime, index) => ({
+              attributes: {
+                name: `HeatRisk_${index + 1}_Mercator`,
+                idp_validtime: validTime
+              }
+            }))
+          })
+        });
+        return;
+      }
+      if (url.pathname.endsWith('/exportImage')) {
+        await raster(Number(url.searchParams.get('time')), route);
+        return;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          timeInfo: {
+            startTimeField: 'idp_validtime',
+            endTimeField: null,
+            timeExtent: [HEAT_TIMES[0], HEAT_TIMES.at(-1)],
+            timeReference: null
+          }
+        })
+      });
+    }
+  );
+}
+
+/**
+ * Begin recording the whole picture every 20 ms. `setInterval`, not
+ * `requestAnimationFrame`: a headless frame callback can be throttled to
+ * nothing, and a sampler that stops sampling would pass this test by
+ * recording no counter-example.
+ */
+async function startContinuitySampler(page: Page, key: string): Promise<void> {
+  await page.evaluate((layerKey) => {
+    const store: { samples: unknown[]; timer: number } = {
+      samples: [],
+      timer: 0
+    };
+    (window as unknown as Record<string, unknown>)['__ddmContinuity'] = store;
+    const shown = (element: Element | null): boolean =>
+      element !== null &&
+      element.getClientRects().length > 0 &&
+      getComputedStyle(element).visibility !== 'hidden';
+    const text = (selector: string): string =>
+      document.querySelector(selector)?.textContent?.trim() ?? '';
+    store.timer = window.setInterval(() => {
+      store.samples.push({
+        pill: text(`[data-layer-status="${layerKey}"]`),
+        indicator: shown(document.getElementById('loading-indicator')),
+        indicatorText: text('#loading-text'),
+        keyLoading: shown(
+          document.querySelector(`#map-key [data-key-loading="${layerKey}"]`)
+        ),
+        stamp: text('#time-bar .time-bar-stamp-headline')
+      });
+    }, 20);
+  }, key);
+}
+
+async function stopContinuitySampler(page: Page): Promise<ContinuitySample[]> {
+  const raw = await page.evaluate(() => {
+    const store = (
+      window as unknown as {
+        __ddmContinuity?: { samples: unknown[]; timer: number };
+      }
+    ).__ddmContinuity;
+    if (!store) return [];
+    window.clearInterval(store.timer);
+    return store.samples;
+  });
+  return raw as ContinuitySample[];
+}
+
+test.describe('DDM-P8-T05 surface continuity across a time change', () => {
+  test('a HeatRisk day change keeps an honest loading state on the map for the whole fetch', async ({
+    page
+  }) => {
+    let releaseDayTwo!: () => void;
+    const dayTwoGate = new Promise<void>((resolve) => {
+      releaseDayTwo = resolve;
+    });
+    await stubHeatRisk(page, async (time, route) => {
+      if (time === HEAT_TIMES[1]) await dayTwoGate;
+      try {
+        await route.fulfill({
+          status: 200,
+          contentType: 'image/png',
+          body: TRANSPARENT_PNG
+        });
+      } catch {
+        // Removing the superseded source cancels its routed requests.
+      }
+    });
+
+    await gotoApp(page, '?layers=heatrisk&view=console');
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await page.locator('#map-key-details-toggle').click();
+    const select = page.locator('#map-key select[data-heatrisk-day]');
+    await expect(select).toHaveValue('1');
+
+    await startContinuitySampler(page, 'heatrisk');
+    await select.selectOption('2');
+    // Day 2's tiles are held, so this window lies entirely inside the fetch.
+    await page.waitForTimeout(700);
+    const samples = await stopContinuitySampler(page);
+    releaseDayTwo();
+
+    const pending = samples.filter((sample) => sample.pill === PILL.loading);
+    // A real window, not one instant: without this the predicate below
+    // would pass vacuously on a transition that was never sampled.
+    expect(pending.length).toBeGreaterThanOrEqual(15);
+    // The acceptance sentence: no sampled instant is surfaceless AND silent.
+    expect(
+      pending.filter((sample) => !sample.indicator && !sample.keyLoading)
+    ).toEqual([]);
+    // And both on-map statements agree with the pill at every instant,
+    // rather than one of them presenting the unpainted frame as live.
+    expect(
+      pending.every((sample) => sample.indicator && sample.keyLoading)
+    ).toBe(true);
+
+    // The loading statement is bounded by the fetch it describes: once the
+    // held tiles land the map reads live and says nothing more.
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await expect(select).toHaveValue('2');
+    await expect(
+      page.locator('#map-key [data-key-loading="heatrisk"]')
+    ).toHaveCount(0);
+    await expect(page.locator('#loading-indicator')).toBeHidden({
+      timeout: 25_000
+    });
+  });
+
+  test('a drought horizon change keeps the previous outlook and says it is still loading', async ({
+    page
+  }) => {
+    let releaseSeasonal!: () => void;
+    const seasonalGate = new Promise<void>((resolve) => {
+      releaseSeasonal = resolve;
+    });
+    const outlookFc = (target: string): unknown => ({
+      type: 'FeatureCollection',
+      features: [
+        {
+          type: 'Feature',
+          properties: {
+            outlook: 'Persistence',
+            fcst_date: '06/30/2026',
+            target
+          },
+          geometry: { type: 'Polygon', coordinates: [PNW_RING] }
+        }
+      ]
+    });
+    await page.route(
+      (url) => url.href.includes('cpc_drought_outlk/MapServer/1/query'),
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: JSON.stringify(outlookFc('Jul 2026'))
+        })
+    );
+    await page.route(
+      (url) => url.href.includes('cpc_drought_outlk/MapServer/4/query'),
+      async (route) => {
+        await seasonalGate;
+        try {
+          await route.fulfill({
+            status: 200,
+            contentType: 'application/geo+json',
+            body: JSON.stringify(outlookFc('September 30'))
+          });
+        } catch {
+          // A superseded range request is aborted, not answered.
+        }
+      }
+    );
+
+    // Drive both drought horizon changes through the chips a person uses.
+    // The first (current to weeks-ahead) is a recipe swap: the North
+    // American Drought Monitor comes off and the CPC Monthly outlook comes
+    // on, and the layer controller's own indicator covers that fetch. The
+    // one this test samples is the second, where the recipe does not
+    // change at all and only the outlook register does, so nothing but
+    // this module's own statement stands between a stale surface and a
+    // silent one.
+    await gotoApp(page, '?view=console');
+    await page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]').click();
+    await expect(layerPill(page, 'drought')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    const headline = page.locator('#time-bar .time-bar-stamp-headline');
+    await expect(headline).toHaveText('Issued Jun 30, 2026 · through Jul 2026');
+
+    await startContinuitySampler(page, 'drought');
+    await page
+      .locator('.shell-horizon-btn[data-horizon="season-ahead"]')
+      .click();
+    await page.waitForTimeout(700);
+    const samples = await stopContinuitySampler(page);
+    releaseSeasonal();
+
+    const pending = samples.filter((sample) => sample.pill === PILL.loading);
+    expect(pending.length).toBeGreaterThanOrEqual(15);
+    // Never blank: the monthly polygons and their stamp stay on the map for
+    // the whole seasonal fetch.
+    expect(
+      pending.every(
+        (sample) => sample.stamp === 'Issued Jun 30, 2026 · through Jul 2026'
+      )
+    ).toBe(true);
+    // Never silently stale: the map names the product it is still fetching
+    // at every one of those instants.
+    expect(pending.filter((sample) => !sample.indicator)).toEqual([]);
+    expect(
+      pending.every(
+        (sample) =>
+          sample.indicatorText ===
+          'Loading the CPC Seasonal Drought Outlook...'
+      )
+    ).toBe(true);
+
+    // The switch completes: the seasonal product replaces the monthly one
+    // and the loading statement is withdrawn.
+    await expect(headline).toHaveText(
+      'Issued Jun 30, 2026 · through September 30',
+      { timeout: 25_000 }
+    );
+    await expect(layerPill(page, 'drought')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await expect(page.locator('#loading-indicator')).toBeHidden({
+      timeout: 25_000
+    });
+  });
+});
+
+test.describe('DDM-P2-T11 time anchors across a mode switch (the heatday rule)', () => {
+  /** An empty answer for the North American Drought Monitor tile source's
+   * vector companion, reached the moment the display switches to Drought. */
+  async function stubNadmEmpty(page: Page): Promise<void> {
+    await page.route('**/NADM-current.geojson', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+      })
+    );
+  }
+
+  /** An empty answer for the Heat cluster's companion alerts layer. */
+  async function stubWwaEmpty(page: Page): Promise<void> {
+    await page.route(
+      (url) =>
+        url.pathname.endsWith(
+          '/eventdriven/rest/services/WWA/watch_warn_adv/MapServer/1/query'
+        ),
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+        })
+    );
+  }
+
+  test('Day 7 survives a valid mode and time restoration', async ({ page }) => {
+    // Well inside the seven-day catalog window, so every phase assertion
+    // below is deterministic regardless of the day the suite runs.
+    await page.clock.setFixedTime(Date.UTC(2026, 6, 29, 18, 0, 0));
+    await stubHeatRisk(page, async (_time, route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        body: TRANSPARENT_PNG
+      });
+    });
+    await stubWwaEmpty(page);
+    await stubNadmEmpty(page);
+
+    await gotoApp(page, '?view=console&cluster=heat&heatday=7');
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await expect(
+      page.locator('#time-bar .time-bar-stamp-detail')
+    ).toContainText('Day 7 of 7');
+    expect(new URLSearchParams(await search(page)).get('heatday')).toBe('7');
+
+    // The mode leg: away from Heat drops the URL's claim to a HeatRisk day
+    // it is no longer honoring (the heatday rule); back to Heat restores it
+    // from the day remembered in src/layers/heatrisk.ts, not from the URL
+    // (which by then carries none).
+    await page.locator('.shell-cluster-btn[data-cluster="drought"]').click();
+    await expect
+      .poll(async () => new URLSearchParams(await search(page)).get('heatday'))
+      .toBeNull();
+
+    await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await expect
+      .poll(async () => new URLSearchParams(await search(page)).get('heatday'))
+      .toBe('7');
+    await expect(
+      page.locator('#time-bar .time-bar-stamp-detail')
+    ).toContainText('Day 7 of 7');
+
+    // The time leg: in Heat, neither other horizon offers an enabled
+    // alternative to click. season-ahead carries no heat surface at all
+    // (src/config/clusters.ts, heat.recipes['season-ahead'] === []) and its
+    // shell button is aria-disabled with the title "No verified season-ahead
+    // Extreme Heat map surface exists yet." weeks-ahead repeats the exact
+    // same recipe as current (['heatrisk', 'nws-alerts']), so
+    // horizonDisabledReason (src/ui/island/shell.tsx) disables it too, with
+    // the title "Near Term shows the same map as Current Conditions here
+    // ..." That no-surface deactivation path is already proven above by the
+    // mode-switch leg (where HeatRisk leaves with the cluster). With no
+    // in-app horizon click reachable from Heat under this stub
+    // configuration, the time half of the rule is proven instead by a
+    // restoration on reload: the URL still carries heatday=7, and a reload
+    // must restore Day 7 from that URL rather than losing it.
+    await page.reload();
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    expect(new URLSearchParams(await search(page)).get('heatday')).toBe('7');
+    await expect(
+      page.locator('#time-bar .time-bar-stamp-detail')
+    ).toContainText('Day 7 of 7');
+  });
+
+  test('with USDM on a past week, every drought claim states the week it read, and a mode switch does not change it silently', async ({
+    page
+  }) => {
+    await stubUsdm(page);
+    await stubHeatRisk(page, async (_time, route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'image/png',
+        body: TRANSPARENT_PNG
+      });
+    });
+    await stubWwaEmpty(page);
+    await stubNadmEmpty(page);
+
+    // week= scrubs the MAP's USDM surface to the prior Tuesday (PRIOR_MS);
+    // the point-click claim reads the issuer's latest map regardless
+    // (DR-091), which this fixture serves at LATEST_MS through the SAME
+    // USDM_current endpoint the map's own current recipe would read.
+    await gotoApp(
+      page,
+      '?view=console&cluster=drought&week=20260623&select=state:WA'
+    );
+
+    const droughtClaim = page.locator('#impact-panel .impact-claim', {
+      hasText: 'U.S. Drought Monitor map dated'
+    });
+    await expect(droughtClaim).toContainText(
+      'the U.S. Drought Monitor map dated Jun 30, 2026'
+    );
+
+    // A round trip through another mode must not silently move the stated
+    // date: the claim is not derived from anything the mode switch touches.
+    await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
+    await page.locator('.shell-cluster-btn[data-cluster="drought"]').click();
+    await expect(droughtClaim).toContainText(
+      'the U.S. Drought Monitor map dated Jun 30, 2026'
+    );
+  });
+});
+
+test.describe('found-030: a Drought boot at an outlook horizon composes the CPC outlook recipe', () => {
+  // Enumerated from clusters.ts (DR-113), never a literal list: the two
+  // horizons whose Drought recipe is the CPC outlook (`current`'s recipe is
+  // the North American Drought Monitor and is deliberately excluded here;
+  // see the pin cases below).
+  const OUTLOOK_HORIZONS = TEMPORAL_HORIZON_KEYS.filter((h) => h !== 'current');
+
+  // The stamp headline the shared stub's fixed fcst_date and per-register
+  // target produce (src/layers/drought.ts's stamp builder), matching the
+  // already-proven strings this file uses above for the same fixture date.
+  const OUTLOOK_HEADLINE: Readonly<Record<string, string>> = {
+    'weeks-ahead': `Issued Jun 30, 2026 · through ${CPC_OUTLOOK_TARGET.monthly}`,
+    'season-ahead': `Issued Jun 30, 2026 · through ${CPC_OUTLOOK_TARGET.seasonal}`
+  };
+
+  for (const horizon of OUTLOOK_HORIZONS) {
+    for (const bootForm of ['no cluster', 'explicit cluster=drought'] as const) {
+      const query =
+        bootForm === 'no cluster'
+          ? `?horizon=${horizon}`
+          : `?cluster=drought&horizon=${horizon}`;
+
+      test(`${bootForm}, horizon=${horizon}: draws the CPC outlook, Drought is pressed, and layers= carries drought`, async ({
+        page
+      }) => {
+        await stubCpcDroughtOutlook(page);
+        await gotoApp(page, query);
+
+        // Predicted red at 531ab66: the Drought fallback ignores the URL's
+        // horizon and always seeds DEFAULT_ON_KEYS, so `drought` stays off
+        // and `nadm-drought` stays on regardless of horizon=.
+        await expect
+          .poll(async () => {
+            const layers = await urlLayers(page);
+            return layers.has('drought') && !layers.has('nadm-drought');
+          })
+          .toBe(true);
+        await expect(layerCheckbox(page, 'drought')).toBeChecked();
+        await expect(layerCheckbox(page, 'nadm-drought')).not.toBeChecked();
+        await expect(
+          page.locator('.shell-cluster-btn[data-cluster="drought"]')
+        ).toHaveAttribute('aria-pressed', 'true');
+
+        // The two outlook horizons render distinct issued content (monthly
+        // versus seasonal target), not merely "some" outlook headline.
+        await expect(
+          page.locator('#time-bar .time-bar-stamp-headline')
+        ).toHaveText(OUTLOOK_HEADLINE[horizon]);
+      });
+    }
+  }
+
+  test('a held CPC outlook response leaves the boot loading, then draws it once released', async ({
+    page
+  }) => {
+    await stubCpcDroughtOutlook(page);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Registered after stubCpcDroughtOutlook (Playwright prefers the most
+    // recently registered route), so only the monthly register this
+    // horizon actually requests is held; the shared stub still answers the
+    // seasonal register if anything unexpectedly reaches it.
+    await page.route(
+      (url) => url.href.includes('cpc_drought_outlk/MapServer/1/query'),
+      async (route) => {
+        await gate;
+        await route
+          .fulfill({
+            status: 200,
+            contentType: 'application/geo+json',
+            body: JSON.stringify(cpcOutlookFixture(CPC_OUTLOOK_TARGET.monthly))
+          })
+          .catch(() => undefined);
+      }
+    );
+
+    await gotoApp(page, '?horizon=weeks-ahead', { bootIdle: false });
+    await expect(layerPill(page, 'drought')).toHaveText(PILL.loading);
+
+    release();
+    await expect(layerPill(page, 'drought')).toHaveText(PILL.live, {
+      timeout: 25_000
+    });
+    await expect(
+      page.locator('#time-bar .time-bar-stamp-headline')
+    ).toHaveText(OUTLOOK_HEADLINE['weeks-ahead']);
+  });
+
+  test('a bare boot and an explicit current-horizon Drought boot both still write the untouched default set', async ({
+    page
+  }) => {
+    // The diagnosed fix must not touch the `current` horizon: both forms
+    // stay on the DEFAULT_ON_KEYS fallback, exactly as before this unit.
+    await gotoApp(page, '');
+    await expect
+      .poll(async () => {
+        const layers = await urlLayers(page);
+        return (
+          layers.size === DEFAULT_ON.length &&
+          (DEFAULT_ON as readonly string[]).every((key) => layers.has(key))
+        );
+      })
+      .toBe(true);
+
+    await gotoApp(page, '?cluster=drought&horizon=current');
+    await expect
+      .poll(async () => {
+        const layers = await urlLayers(page);
+        return (
+          layers.size === DEFAULT_ON.length &&
+          (DEFAULT_ON as readonly string[]).every((key) => layers.has(key))
+        );
+      })
+      .toBe(true);
+  });
+
+  test('an explicit layers= at an outlook horizon keeps exactly what it names (the legacy-link case)', async ({
+    page
+  }) => {
+    // No CPC outlook stub: an explicit layers= must never reach the outlook
+    // service at all, since composeClusterIntent is never consulted on this
+    // path (src/state/url.ts's `params.has('layers')` branch outranks the
+    // Drought fallback).
+    await gotoApp(page, '?horizon=weeks-ahead&layers=nadm-drought');
+    const layers = await urlLayers(page);
+    expect([...layers]).toEqual(['nadm-drought']);
+    await expect(layerCheckbox(page, 'nadm-drought')).toBeChecked();
+    await expect(layerCheckbox(page, 'drought')).not.toBeChecked();
   });
 });

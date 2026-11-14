@@ -2,38 +2,39 @@
  * Fire-in-context composition (0.4.0 unit B1).
  *
  * Clicking a current mapped NIFC fire perimeter composes existing reads for the
- * clicked location into a short "Fire in context" block appended to the
- * perimeter popup: the US Drought Monitor (USDM) class beneath the point, and
- * the nearest telemetry stations from the station registry inside a fixed
- * radius.
+ * clicked location into the perimeter popup: the drought class beneath the
+ * point, read exactly as the place card reads it (src/ui/popup-conditions.ts
+ * `droughtRow`: NADM when it is on, else USDM, with the USDM change register
+ * named rather than read as an absence), and the nearest telemetry stations from the
+ * station registry inside a fixed radius. Since S30D D1 M26a (DDM-P11-T04)
+ * the reads are typed popup-frame rows (`readFireContext`): the drought class
+ * is a value row with its own issuer and map date (plan_rules 3), the fuels
+ * pointer a row, the stations a semantic list whose distances keep their
+ * metres in a tooltip, and the closing statement a qualification.
  *
  * This unit COMPOSES only what is already on the map and in the registry. It
  * deliberately does NOT compute a conditions-based fire potential (drought plus
  * fuels plus weather into a hazard read). The sources stay separate, and the
  * fuels row is only an honest pointer to the separately labeled hazard context.
  *
- * Every branch is honest. When the USDM surface is off, the block says to turn
- * it on rather than inventing a class. When no D0 to D4 polygon covers the
- * point, the block reports that absence without inferring drought-free
- * conditions because this client has no analyzed-area mask. When no curated
+ * Every branch is honest. When no drought surface is on, the block says to turn
+ * one on rather than inventing a class; the absence and loading rows are the
+ * place card's own. When no curated
  * station sits inside the station-list ceiling, the block says so rather than
  * ranking the whole registry and calling a gauge in another region
  * "nearest".
  */
-import * as maplibregl from 'maplibre-gl';
-import type { GeoJsonProperties } from 'geojson';
-import { USDM_CATEGORIES } from '../config/palette';
+import type * as maplibregl from 'maplibre-gl';
 import { STATIC_TELEMETRY_STATION_REGISTRY, distanceMeters } from '../config/station-registry';
-import { escapeHtml } from '../util/escape';
+import type { ListItem, PopupDetail, ValueRow } from '../ui/popup-frame';
+import { droughtRow } from '../ui/popup-conditions';
 import { formatDistanceKm } from './point-heat-format';
 
-/** The USDM frame-slot fill ids (0.5.0b scrubber; mirrors
- * src/ui/conditions-strip.ts). Only the visible slot matches a rendered
- * query, so the read is always the week actually on screen. */
-const USDM_FILLS = ['usdm-frame-a-fill', 'usdm-frame-b-fill'] as const;
+/** The USFS Wildfire Hazard Potential raster layer ids (src/layers/usfs-whp.ts). */
+const WHP_LAYERS = ['usfs-whp', 'usfs-whp-classes'] as const;
 
-/** The USFS Wildfire Hazard Potential raster layer id (src/layers/usfs-whp.ts). */
-const WHP_LAYER = 'usfs-whp';
+/** The Wildfire 3D perimeter-masked fuel risk drape (src/layers/whp-3d.ts). */
+const WHP_3D_DRAPE = 'whp-2023';
 
 /** How many nearest stations to name. */
 const NEAREST_STATION_COUNT = 3;
@@ -59,53 +60,46 @@ const METERS_PER_MILE = 1609.344;
 const NEAREST_STATION_MAX_METERS = NEAREST_STATION_MAX_MILES * METERS_PER_MILE;
 const NEAREST_STATION_MAX_KM = Math.round(NEAREST_STATION_MAX_METERS / 1000);
 
+const FIRE_CONTEXT_NOTE =
+  // vocab-allow: honesty disclaimer, denies being a forecast
+  'A read of separate current and long-term sources around this perimeter, not a fire forecast or a combined fire-risk class.';
+
+/** The fire-in-context reads for one clicked perimeter, as popup-frame rows. */
+export interface FireContext {
+  /** The drought class beneath the click: a condition row with its own issuer and map date where a class is read. */
+  readonly drought: ValueRow;
+  /** The fuels pointer, then the nearest stations (a list, or the stated absence). */
+  readonly details: readonly PopupDetail[];
+  /** The closing statement: separate sources, no forecast, no combined class. */
+  readonly note: string;
+}
+
 /**
- * Build the "Fire in context" HTML block for a clicked perimeter. `point` is
- * the click position in screen pixels (for the point-precise USDM query);
- * `lngLat` is the geographic click position (for the nearest-station distances).
+ * Read the fire-in-context rows for a clicked perimeter. `point` is the click
+ * position in screen pixels (for the point-precise drought query); `lngLat` is
+ * the geographic click position (for the nearest-station distances).
  */
-export function buildFireContextHtml(
+export function readFireContext(
   map: maplibregl.Map,
   point: maplibregl.PointLike,
   lngLat: maplibregl.LngLat
-): string {
-  // vocab-allow: honesty disclaimer, denies being a forecast
-  return `
-    <div class="fire-context">
-      <div class="fire-context-heading">Fire in context</div>
-      ${droughtBeneathRow(map, point)}
-      ${fuelsRow(map)}
-      ${nearestStationsBlock(lngLat)}
-      <p class="fire-context-note">A read of separate current and long-term sources around this perimeter, not a fire forecast or a combined fire-risk class.</p>
-    </div>`;
+): FireContext {
+  return {
+    drought: droughtBeneathRow(map, point),
+    details: [fuelsRow(map), nearestStationsDetail(lngLat)],
+    note: FIRE_CONTEXT_NOTE
+  };
 }
 
-/** The USDM class beneath the clicked point, or an honest off/none state. */
-function droughtBeneathRow(map: maplibregl.Map, point: maplibregl.PointLike): string {
-  const presentFills = USDM_FILLS.filter((id) => map.getLayer(id));
-  if (presentFills.length === 0) {
-    return contextRow(
-      'Drought beneath',
-      'Turn on the US Drought Monitor to read the drought class here.'
-    );
-  }
-
-  const feats = map.queryRenderedFeatures(point, { layers: [...presentFills] });
-  let maxDm = -1;
-  for (const f of feats) {
-    const dm = readDm(f.properties);
-    if (dm !== null && dm > maxDm) maxDm = dm;
-  }
-
-  if (maxDm < 0) {
-    return contextRow(
-      'Drought beneath',
-      'No D0-D4 polygon rendered here. This client has no analyzed-area mask here, so this does not confirm no drought.'
-    );
-  }
-
-  const cat = maxDm < USDM_CATEGORIES.length ? USDM_CATEGORIES[maxDm] : undefined;
-  return contextRow('Drought beneath', cat ? `${cat.code} ${cat.label}` : 'Unknown');
+/**
+ * The drought row beneath the clicked point, as the place card reads it
+ * (`droughtRow`), relabeled for this popup; when no drought surface is on,
+ * the pointer to turn one on.
+ */
+function droughtBeneathRow(map: maplibregl.Map, point: maplibregl.PointLike): ValueRow {
+  const label = 'Drought beneath';
+  const marked = droughtRow(map, point);
+  return marked ? { ...marked.row, label } : { label, text: 'Turn on the US Drought Monitor to read the drought class here.' };
 }
 
 /**
@@ -114,28 +108,32 @@ function droughtBeneathRow(map: maplibregl.Map, point: maplibregl.PointLike): st
  * endpoint. This is an honest pointer: it reflects whether the WHP surface is
  * on and directs the eye to it, and never fakes a hazard class.
  */
-function fuelsRow(map: maplibregl.Map): string {
-  return map.getLayer(WHP_LAYER)
-    ? contextRow(
-        'Fuels and hazard',
-        'Wildfire Hazard Potential is on; read the class from the shaded surface beneath this perimeter.'
-      )
-    : contextRow(
-        'Fuels and hazard',
-        'Turn on Wildfire Hazard Potential to see the fuels hazard here.'
-      );
+function fuelsRow(map: maplibregl.Map): PopupDetail {
+  return {
+    kind: 'row',
+    label: 'Fuels and hazard',
+    // The Wildfire 3D drape draws nothing inside a perimeter (src/layers/whp-3d.ts),
+    // unless the issuer colours row stood it down and draws unmasked itself.
+    text:
+      map.getLayer(WHP_3D_DRAPE) && !map.getLayer('usfs-whp-classes')
+        ? 'In Wildfire 3D, fuel risk is not drawn inside current fire perimeters (NIFC).'
+        : WHP_LAYERS.some((id) => map.getLayer(id))
+          ? 'Wildfire Hazard Potential is on; read the class from the shaded surface beneath this perimeter.'
+          : 'Turn on Wildfire Hazard Potential to see the fuels hazard here.'
+  };
 }
 
 /**
  * The nearest curated telemetry stations to the clicked point, inside
- * NEAREST_STATION_MAX_MILES and never beyond it.
+ * NEAREST_STATION_MAX_MILES and never beyond it, one list item per station.
  *
  * Distances read US customary first with the metric secondary (owner
  * decision 2026-08-31, PR 53), through the same formatter the point-heat
  * read uses so the two surfaces cannot drift; the raw metres the ranking
- * actually compared stay one hover away in the title.
+ * actually compared stay one hover away in the qualifier's title.
  */
-function nearestStationsBlock(lngLat: maplibregl.LngLat): string {
+function nearestStationsDetail(lngLat: maplibregl.LngLat): PopupDetail {
+  const label = 'Nearest monitoring stations';
   const here: readonly [number, number] = [lngLat.lat, lngLat.lng];
   const ranked = STATIC_TELEMETRY_STATION_REGISTRY.map((entry) => ({
     name: entry.station.name,
@@ -145,42 +143,22 @@ function nearestStationsBlock(lngLat: maplibregl.LngLat): string {
     .sort((a, b) => a.meters - b.meters)
     .slice(0, NEAREST_STATION_COUNT);
 
-  if (ranked.length === 0) {
-    return contextRow(
-      'Nearest monitoring stations',
-      `No station in the curated Pacific Northwest station registry is within ` +
+  const [first, ...rest] = ranked.map(
+    (s): ListItem => ({
+      text: s.name,
+      qualifier: { text: formatDistanceKm(s.meters / 1000), title: `${Math.round(s.meters)} m from the clicked point` }
+    })
+  );
+  if (first === undefined) {
+    return {
+      kind: 'row',
+      label,
+      text:
+        `No station in the curated Pacific Northwest station registry is within ` +
         `${NEAREST_STATION_MAX_MILES} miles (${NEAREST_STATION_MAX_KM} km) of ` +
         `this perimeter. Other networks may operate nearer; this reports the ` +
         `registry, not the field.`
-    );
+    };
   }
-
-  const items = ranked
-    .map(
-      (s) =>
-        `<li>${escapeHtml(s.name)} <span class="fire-context-distance" title="${escapeHtml(`${Math.round(s.meters)} m from the clicked point`)}">${escapeHtml(formatDistanceKm(s.meters / 1000))}</span></li>`
-    )
-    .join('');
-  return `
-    <div class="fire-context-block">
-      <div class="fire-context-label">Nearest monitoring stations</div>
-      <ul class="fire-context-stations">${items}</ul>
-    </div>`;
+  return { kind: 'list', label, items: [first, ...rest] };
 }
-
-function contextRow(label: string, value: string): string {
-  return `
-    <div class="fire-context-block">
-      <span class="fire-context-label">${escapeHtml(label)}</span>
-      <span class="fire-context-value">${escapeHtml(value)}</span>
-    </div>`;
-}
-
-/** USDM drought category index (0 = D0 through 4 = D4) from feature properties. */
-function readDm(props: GeoJsonProperties): number | null {
-  if (!props) return null;
-  const raw = props['DM'] ?? props['dm'];
-  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
-  return Number.isInteger(n) ? n : null;
-}
-

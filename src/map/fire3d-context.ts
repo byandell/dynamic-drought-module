@@ -26,6 +26,7 @@
  */
 
 import type * as maplibregl from 'maplibre-gl';
+import { WHP_SHADE_QUALIFICATION } from '../config/whp-shade';
 
 import { activateWhpDrape, deactivateWhpDrape } from '../layers/whp-3d';
 import { getPowerContextState } from '../state/power-context';
@@ -38,19 +39,18 @@ import {
 /** Stable keys for the context layers, in activation order. */
 export type Fire3DContextKey = 'whp' | 'power' | 'structures';
 
-/** What the orchestrator publishes: the active keys, and one embed
- * disclosure line per active key describing exactly what is rendered. */
+/** What the orchestrator publishes: the active keys, and the embed
+ * disclosure lines describing exactly what is rendered (the buildings
+ * add none: nothing about them prints on the map, owner 2026-11-12). */
 export interface Fire3DContextActivation {
   readonly keys: readonly Fire3DContextKey[];
   readonly embedLines: readonly string[];
 }
 
-const WHP_EMBED_LINE =
-  'Hazard colors: USFS Wildfire Hazard Potential 2023, the issuer\'s published classes, a translucent static snapshot at reduced resolution; not current fire conditions.';
-
-/** Exported for the disclosure cross-gate test beside the archive. */
-export const STRUCTURES_EMBED_LINE =
-  'Buildings: Overture footprints (ODbL), central Oregon pilot bake only, drawn from zoom 13; dimmer buildings draw at a disclosed placeholder height.';
+/** The drape can be mounted stood down, so the orchestrator prints this line
+ * only while the last `ddm:whp-shade` event says the drape is mounted. */
+export const WHP_EMBED_LINE =
+  `${WHP_SHADE_QUALIFICATION} Pacific Northwest; reduced resolution.`;
 
 /** Compose the power embed line from the surfaces actually in the scene. */
 export function buildPowerEmbedLine(state: PowerContextState): string {
@@ -89,7 +89,7 @@ export async function activateContextLayers(
       embedLines.push(WHP_EMBED_LINE);
     }
   } catch (err) {
-    console.warn('[fire3d-context] the hazard drape failed to activate.', err);
+    console.warn('[fire3d-context] WHP activation failed.', err);
   }
 
   // Power infrastructure is a CATALOG layer since 2026-08-19 (owner
@@ -104,12 +104,9 @@ export async function activateContextLayers(
   }
 
   try {
-    if (await activateStructures(map, signal)) {
-      keys.push('structures');
-      embedLines.push(STRUCTURES_EMBED_LINE);
-    }
+    if (await activateStructures(map, signal)) keys.push('structures');
   } catch (err) {
-    console.warn('[fire3d-context] the structures context failed to activate.', err);
+    console.warn('[fire3d-context] structures activation failed.', err);
   }
 
   if (signal.aborted) {

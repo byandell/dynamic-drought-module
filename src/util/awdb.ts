@@ -21,6 +21,8 @@
 
 import { URLS } from '../config/urls';
 import { fetchBufferedWithBudget } from './fetch';
+import { isObject } from './guards';
+import { isoDayLocal } from './iso-day';
 import type { StationValue, TelemetryFreshness } from '../types/station';
 
 /** Per-call network budget, matching the popup hydration budget. */
@@ -30,6 +32,8 @@ const FETCH_TIMEOUT_MS = 8000;
 export interface AwdbElementSeries {
   readonly element: string;
   readonly unit: string;
+  /** Sensor depth below the surface in inches (AWDB `heightDepth`, negated), when the element has one. */
+  readonly depthIn?: number;
   readonly readings: ReadonlyArray<{ date: string; value: number }>;
 }
 
@@ -41,14 +45,6 @@ const ELEMENT_LABELS: Readonly<Record<string, { parameter: string; label: string
   SMS: { parameter: 'soil_moisture_pct', label: 'Soil moisture' }
 };
 
-/** Format a Date as the YYYY-MM-DD string the AWDB REST API expects. */
-function isoDay(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
 function buildDataUrl(triplet: string, elements: readonly string[], days: number): string {
   const end = new Date();
   const begin = new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
@@ -56,8 +52,8 @@ function buildDataUrl(triplet: string, elements: readonly string[], days: number
     stationTriplets: triplet,
     elements: elements.join(','),
     duration: 'DAILY',
-    beginDate: isoDay(begin),
-    endDate: isoDay(end)
+    beginDate: isoDayLocal(begin),
+    endDate: isoDayLocal(end)
   });
   return `${URLS.nrcsAwdbRest}?${params.toString()}`;
 }
@@ -109,18 +105,17 @@ function parseAwdbPayload(payload: unknown): AwdbElementSeries[] {
 
   const out: AwdbElementSeries[] = [];
   for (const block of station.data) {
-    const el = (block as { stationElement?: unknown }).stationElement as
-      | { elementCode?: unknown; storedUnitCode?: unknown }
-      | undefined;
-    const values = (block as { values?: unknown }).values;
-    if (!el || typeof el.elementCode !== 'string' || !Array.isArray(values)) continue;
+    if (!isObject(block)) continue;
+    const { stationElement: el, values } = block;
+    if (!isObject(el) || typeof el.elementCode !== 'string' || !Array.isArray(values)) continue;
 
     const readings: Array<{ date: string; value: number }> = [];
     for (const v of values) {
-      const date = (v as { date?: unknown }).date;
-      const value = (v as { value?: unknown }).value;
+      if (!isObject(v)) continue;
+      const { date, value } = v;
       if (typeof date !== 'string') continue;
-      const n = typeof value === 'number' ? value : Number(value);
+      const n = typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')
+        ? Number(value) : NaN;
       if (!Number.isFinite(n)) continue;
       readings.push({ date, value: n });
     }
@@ -128,6 +123,7 @@ function parseAwdbPayload(payload: unknown): AwdbElementSeries[] {
     out.push({
       element: el.elementCode,
       unit: typeof el.storedUnitCode === 'string' ? el.storedUnitCode : '',
+      ...(typeof el.heightDepth === 'number' && el.heightDepth < 0 ? { depthIn: -el.heightDepth } : {}),
       readings
     });
   }
@@ -136,14 +132,14 @@ function parseAwdbPayload(payload: unknown): AwdbElementSeries[] {
 
 /**
  * Freshness for a daily-duration reading date (YYYY-MM-DD, no time
- * component): today or yesterday in local time is `fresh`, older is
- * `stale`. The caller maps "no readings at all" to `unavailable`.
+ * component): measured from the start of that day, `fresh` up to about 60
+ * hours old (a day's reading posts the next day), else `stale`, so the
+ * answer does not flip at the reader's local midnight. The caller maps "no
+ * readings at all" to `unavailable`.
  */
 export function dailyFreshness(latestDate: string): TelemetryFreshness {
-  const today = new Date();
-  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-  if (latestDate === isoDay(today) || latestDate === isoDay(yesterday)) return 'fresh';
-  return 'stale';
+  const t = Date.parse(`${latestDate}T00:00:00`);
+  return Date.now() - t <= 60 * 3_600_000 ? 'fresh' : 'stale';
 }
 
 /**
@@ -156,8 +152,10 @@ export function toStationValue(
   stationId: string,
   series: AwdbElementSeries
 ): StationValue | null {
-  const meta = ELEMENT_LABELS[series.element];
-  if (!meta) return null;
+  const base = ELEMENT_LABELS[series.element];
+  if (!base) return null;
+  // A SCAN station reports soil moisture at several depths; each row names its own.
+  const meta = series.depthIn === undefined ? base : { ...base, label: `${base.label} at ${series.depthIn} in` };
   const latest = series.readings[series.readings.length - 1];
   if (!latest) {
     return {
@@ -186,8 +184,12 @@ export function toStationValue(
 /** The elements DDM requests for a SNOTEL station, in display order. */
 export const SNOTEL_ELEMENTS: readonly string[] = ['WTEQ', 'SNWD', 'PREC'];
 
-/** The elements DDM requests for a SCAN station, in display order. */
-export const SCAN_ELEMENTS: readonly string[] = ['SMS'];
+/**
+ * The elements DDM requests for a SCAN station. AWDB answers a bare `SMS`
+ * with an empty list (observed live 2026-10-12): soil moisture must name a
+ * depth, and `:*` asks for every depth the station has, shallowest first.
+ */
+export const SCAN_ELEMENTS: readonly string[] = ['SMS:*'];
 
 export function elementsForAwdbStationTriplet(triplet: string): readonly string[] {
   return triplet.endsWith(':SCAN') ? SCAN_ELEMENTS : SNOTEL_ELEMENTS;

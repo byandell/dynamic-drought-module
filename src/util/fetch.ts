@@ -1,68 +1,67 @@
 /**
  * Cancellable fetch helpers.
  *
- * Direct ports of `fetchWithBudget` and `sleepUnlessAborted` from the
- * vanilla `app.js` v0.1.x baseline (lines ~1374 to 1413). These are the
- * primitives behind the project's cancellation
+ * These are the primitives behind the project's cancellation
  * invariant: every non-trivial network operation must respect a master
  * cancellation signal AND a per-call timeout, and late-arriving responses
  * to superseded operations are dropped rather than rendered.
  *
  * Browser support note. Modern browsers expose `AbortSignal.any()` for
- * composing multiple signals, but Safari 14 and older WebKit builds do
- * not. README declares Safari 14 as the floor, so the master signal is
+ * composing multiple signals, but WebKit before Safari 17.4 does not.
+ * README declares Safari 15.5 as the floor, so the master signal is
  * composed manually with `addEventListener('abort', ...)` and a hand-
  * rolled timer rather than via `AbortSignal.any()`.
  */
 
 /**
- * `fetch()` wrapper that respects an external "master" cancellation
- * signal AND a per-call timeout. The two are composed manually so this
- * works on Safari 14 plus where `AbortSignal.any()` is not available.
- *
- * Returns the Response. Throws an AbortError on either user-cancel
- * (master signal aborted) or timeout (per-call budget elapsed).
- *
- * @param url          Target URL passed straight to `fetch`.
- * @param opts         Standard `RequestInit`, or `null` for a default GET.
- * @param masterSignal The owning operation's abort signal, or `null` to
- *                     run with timeout-only cancellation.
- * @param timeoutMs    Per-call timeout in milliseconds. After this many
- *                     ms the inner controller aborts.
+ * A request that ran out its own time budget. It is an `AbortError` by name so
+ * every caller that already treats a helper abort as transient keeps working,
+ * and it is told apart from the caller's cancel by `isFetchTimeout`: a cancel
+ * logs nothing, a timeout says the source did not answer in time (B7).
  */
-export async function fetchWithBudget(
-  url: string,
-  opts: RequestInit | null,
-  masterSignal: AbortSignal | null,
-  timeoutMs: number
-): Promise<Response> {
-  const ctrl = new AbortController();
-  if (masterSignal && masterSignal.aborted) {
-    ctrl.abort();
-    throw new DOMException('Aborted', 'AbortError');
-  }
-  const onMasterAbort = (): void => ctrl.abort();
-  if (masterSignal) masterSignal.addEventListener('abort', onMasterAbort);
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...(opts ?? {}), signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
-    if (masterSignal) masterSignal.removeEventListener('abort', onMasterAbort);
+export class FetchTimeoutError extends DOMException {
+  constructor(timeoutMs: number) {
+    super(`Request exceeded its ${timeoutMs} ms budget.`, 'AbortError');
   }
 }
 
+/** True for a budget timeout raised by these helpers, never for a cancel. */
+export function isFetchTimeout(err: unknown): boolean {
+  return err instanceof FetchTimeoutError;
+}
+
 /**
- * Fetch and parse a JSON response while retaining the owning cancellation
- * signal and timeout through response-body consumption.
- *
- * This is intentionally separate from `fetchWithBudget`, whose contract ends
- * when response headers arrive. The response body is read through an explicit
- * reader so an abort can cancel a stalled stream before JSON parsing finishes.
+ * One budget timer: aborts `ctrl` when `timeoutMs` passes, and turns the
+ * resulting abort into a `FetchTimeoutError` unless the master signal also
+ * aborted (that is a cancel and stays an ordinary `AbortError`).
+ */
+function armBudget(
+  ctrl: AbortController,
+  masterSignal: AbortSignal | null,
+  timeoutMs: number
+): { stop: () => void; classify: (err: unknown) => unknown } {
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, timeoutMs);
+  return {
+    stop: () => clearTimeout(timer),
+    classify: (err) =>
+      timedOut && !masterSignal?.aborted && err instanceof DOMException && err.name === 'AbortError'
+        ? new FetchTimeoutError(timeoutMs)
+        : err
+  };
+}
+
+/**
+ * Read the body through an explicit reader so an abort can cancel a stalled
+ * stream before consumption finishes.
  */
 async function readBodyBytes(
   response: Response,
-  signal: AbortSignal
+  signal: AbortSignal,
+  maxDecodedBytes?: number
 ): Promise<ArrayBuffer | null> {
   if (response.body === null) return null;
 
@@ -76,7 +75,7 @@ async function readBodyBytes(
 
   try {
     if (signal.aborted) {
-      await reader.cancel().catch(() => undefined);
+      void reader.cancel().catch(() => undefined);
       throw new DOMException('Aborted', 'AbortError');
     }
 
@@ -84,6 +83,10 @@ async function readBodyBytes(
       const chunk = await reader.read();
       if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
       if (chunk.done) break;
+      if (maxDecodedBytes !== undefined && byteLength + chunk.value.byteLength > maxDecodedBytes) {
+        void reader.cancel().catch(() => undefined);
+        throw new RangeError('Response body exceeded decoded byte limit.');
+      }
       chunks.push(chunk.value);
       byteLength += chunk.value.byteLength;
     }
@@ -105,7 +108,8 @@ export async function fetchJsonWithBudget(
   url: string,
   opts: RequestInit | null,
   masterSignal: AbortSignal | null,
-  timeoutMs: number
+  timeoutMs: number,
+  maxDecodedBytes = 8 * 1024 * 1024
 ): Promise<unknown> {
   const ctrl = new AbortController();
   if (masterSignal && masterSignal.aborted) {
@@ -115,32 +119,49 @@ export async function fetchJsonWithBudget(
 
   const onMasterAbort = (): void => ctrl.abort();
   if (masterSignal) masterSignal.addEventListener('abort', onMasterAbort);
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const budget = armBudget(ctrl, masterSignal, timeoutMs);
 
   try {
     const response = await fetch(url, { ...(opts ?? {}), signal: ctrl.signal });
     if (!response.ok) {
+      ctrl.abort();
       throw new Error(`HTTP ${response.status} ${response.statusText}`);
     }
-    const bytes = await readBodyBytes(response, ctrl.signal);
+    const bytes = await readBodyBytes(response, ctrl.signal, maxDecodedBytes);
     return JSON.parse(new TextDecoder().decode(bytes ?? new Uint8Array())) as unknown;
+  } catch (err) {
+    throw budget.classify(err);
   } finally {
-    clearTimeout(timer);
+    budget.stop();
     if (masterSignal) masterSignal.removeEventListener('abort', onMasterAbort);
   }
 }
 
 /**
  * Fetch a response and retain cancellation ownership until its exact body bytes
- * have arrived. Use this when callers need status and headers before parsing;
- * unlike `fetchWithBudget`, the timeout cannot expire between headers and body.
+ * have arrived. Use this when callers need status and headers before parsing.
+ *
+ * The returned Response carries the original status, statusText and headers
+ * over an in-memory body, so `.ok` checks, `.json()`, `.text()` and
+ * `.arrayBuffer()` read exactly as they would on the network Response and a
+ * caller's error taxonomy (a 404 meaning "no data", a non-OK meaning
+ * "error", an AbortError meaning "superseded") is unchanged; only `.url`,
+ * `.type` and `.redirected` are not carried, and no caller reads them. An
+ * abort of the master signal, or the budget expiring, during the body read
+ * cancels the stream and rejects with an AbortError, as a header-time abort
+ * always did. A null-body status (101, 204, 205, 304) is reconstructed with a
+ * null body because the Response constructor refuses a body there.
  */
 export async function fetchBufferedWithBudget(
   url: string,
   opts: RequestInit | null,
   masterSignal: AbortSignal | null,
-  timeoutMs: number
+  timeoutMs: number,
+  maxDecodedBytes?: number
 ): Promise<Response> {
+  if (maxDecodedBytes !== undefined && (!Number.isSafeInteger(maxDecodedBytes) || maxDecodedBytes <= 0)) {
+    throw new RangeError('Invalid decoded byte limit.');
+  }
   const ctrl = new AbortController();
   if (masterSignal?.aborted) {
     ctrl.abort();
@@ -148,21 +169,48 @@ export async function fetchBufferedWithBudget(
   }
   const onMasterAbort = (): void => ctrl.abort();
   masterSignal?.addEventListener('abort', onMasterAbort);
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const budget = armBudget(ctrl, masterSignal, timeoutMs);
   try {
     const response = await fetch(url, { ...(opts ?? {}), signal: ctrl.signal });
-    const body = await readBodyBytes(response, ctrl.signal);
+    const body = await readBodyBytes(response, ctrl.signal, maxDecodedBytes);
     if (ctrl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
-    return new Response(body, {
+    const nullBodyStatus =
+      response.status === 101 ||
+      response.status === 204 ||
+      response.status === 205 ||
+      response.status === 304;
+    return new Response(nullBodyStatus ? null : body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers
     });
+  } catch (err) {
+    throw budget.classify(err);
   } finally {
-    clearTimeout(timer);
+    budget.stop();
     masterSignal?.removeEventListener('abort', onMasterAbort);
   }
 }
+
+/**
+ * Shared-transport key for the bundled US state boundaries (DDM-P14-T06).
+ * Seven readers across the codebase read `public/data/us-states.geojson`
+ * independently (the states layer's own activation, the click-door fallback
+ * in `location-identity.ts`, the `select=` deep link, the place catalog's
+ * state list, the Place studio's selection and overlap-candidate readers,
+ * and the emphasis-target resolver in `display-snapshot.ts`); this key
+ * collapses them to one page-lifetime fetch regardless of how many of them
+ * run in a session.
+ */
+export const US_STATES_SHARED_KEY = 'us-states-geojson';
+
+/**
+ * Shared-transport key for the bundled ENSO indices snapshot (DDM-P14-T06).
+ * The ENSO briefing claims (`fetchEnsoClaims`) and the ENSO minimap label
+ * (`readEnsoPhaseLabel`) each read `public/data/enso-indices.json`
+ * independently; this key collapses them to one fetch.
+ */
+export const ENSO_INDICES_SHARED_KEY = 'enso-indices-json';
 
 interface SharedJsonRequest {
   promise: Promise<unknown>;
@@ -173,25 +221,46 @@ interface SharedJsonRequest {
 const sharedJsonRequests = new Map<string, SharedJsonRequest>();
 
 /**
- * How many shared transports are in flight right now (DR-052 follow-up, the
- * boot-idle seam). A fulfilled entry stays in `sharedJsonRequests` for the
- * page lifetime by design, so "the map is empty" can never mean "nothing is
- * pending" after the first success; this counter can. It rises when a
- * transport is created and falls when its promise settles either way,
- * including an abort from `invalidateSharedJsonRequest`, and never counts a
- * cached fulfilled entry.
+ * Which shared transports are in flight right now, and how many entries per
+ * key (DR-052 follow-up, the boot-idle seam; DDM-P1-T09 step 2). A fulfilled
+ * entry stays in `sharedJsonRequests` for the page lifetime by design, so
+ * "the map is empty" can never mean "nothing is pending" after the first
+ * success; this set can. It is keyed on the in-flight ENTRY object, not the
+ * key string, because `invalidateSharedJsonRequest` plus an immediate
+ * re-request can leave two in-flight entries under one key: deleting by
+ * string on the first settle would under-count the second. An entry is
+ * added when its transport is created and removed exactly once, when its
+ * promise settles either way (success, failure, timeout, or an abort from
+ * `invalidateSharedJsonRequest`); the removal is a `Map.delete` on the
+ * entry's own identity, so a caller that accidentally settled the same entry
+ * twice is a no-op the second time rather than an undercount hidden by a
+ * clamp.
  */
-let pendingSharedTransports = 0;
+const pendingSharedTransportEntries = new Map<SharedJsonRequest, string>();
 const sharedTransportListeners = new Set<() => void>();
 
-function settleSharedTransport(): void {
-  pendingSharedTransports = Math.max(0, pendingSharedTransports - 1);
+function settleSharedTransport(entry: SharedJsonRequest): void {
+  if (!pendingSharedTransportEntries.delete(entry)) return;
   for (const listener of sharedTransportListeners) listener();
 }
 
 /** The number of shared JSON transports still in flight. */
 export function pendingSharedTransportCount(): number {
-  return pendingSharedTransports;
+  return pendingSharedTransportEntries.size;
+}
+
+/**
+ * The pending shared transport keys right now, each with the count of
+ * in-flight entries under it (normally 1; 2 only in the invalidate-then-
+ * re-request window). Read-only: a caller cannot reach the tracker's state
+ * through the returned object.
+ */
+export function pendingSharedTransportKeys(): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const key of pendingSharedTransportEntries.values()) {
+    counts[key] = (counts[key] ?? 0) + 1;
+  }
+  return counts;
 }
 
 /**
@@ -242,7 +311,7 @@ export function fetchSharedJsonWithBudget(
       controller,
       consumers: 0,
     };
-    pendingSharedTransports += 1;
+    pendingSharedTransportEntries.set(next, key);
     next.promise = fetchJsonWithBudget(
       url,
       opts,
@@ -251,7 +320,7 @@ export function fetchSharedJsonWithBudget(
     ).then(
       (value) => {
         next.controller = null;
-        settleSharedTransport();
+        settleSharedTransport(next);
         return value;
       },
       (error: unknown) => {
@@ -259,7 +328,7 @@ export function fetchSharedJsonWithBudget(
           sharedJsonRequests.delete(key);
         }
         next.controller = null;
-        settleSharedTransport();
+        settleSharedTransport(next);
         throw error;
       },
     );
@@ -294,6 +363,32 @@ export function fetchSharedJsonWithBudget(
 }
 
 /**
+ * Make `child` abort whenever `parent` aborts (DDM-P1-T02, 2026-09-08).
+ *
+ * The layer controller owns one signal per activation attempt and hands it
+ * to the module; the module keeps its own per-fetch controller (the one it
+ * also aborts when a new viewport supersedes the request) and links it here,
+ * so the controller's abort reaches every fetch the module has in flight
+ * without the module exposing a second seam. Composed by hand because
+ * `AbortSignal.any()` is missing from the Safari floor.
+ *
+ * Returns an unlink function; call it when the child's work is over so a
+ * long-lived parent does not accumulate listeners across viewport refreshes.
+ * A parent that is already aborted aborts the child at once. A `null` parent
+ * (a module activated without the seam, as a spec may do) links nothing.
+ */
+export function linkAbort(child: AbortController, parent: AbortSignal | null): () => void {
+  if (!parent) return () => undefined;
+  if (parent.aborted) {
+    child.abort();
+    return () => undefined;
+  }
+  const onAbort = (): void => child.abort();
+  parent.addEventListener('abort', onAbort, { once: true });
+  return () => parent.removeEventListener('abort', onAbort);
+}
+
+/**
  * Sleep for `ms` milliseconds, but resolve early if the signal aborts.
  * Resolves rather than rejects on abort so callers can re-check
  * `signal.aborted` and bail cleanly without a try/catch wrapper.
@@ -311,16 +406,12 @@ export function sleepUnlessAborted(
       resolve();
       return;
     }
-    const timer = setTimeout(resolve, ms);
-    if (signal) {
-      signal.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(timer);
-          resolve();
-        },
-        { once: true }
-      );
-    }
+    const finish = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal?.addEventListener('abort', finish, { once: true });
   });
 }

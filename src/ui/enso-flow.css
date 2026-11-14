@@ -1,0 +1,188 @@
+#enso-flow-controls:empty {
+  display: none;
+}
+
+@media (min-width: 721px) {
+  .enso-flow button, .enso-flow select, #map-key > .map-key-flow-pause { border-radius: 0; }
+}
+
+.sidebar-scroll > #enso-flow-controls {
+  margin-inline: 18px;
+}
+
+.enso-flow {
+  --enso-flow-line: var(--rule-control);
+  --enso-flow-ink: var(--ink);
+  color: var(--enso-flow-ink);
+  padding: 12px 0;
+  border-top: 1px solid var(--enso-flow-line);
+  font-size: 12px;
+}
+
+.enso-flow h3 {
+  font: inherit;
+  font-weight: 650;
+  margin: 0 0 8px;
+}
+
+.enso-flow-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.enso-flow button,
+.enso-flow select {
+  color: inherit;
+  font: inherit;
+  background: var(--surface-overlay);
+  border: 1px solid var(--enso-flow-line);
+  border-radius: var(--radius-sm);
+  min-height: 36px;
+  padding: 6px 8px;
+}
+
+/* Selected inverts, as everywhere else: ink as the face, an even outline,
+   and a rich-black ring inside the face while it holds focus. */
+.enso-flow button[aria-pressed="true"] {
+  forced-color-adjust: none; /* FORCED COLOURS, app.css */
+  --selection-shadow: var(--selected-focus-inset);
+  border-color: var(--face-selected);
+  background: var(--face-selected);
+  color: var(--ink-on-selected);
+  font-weight: var(--fw-strong);
+  box-shadow: none;
+}
+
+.enso-flow button:focus-visible,
+.enso-flow select:focus-visible,
+.enso-flow summary:focus-visible {
+  outline: 2px solid var(--focus-inner);
+  outline-offset: 0;
+  box-shadow: 0 0 0 4px var(--focus-outer), var(--selection-shadow, 0 0 transparent);
+}
+
+.enso-flow-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 8px;
+}
+
+.enso-flow-toolbar[hidden] {
+  display: none;
+}
+
+.enso-flow-toolbar label {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+}
+
+.enso-flow-status {
+  margin: 8px 0 4px;
+  line-height: 1.45;
+}
+
+.enso-flow details {
+  margin-top: 6px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+}
+
+/* At least 24 x 24 CSS px on desktop (SC 2.5.8, found-020); 44 px on touch below. */
+.enso-flow summary {
+  min-height: 24px;
+  cursor: pointer;
+  align-content: center;
+}
+
+.enso-flow details p {
+  margin: 6px 0;
+}
+
+.enso-flow a {
+  color: var(--ink);
+  text-decoration: underline;
+}
+
+@media (pointer: coarse), (max-width: 720px) {
+  .enso-flow button,
+  .enso-flow select,
+  .enso-flow summary {
+    min-height: 44px;
+  }
+}
+
+/* E1-4 (ENSO-FLOW-PLAN.md; C-fit.md 1.8): the flowing paths' Pause toggle
+   in the map key's collapsed header, after the chip. The key host turns
+   into a two-column grid only while the toggle shows (data-flow-motion,
+   set by src/ui/map-key.ts), so every other key keeps its layout exactly.
+   The target is at least 24 x 24 CSS px (SC 2.5.8), 40 px on touch. */
+#app #map-key[data-flow-motion]:not([hidden]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+#map-key[data-flow-motion] > .map-key-details-toggle {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+#map-key[data-flow-motion] > .map-key-content {
+  grid-column: 1 / -1;
+  grid-row: 2;
+}
+
+#map-key > .map-key-flow-pause {
+  grid-column: 2;
+  grid-row: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  width: 28px;
+  height: 28px;
+  margin: 0 6px;
+  padding: 0;
+  color: var(--fg-1, #e2e8f0);
+  background: transparent;
+  border: 1px solid var(--line-strong, #334155);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+#map-key > .map-key-flow-pause[hidden] {
+  display: none;
+}
+
+#map-key > .map-key-flow-pause:focus-visible {
+  outline: 2px solid var(--focus-inner);
+  outline-offset: 0;
+  box-shadow: 0 0 0 4px var(--focus-outer);
+}
+
+#map-key > .map-key-flow-pause svg {
+  fill: currentColor;
+}
+
+#map-key > .map-key-flow-pause .map-key-flow-pause-play,
+#map-key > .map-key-flow-pause[data-paused='true'] .map-key-flow-pause-bars {
+  display: none;
+}
+
+#map-key > .map-key-flow-pause[data-paused='true'] .map-key-flow-pause-play {
+  display: inline;
+}
+
+@media (pointer: coarse), (max-width: 720px) {
+  #map-key > .map-key-flow-pause {
+    width: 40px;
+    height: 40px;
+    margin: 0 0 0 6px;
+  }
+}

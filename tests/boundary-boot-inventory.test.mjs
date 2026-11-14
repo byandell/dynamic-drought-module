@@ -114,7 +114,17 @@ const LIVE_BOUNDARY_MODE = /boundar[a-z]*[^\n]*['"]live['"]/i;
  */
 const ROUTE_HOMES = [
   { home: 'tests/tribal-fixtures.ts', marker: BOUNDARY_MARKER, family: 'boundary' },
-  { home: 'tests/minimap-fixtures.ts', marker: MINIMAP_MARKER, family: 'minimap analysis' }
+  { home: 'tests/minimap-fixtures.ts', marker: MINIMAP_MARKER, family: 'minimap analysis' },
+  // DDM-P9-T13: the Wildfire 3D dryness ground's NOAA STAR and USGS RG arms
+  // (installDefaultDrynessStub); a spec sets an arm, never its own route.
+  {
+    home: 'tests/helpers.ts',
+    marker: /STAR_VHI_TILE_PATH|USGS_RG_WMS|star\.nesdis\.noaa\.gov|firedanger_rg_conus_week_data/,
+    family: 'dryness ground'
+  },
+  // ENSO block B3: the tropical MapServer's arms (installDefaultTropicalStub);
+  // a spec names an arm through gotoApp's `tropical` option.
+  { home: 'tests/tropical-fixtures.ts', marker: /NHC_tropical_weather|TROPICAL_SERVICE_PATH|isTropicalRequestUrl/, family: 'tropical cyclones' }
 ];
 
 /**
@@ -141,25 +151,55 @@ const LIVE_BOUNDARY_ALLOWANCE = {
  * `routeAllTribalFixtures` or `routeBoundary` for exactly that reason).
  */
 const DIRECT_BOOT_REASONS = {
+  'tests/fonts.spec.ts': {
+    sites: 1,
+    reason:
+      'after gotoApp supplies built stylesheet URLs, an isolated same-origin routed font specimen navigates without application scripts; boundary and minimap stubs are explicitly installed on the specimen before navigation'
+  },
+  'tests/place-popups.spec.ts': {
+    sites: 1,
+    reason:
+      'the briefing-door animation test renders the shipped serializer and stylesheet in an isolated document without app scripts; it explicitly installs boundary and minimap stubs before setContent and retains the offline context'
+  },
+  'tests/offline-boundary.spec.ts': {
+    sites: 5,
+    reason:
+      'the routing regression navigates only to its own loopback text sentinel and about:blank; no application boots, and it installs the boundary and minimap stubs before navigation as well as inheriting the global offline context'
+  },
   'tests/helpers.ts': {
     sites: 1,
     reason:
       'this is gotoApp itself, the one navigation the whole suite is funnelled through, and it installs the suite-wide stub immediately before it'
   },
   'tests/boot-without-map.spec.ts': {
-    sites: 1,
+    sites: 2,
     reason:
-      'boots with WebGL 2 removed (DR-035 a), where gotoApp cannot apply because it asserts the generated sidebar that only builds once a map exists; the spec installs the boundary and minimap stubs itself before navigating'
+      'boots with WebGL 2 removed (DR-035 a), twice (the second with sidebar=closed, found-084), where gotoApp cannot apply because it asserts the generated sidebar that only builds once a map exists; the spec installs the boundary and minimap stubs itself before each navigation'
   },
   'tests/deployment-subpath.spec.ts': {
     sites: 1,
     reason:
       'boots the production artifact from the GitHub Pages subpath mount, which gotoApp does not model'
   },
+  'tests/precedence.spec.ts': {
+    sites: 1,
+    reason:
+      'D1 M7: the one rawNavigate site serves the held-entry boot (S1, at the root and the Pages-like subpath mount), which never reaches DOMContentLoaded; the F7, F8 and S6 cases and the copied-Share recipients, which frame the app in a synthesized same-origin host; and the real bfcache case, which leaves a gotoApp-booted page for a synthesized same-origin away page. installRawBootStubs installs the boundary, minimap, NADM, NIFC, CPC and SPC stubs by hand before every raw app boot'
+  },
   'tests/embed-viewport.spec.ts': {
     sites: 1,
     reason:
       'navigates to a synthesized host page that frames the app in an iframe at the minimum embed width'
+  },
+  'tests/interface-responsive.spec.ts': {
+    sites: 3,
+    reason:
+      'three DDM-P10-T05 fixtures paint a synthetic document to prove the collision audit reads clipped geometry in both directions; no application boots, and the describe installs both stubs before each'
+  },
+  'tests/island-chunk-isolation.spec.ts': {
+    sites: 1,
+    reason:
+      'one case needs a view=brief non-embed boot whose island chunk is deliberately broken; gotoApp waits unconditionally on the catalog for any boot that is not a brief embed, so it cannot express a boot where the catalog is expected to stay absent, and the helper installs the same suite-wide stubs by hand before navigating'
   },
   'tests/island-premount.spec.ts': {
     sites: 1,
@@ -183,10 +223,38 @@ const DIRECT_BOOT_REASONS = {
 };
 
 /**
- * Modules allowed to create a second Page, with the reason. Empty today, and
- * that is the point: the first one to appear fails this test.
+ * Modules allowed to create a second Page, with the reason. Three entries
+ * today (the frame census and the PF3 tier rows joined on 2026-10-01).
+ * The first one to appear failed this test, which is what it is for: the
+ * decision below was made deliberately, at the tripwire, and written down.
+ *
+ * A precision limit worth knowing before adding an entry: the SECOND_PAGE
+ * pattern matches the CALL textually and cannot tell a popup in an existing
+ * context (the shape this tripwire was built for, which arrives with its own
+ * unstubbed boot) from the first and only page of a brand new context (which
+ * is just an ordinary boot in a clean profile). Both read as a second Page
+ * here, so an entry has to say which shape it is.
  */
-const SECOND_PAGE_REASONS = {};
+const SECOND_PAGE_REASONS = {
+  'tests/fonts.spec.ts':
+    'the second Page isolates lazy font loading from the application DOM; it inherits the offline context, explicitly installs boundary and minimap stubs before its routed same-origin specimen navigation, and closes in finally',
+  'tests/identify-paths.spec.ts': {
+    reason:
+      'the D1 M24 to M26 frame census (tests/frame-fixtures.ts): one fresh page in the SAME context per migrated builder, so one fixture\'s page routes and viewport never reach the next. Not a popup: each page is created by the spec and booted by its fixture through gotoApp, which installs the suite stubs (the same stub story as the census boots before them), and each fixture routes its own data.'
+  },
+  'tests/popup-viewport.spec.ts': {
+    reason:
+      'the D1 M23 PF3 tier rows over migrated builders (tests/frame-fixtures.ts): one fresh page in the SAME context per migrated builder, so one fixture\'s page routes and viewport never reach the next. Not a popup: each page is created by the spec and booted by its fixture through gotoApp, which installs the suite stubs; a fixture routes its own data and never clicks an external link (the source links are hit-tested, not followed).'
+  },
+  'tests/mode-switch-cost.spec.ts': {
+    reason:
+      'the DDM-P14-T08 mode-switch measurement (DR-095): one page per FRESH browser.newContext(), not a popup in an existing context, because each of the twelve ordered switches has to be measured from cold caches or the previous switch pays for this one. Every one of those pages boots through gotoApp, so it installs the same satellite, sovereign-boundary and minimap stubs as any other boot in this suite, and no page here reaches a live sovereign-geography service. It installs the offline context backstop before page creation and uses the default deterministic feed fixtures. The spec runs only in its own chromium-measure project, which CI never invokes.'
+  },
+  'tests/flow-measure.spec.ts': {
+    reason:
+      'the ENSO-FLOW-PLAN E2-2 flow measurement (section 4.2): one page per FRESH browser.newContext(), not a popup in an existing context, because every condition is measured three times from a cold page and one condition must not pay for the previous one. Every page boots through gotoApp, so it installs the same satellite, boundary, minimap, NADM, NIFC, NWS and NOAA NODD suite stubs as any boot here; the spec adds its own SST and basemap-tile routes and a context backstop that aborts and logs any other host, so no page reaches a live service. The spec runs only in the chromium-measure project, which CI never invokes.'
+  }
+};
 
 /**
  * Modules allowed to call `page.screenshot()`, with the reason and the site
@@ -205,6 +273,16 @@ const SCREENSHOT_REASONS = {
     sites: 1,
     reason:
       'reads the map canvas back as a buffer to assert rendered colour bands in the test itself, and never attaches it'
+  },
+  'tests/map-chrome-icons.spec.ts': {
+    sites: 1,
+    reason:
+      'decodes crops of the desktop column icons in the test itself to measure their optical centring (S30D D1 M9), and never attaches them'
+  },
+  'tests/wildfire3d-ground.spec.ts': {
+    sites: 1,
+    reason:
+      'decodes a crop of the 3D ground in the test itself to prove a revised STAR week is drawn on re-entry (DDM-P9-T13), and never attaches it'
   }
 };
 
@@ -225,6 +303,11 @@ const UNROUTE_REASONS = {
     sites: 1,
     reason:
       'replaces its own satellite tile fixture with an aborting handler for the tile-failure path, in the module that owns that route'
+  },
+  'tests/flow-wire.spec.ts': {
+    sites: 1,
+    reason:
+      'the off-intent case holds the two NODD message ranges with its own page.route for the NODD bucket (the .idx falls through to the suite stub), then page.unroute drops that one holding route so the same page can read wind again from the suite-wide NODD stub and show a moving field; the route it removes is its own, the context-level suite stub is never touched'
   }
 };
 
@@ -432,6 +515,25 @@ test('the suite-wide stubs route the browser context, so a Page nobody opened is
   assert.match(fixtures, /await context\.route\(BOUNDARY_PATTERNS\[service\]/);
   assert.match(minimap, /await context\.route\(NA_LAND_BASE_ROUTE/);
   assert.match(minimap, /await context\.route\(NUNAVUT_ANALYSIS_ROUTE/);
+});
+
+test('the shared boot helper installs the WFIGS default on the context before it navigates (J12)', async () => {
+  const helpers = await readFile(join(TESTS_DIR, 'helpers.ts'), 'utf8');
+  const wildfire = await readFile(join(TESTS_DIR, 'wildfire-fixtures.ts'), 'utf8');
+  const urls = await readFile(join(ROOT, 'src/config/urls.ts'), 'utf8');
+  const gotoApp = helpers.slice(helpers.indexOf('export async function gotoApp'));
+  const body = gotoApp.slice(0, gotoApp.indexOf('page.goto('));
+  assert.match(
+    body,
+    /await installDefaultNifcStub\(page, options\.nifc \?\? 'fixture'\);/,
+    'gotoApp must install the WFIGS default stub before it navigates'
+  );
+  // Context routing, so a Page nobody opened is covered and a spec's own
+  // page route still wins; and the service name the stub matches is still
+  // the one the runtime's URL carries.
+  assert.match(wildfire, /await context\.route\(\s*\(url\) => isNifcRequestUrl\(url\.href\)/);
+  assert.match(wildfire, /const NIFC_SERVICE_NAME = 'WFIGS_Interagency_Perimeters_Current';/);
+  assert.match(urls, /\/WFIGS_Interagency_Perimeters_Current\/FeatureServer\/0'/);
 });
 
 test('the fixture route patterns still match the URLs the runtime builds', async () => {

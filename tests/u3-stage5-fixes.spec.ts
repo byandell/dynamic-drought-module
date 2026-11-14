@@ -1,5 +1,6 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 import type * as maplibregl from 'maplibre-gl';
+import type { Polygon } from 'geojson';
 
 import { gotoApp } from './helpers';
 import { BIA_ROUTE, routeBoundary } from './tribal-fixtures';
@@ -75,7 +76,7 @@ test.describe('U3 stage-5: located-boundary clear seam (major 4)', () => {
     return { map, state };
   }
 
-  const GEOM = { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] } as const;
+  const GEOM: Polygon = { type: 'Polygon', coordinates: [[[0, 0], [1, 0], [1, 1], [0, 0]]] };
 
   let dispose: (() => void) | null = null;
   test.afterEach(() => {
@@ -197,6 +198,75 @@ test.describe('U3 stage-5: honest search failure states (major 5)', () => {
     );
   });
 
+  test('after a failed roster load a keystroke does not retry; a new search does', async ({
+    page
+  }) => {
+    // Every roster request fails until `hold` is set; after that the retry is
+    // held on a gate so its in-flight state can be inspected. Typed holders,
+    // as in the minor-8 case below, because the closures assign them.
+    const roster: {
+      hold: boolean;
+      requests: number;
+      release: (() => void) | null;
+      requested: (() => void) | null;
+    } = { hold: false, requests: 0, release: null, requested: null };
+    const gate = new Promise<void>((resolve) => {
+      roster.release = resolve;
+    });
+    const retryRequested = new Promise<void>((resolve) => {
+      roster.requested = resolve;
+    });
+    await page.route('**/data/tribal-roster.json', async (route) => {
+      roster.requests += 1;
+      if (!roster.hold) {
+        await route.fulfill({ status: 500, contentType: 'text/plain', body: 'boom' });
+        return;
+      }
+      roster.requested?.();
+      await gate;
+      await route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({ meta: {}, areas: [] })
+      });
+    });
+
+    await gotoApp(page, '?view=console');
+    const input = page.locator(CONSOLE_SEARCH);
+    await input.fill('washingto');
+
+    const unavailable = page.locator('#catalog-search .ddm-search-unavailable');
+    const loading = page.locator('#catalog-search .ddm-search-loading');
+    const washington = page.locator(
+      '#catalog-search [data-search-kind="place"][data-search-id="WA"]'
+    );
+    await expect(unavailable).toContainText('Tribal land area search is unavailable');
+    await expect(washington).toBeVisible();
+    const failedRequests = roster.requests;
+
+    // The next keystroke lands in a list already on screen: no retry, so no
+    // late roster can push Washington out from under a pointer.
+    roster.hold = true;
+    await input.press('n');
+    await expect(input).toHaveValue('washington');
+    await expect(loading).toHaveCount(0);
+    await expect(unavailable).toBeVisible();
+    await expect(washington).toBeVisible();
+    expect(roster.requests).toBe(failedRequests);
+
+    // Clearing the box and typing again begins a new search, which retries.
+    await input.fill('');
+    await input.fill('washingto');
+    await retryRequested;
+    expect(roster.requests).toBe(failedRequests + 1);
+    await expect(loading).toBeVisible();
+    await expect(washington).toHaveCount(0);
+
+    roster.release?.();
+    await expect(washington).toBeVisible();
+    await expect(unavailable).toHaveCount(0);
+    await expect(loading).toHaveCount(0);
+  });
+
   test('a failed live BIA locate surfaces a toast, never a silent no-op', async ({ page }) => {
     // The bundled roster loads normally; only the live AIAN-LAR locate dies.
     await routeBoundary(page, BIA_ROUTE, (route) => route.abort());
@@ -212,7 +282,7 @@ test.describe('U3 stage-5: honest search failure states (major 5)', () => {
 
     const toast = page.locator('#copy-toast');
     await expect(toast).toBeVisible();
-    await expect(toast).toContainText('Could not reach the BIA land area service');
+    await expect(toast).toContainText('Could not reach the BIA Land Area Representation (AIAN-LAR) service');
   });
 });
 
@@ -244,12 +314,15 @@ test.describe('U3 stage-5: embed-exit Brief search (minor 7)', () => {
 // ---------------------------------------------------------------------------
 
 test.describe('U3 stage-5: item-keyed keyboard highlight (minor 8)', () => {
-  test('async Tribal results do not move the highlight off the chosen row', async ({ page }) => {
-    // Hold the roster response until the highlight is placed, then release
-    // it; the resolved Tribal group inserts ABOVE the Layers group.
-    let releaseRoster: (() => void) | null = null;
+  test('async Tribal results never shift rows already on screen', async ({ page }) => {
+    // Hold the roster response, then release it; the resolved Tribal group
+    // renders ABOVE the Layers group.
+    // A typed holder, not a bare `let`: the Promise executor's assignment
+    // happens inside a closure TypeScript cannot see from the read site
+    // below, which would otherwise narrow the binding to `null`.
+    const rosterRelease: { release: (() => void) | null } = { release: null };
     const gate = new Promise<void>((resolve) => {
-      releaseRoster = resolve;
+      rosterRelease.release = resolve;
     });
     await page.route('**/data/tribal-roster.json', async (route) => {
       await gate;
@@ -278,23 +351,17 @@ test.describe('U3 stage-5: item-keyed keyboard highlight (minor 8)', () => {
     const layerRow = page.locator(
       '#catalog-search [data-search-kind="layer"][data-search-id="aiannh"]'
     );
-    await expect(layerRow).toBeVisible();
+    // The Tribal group sits first: while it loads, rows below it are held
+    // back, so the roster landing never slides a row out from under a pointer.
+    await expect(page.locator('#catalog-search .ddm-search-loading')).toBeVisible();
+    await expect(layerRow).toHaveCount(0);
 
-    // Highlight the layer row while the Tribal group is still pending.
-    await input.press('ArrowDown');
-    await expect(layerRow).toHaveAttribute('aria-selected', 'true');
-
-    // The roster lands; its group renders above Layers, shifting positions.
-    releaseRoster?.();
+    // The roster lands; its group renders above Layers.
+    rosterRelease.release?.();
     await expect(
       page.locator('#catalog-search [data-search-kind="tribal"][data-search-id="Tribal Highlight Fixture"]')
     ).toBeVisible();
-
-    // The highlight stayed on the ITEM, not the position.
-    await expect(layerRow).toHaveAttribute('aria-selected', 'true');
-    const active = page.locator('#catalog-search [role="option"][aria-selected="true"]');
-    await expect(active).toHaveCount(1);
-    await expect(active).toHaveAttribute('data-search-kind', 'layer');
+    await expect(layerRow).toBeVisible();
   });
 });
 
@@ -348,10 +415,9 @@ test.describe('U3 stage-5 round 2: LARNAME abort on supersede and close', () => 
       if (req.url().includes('BIA_AIAN_National_LAR')) larAborted = true;
     });
 
-    // A briefing is already open via the select= deep link (an explicitly
-    // direct open; the SEARCH path is summary-first under D-0.7.0-070 and
-    // no longer opens the panel), so the panel's close control exists
-    // while the locate is in flight.
+    // A briefing is already open via the select= deep link, so the panel's
+    // close control exists while the locate is in flight (the held LAR
+    // query never lets the search pick open its own briefing).
     // The BIA route above holds its response open on purpose, so the boot
     // cannot settle: opt out of the boot-idle wait.
     await gotoApp(page, '?view=console&select=state:WA', { bootIdle: false });

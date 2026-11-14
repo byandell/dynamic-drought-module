@@ -17,12 +17,16 @@
 import type * as maplibregl from 'maplibre-gl';
 import type { GeoJsonProperties } from 'geojson';
 
+import { getSelectedHazard } from '../../state/cluster-service';
 import { registry } from '../../state/registry';
 import { timeline } from '../../state/timeline';
-import { NADM_CATEGORIES, USDM_CATEGORIES } from '../../config/palette';
+import { HAZARD_CLUSTERS, HEAT_FIRE_ALERTS } from '../../config/clusters';
+import { NADM_CATEGORIES, USDM_CATEGORIES, readUsdmDm } from '../../config/palette';
+import { normalizeNadmYearMonth } from '../../util/nadm-collection';
 import { getLayerDef } from '../../config/layers';
 import { classifyNifcIncidentType } from '../../config/wildfire-presentation';
 import { resolveStatusPillText } from './pill-text';
+import { isChecked } from './bridge';
 
 // ---------------------------------------------------------------------------
 // Layer keys and fill-layer ids
@@ -44,6 +48,7 @@ const USDM_FILLS = ['usdm-frame-a-fill', 'usdm-frame-b-fill'] as const;
 // swaps the absolute categories for the 1-week / 4-week change view.
 const USDM_CHANGE_FILL = 'usdm-change-fill';
 const NADM_KEY = 'nadm-drought';
+const NADM_SOURCE = 'nadm-drought-areas';
 const NADM_FILL = 'nadm-drought-fill';
 
 const ALERTS_KEY = 'nws-alerts';
@@ -51,6 +56,16 @@ const ALERTS_FILL = 'nws-alerts-fill';
 
 const FIRES_KEY = 'nifc-fires';
 const FIRES_FILL = 'nifc-fires-fill';
+
+/** Only these sources can change the rendered readings in this strip. */
+export const CONDITIONS_METRIC_SOURCES: ReadonlySet<string> = new Set([
+  NADM_SOURCE,
+  'usdm-frame-a',
+  'usdm-frame-b',
+  'usdm-change',
+  ALERTS_KEY,
+  FIRES_KEY
+]);
 
 export interface Metric {
   /** Headline value: a category code, a count, or an em-dash-free placeholder. */
@@ -75,16 +90,6 @@ export interface Metric {
 // Property readers (defensive; the ESRI GeoJSON casing is uppercase canonical
 // with lowercase fallbacks observed in the layer modules)
 // ---------------------------------------------------------------------------
-
-function readInt(raw: unknown): number | null {
-  const n = typeof raw === 'number' ? raw : Number(raw);
-  return Number.isFinite(n) ? Math.trunc(n) : null;
-}
-
-function readDm(props: GeoJsonProperties): number | null {
-  if (!props) return null;
-  return readInt(props['DM'] ?? props['dm']);
-}
 
 function readMapDateMs(props: GeoJsonProperties): number | null {
   if (!props) return null;
@@ -175,21 +180,39 @@ function pendingMetric(key: string): Metric {
  * `active || loading` tracks the checkbox intent without reaching for
  * DOM. Keeps the button semantics stable across the whole lifecycle
  * (off, loading, ready, zero, error; guardrail spec).
+ *
+ * A key whose activation failed but stays checked (a recipe member of the
+ * committed cluster, D1 M5, 2026-09-27) is not registered active; it counts
+ * as on here so its pressed tile reads the pending "unavailable" state, not
+ * "Layer off". A failed key the controller unchecked stays off.
  */
 function isLayerOn(key: string): boolean {
-  return registry.getActiveKeys().has(key) || registry.getStatus(key) === 'loading';
+  const status = registry.getStatus(key);
+  return (
+    registry.getActiveKeys().has(key) ||
+    status === 'loading' ||
+    (status === 'error' && isChecked(key))
+  );
+}
+
+/** A drawn layer whose source has not finished tiling: loading, never an absence. */
+function sourceLoadingMetric(): { metric: Metric; dateMs: null } {
+  return { metric: { value: '-', sublabel: resolveStatusPillText('loading'), tone: 'loading' }, dateMs: null };
 }
 
 export function droughtMetric(
   map: maplibregl.Map,
   preferredKey: typeof USDM_KEY | typeof NADM_KEY = NADM_KEY
-): { metric: Metric; dateMs: number | null } {
+): { metric: Metric; dateMs: number | null; dateLabel?: string } {
   if (isLayerOn(NADM_KEY)) {
     if (!map.getLayer(NADM_FILL)) {
       return { metric: pendingMetric(NADM_KEY), dateMs: null };
     }
     const features = map.queryRenderedFeatures({ layers: [NADM_FILL] });
     if (features.length === 0) {
+      // Registry ready means the source was installed, not that its worker
+      // tiles have rendered. An unfinished source cannot establish absence.
+      if (!map.isSourceLoaded(NADM_SOURCE)) return sourceLoadingMetric();
       return {
         metric: {
           value: 'No polygon',
@@ -206,6 +229,24 @@ export function droughtMetric(
       if (index > maxIndex) maxIndex = index;
     }
     const category = maxIndex >= 0 ? NADM_CATEGORIES[maxIndex] : undefined;
+    // Read the NADM consensus month from the rendered features so the
+    // conditions strip can display it (the NADM surface carries YEAR_MONTH
+    // at month precision, not the day-precision MapDate that USDM uses).
+    let nadmDateMs: number | null = null;
+    let nadmDateLabel: string | undefined;
+    for (const f of features) {
+      const ym = normalizeNadmYearMonth(f.properties?.['YEAR_MONTH']);
+      if (ym !== null) {
+        const [y, m] = ym.split('-').map(Number);
+        nadmDateMs = Date.UTC(y!, m! - 1, 1);
+        nadmDateLabel = new Intl.DateTimeFormat('en-US', {
+          month: 'long',
+          year: 'numeric',
+          timeZone: 'UTC'
+        }).format(new Date(nadmDateMs));
+        break;
+      }
+    }
     return category
       ? {
           metric: {
@@ -214,7 +255,8 @@ export function droughtMetric(
             tone: 'data',
             color: category.color
           },
-          dateMs: null
+          dateMs: nadmDateMs,
+          ...(nadmDateLabel != null ? { dateLabel: nadmDateLabel } : {})
         }
       : {
           metric: {
@@ -266,6 +308,8 @@ export function droughtMetric(
 
   const feats = map.queryRenderedFeatures({ layers: [...presentFills] });
   if (feats.length === 0) {
+    // As NADM above: an unfinished slot source cannot establish absence.
+    if (presentFills.some((id) => !map.isSourceLoaded(id.replace(/-fill$/, '')))) return sourceLoadingMetric();
     // The USDM surface supplies D0 through D4 polygons, but this client has
     // no analyzed-area mask. A zero rendered-feature query proves only that
     // no category polygon is drawn here, not that the view is drought-free.
@@ -282,7 +326,7 @@ export function droughtMetric(
   let maxDm = -1;
   let dateMs: number | null = null;
   for (const f of feats) {
-    const dm = readDm(f.properties);
+    const dm = readUsdmDm(f.properties);
     if (dm !== null && dm > maxDm) maxDm = dm;
     const d = readMapDateMs(f.properties);
     if (d !== null) dateMs = d; // every feature carries the same weekly MapDate
@@ -310,12 +354,19 @@ export function alertsMetric(map: maplibregl.Map): Metric {
   if (!map.getLayer(ALERTS_FILL)) return pendingMetric(ALERTS_KEY);
   const feats = map.queryRenderedFeatures({ layers: [ALERTS_FILL] });
   const n = countDistinct(feats, (p) =>
-    [p?.['prod_type'], p?.['onset'], p?.['ends'], p?.['wfo']].join('|')
+    [p?.['event'], p?.['onset'], p?.['ends'], p?.['issuer']].join('|')
   );
+  // A pending, failed or cut-off read cannot establish absence: never a zero (a nonzero count is kept).
+  const status = registry.getStatus(ALERTS_KEY);
+  if (n === 0 && (status === 'loading' || status === 'error' || status === 'degraded')) {
+    return pendingMetric(ALERTS_KEY);
+  }
+  const heatFire = HAZARD_CLUSTERS[getSelectedHazard()].alerts === HEAT_FIRE_ALERTS;
   return {
     value: String(n),
-    // vocab-allow: counts the NWS heat/fire alert products, upstream data
-    sublabel: n === 1 ? 'heat/fire alert' : 'heat/fire alerts',
+    // DRAFT wording (pending the owner's read-back) for any other set: the chip's and the place row's own words.
+    // vocab-allow: counts the NWS alert products the mode asks for, upstream data
+    sublabel: heatFire ? (n === 1 ? 'heat/fire alert' : 'heat/fire alerts') : n === 1 ? 'NWS alert' : 'NWS alerts',
     tone: n > 0 ? 'data' : 'none'
   };
 }
@@ -342,6 +393,10 @@ export function firesMetric(map: maplibregl.Map): Metric {
       p?.['IncidentName']
     )
   );
+  // Never a zero while the request is in flight or after it failed (the source
+  // still holds the previous view's perimeters); a nonzero count is kept.
+  const status = registry.getStatus(FIRES_KEY);
+  if (n === 0 && (status === 'loading' || status === 'error')) return pendingMetric(FIRES_KEY);
   return {
     value: String(n),
     sublabel:
@@ -361,11 +416,19 @@ export function firesMetric(map: maplibregl.Map): Metric {
 // older than two full cycles means at least one release was missed: the upstream
 // has frozen or drifted and the map is showing an old week. That is the
 // "confident-looking stale map" harm from critical-review #6, so we flag it.
-const USDM_STALE_AFTER_MS = 14 * 24 * 60 * 60 * 1000;
+// The NADM consensus month (dated its first day) is published 2 to 3 weeks after
+// month-end, so the newest month is at most about 80 days old; past 92 days at
+// least one monthly release was missed.
+const DAY_MS = 24 * 60 * 60 * 1000;
+const STALE_AFTER_MS = { usdm: 14 * DAY_MS, 'nadm-drought': 92 * DAY_MS };
 
-/** True when a USDM MapDate is old enough that the feed has plainly stopped updating. */
-export function isUsdmStale(dateMs: number | null, nowMs = Date.now()): boolean {
-  return dateMs !== null && nowMs - dateMs > USDM_STALE_AFTER_MS;
+/** True when a drought surface's date is old enough that its feed has plainly stopped updating. */
+export function isDroughtStale(
+  key: keyof typeof STALE_AFTER_MS,
+  dateMs: number | null,
+  nowMs = Date.now()
+): boolean {
+  return dateMs !== null && nowMs - dateMs > STALE_AFTER_MS[key];
 }
 
 /** Compact "Mon D, YYYY" from a millisecond epoch, in UTC to match the USDM release date. */

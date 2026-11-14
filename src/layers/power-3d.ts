@@ -75,8 +75,8 @@ import {
   showLegend
 } from '../ui/legend-registry';
 import {
-  buildPowerLinePopupHtml,
-  buildPowerPlantPopupHtml
+  buildPowerLinePopupModel,
+  buildPowerPlantPopupModel
 } from '../ui/power-popups';
 import { fetchJsonWithBudget } from '../util/fetch';
 import { probeArchiveHeader } from '../util/pmtiles-probe';
@@ -94,6 +94,15 @@ const PLANTS_CLUSTER_LAYER_ID = 'power-plants-clusters';
 const PLANTS_CLUSTER_COUNT_LAYER_ID = 'power-plants-cluster-count';
 const LEGEND_KEY = 'power-context';
 const PLANTS_TIMEOUT_MS = 15_000;
+/**
+ * After a build that left a half missing, read that half again after each
+ * of these delays in turn (found-125). A first read that starts inside the
+ * 3D scene's startup stall can outlive its budget only because the page was
+ * busy, and nothing used to read it again, so the layer said partial until
+ * someone toggled it. Bounded: three more reads at most, then the partial
+ * (or unavailable) state stands.
+ */
+const RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
 
 /** The self-hosted fontstack; MapLibre's implicit default is not hosted. */
 const GLYPH_FONT = 'Noto Sans Regular';
@@ -119,6 +128,11 @@ let controller: AbortController | null = null;
 let zoomWatcher: (() => void) | null = null;
 /** The last status written, so a camera move cannot re-announce it. */
 let lastStatus: LayerStatus | null = null;
+/** The pending re-read of a missing half, and how many this build has used. */
+let retryTimer: ReturnType<typeof setTimeout> | undefined;
+let retriesUsed = 0;
+/** The reporting period of the plants drawn; a zoom back above the gate reuses them. */
+let plantsPeriodLabel: string | null = null;
 
 function plantsQueryUrl(): string {
   const params = new URLSearchParams({
@@ -192,6 +206,7 @@ export function deactivate(map: maplibregl.Map): void {
  * `deactivate`, so a slow EIA read stops immediately.
  */
 export function cancelActivation(): void {
+  clearTimeout(retryTimer);
   controller?.abort();
   controller = null;
 }
@@ -209,8 +224,9 @@ export function bindPopups(map: maplibregl.Map): void {
       const name = feature.properties?.['Plant_Name'];
       return typeof name === 'string' && name.length > 0 ? name : 'Power plant';
     },
+    // The plant's frame model (S30D D1 M26b), painted by the coordinator.
     respond: (feature) => ({
-      content: buildPowerPlantPopupHtml(feature.properties ?? {})
+      model: buildPowerPlantPopupModel(feature.properties ?? {})
     })
   });
 
@@ -218,8 +234,9 @@ export function bindPopups(map: maplibregl.Map): void {
     kind: 'point-event',
     layerIds: [LINES_LAYER_ID, LINES_UNKNOWN_LAYER_ID],
     label: () => 'Transmission line',
+    // The line's frame model (S30D D1 M26b), painted by the coordinator.
     respond: (feature) => ({
-      content: buildPowerLinePopupHtml(feature.properties ?? {})
+      model: buildPowerLinePopupModel(feature.properties ?? {})
     })
   });
 
@@ -270,9 +287,11 @@ export function bindPopups(map: maplibregl.Map): void {
  * Reconcile the layer with the current camera. Called on activation and on
  * every settled camera move; idempotent, and safe to re-enter because a
  * newer call aborts the older one's in-flight work through the shared
- * controller.
+ * controller. `retry` is the timed re-read of a half the last build could
+ * not draw (RETRY_DELAYS_MS): it reads only what is missing and keeps the
+ * partial or unavailable status it is trying to lift until it succeeds.
  */
-async function syncForZoom(map: maplibregl.Map): Promise<void> {
+async function syncForZoom(map: maplibregl.Map, retry = false): Promise<void> {
   if (map.getZoom() < POWER_MIN_ZOOM) {
     // Nothing is drawn below the gate (every layer carries the same
     // minzoom), so the legend must not claim otherwise, and the composed
@@ -284,18 +303,26 @@ async function syncForZoom(map: maplibregl.Map): Promise<void> {
     return;
   }
   const built = getPowerContextState();
-  if (built !== null) {
+  if (built !== null && !retry) {
     // Already built and still above the gate: an ordinary pan must not
     // re-render the legend or re-announce the status.
     setStatusOnce(built.linesOn && built.plantsOn ? 'ready' : 'degraded');
     return;
   }
 
+  // A fresh build earns a fresh set of re-reads.
+  if (!retry) retriesUsed = 0;
   const signal = renewSignal();
-  setStatusOnce('loading');
-  const state = await buildSurfaces(map, signal);
+  if (!retry) setStatusOnce('loading');
+  const state = await buildSurfaces(map, signal, built);
   // A newer sync (or a teardown) superseded this one; it owns the outcome.
   if (signal.aborted) return;
+  if (!state?.linesOn || !state.plantsOn) {
+    const delay = RETRY_DELAYS_MS[retriesUsed++];
+    if (delay !== undefined) {
+      retryTimer = setTimeout(() => void syncForZoom(map, true), delay);
+    }
+  }
   if (state === null) {
     setStatusOnce('error');
     return;
@@ -306,6 +333,7 @@ async function syncForZoom(map: maplibregl.Map): Promise<void> {
 }
 
 function renewSignal(): AbortSignal {
+  clearTimeout(retryTimer);
   controller?.abort();
   controller = new AbortController();
   return controller.signal;
@@ -324,15 +352,19 @@ function setStatusOnce(status: LayerStatus): void {
 }
 
 /**
- * Add lines (baked) and plants (live) independently. Returns the
- * activation state, or null when both sources failed.
+ * Add lines (baked) and plants (live) independently, skipping a half that
+ * `prev` already drew. Returns the activation state, or null when both
+ * sources failed.
  */
 async function buildSurfaces(
   map: maplibregl.Map,
-  signal: AbortSignal
+  signal: AbortSignal,
+  prev: PowerContextState | null
 ): Promise<PowerContextState | null> {
-  const linesOn = await activateLines(map, signal);
-  const periodLabel = await activatePlants(map, signal);
+  const linesOn = prev?.linesOn || (await activateLines(map, signal));
+  const periodLabel = prev?.plantsOn
+    ? prev.periodLabel
+    : await activatePlants(map, signal);
   const plantsOn = periodLabel !== null;
   if (!linesOn && !plantsOn) return null;
   return { linesOn, plantsOn, periodLabel };
@@ -346,9 +378,39 @@ function showPowerLegend(state: PowerContextState): void {
     POWER_SHARED_QUALIFICATION
   ].join(' ');
 
+  // DR-163 (a), S30D D1 M22: one visible credit naming the federal source
+  // and the Esri host, rendered in the power layer's own key whenever a
+  // power surface draws (each line only while its surface draws).
+  const credits = [
+    // ledger: eia-power-plants; esri-fuc-power-plants-host (cite sheet c04)
+    ...(state.plantsOn
+      ? [
+          `Power plants: Source: U.S. Energy Information Administration (reporting period ${state.periodLabel}), Forms EIA-860/860M, via the Esri Federal User Community (ArcGIS Living Atlas) copy.`
+        ]
+      : []),
+    // ledger: esri-fuc-transmission-lines-host (cite sheet c05; DR-163)
+    ...(state.linesOn
+      ? [
+          'Transmission lines: U.S. Electric Power Transmission Lines (U.S. Government), archived copy last updated 2024-09-30, via the Esri Federal User Community.'
+        ]
+      : [])
+  ];
+
   showLegend(LEGEND_KEY, {
     order: LEGEND_ORDER.event + 4,
-    render: (body) =>
+    render: (body) => {
+      renderPowerSwatches(body);
+      for (const text of credits) {
+        const line = document.createElement('p');
+        line.className = 'legend-note legend-credit';
+        line.dataset['powerCredit'] = '';
+        line.textContent = text;
+        body.append(line);
+      }
+    }
+  });
+
+  function renderPowerSwatches(body: HTMLElement): void {
       renderSwatchLegend(
         body,
         'Power infrastructure',
@@ -376,8 +438,8 @@ function showPowerLegend(state: PowerContextState): void {
             : [])
         ],
         qualification
-      )
-  });
+      );
+  }
 }
 
 async function activateLines(
@@ -452,6 +514,7 @@ async function activatePlants(
   map: maplibregl.Map,
   signal: AbortSignal
 ): Promise<string | null> {
+  if (plantsPeriodLabel !== null && map.getSource(PLANTS_SOURCE_ID)) return plantsPeriodLabel;
   let body: FeatureCollection;
   try {
     // fetchJsonWithBudget keeps the BODY READ inside the timeout and the
@@ -529,7 +592,8 @@ async function activatePlants(
       reassertThematicOrder(map);
       reassertLabelOrder(map);
     }
-    return periodLabelOf(body);
+    plantsPeriodLabel = periodLabelOf(body);
+    return plantsPeriodLabel;
   } catch (err) {
     console.warn('[power-3d] power-plant setup failed.', err);
     removePlantSurfaces(map);
@@ -538,6 +602,7 @@ async function activatePlants(
 }
 
 function removePlantSurfaces(map: maplibregl.Map): void {
+  plantsPeriodLabel = null;
   for (const layerId of [
     PLANTS_LAYER_ID,
     PLANTS_CLUSTER_COUNT_LAYER_ID,

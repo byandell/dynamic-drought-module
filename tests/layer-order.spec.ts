@@ -1,4 +1,6 @@
-import { test, expect } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+
+import { test, expect } from './offline-test';
 
 import {
   BOTTOM_STACK_IDS,
@@ -55,34 +57,34 @@ test.describe('layer-order: bottom-stack insertion', () => {
   test('satellite inserted late lands under an existing hillshade and data', () => {
     const map = fakeMap([
       'background',
-      'basemap',
+      'base-land',
       'hillshade',
       'usdm-fill'
     ]);
-    // Recent satellite skips the persistent basemap pair, so its anchor is
-    // hillshade: it inserts below hillshade, inside the stack.
+    // Recent satellite skips the base map's ground (src/map/satellite.ts), so its
+    // anchor is hillshade: it inserts below hillshade, inside the stack.
     const beforeId = firstLayerIdAbove(
       map as never,
-      ['background', 'basemap']
+      BOTTOM_STACK_IDS.slice(0, BOTTOM_STACK_IDS.indexOf('basemap-satellite'))
     );
     expect(beforeId).toBe('hillshade');
   });
 
   test('hillshade inserted late lands above satellite and under data', () => {
-    const map = fakeMap(['background', 'basemap', 'basemap-satellite', 'ecoregions-l3-fill']);
+    const map = fakeMap(['background', 'base-land', 'basemap-satellite', 'ecoregions-l3-fill']);
     const beforeId = firstLayerIdAbove(map as never, BOTTOM_STACK_IDS);
     expect(beforeId).toBe('ecoregions-l3-fill');
   });
 
   test('a bottom-stack-only style appends at the top (undefined anchor)', () => {
-    const map = fakeMap(['background', 'basemap', 'basemap-satellite']);
+    const map = fakeMap(['background', 'base-land', 'basemap-satellite']);
     expect(firstLayerIdAbove(map as never, BOTTOM_STACK_IDS)).toBeUndefined();
   });
 
   test('a data layer skipping the whole stack lands above satellite AND hillshade', () => {
     // The ecoregions case that failed the adversarial review: satellite or
     // hillshade activated FIRST must not become a data layer's beforeId.
-    const map = fakeMap(['background', 'basemap', 'basemap-satellite', 'hillshade', 'states-line']);
+    const map = fakeMap(['background', 'base-land', 'basemap-satellite', 'hillshade', 'states-line']);
     const beforeId = firstLayerIdAbove(map as never, [
       ...BOTTOM_STACK_IDS,
       'ecoregions-l3-fill',
@@ -94,17 +96,17 @@ test.describe('layer-order: bottom-stack insertion', () => {
 
 test.describe('layer-order: label reassert', () => {
   test('a surface activated after the labels is moved back under them', () => {
-    const map = fakeMap(['background', 'basemap', 'us-places-labels', 'usdm-fill']);
+    const map = fakeMap(['background', 'base-land', 'us-places-labels', 'usdm-fill']);
     // The controller calls reassertLabelOrder after each activation; the
     // labels move back to the very top.
     reassertLabelOrder(map as never);
-    expect(map.order()).toEqual(['background', 'basemap', 'usdm-fill', 'us-places-labels']);
+    expect(map.order()).toEqual(['background', 'base-land', 'usdm-fill', 'us-places-labels']);
   });
 
   test('no-op when the labels layer is absent', () => {
-    const map = fakeMap(['background', 'basemap', 'usdm-fill']);
+    const map = fakeMap(['background', 'base-land', 'usdm-fill']);
     reassertLabelOrder(map as never);
-    expect(map.order()).toEqual(['background', 'basemap', 'usdm-fill']);
+    expect(map.order()).toEqual(['background', 'base-land', 'usdm-fill']);
   });
 });
 
@@ -128,6 +130,28 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
     expect(idx('aiannh-fill')).toBeLessThan(idx('bia-reservations-fill'));
   });
 
+  test('the national border draws above the Drought fill (owner item 12)', () => {
+    const idx = (id: string): number => THEMATIC_STACK_IDS.indexOf(id);
+    expect(idx('nadm-drought-fill')).toBeGreaterThanOrEqual(0);
+    expect(idx('nadm-drought-fill')).toBeLessThan(idx('us-states-outline'));
+    expect(idx('nadm-drought-fill')).toBeLessThan(idx('us-states-casing'));
+    // The outline layer's filter carries kind 'country' as well as 'state'.
+    const states = readFileSync(new URL('../src/layers/states.ts', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+    const filter = states.match(/const STATE_LINES = \{[\s\S]*?\n\};/)?.[0] ?? '';
+    expect(filter).toContain("'country'");
+    expect(filter).toContain("'state'");
+  });
+
+  test('the coast lines draw above the Drought fill, casings under the lines (owner, 2026-11-13)', () => {
+    const idx = (id: string): number => THEMATIC_STACK_IDS.indexOf(id);
+    for (const id of ['us-coast-casing', 'us-coast-lakes-casing', 'us-coast-outline', 'us-coast-lakes-outline']) {
+      expect(idx(id), id).toBeGreaterThan(idx('nadm-drought-fill'));
+      expect(idx(id), id).toBeLessThan(idx('aiannh-fill'));
+    }
+    expect(idx('us-coast-lakes-casing')).toBeLessThan(idx('us-states-outline'));
+    expect(idx('us-states-outline')).toBeLessThan(idx('us-coast-outline'));
+  });
+
   test('the complete chain has explicit condition, event, and reference bands', () => {
     // The 3D Fire context overlays (W-CTX) seat between condition
     // surfaces and event overlays: infrastructure context reads over the
@@ -138,12 +162,16 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
       ...EVENT_OVERLAY_IDS,
       ...REFERENCE_BOUNDARY_IDS
     ]);
+    // The 3D edge fade veils the seam above every drape, below the context overlays.
+    expect(CONDITION_SURFACE_IDS.at(-1)).toBe('fire3d-terrain-edge');
+    expect(BOTTOM_STACK_IDS).not.toContain('fire3d-terrain-edge');
     expect(CONDITION_SURFACE_IDS).toEqual(
       expect.arrayContaining([
         'gridded-index-raster',
         'sst-anomaly',
         'heatrisk',
         'usfs-whp',
+        'usfs-whp-classes',
         'nadm-drought-fill',
         'cdm-drought-fill',
         'bc-drought-fill'
@@ -165,7 +193,7 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
     // then AIANNH (each appended above the last, as insertion would).
     const map = fakeMap([
       'background',
-      'basemap',
+      'base-land',
       'hillshade',
       'us-states-fill',
       'us-states-outline',
@@ -175,13 +203,15 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
       'bia-reservations-outline',
       'aiannh-fill',
       'aiannh-outline',
+      'aiannh-nation-labels',
       'us-places-labels'
     ]);
     reassertThematicOrder(map as never);
     reassertLabelOrder(map as never);
+    // The Nations' names read above the city names, so MapLibre places them first.
     expect(map.order()).toEqual([
       'background',
-      'basemap',
+      'base-land',
       'hillshade',
       'usdm-frame-a-fill',
       'usdm-frame-a-outline',
@@ -191,14 +221,15 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
       'aiannh-outline',
       'bia-reservations-fill',
       'bia-reservations-outline',
-      'us-places-labels'
+      'us-places-labels',
+      'aiannh-nation-labels'
     ]);
   });
 
   test('a surface activated last still lands below the boundary chain', () => {
     const map = fakeMap([
       'background',
-      'basemap',
+      'base-land',
       'aiannh-fill',
       'bia-reservations-fill',
       'usdm-frame-a-fill'
@@ -206,7 +237,7 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
     reassertThematicOrder(map as never);
     expect(map.order()).toEqual([
       'background',
-      'basemap',
+      'base-land',
       'usdm-frame-a-fill',
       'aiannh-fill',
       'bia-reservations-fill'
@@ -216,7 +247,7 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
   test('events stay above conditions and below references; ecoregions stay below', () => {
     const map = fakeMap([
       'background',
-      'basemap',
+      'base-land',
       'ecoregions-l3-fill',
       'bia-reservations-fill',
       'nifc-fires-fill',
@@ -226,7 +257,7 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
     reassertThematicOrder(map as never);
     expect(map.order()).toEqual([
       'background',
-      'basemap',
+      'base-land',
       'ecoregions-l3-fill',
       'usdm-frame-a-fill',
       'nifc-fires-fill',
@@ -235,10 +266,47 @@ test.describe('layer-order: thematic reassert (E1 deliverable 2)', () => {
     ]);
   });
 
+  test('ENSO-FLOW-PLAN E2-1: flow-paths and the still ids take the old ENSO arrow seat, above the SST and below every outline', () => {
+    const idx = (id: string): number => CONDITION_SURFACE_IDS.indexOf(id);
+    const flowIds = ['flow-still-casing', 'flow-still', 'flow-still-marks', 'flow-paths'];
+    for (const id of flowIds) {
+      expect(idx(id), `${id} is in the condition band`).toBeGreaterThanOrEqual(0);
+      expect(idx(id), `${id} sits above the SST and the Nino box`).toBeGreaterThan(idx('nino34-box-line'));
+      expect(idx(id), `${id} sits below the Nino 3.4 label, which the paths must not invert`).toBeLessThan(idx('nino34-box-label'));
+      expect(idx(id), `${id} sits below heatrisk, as the old arrows did`).toBeLessThan(idx('heatrisk'));
+    }
+    // The still layers paint casing first. The sampled current arrows are gone: currents draw through these ids too.
+    expect(flowIds.map(idx)).toEqual([...flowIds.map(idx)].sort((a, b) => a - b));
+    expect(CONDITION_SURFACE_IDS.filter((id) => id.startsWith('enso-flow'))).toEqual([]);
+    // A late custom layer is re-seated under the Tribal outlines and the labels.
+    const map = fakeMap(['background', 'base-land', 'sst-anomaly', 'tribal-lands-outline', 'us-places-labels', 'flow-paths', 'flow-still']);
+    reassertThematicOrder(map as never);
+    reassertLabelOrder(map as never);
+    expect(map.order()).toEqual(['background', 'base-land', 'sst-anomaly', 'flow-still', 'flow-paths', 'tribal-lands-outline', 'us-places-labels']);
+  });
+
+  test('the precipitable water shade seats above the SST and the Nino box, under the paths, the storms, every outline and the labels', () => {
+    const idx = (id: string): number => CONDITION_SURFACE_IDS.indexOf(id);
+    // A dated SST frame inserts directly under the Nino box's line, so the shade must sit above the box to stay above it.
+    expect(idx('flow-shade')).toBe(idx('nino34-box-line') + 1);
+    expect(idx('flow-shade')).toBe(idx('flow-still-casing') - 1);
+    expect(idx('flow-shade')).toBeGreaterThan(idx('sst-anomaly'));
+    const map = fakeMap(['background', 'base-land', 'sst-anomaly', 'nino34-box-line', 'tropical-cyclones-points', 'us-states-outline', 'us-places-labels', 'flow-shade']);
+    reassertThematicOrder(map as never);
+    reassertLabelOrder(map as never);
+    expect(map.order()).toEqual(['background', 'base-land', 'sst-anomaly', 'nino34-box-line', 'flow-shade', 'tropical-cyclones-points', 'us-states-outline', 'us-places-labels']);
+    // A dated SST frame (inserted under the Nino box's line by its own module) is never the anchor: it stays put
+    // and the chain, outlines included, re-seats above it.
+    const dated = fakeMap(['background', 'base-land', 'sst-anomaly', 'nino34-box-fill', 'sst-frame-2026-09-06', 'nino34-box-line', 'us-states-outline', 'us-places-labels', 'flow-shade']);
+    reassertThematicOrder(dated as never);
+    reassertLabelOrder(dated as never);
+    expect(dated.order()).toEqual(['background', 'base-land', 'sst-frame-2026-09-06', 'sst-anomaly', 'nino34-box-fill', 'nino34-box-line', 'flow-shade', 'us-states-outline', 'us-places-labels']);
+  });
+
   test('idempotent: a second pass changes nothing', () => {
     const map = fakeMap([
       'background',
-      'basemap',
+      'base-land',
       'bia-reservations-fill',
       'usdm-frame-a-fill',
       'aiannh-fill',

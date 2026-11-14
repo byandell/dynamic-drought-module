@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './offline-test';
 import { gotoApp } from './helpers';
 import { stubRecentSatellite } from './satellite-fixture';
 import { routeAllTribalFixtures } from './tribal-fixtures';
@@ -217,9 +217,19 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
     // and the credits links must land in the panel DOM.
     const infoButton = embedded.locator('#map-info-btn');
     await expect(infoButton).toBeVisible();
+    // This raw boot has no boot-idle wait, and the canvas above is visible
+    // before the disclosure is wired (initMapInformation runs after the map
+    // is made). The credits pointer is built in the same synchronous pass
+    // that binds the button's click, so its presence is the wired signal;
+    // a click before it opened nothing and read zero pointers (run
+    // 43391207193, green on the retry).
+    await expect(embedded.locator('#map-info-attribution button[data-open-acknowledgements]')).toHaveCount(1);
     await infoButton.click();
+    // Value-only migration (S30D D1 M22, DR-162): the credits line holds
+    // the pointer to the Acknowledgements; no credit rides the map itself
+    // since DDM's own base map (DDM-P17-T12).
     expect(
-      await embedded.locator('#map-info-attribution a').count()
+      await embedded.locator('#map-info-attribution button[data-open-acknowledgements]').count()
     ).toBeGreaterThan(0);
     await page.keyboard.press('Escape');
 
@@ -247,7 +257,7 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
     }
   });
 
-  test('an oversized Heat key collapses to its scale essentials behind the chevron (W2-D4)', async ({
+  test('an oversized Heat key opens once and scrolls within the narrow embed', async ({
     page
   }) => {
     await stubHeatRiskService(page);
@@ -284,20 +294,11 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
 
     const key = page.locator('#map-key');
     const content = page.locator('#map-key-content');
-    const expander = page.locator('#map-key-expand');
+    const indicator = page.locator('#map-key-details-toggle');
     await expect(key).toBeVisible();
-    await expect(key.locator('[data-heatrisk-scale]')).toBeVisible();
-    await expect(key.locator('[data-nws-products-key]')).toBeVisible();
-
-    // The measured overflow collapses the key to the shared collapsed
-    // capacity (190px at this short viewport) instead of letting it
-    // consume half the iframe, and the chevron discloses the rest.
-    await expect(expander).toBeVisible();
-    await expect(expander).toHaveAttribute('aria-expanded', 'false');
-    const collapsed = await content.evaluate(
-      (element) => element.getBoundingClientRect().height
-    );
-    expect(collapsed).toBeLessThanOrEqual(195);
+    await expect(content).toBeHidden();
+    await expect(page.locator('#map-key-expand')).toHaveCount(0);
+    await expect(indicator).toHaveAttribute('aria-expanded', 'false');
     const collapsedKey = await key.evaluate((element) => {
       const box = element.getBoundingClientRect();
       return { top: box.top, bottom: box.bottom, left: box.left, right: box.right };
@@ -318,16 +319,19 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
       sat.top < collapsedKey.bottom;
     expect(intersects, 'the collapsed key overlaps the SAT control').toBe(false);
 
-    // Bounded expansion: the expanded content grows but stays inside the
-    // viewport, and the chevron reports its state.
-    await expander.click();
-    await expect(expander).toHaveAttribute('aria-expanded', 'true');
-    await expect(key).toHaveAttribute('data-key-expanded', 'true');
+    // One disclosure reveals the full source key. Extra rows scroll within
+    // its map bounds and are reachable without a second expansion control.
+    await indicator.click();
+    await expect(indicator).toHaveAttribute('aria-expanded', 'true');
+    await expect(key.locator('[data-heatrisk-scale]')).toBeVisible();
+    await expect(key.locator('[data-nws-products-key]')).toBeVisible();
+    await content.focus();
+    await page.keyboard.press('End');
     await expect
       .poll(() =>
-        content.evaluate((element) => element.getBoundingClientRect().height)
+        content.evaluate((element) => element.scrollTop)
       )
-      .toBeGreaterThan(collapsed);
+      .toBeGreaterThan(0);
     const expandedKey = await key.evaluate((element) => {
       const box = element.getBoundingClientRect();
       return { top: box.top, bottom: box.bottom };
@@ -335,8 +339,9 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
     expect(expandedKey.top).toBeGreaterThanOrEqual(0);
     expect(expandedKey.bottom).toBeLessThanOrEqual(600);
 
-    await expander.click();
-    await expect(expander).toHaveAttribute('aria-expanded', 'false');
+    await indicator.click();
+    await expect(indicator).toHaveAttribute('aria-expanded', 'false');
+    await expect(content).toBeHidden();
   });
 
   test('an NWS alert popup fits the 200px embed with its agency and vintage legible', async ({
@@ -415,15 +420,22 @@ test.describe('Embed at 200x600 (minimum-width iframe floor)', () => {
       .toBe('ok');
 
     // The agency line and the product vintage (From / Until) are rendered,
-    // inside the viewport, and legible (a real text size, not clipped).
-    await expect(content.locator('.popup-title')).toHaveText('Heat Advisory');
-    const agency = content.locator('.popup-agency');
+    // inside the viewport, and legible (a real text size, not clipped). The
+    // alert is a framed card (S30D D1 M26b): the frame's title, the issuer
+    // line naming the office, the product name verbatim in the value slot,
+    // the head clock (From) and Until in the body's more-clocks slot.
+    await expect(content.locator('[data-popup-frame]')).toHaveCount(1);
+    await expect(content.locator('[data-popup-slot="title"]')).toHaveText('National Weather Service alert');
+    const agency = content.locator('[data-popup-slot="issuer"]');
     await expect(agency).toBeVisible();
-    await expect(agency).toHaveText('NOAA NWS · Active Alert');
-    const vintageRows = content.locator('.popup-treaty-meta');
-    await expect(vintageRows.nth(0)).toContainText('From:');
-    await expect(vintageRows.nth(1)).toContainText('Until:');
-    for (const row of [agency, vintageRows.nth(0), vintageRows.nth(1)]) {
+    await expect(agency).toHaveText('Issued by: NOAA NWS, office PDT');
+    await expect(content.locator('[data-popup-slot="value"]')).toHaveText('Heat Advisory');
+    const vintageRows = [content.locator('[data-popup-slot="clock"] > p'), content.locator('[data-popup-slot="more-clocks"] > p')];
+    await expect(vintageRows[0]!).toHaveCount(1);
+    await expect(vintageRows[1]!).toHaveCount(1);
+    await expect(vintageRows[0]!).toContainText('From');
+    await expect(vintageRows[1]!).toContainText('Until');
+    for (const row of [agency, vintageRows[0]!, vintageRows[1]!]) {
       const rowBox = await row.boundingBox();
       expect(rowBox).not.toBeNull();
       expect(rowBox!.x).toBeGreaterThanOrEqual(-1);

@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 
 import {
   FRAMINGS,
@@ -123,9 +123,10 @@ test.describe('S1 hazard clusters (D-0.7.0-042/043/044)', () => {
     expect(current).not.toContain('usfs-whp');
   });
 
-  test('ENSO v1 is the shipped SST anomaly surface at every horizon (D-0.7.0-042 honesty boundary)', () => {
+  test('ENSO is the shipped SST anomaly surface plus the active tropical cyclones at every horizon (D-0.7.0-042; ENSO B3), with the CPC 8-14 day precipitation outlook at Weeks ahead and the CPC seasonal one at Season ahead', () => {
+    const outlook = { current: [], 'weeks-ahead': ['cpc-814-precip'], 'season-ahead': ['cpc-seasonal-precip'] } as const;
     for (const horizon of TEMPORAL_HORIZON_KEYS) {
-      expect(HAZARD_CLUSTERS.enso.recipes[horizon]).toEqual(['sst-anomaly']);
+      expect(HAZARD_CLUSTERS.enso.recipes[horizon]).toEqual(['sst-anomaly', ...outlook[horizon], 'tropical-cyclones']);
     }
   });
 });

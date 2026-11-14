@@ -24,22 +24,29 @@
  */
 
 import { URLS } from '../config/urls';
-import { HEATRISK_CATEGORIES } from '../config/palette';
+import { HEATRISK_CATEGORIES, SPC_FIREWX_CATEGORIES } from '../config/palette';
 import {
   NIFC_AREA_QUERY_RECORD_CAP,
-  buildNifcAreaPerimeterClaim
+  buildNifcAreaPerimeterClaim,
+  classifyNifcIncidentType
 } from '../config/wildfire-presentation';
 import {
+  bboxCoveredByEnvelope,
   loadServiceEnvelopePieces,
-  mergeByStableIdentifier
+  mergeByStableIdentifier,
+  serviceBboxPieces
 } from '../util/bbox';
 import { naiveBboxSuggestsAntimeridianCrossing } from '../util/antimeridian';
-import { fetchJsonWithBudget } from '../util/fetch';
+import { ExpiringLruCache } from '../util/bounded-cache';
+import { fetchJsonWithBudget, isFetchTimeout } from '../util/fetch';
+import { heatRiskMoment, isoDayLocal } from '../util/iso-day';
 import { isObject } from '../util/guards';
-import { cpcOutlookBarsSvg, trendLineSvg, type TrendPoint } from '../ui/charts';
+import { trendLineSvg, type TrendPoint } from '../ui/charts';
 import { categoryImpact } from './category-impacts';
 import { makeClaim, todayIso } from './evidence';
+import { pointReadPlace } from './point-heat-format';
 import { contextStateFips, contextStateName } from './resources';
+import { registry } from '../state/registry';
 import {
   NWS_CACHE_TTL,
   createNwsRequestSession,
@@ -47,10 +54,17 @@ import {
   nwsCoordinate,
   type NwsRequestSession
 } from './nws-point';
+import type { Geometry, Polygon } from 'geojson';
 import type {
   BoundarySelectionContext,
+  CpcTercileReading,
+  HeatRiskLevelReading,
   HeatSourceRead,
-  SourcedClaim
+  NwsProductsReading,
+  SourcedClaim,
+  SpcFireDaysReading,
+  UsdmCategoryReading,
+  WfigsPerimetersReading
 } from './types';
 
 /** The outcome of one source fetch. */
@@ -58,14 +72,21 @@ export interface SourceResult {
   readonly claims: SourcedClaim[];
   /** True if the fetch completed (even if it found nothing); false on error. */
   readonly ok: boolean;
-  /** Optional honest note shown when `ok` is false. */
+  /** Optional honest note shown when `ok` is false, or when `partial` is true. */
   readonly note?: string;
+  /**
+   * True when the fetch answered only in part: some of its reads failed, the
+   * claims it did establish stand, and `note` (when the fetcher has one) says
+   * what is missing. Still `ok`; the briefing cell it feeds reads live
+   * (partial), never live (`fillCell` in matrix.ts; S30D P3-TRUTH).
+   */
+  readonly partial?: boolean;
   /** Optional typed heat read used by the cross-source comparison. */
   readonly heatRead?: HeatSourceRead;
 }
 
 const TIMEOUT_MS = 10_000;
-const GEOJSON_ACCEPT = { Accept: 'application/geo+json, application/json' };
+export const GEOJSON_ACCEPT = { Accept: 'application/geo+json, application/json' };
 
 /** Round a coordinate to 4 decimals; the NWS API rejects more precision. */
 function round4(n: number): number {
@@ -73,11 +94,40 @@ function round4(n: number): number {
 }
 
 /**
+ * S30D P3-TRUTH (repair round 2): a lazy chunk a read waits on, bounded.
+ * Resolves the load's value, or `null` when the briefing aborts, when
+ * `TIMEOUT_MS` (the per-request budget every read here already has) passes
+ * first, or when the load rejects. A rejection is logged (`what` names the
+ * load) unless the briefing was cancelled, which is never a defect.
+ */
+function settleLazy<T>(
+  load: () => Promise<T>,
+  signal: AbortSignal,
+  what: string
+): Promise<T | null> {
+  return new Promise((resolve) => {
+    const finish = (value: T | null): void => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', stop);
+      resolve(value);
+    };
+    const stop = (): void => finish(null);
+    const timer = setTimeout(stop, TIMEOUT_MS);
+    signal.addEventListener('abort', stop, { once: true });
+    if (signal.aborted) stop();
+    load().then(finish, (err: unknown) => {
+      if (!signal.aborted) console.warn(`[impact] ${what} failed.`, err);
+      finish(null);
+    });
+  });
+}
+
+/**
  * Build an Environmental Systems Research Institute (ESRI) FeatureServer
  * point-intersect query. The shared keys (where, inSR, spatialRel,
  * returnGeometry, f) are baked in; the caller supplies the `outFields`.
  */
-function esriPointQuery(lng: number, lat: number, outFields: string): URLSearchParams {
+export function esriPointQuery(lng: number, lat: number, outFields: string): URLSearchParams {
   return new URLSearchParams({
     where: '1=1',
     geometry: `${round4(lng)},${round4(lat)}`,
@@ -115,7 +165,7 @@ function esriEnvelopeQuery(envelope: string, outFields: string, recordCount?: nu
  * timeout remain active through response-body consumption. Callers keep their
  * own `signal.aborted` re-check immediately after, before touching the panel.
  */
-async function fetchJson(
+export async function fetchJson(
   url: string,
   headers: Record<string, string>,
   signal: AbortSignal,
@@ -134,7 +184,7 @@ async function fetchJson(
  * envelope as an empty result and asserting `no data` (an outage must never
  * become a positive finding of absence).
  */
-class EsriServiceError extends Error {
+export class EsriServiceError extends Error {
   /** The service's own message text, verbatim; logged with the failure. */
   readonly serviceMessage: string;
 
@@ -170,14 +220,15 @@ function esriErrorMessage(json: unknown): string | null {
 }
 
 /**
- * The `features` array of a GeoJSON-shaped payload, or `[]` when absent.
+ * The `features` array of a GeoJSON-shaped payload; malformed payloads throw.
  * Throws `EsriServiceError` on an HTTP 200 error envelope (see above); no
  * retry is attempted, so the existing per-call budget still bounds the work.
  */
-function featuresOf(json: unknown): unknown[] {
+export function featuresOf(json: unknown): unknown[] {
   const serviceMessage = esriErrorMessage(json);
   if (serviceMessage !== null) throw new EsriServiceError(serviceMessage);
-  return isObject(json) && Array.isArray(json.features) ? json.features : [];
+  if (!isObject(json) || !Array.isArray(json.features)) throw new Error('Missing features array');
+  return json.features;
 }
 
 /**
@@ -186,21 +237,43 @@ function featuresOf(json: unknown): unknown[] {
  * a service that never answered. `service` is the subject of the sentence,
  * for example "The U.S. Drought Monitor".
  */
-function upstreamNote(err: unknown, service: string): string {
+export function upstreamNote(err: unknown, service: string): string {
+  if (isFetchTimeout(err)) return `${service} did not answer in time.`;
   return err instanceof EsriServiceError
     ? `${service} is unavailable: it answered with an error rather than data.`
     : `${service} did not respond.`;
 }
 
+/**
+ * Log one failed source read, by outcome (B7). A cancel never reaches here (each
+ * caller returns quietly when its signal aborted); a budget timeout logs once as
+ * a timeout; any other failure logs today's line with the error.
+ */
+function warnSourceFailure(what: string, err: unknown): void {
+  if (isFetchTimeout(err)) console.warn(`[impact] ${what} did not answer in time.`);
+  else console.warn(`[impact] ${what} failed.`, err);
+}
+
 /** An epoch-millisecond upstream Date field, or null when absent or unusable. */
-function epochField(value: unknown): number | null {
+export function epochField(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isFinite(value)) return null;
   return value;
 }
 
 /** The UTC calendar day of an instant, ISO 8601, for a claim's `dates`. */
-function isoDayUtc(time: number): string {
+export function isoDayUtc(time: number): string {
   return new Date(time).toISOString().slice(0, 10);
+}
+
+/**
+ * The calendar day an upstream ISO 8601 timestamp names in its own offset
+ * ("2026-11-06T18:00:00-08:00" is 2026-11-06, never the UTC 2026-11-07), for
+ * a claim's `dates`, or `undefined` when the field is missing or unparseable
+ * (never invented; the caller keeps `retrieved` as the honest fallback).
+ */
+function issuerCalendarDay(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T/.test(value)) return undefined;
+  return Number.isFinite(Date.parse(value)) ? value.slice(0, 10) : undefined;
 }
 
 /**
@@ -208,7 +281,7 @@ function isoDayUtc(time: number): string {
  * midnights, so the day is read in UTC; a local read would show the previous
  * day for every viewer west of Greenwich.
  */
-function humanDayUtc(time: number): string {
+export function humanDayUtc(time: number): string {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',
@@ -218,7 +291,7 @@ function humanDayUtc(time: number): string {
 }
 
 /** "Aug 25", for the start of a span whose end carries the shared year. */
-function humanDayUtcNoYear(time: number): string {
+export function humanDayUtcNoYear(time: number): string {
   return new Intl.DateTimeFormat('en-US', {
     month: 'short',
     day: 'numeric',
@@ -230,19 +303,6 @@ function humanDayUtcNoYear(time: number): string {
 // Current: issuer-published HeatRisk class at the selected frame and point
 // ---------------------------------------------------------------------------
 
-function heatRiskMoment(time: number): string {
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZone: 'UTC',
-    timeZoneName: 'short'
-  }).format(new Date(time));
-}
-
 /**
  * Read the selected HeatRisk frame at the selected point. The identify helper
  * sends that frame's exact epoch and verifies the returned catalog time before
@@ -253,19 +313,38 @@ export async function fetchHeatRiskClaims(
   signal: AbortSignal
 ): Promise<SourceResult> {
   try {
-    const { identifySelectedHeatRisk } = await import(
-      '../ui/heatrisk-sequence'
-    );
-    const identified = await identifySelectedHeatRisk(
+    const { identifyHeatRiskForBriefing, heatRiskClaimRegister, REQUIRED_FRAME_COUNT } =
+      await import('../ui/heatrisk-sequence');
+    // DR-014 a: this reads independently of the map layer's activation, so
+    // the near-term heat claim states its evidence whether or not HeatRisk is
+    // displayed. The briefing describes the place, not the map.
+    const result = await identifyHeatRiskForBriefing(
       context.lngLat.lng,
       context.lngLat.lat,
       signal
     );
     if (signal.aborted) return { claims: [], ok: false };
-    // HeatRisk is contextual to its active displayed frame. An inactive layer
-    // adds no source slot and does not make an otherwise complete horizon
-    // partial.
-    if (!identified) return { claims: [], ok: true };
+    // DDM-P7-T05 F3: the three nulls the old signature collapsed into one
+    // note are told apart here (see HeatRiskBriefingRead's own doc).
+    if (result.kind === 'no-displayed-frame') {
+      // HeatRisk is contextual to its active displayed frame. An inactive
+      // layer adds no source slot and does not make an otherwise complete
+      // horizon partial.
+      return { claims: [], ok: true };
+    }
+    if (result.kind === 'catalog-failed') {
+      return {
+        claims: [],
+        ok: false,
+        note: 'The National Weather Service HeatRisk catalog did not respond.'
+      };
+    }
+    if (result.kind === 'superseded') return { claims: [], ok: false };
+    const identified = result.identify;
+    const frameLabel =
+      identified.frameSource === 'selected'
+        ? 'the selected frame'
+        : `day ${identified.frame.day} of ${REQUIRED_FRAME_COUNT} of the catalog`;
 
     const validity =
       `${heatRiskMoment(identified.frame.validTime)} to ` +
@@ -275,14 +354,39 @@ export async function fetchHeatRiskClaims(
     const shared = {
       source,
       sourceUrl,
+      product: 'heatrisk',
       evidence: 'classified',
+      // DR-070 amended 2026-09-08, DR-071: HeatRisk stays 'classified'
+      // evidence (the badge stays Classified), but the issuer's own words
+      // describe a forecast, "provides a forecast of the potential level of
+      // risk for heat-related impacts to occur over a 24-hour period"
+      // (HeatRisk v2.6 Overview). A claim whose 24-hour period is still IN
+      // FORCE (has not ended) therefore overrides the classified ->
+      // observed default and reads outlook; an ENDED period reads observed
+      // (the spent claim the doctrine forbids as an outlook). This is the
+      // same boundary the time bar draws for the same product
+      // (src/layers/heatrisk.ts frameStamp/framePhase), read here through
+      // the one shared helper (heatRiskClaimRegister) so the briefing and
+      // the map can never disagree about when a HeatRisk claim is in force.
+      register: heatRiskClaimRegister(identified.validThrough, Date.now()),
       dates: {
         valid: isoDayUtc(identified.frame.validTime),
         retrieved: todayIso()
       },
       support: {
         native: 'National Weather Service HeatRisk raster cell',
-        reporting: 'the cell at the selected point'
+        reporting: 'the cell at the selected point',
+        // DDM-P13-T02: `heatrisk` is the src/ui/legend-registry.ts key this
+        // layer already builds its category legend under (src/layers/heatrisk.ts).
+        legendKey: 'heatrisk'
+      },
+      // DDM-P13-T02: quoted, not authored here. The issuer's own definition
+      // of the product this claim reads, already carried in prose at
+      // src/layers/heatrisk.ts:200-204 (HeatRisk v2.6 Overview, read
+      // 2026-09-08): a 24-hour-period forecast, not an instant reading.
+      method: {
+        // vocab-allow: verbatim quoted upstream product definition (HeatRisk v2.6 Overview), quotation marks and all; not DDM's own word for its own read
+        basis: 'HeatRisk "provides a forecast of the potential level of risk for heat-related impacts to occur over a 24-hour period" and is calculated "from the current date through seven days in the future" (HeatRisk v2.6 Overview).'
       },
       uncertainty: {
         kind: 'categorical',
@@ -290,21 +394,38 @@ export async function fetchHeatRiskClaims(
       }
     } as const;
 
+    const heatReadLabel =
+      identified.frameSource === 'selected'
+        ? 'NWS HeatRisk selected frame'
+        : `NWS HeatRisk day ${identified.frame.day} of ${REQUIRED_FRAME_COUNT}`;
+    // The class as data, beside the sentence (types.ts `ClaimReading`): the
+    // identify's own verified pixel value (`identified.value`, null for the
+    // service's NoData cell), its catalog day, and the frame's own 24-hour
+    // window (`frame.validTime` to `validThrough`), the same three values the
+    // sentence below is built from.
+    const reading: HeatRiskLevelReading = {
+      kind: 'heatrisk-level',
+      value: identified.value,
+      day: identified.frame.day,
+      window: { from: identified.frame.validTime, to: identified.validThrough }
+    };
+
     if (identified.value === null) {
       const text =
-        `HeatRisk (Experimental): no data at the selected point for ${context.title} for the selected frame. ` +
+        `HeatRisk (Experimental): no data at ${pointReadPlace(context)} for ${context.title} for ${frameLabel}. ` +
         `Valid ${validity}.`;
       return {
         ok: true,
         claims: [
           makeClaim({
             text,
-            ...shared
+            ...shared,
+            reading
           })
         ],
         heatRead: {
           key: 'heatRisk',
-          label: 'NWS HeatRisk selected frame',
+          label: heatReadLabel,
           text,
           sourceUrl
         }
@@ -313,30 +434,31 @@ export async function fetchHeatRiskClaims(
 
     const category = HEATRISK_CATEGORIES[identified.value]!;
     const text =
-      `HeatRisk (Experimental) value ${category.value}, ${category.label}, at the selected point for ${context.title}. ` +
+      `HeatRisk (Experimental) value ${category.value}, ${category.label}, at ${pointReadPlace(context)} for ${context.title}. ` +
       `Valid ${validity}. ${category.meaning}`;
     return {
       ok: true,
       claims: [
         makeClaim({
           text,
-          ...shared
+          ...shared,
+          reading
         })
       ],
       heatRead: {
         key: 'heatRisk',
-        label: 'NWS HeatRisk selected frame',
+        label: heatReadLabel,
         text,
         sourceUrl
       }
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] HeatRisk identify failed.', err);
+    warnSourceFailure('HeatRisk identify', err);
     return {
       claims: [],
       ok: false,
-      note: 'The National Weather Service HeatRisk classification did not respond.'
+      note: upstreamNote(err, 'The National Weather Service HeatRisk classification')
     };
   }
 }
@@ -355,35 +477,230 @@ export async function fetchHeatRiskClaims(
 const USDM_OUT_FIELDS = 'DM,MapDate,ValidStart,ValidEnd';
 
 /**
- * Query the United States Drought Monitor FeatureServer for the polygons that
- * contain the clicked point and translate the worst (highest) category present
- * into claims: the analyzed drought state, then the derived wildfire
- * implication. (The former extreme-heat companion was removed by ruling
- * D-0.8.0-047 and is not rebuilt here.) If no polygon contains the point, the
- * location is better than D0 on that map, which is itself a plain reading.
+ * DDM-P13-T02 F2: the U.S. Drought Monitor's own published percentile basis
+ * for its D0 to D4 categories, quoted from the issuer (NDMC, "Drought
+ * Classification",
+ * https://droughtmonitor.unl.edu/About/AbouttheData/DroughtClassification.aspx),
+ * not authored here. Every claim that names a D-category (the per-point USDM
+ * claims below, and the statewide DSCI claim) carries this SAME string
+ * character for character, so the method line reads identically wherever a
+ * category appears.
+ */
+// vocab-allow: verbatim quoted upstream table heading ("example percentile range for most indicators"), quotation marks and all; not DDM's own word for its own read
+const USDM_PERCENTILE_BASIS =
+  'The U.S. Drought Monitor assigns D0 to D4 by percentile; the NDMC\'s "example percentile range for most indicators" is D0 20.01-30.00, D1 10.01-20.00, D2 5.01-10.00, D3 2.01-5.00, D4 0.00-2.00 (NDMC, Drought Classification).';
+
+/** About 10,000 vertices: a form body near 280 KB, posted inside the read's own time limit. */
+const MAX_OUTLINE_CHARS = 200_000;
+
+/**
+ * Simplification tolerances in degrees, tried in turn until the outline fits:
+ * about 110 m doubling to about 7 km. A simplified outline can miss or add a
+ * sliver at its edge, which matters nothing at the drought map's scale (the
+ * USDM draws its categories over whole regions).
+ */
+const OUTLINE_TOLERANCES = [0.001, 0.002, 0.004, 0.008, 0.016, 0.032, 0.064];
+
+/** Squared distance from `p` to the segment `a`-`b` (to `a` when the segment is a point). */
+function segmentDistance2(p: number[], a: number[], b: number[]): number {
+  const dx = b[0]! - a[0]!;
+  const dy = b[1]! - a[1]!;
+  const length2 = dx * dx + dy * dy;
+  const t = length2 === 0 ? 0 : Math.max(0, Math.min(1, ((p[0]! - a[0]!) * dx + (p[1]! - a[1]!) * dy) / length2));
+  const ex = p[0]! - a[0]! - t * dx;
+  const ey = p[1]! - a[1]! - t * dy;
+  return ex * ex + ey * ey;
+}
+
+/** The index in (from, to) farthest from the segment `from`-`to`, with its squared distance. */
+function farthest(ring: number[][], from: number, to: number): [number, number] {
+  let index = -1;
+  let best = -1;
+  for (let i = from + 1; i < to; i += 1) {
+    const d = segmentDistance2(ring[i]!, ring[from]!, ring[to]!);
+    if (d > best) [index, best] = [i, d];
+  }
+  return [index, best];
+}
+
+/**
+ * Douglas-Peucker over one closed ring (first vertex equals last), keeping
+ * the place's own vertices only and never fewer than four points, so a tiny
+ * islet or hole is still sent.
+ */
+function simplifyRing(ring: number[][], tolerance: number): number[][] {
+  const last = ring.length - 1;
+  if (last < 4) return ring;
+  const keep = new Uint8Array(ring.length);
+  keep[0] = keep[last] = 1;
+  // The closing segment is a point, so the first split is the vertex farthest from the start.
+  const [far] = farthest(ring, 0, last);
+  keep[far] = 1;
+  const limit = tolerance * tolerance;
+  const spans: [number, number][] = [[0, far], [far, last]];
+  for (let span = spans.pop(); span; span = spans.pop()) {
+    const [from, to] = span;
+    const [i, d] = farthest(ring, from, to);
+    if (i < 0 || d <= limit) continue;
+    keep[i] = 1;
+    spans.push([from, i], [i, to]);
+  }
+  if (keep.reduce((sum, k) => sum + k, 0) < 4) {
+    const [a, da] = farthest(ring, 0, far);
+    const [b, db] = farthest(ring, far, last);
+    keep[da >= db ? a : b] = 1;
+  }
+  return ring.filter((_, i) => keep[i] === 1);
+}
+
+/**
+ * A place's own Polygon or MultiPolygon as an ArcGIS `esriGeometryPolygon` in
+ * WGS 84: rings in the ArcGIS winding (exterior clockwise, holes
+ * counter-clockwise; GeoJSON winds the other way) and rounded as the point
+ * query is, each rounded vertex sent once. An outline longer than
+ * `MAX_OUTLINE_CHARS` is simplified (`OUTLINE_TOLERANCES`) until it fits.
+ * Null when the geometry is not a polygon, a ring is malformed, a longitude
+ * leaves [-180, 180] (an unwrapped ring across the antimeridian, which the
+ * service would read as a different place), or the outline does not fit even
+ * at the coarsest tolerance.
+ */
+export function esriPlacePolygon(geometry: Geometry | null | undefined): string | null {
+  const polygons =
+    geometry?.type === 'Polygon' ? [geometry.coordinates] : geometry?.type === 'MultiPolygon' ? geometry.coordinates : null;
+  if (!polygons) return null;
+  const rounded: { ring: number[][]; exterior: boolean }[] = [];
+  for (const polygon of polygons) {
+    for (const [index, source] of polygon.entries()) {
+      if (source.length < 4) return null;
+      const ring: number[][] = [];
+      for (const [lng, lat] of source) {
+        if (!Number.isFinite(lng) || !Number.isFinite(lat) || Math.abs(lng!) > 180 || Math.abs(lat!) > 90) return null;
+        const point = [round4(lng!), round4(lat!)];
+        const last = ring[ring.length - 1];
+        if (!last || last[0] !== point[0] || last[1] !== point[1]) ring.push(point);
+      }
+      // A ring smaller than the rounding (an islet or hole under about 11 m) has nothing to send.
+      if (ring.length < 4) continue;
+      rounded.push({ ring, exterior: index === 0 });
+    }
+  }
+  if (rounded.length === 0) return null;
+  for (const tolerance of [0, ...OUTLINE_TOLERANCES]) {
+    const rings = rounded.map(({ ring: source, exterior }) => {
+      const ring = tolerance === 0 ? [...source] : simplifyRing(source, tolerance);
+      // Twice the signed area: positive is counter-clockwise.
+      let turn = 0;
+      for (const [i, [x, y]] of ring.entries()) {
+        const [nx, ny] = ring[(i + 1) % ring.length]!;
+        turn += x! * ny! - nx! * y!;
+      }
+      if (exterior === turn > 0) ring.reverse();
+      return ring;
+    });
+    const outline = JSON.stringify({ rings, spatialReference: { wkid: 4326 } });
+    if (outline.length <= MAX_OUTLINE_CHARS) return outline;
+  }
+  return null;
+}
+
+/**
+ * Query the United States Drought Monitor FeatureServer and translate the
+ * worst (highest) category present into claims: the analyzed drought state,
+ * then the derived wildfire implication. (The former extreme-heat companion
+ * was removed by ruling D-0.8.0-047 and is not rebuilt here.)
+ *
+ * A place that carries its own outline (`placeGeometry`) is read over that
+ * outline: the outline is posted to the issuer's service, which returns every
+ * category polygon intersecting it, and the claim names the worst of them in
+ * the place card's words ("the worst in this area"). Any other selection (a
+ * click, or an outline the service cannot take) reads the polygons that
+ * contain its one point, stated as a point. If no polygon is found, the claim
+ * says only that, in the popup's own words: with no analyzed-area mask in the
+ * client, no polygon does not confirm no drought. An area answer the service
+ * cut at its transfer limit names no category and no absence (live, partial).
  */
 export async function fetchUsdmClaims(
   context: BoundarySelectionContext,
   signal: AbortSignal
 ): Promise<SourceResult> {
   const { lng, lat } = context.lngLat;
-  const url = `${URLS.usdmFeatureServer}/query?${esriPointQuery(lng, lat, USDM_OUT_FIELDS).toString()}`;
+  const pointQuery = esriPointQuery(lng, lat, USDM_OUT_FIELDS);
+  const outline = esriPlacePolygon(context.placeGeometry);
+  const area = outline !== null;
   const source = 'U.S. Drought Monitor (NDMC / NOAA / USDA)';
   const sourceUrl = 'https://droughtmonitor.unl.edu/';
+  // Where the read is: the place's own area, the user's click, or a point the app chose inside a selected place.
+  const at = area
+    ? 'in this area'
+    : context.readAt
+      ? `at ${context.readAt}`
+      : context.pointInsidePlace
+        ? 'at a point inside the selected place'
+        : 'at the clicked point';
 
   try {
-    const json: unknown = await fetchJson(url, GEOJSON_ACCEPT, signal);
+    let json: unknown;
+    if (outline !== null) {
+      // The outline can be far longer than a URL allows, so the same query is posted as a form.
+      // `f` stays in the URL (the service merges it with the form), so the read keeps the point read's `/query?` shape.
+      pointQuery.set('geometry', outline);
+      pointQuery.set('geometryType', 'esriGeometryPolygon');
+      pointQuery.delete('f');
+      json = await fetchJsonWithBudget(
+        `${URLS.usdmFeatureServer}/query?f=geojson`,
+        {
+          method: 'POST',
+          headers: { ...GEOJSON_ACCEPT, 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: pointQuery
+        },
+        signal,
+        TIMEOUT_MS
+      );
+    } else {
+      json = await fetchJson(`${URLS.usdmFeatureServer}/query?${pointQuery.toString()}`, GEOJSON_ACCEPT, signal);
+    }
     if (signal.aborted) return { claims: [], ok: false };
 
     const features = featuresOf(json);
+    // A cut answer may have dropped a worse category: it states neither a class nor an absence.
+    if (isObject(json) && (json.exceededTransferLimit === true || (isObject(json.properties) && json.properties.exceededTransferLimit === true))) {
+      return { claims: [], ok: true, partial: true };
+    }
     let worst = -1;
     let mapDate: number | null = null;
+    // The window the map speaks for, as the service states it: `ValidStart`
+    // and `ValidEnd` are USDM_current's own fields (src/layers/usdm.ts:255-258),
+    // already requested above. Read for the structured reading only; the
+    // sentence still names the map date.
+    let validStart: number | null = null;
+    let validEnd: number | null = null;
     for (const f of features) {
-      if (!isObject(f) || !isObject(f.properties)) continue;
-      const dm = Number(f.properties.DM);
-      if (Number.isInteger(dm) && dm > worst) worst = dm;
+      if (!isObject(f) || !isObject(f.properties)) throw new Error('Invalid USDM feature');
+      const value = f.properties.DM;
+      const dm = typeof value === 'number' || (typeof value === 'string' && value.trim() !== '')
+        ? Number(value) : NaN;
+      if (!Number.isInteger(dm) || dm < 0 || dm > 4) throw new Error('Invalid USDM category');
+      if (dm > worst) worst = dm;
       mapDate ??= epochField(f.properties.MapDate);
+      validStart ??= epochField(f.properties.ValidStart);
+      validEnd ??= epochField(f.properties.ValidEnd);
     }
+    // The class as data, beside the sentence (types.ts `ClaimReading`): the
+    // same `worst` integer `DM` the sentences below state (0 is D0, 4 is D4),
+    // or null when no D0 to D4 polygon contains the point (or meets the area).
+    const usdmReading: UsdmCategoryReading = {
+      kind: 'usdm-category',
+      dm: worst < 0 ? null : (worst as 0 | 1 | 2 | 3 | 4),
+      ...(area ? { scope: 'area' as const } : {}),
+      ...(validStart !== null || validEnd !== null
+        ? {
+            window: {
+              ...(validStart !== null ? { from: validStart } : {}),
+              ...(validEnd !== null ? { to: validEnd } : {})
+            }
+          }
+        : {})
+    };
     // The USDM is an expert-analyzed weekly product: evidence 'analyzed'. The
     // map date is the issuer's own, so the claim is dated by the map it reads
     // and not by the moment DDM fetched it (DWH-05); a payload that carries no
@@ -391,13 +708,16 @@ export async function fetchUsdmClaims(
     const usdmShared = {
       source,
       sourceUrl,
+      product: 'usdm' as const,
       evidence: 'analyzed' as const,
       dates:
         mapDate === null
           ? { retrieved: todayIso() }
           : { valid: isoDayUtc(mapDate), retrieved: todayIso() },
-      support: { reporting: 'the USDM polygon at the clicked point' }
+      support: { reporting: area ? 'the USDM polygons in this area' : `the USDM polygon ${at}` }
     };
+    // The place card's area words (popup-conditions.ts droughtRow) for a category read over the place.
+    const worstHere = 'is the worst in this area';
     // "this week's map" is only true until Thursday's release: NDMC publishes
     // on Thursday using data through the previous Tuesday morning, so the map
     // date is named whenever the service returns it.
@@ -405,14 +725,22 @@ export async function fetchUsdmClaims(
       mapDate === null
         ? "this week's U.S. Drought Monitor"
         : `the U.S. Drought Monitor map dated ${humanDayUtc(mapDate)}`;
+    // While the NADM surface is on, the map and place card read it, not USDM
+    // (popup-conditions.ts droughtRow), so the two categories are named apart.
+    const mapProduct = registry.getActiveKeys().has('nadm-drought')
+      ? // DRAFT wording (pending the owner's read-back); the NADM description is the layer's own (nadm-drought.ts).
+        ' The map shows the North American Drought Monitor, a tri-national monthly consensus published 2 to 3 weeks after month-end, so its category here can differ from this weekly U.S. Drought Monitor read.'
+      : '';
 
     if (worst < 0) {
       return {
         ok: true,
         claims: [
           makeClaim({
-            text: `No drought category is mapped at this location in ${asOfMap} (conditions are better than D0, Abnormally Dry).`,
-            ...usdmShared
+            // For a click, the popup's no-polygon sentence (popup-conditions.ts), word for word.
+            text: `No D0-D4 category polygon ${area || context.pointInsidePlace || context.readAt ? at : 'here'} (U.S. Drought Monitor). This client has no analyzed-area mask, so this does not confirm no drought.${mapProduct}`,
+            ...usdmShared,
+            reading: usdmReading
           })
         ]
       };
@@ -424,8 +752,13 @@ export async function fetchUsdmClaims(
         ok: true,
         claims: [
           makeClaim({
-            text: `This location is in a mapped drought category (DM ${worst}) in ${asOfMap}.`,
-            ...usdmShared
+            text: area
+              ? `A mapped drought category (DM ${worst}) ${worstHere} in ${asOfMap}.${mapProduct}`
+              : `This location is in a mapped drought category (DM ${worst}) in ${asOfMap}.${mapProduct}`,
+            ...usdmShared,
+            support: { ...usdmShared.support, legendKey: 'usdm' },
+            method: { basis: USDM_PERCENTILE_BASIS },
+            reading: usdmReading
           })
         ]
       };
@@ -435,14 +768,24 @@ export async function fetchUsdmClaims(
       ok: true,
       claims: [
         makeClaim({
-          text: `This location is in ${impact.code} ${impact.label} as of ${asOfMap}. ${impact.summary}`,
-          ...usdmShared
+          text: `${area ? `${impact.code} ${impact.label} ${worstHere}` : `This location is in ${impact.code} ${impact.label}`} as of ${asOfMap}. ${impact.summary}${mapProduct}`,
+          ...usdmShared,
+          support: { ...usdmShared.support, legendKey: 'usdm' },
+          method: { basis: USDM_PERCENTILE_BASIS },
+          reading: usdmReading
         }),
         // The wildfire companion translates the analyzed category through the
         // documented USDM impact profiles: a DDM-derived read, labeled so.
         // The former extreme-heat companion was removed by ruling
         // (D-0.8.0-047); do not reintroduce a heat claim inferred from the
         // USDM category.
+        //
+        // It stays in the Drought row of the matrix deliberately. Its issuer
+        // is the U.S. Drought Monitor and its clock is that map's date, so
+        // filing it under Fire would give the Fire row a drought issuer and a
+        // drought validity date, which is exactly what the matrix exists to
+        // prevent. It is a drought-impact read that names wildfire, not a
+        // fire product.
         makeClaim({
           text: `Wildfire: ${impact.wildfire} Drought raises the odds and the potential intensity of wildfire by drying and curing fuels; it does not by itself start fires.`,
           ...usdmShared,
@@ -451,7 +794,7 @@ export async function fetchUsdmClaims(
           // attribute (DR-058 a): "ddm-drought-impact-modeling causal-chain
           // reads" was internal vocabulary inside a public claim.
           lineage: [
-            'USDM category at the clicked point',
+            area ? 'USDM category, the worst in this area' : `USDM category ${at}`,
             'the documented USDM impact profile for that category, read through the DDM drought-impact model'
           ],
           lineageRef: 'ddm-drought-impact-modeling',
@@ -461,7 +804,7 @@ export async function fetchUsdmClaims(
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] USDM point query failed.', err);
+    warnSourceFailure(area ? 'USDM area query' : 'USDM point query', err);
     return { claims: [], ok: false, note: upstreamNote(err, 'The U.S. Drought Monitor') };
   }
 }
@@ -476,6 +819,17 @@ function fmtUsdmDate(d: Date): string {
 
 /** One week in milliseconds; the DSCI series is weekly. */
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+// The weekly DSCI series changes once a week; a briefing click in the same
+// state reuses it instead of spending another Worker request. Keyed on the
+// final request URL, so a new day (a new enddate) is a new entry.
+const DSCI_CACHE_TTL_MS = 30 * 60_000;
+const DSCI_RESPONSE_CACHE = new ExpiringLruCache<string, unknown>(8);
+
+/** Test-only hook for deterministic cache assertions (as clearNwsResponseCache). */
+export function clearDsciResponseCache(): void {
+  DSCI_RESPONSE_CACHE.clear();
+}
 
 /** A calendar day, free of any timezone interpretation. */
 interface CalendarDay {
@@ -520,7 +874,7 @@ function calendarToIso(c: CalendarDay): string {
 
 /**
  * Fetch the Drought Severity and Coverage Index (DSCI, 0 to 500) weekly series
- * for the region's primary state over roughly the past 14 months from the USDM
+ * for the region's primary state over the past year (the chart's own title) from the USDM
  * Data Services API and render it as an observed trend line. DSCI is a
  * statewide measure (not point-specific), so the claim is framed as statewide
  * context. The chart is solid throughout (all observation) with the current
@@ -550,9 +904,9 @@ export async function fetchDsciTrendClaims(
   }
   const end = new Date();
   const start = new Date(end);
-  start.setMonth(start.getMonth() - 14);
+  start.setMonth(start.getMonth() - 12);
   const params = new URLSearchParams({
-    aoi: String(fips),
+    aoi: String(fips).padStart(2, '0'),
     startdate: fmtUsdmDate(start),
     enddate: fmtUsdmDate(end),
     statisticsType: '1'
@@ -575,7 +929,9 @@ export async function fetchDsciTrendClaims(
   const sourceUrl = 'https://droughtmonitor.unl.edu/About/AbouttheData/DSCI.aspx';
 
   try {
-    const json: unknown = await fetchJson(url, { Accept: 'application/json' }, signal);
+    const cachedJson = DSCI_RESPONSE_CACHE.get(url);
+    const json: unknown =
+      cachedJson ?? (await fetchJson(url, { Accept: 'application/json' }, signal));
     if (signal.aborted) return { claims: [], ok: false };
 
     const rows = Array.isArray(json) ? json : [];
@@ -587,7 +943,8 @@ export async function fetchDsciTrendClaims(
     for (const r of rows) {
       if (!isObject(r) || typeof r.mapDate !== 'string') continue;
       const t = Date.parse(r.mapDate);
-      const v = typeof r.dsci === 'number' ? r.dsci : Number(r.dsci);
+      const v = typeof r.dsci === 'number' || (typeof r.dsci === 'string' && r.dsci.trim() !== '')
+        ? Number(r.dsci) : NaN;
       if (Number.isFinite(t) && Number.isFinite(v)) {
         points.push({ t, v });
         rawByT.set(t, r.mapDate);
@@ -616,6 +973,8 @@ export async function fetchDsciTrendClaims(
     if (!lastCal) {
       return { claims: [], ok: false, note: 'The USDM Data Services drought-severity series was unavailable.' };
     }
+    // Only a series that reads cleanly is kept for the next briefing.
+    if (cachedJson === undefined) DSCI_RESPONSE_CACHE.set(url, json, DSCI_CACHE_TTL_MS);
     const asOf = calendarToProse(lastCal);
     // The comparison map's own date, read the same textual way, so the span
     // the sentence claims is the span the data actually covers.
@@ -651,23 +1010,197 @@ export async function fetchDsciTrendClaims(
             'the NDMC publishes no DSCI trend threshold and calls the index itself experimental.',
           source,
           sourceUrl,
+          product: 'dsci',
           evidence: 'analyzed',
           dates: { valid: calendarToIso(lastCal), retrieved: todayIso() },
-          support: { reporting: `statewide (${stateName})` },
+          support: {
+            reporting: `statewide (${stateName})`,
+            // DDM-P13-T02: `usdm` is the src/ui/legend-registry.ts key the
+            // U.S. Drought Monitor layer already builds its category legend
+            // under (src/layers/usdm.ts showAbsoluteLegend).
+            legendKey: 'usdm'
+          },
+          // DDM-P13-T02 correction: quoted from the issuer's own published
+          // basis, held once as USDM_PERCENTILE_BASIS above and shared with
+          // the per-point USDM category claims. The DSCI caveat stays in the
+          // claim `text` above, unmoved; this is the USDM category's
+          // percentile basis, a distinct fact from the DSCI caveat.
+          method: {
+            basis: USDM_PERCENTILE_BASIS
+          },
           ...(chartSvg ? { chartSvg } : {})
         })
       ]
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] DSCI trend query failed.', err);
-    return { claims: [], ok: false, note: 'The USDM drought-severity trend did not respond.' };
+    warnSourceFailure('DSCI trend query', err);
+    return { claims: [], ok: false, note: upstreamNote(err, 'The USDM drought-severity trend') };
   }
 }
 
 // ---------------------------------------------------------------------------
 // Current: mapped NIFC fire perimeters near the selection
 // ---------------------------------------------------------------------------
+
+/** Shared claim identity for both the network read below and the
+ * collection-read fast path, so the two never drift into naming two
+ * different sources for the same NIFC observation. */
+const NIFC_AREA_CLAIM_SOURCE = 'NIFC current mapped fire perimeters (WFIGS)';
+const NIFC_AREA_CLAIM_SOURCE_URL = 'https://data-nifc.opendata.arcgis.com/';
+
+/** One service piece as the NIFC envelope query sends it, rounded to 4
+ * decimals; the loaded-collection read tests this same rectangle. */
+function serviceRectangle(
+  piece: readonly [number, number, number, number]
+): [number, number, number, number] {
+  return [round4(piece[0]), round4(piece[1]), round4(piece[2]), round4(piece[3])];
+}
+
+/**
+ * DDM-P14-T07 (design amended by the director after the C3 report's review:
+ * the shipped version of this comment claimed the two read paths shared one
+ * declared filter, which was wrong): when the NIFC perimeters layer is on
+ * the map, loaded, and its already-fetched collection (DDM-P1-T06's
+ * `loadedNifcCollection`) fully covers this place's request bbox, count the
+ * SAME set the network read below would: every mapped incident whose
+ * geometry intersects the bbox, wildfire, Prescribed fire, or unclassified
+ * alike, deduplicated by `attr_UniqueFireIdentifier` exactly like
+ * `mergeByStableIdentifier` does for the network path's pages, then split by
+ * type through `buildNifcAreaPerimeterClaim`. The two paths therefore
+ * produce the identical sentence for the identical loaded set; the network
+ * path's 50-record cap and its resulting lower-bound sentence stay a
+ * NETWORK-PATH property only (this collection is not paginated, so there is
+ * nothing to report as a floor). The minimap's declared filter
+ * (`MINIMAP_ACTIVE_WILDFIRE_FILTER`, active WF/CX only) is NOT applied
+ * here; it belongs to the minimap's own narrower count, never this one.
+ * Returns `null` (never a false zero) when the layer is off, not yet
+ * loaded, or does not cover this bbox, so the caller falls through to the
+ * unchanged network read (the T06 rule: never read the collection as zero
+ * for a place it does not cover). The layer module is reached only through
+ * a dynamic import, behind the registry-status guard: a static import
+ * would pull `src/layers/nifc-fires.ts` and its MapLibre/DOM dependency
+ * graph into this already-lazy briefing chunk's first-activation closure
+ * even when the layer is off, which is the common case.
+ */
+async function nifcClaimFromLoadedCollection(
+  requestBbox: readonly [number, number, number, number]
+): Promise<SourceResult | null> {
+  // S30D P3-TRUTH (repair round 2): this read tests the ONE rectangle the
+  // network read below sends the service, normalized and split by
+  // `serviceBboxPieces` and rounded by `serviceRectangle`, so a perimeter
+  // edge the service's rounding reaches counts on both paths alike. A
+  // rectangle the service would split in two (an antimeridian crossing,
+  // encoded or unwrapped) or that rounds to no area declines.
+  const pieces = serviceBboxPieces(requestBbox);
+  if (pieces.length !== 1) return null;
+  const [west, south, east, north] = serviceRectangle(pieces[0]);
+  if (west >= east || south >= north) return null;
+
+  const { loadedNifcCollection } = await import('../layers/nifc-fires');
+  const loaded = loadedNifcCollection();
+  // The caller's `ready` check ran before the import above; a refresh can
+  // publish a truncated collection in between, so completeness is read from
+  // this snapshot itself (Codex block 1 review, P1).
+  if (loaded === null || loaded.truncated) return null;
+  // The layer refetches only on a pan and keeps `ready` after a failed refresh, so a set past
+  // its own 5-minute check window (CURRENT_CHECK_WINDOW_MS, src/layers/nifc-fires.ts) is not
+  // current: the network read answers (the minimap's reader does the same).
+  if (Date.now() - loaded.fetchedAt >= 5 * 60_000) return null;
+  if (!bboxCoveredByEnvelope(loaded.envelope, [west, south, east, north])) return null;
+
+  // S30D P3-TRUTH: a perimeter counts when its GEOMETRY meets the place's
+  // query rectangle, the predicate the network read's
+  // `esriSpatialRelIntersects` envelope query applies, so the two paths
+  // answer alike for one place. The bounding-box test this used alone
+  // counted a place sitting in a perimeter's hole, in the empty corner of a
+  // diagonal fire's box, or between the parts of a multipolygon. It stays
+  // the cheap rejection, now inside `geometriesOverlap` itself (its
+  // whole-geometry box test, then one per ring, before any ray cast), which
+  // replaced this file's own bbox walker and kept the briefing's
+  // first-activation closure under its line. The overlap test (the one
+  // `src/state/minimap-wildfire.ts` runs on this same collection) is reached
+  // through a dynamic import, like the layer module above, so it never joins
+  // that closure; against a four-vertex rectangle its cost is linear in the
+  // perimeter's vertices, which the layer's server-side generalization
+  // already bounds. A feature that is not a Polygon or MultiPolygon is never
+  // counted (that function's conservative false).
+  const { geometriesOverlap } = await import('../util/polygon-overlap');
+  const rectangle: Polygon = {
+    type: 'Polygon',
+    coordinates: [[[west, south], [east, south], [east, north], [west, north], [west, south]]]
+  };
+  const candidates = loaded.collection.features.filter(
+    (feature) =>
+      isObject(feature) &&
+      isObject(feature.properties) &&
+      geometriesOverlap(feature.geometry as Geometry | null, rectangle)
+  );
+  // Same dedupe rule as the network path's `mergeByStableIdentifier(pages,
+  // ...)` call below, applied to one "page" (the loaded collection has no
+  // pagination of its own).
+  const deduped = mergeByStableIdentifier([candidates], (feature) => {
+    if (!isObject(feature) || !isObject(feature.properties)) return null;
+    const id = feature.properties.attr_UniqueFireIdentifier;
+    return typeof id === 'string' || typeof id === 'number' ? id : null;
+  });
+  const incidentTypes = deduped.map((feature) =>
+    isObject(feature) && isObject(feature.properties)
+      ? feature.properties.attr_IncidentTypeCategory
+      : undefined
+  );
+  const text = buildNifcAreaPerimeterClaim(incidentTypes);
+
+  return {
+    ok: true,
+    // Dated by the collection's own fetchedAt, not today, so an older
+    // collection never claims a fresher retrieval (DDM-P14-T07).
+    claims: [
+      nifcAreaClaim(
+        text,
+        isoDayLocal(new Date(loaded.fetchedAt)),
+        nifcPerimetersReading(incidentTypes, false)
+      )
+    ]
+  };
+}
+
+/**
+ * The perimeter count as data, beside the sentence (types.ts `ClaimReading`):
+ * the same `attr_IncidentTypeCategory` values `buildNifcAreaPerimeterClaim`
+ * counts, split by the same classifier (`classifyNifcIncidentType`: WF and CX
+ * are wildfire, RX is Prescribed fire, anything else unclassified), so the
+ * reading and the sentence can never disagree. `lowerBound` is the sentence's
+ * own record-cap flag.
+ */
+function nifcPerimetersReading(
+  incidentTypes: readonly unknown[],
+  lowerBound: boolean
+): WfigsPerimetersReading {
+  const counts = { wildfire: 0, prescribed: 0, other: 0 };
+  for (const value of incidentTypes) counts[classifyNifcIncidentType(value)] += 1;
+  return { kind: 'wfigs-perimeters', ...counts, lowerBound };
+}
+
+/** The one `makeClaim` call site both the network read below and the
+ * collection-read fast path above share (`tests/product-catalog.spec.ts`'s
+ * pinned call-site count counts text occurrences, not code paths, so two
+ * separate calls here would move that count for no product reason). */
+function nifcAreaClaim(
+  text: string,
+  retrieved: string,
+  reading: WfigsPerimetersReading
+): SourcedClaim {
+  return makeClaim({
+    text,
+    source: NIFC_AREA_CLAIM_SOURCE,
+    sourceUrl: NIFC_AREA_CLAIM_SOURCE_URL,
+    product: 'nifc-fires',
+    evidence: 'observed',
+    dates: { retrieved },
+    reading
+  });
+}
 
 /**
  * Query the National Interagency Fire Center (NIFC) current-perimeters
@@ -682,14 +1215,18 @@ export async function fetchDsciTrendClaims(
  * polygon-exact query that would make the count a count over the place is
  * backed up on origin at feature/nifc-perimeter-evidence (905671d) and was
  * set aside by that ruling.
+ *
+ * DDM-P14-T07: when the perimeters layer is on the map and already covers
+ * this bbox, `nifcClaimFromLoadedCollection` answers from its loaded
+ * collection first, issuing no request at all; this function's network read
+ * runs only when that fast path declines (layer off, not loaded, or this
+ * bbox reaches outside what it has loaded).
  */
 export async function fetchNifcClaims(
   context: BoundarySelectionContext,
   signal: AbortSignal
 ): Promise<SourceResult> {
   const { lng, lat } = context.lngLat;
-  const source = 'NIFC current mapped fire perimeters (WFIGS)';
-  const sourceUrl = 'https://data-nifc.opendata.arcgis.com/';
   const incompleteCrossingEnvelope =
     !context.serviceBbox &&
     (context.bboxCrossesAntimeridian === true ||
@@ -707,12 +1244,36 @@ export async function fetchNifcClaims(
     context.bbox ??
     ([lng - 0.5, lat - 0.5, lng + 0.5, lat + 0.5] as const);
 
+  // Synchronous guard BEFORE any `await`: when the layer is off (the common
+  // case, and every existing lane-timing assumption), this never touches a
+  // promise and falls straight into the unchanged network read below in the
+  // same tick, exactly as before this task.
+  //
+  // S30D P3-TRUTH (repair round 2): only a COMPLETE loaded collection
+  // answers. The layer reports `degraded` for a transfer-limited (truncated)
+  // response, and its getter carries no completeness, so a degraded
+  // collection could state an absence or a count over perimeters it never
+  // received; the network read answers instead. The fast path's two lazy
+  // loads (the layer module and the overlap test) are bounded by
+  // `settleLazy`: a load that fails, a defect it throws (logged), or a load
+  // still pending at the deadline declines like any other decline, and a
+  // briefing abort settles this read with no late claim and no request.
+  if (registry.getStatus('nifc-fires') === 'ready') {
+    const fromCollection = await settleLazy(
+      () => nifcClaimFromLoadedCollection(requestBbox),
+      signal,
+      'NIFC loaded-perimeters read'
+    );
+    if (signal.aborted) return { claims: [], ok: false };
+    if (fromCollection !== null) return fromCollection;
+  }
+
   try {
     const payloads = await loadServiceEnvelopePieces(
       requestBbox,
       signal,
       async (piece, siblingSignal) => {
-        const envelope = piece.map(round4).join(',');
+        const envelope = serviceRectangle(piece).join(',');
         const query = esriEnvelopeQuery(
           envelope,
           'attr_UniqueFireIdentifier,attr_IncidentName,attr_IncidentTypeCategory',
@@ -739,24 +1300,20 @@ export async function fetchNifcClaims(
     // A page that came back full may have been cut at the cap; the sentence
     // then reports the count as a lower bound rather than a total.
     const truncated = pages.some((page) => page.length >= NIFC_AREA_QUERY_RECORD_CAP);
-    const text = buildNifcAreaPerimeterClaim(
-      features.map((feature) =>
-        isObject(feature) && isObject(feature.properties)
-          ? feature.properties.attr_IncidentTypeCategory
-          : undefined
-      ),
-      { truncated }
+    const incidentTypes = features.map((feature) =>
+      isObject(feature) && isObject(feature.properties)
+        ? feature.properties.attr_IncidentTypeCategory
+        : undefined
     );
+    const text = buildNifcAreaPerimeterClaim(incidentTypes, { truncated });
     // Mapped incident perimeters and their count: directly observed.
     return {
       ok: true,
-      claims: [
-        makeClaim({ text, source, sourceUrl, evidence: 'observed', dates: { retrieved: todayIso() } })
-      ]
+      claims: [nifcAreaClaim(text, todayIso(), nifcPerimetersReading(incidentTypes, truncated))]
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] NIFC query failed.', err);
+    warnSourceFailure('NIFC query', err);
     return {
       claims: [],
       ok: false,
@@ -797,7 +1354,7 @@ function nwsActiveProductFeatures(json: unknown): unknown[] | null {
 
 /**
  * Query the National Weather Service active alerts at the clicked point and
- * surface any fire-weather or extreme-heat alerts as observations. When none
+ * surface any fire-weather or heat alerts as observations. When none
  * are active, that is reported plainly (a meaningful all-clear for the
  * foregrounded hazards).
  */
@@ -833,41 +1390,81 @@ export async function fetchNwsAlertClaims(
     const heatText =
       heat.length > 0
         // vocab-allow: reports upstream NWS alert products in effect
-        ? `NWS active alerts at the selected point: ${heat.join(', ')}.`
+        ? `NWS active alerts at ${pointReadPlace(context)}: ${heat.join(', ')}.`
+        // DRAFT wording: "heat alert", as in the presence sentence below; HEAT_EVENTS
+        // includes a Heat Advisory, so "extreme-heat" understated the absence.
         // vocab-allow: reports the absence of upstream NWS alert products
-        : 'NWS reports no active extreme-heat alert at the selected point.';
+        : `NWS reports no active heat alert at ${pointReadPlace(context)}.`;
     // Whether an NWS alert is in effect at the point is a directly observed
     // fact (the alert names quoted are verbatim upstream product names).
-    const alertShared = { source, sourceUrl, evidence: 'observed', dates: { retrieved: todayIso() } } as const;
+    const alertShared = { source, sourceUrl, product: 'nws-alerts', evidence: 'observed', dates: { retrieved: todayIso() } } as const;
+    // The products in effect as data, beside each sentence (types.ts
+    // `ClaimReading`): the same verbatim `event` names the sentence joins,
+    // one list per hazard row. An empty list is the read that none of that
+    // row's products is in effect at the point.
+    const productsReading = (events: readonly string[]): NwsProductsReading => ({
+      kind: 'nws-products',
+      events: [...events]
+    });
     const claims: SourcedClaim[] = [];
     if (fire.length > 0) {
+      // Only a Red Flag Warning is "imminent"; a Fire Weather Watch is NWS's
+      // "critical fire weather conditions are possible but not imminent or
+      // occurring" (https://www.weather.gov/safety/wildfire-ww).
+      const fireMeaning = fire.includes('Red Flag Warning') // vocab-allow: verbatim NWS product name
+        ? 'This signals imminent fire-weather conditions (low humidity, wind, dry fuels).'
+        // DRAFT wording: NWS's own Fire Weather Watch definition, owner to confirm.
+        : 'This means critical fire weather conditions are possible but not imminent or occurring (low humidity, wind, dry fuels).';
       claims.push(
         makeClaim({
           // vocab-allow: reports the NWS alert products in effect, upstream data
-          text: `A fire-weather alert is in effect here: ${fire.join(', ')}. This signals imminent fire-weather conditions (low humidity, wind, dry fuels).`,
-          ...alertShared
+          text: `A fire-weather alert is in effect here: ${fire.join(', ')}. ${fireMeaning}`,
+          ...alertShared,
+          // One query answers for two hazard rows, so each statement names
+          // the row it speaks for and neither row carries the other's.
+          hazards: ['fire'],
+          reading: productsReading(fire)
         })
       );
     }
-    if (heat.length > 0) {
+    // S30D P3-TRUTH: a fire-only answer read the heat products too, and
+    // found none in effect. The Heat row then carries the same absence
+    // sentence the heat comparison states (`heatText`), never an empty cell
+    // that `fillCell` would call unavailable. (The mirror, a heat-only answer
+    // and the Fire row, needs a fire-only absence sentence the tree does not
+    // have yet; see the P3-TRUTH report.)
+    if (heat.length > 0 || fire.length > 0) {
       claims.push(
         makeClaim({
           // The former tail, "and drought-dried soils amplify it", asserted a
           // drought-to-heat coupling: the class of claim ruling D-0.8.0-047
           // removed from the USDM category ladder. It is removed here too
           // (DWH-07); do not reintroduce a DDM-inferred drought-to-heat link.
-          // vocab-allow: reports the NWS alert products in effect, upstream data
-          text: `An extreme-heat alert is in effect here: ${heat.join(', ')}. Heat raises drinking-water demand and human-health stress.`,
-          ...alertShared
+          text:
+            heat.length > 0
+              // DRAFT wording: "NWS heat alert", since NWS keeps a Heat Advisory
+              // below its Extreme Heat criteria ("dangerous heat conditions that
+              // are not expected to reach warning criteria",
+              // https://www.weather.gov/safety/heat-ww); the product names stay verbatim.
+              // vocab-allow: reports the NWS alert products in effect, upstream data
+              ? `An NWS heat alert is in effect here: ${heat.join(', ')}. Heat raises drinking-water demand and human-health stress.`
+              : heatText,
+          ...alertShared,
+          hazards: ['heat'],
+          reading: productsReading(heat)
         })
       );
     }
     if (claims.length === 0) {
       claims.push(
         makeClaim({
+          // This one sentence reports both hazards, so it keeps the lane's own
+          // pair and stands in the Fire row and the Heat row alike.
+          // DRAFT wording: "heat alerts", the same HEAT_EVENTS set as `heatText`.
           // vocab-allow: reports the absence of NWS alert products, upstream data
-          text: 'No active red-flag fire-weather or extreme-heat alerts at this location right now (NWS).',
-          ...alertShared
+          text: 'No active red-flag fire-weather or heat alerts at this location right now (NWS).',
+          ...alertShared,
+          reading: productsReading([])
         })
       );
     }
@@ -884,9 +1481,10 @@ export async function fetchNwsAlertClaims(
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] NWS alerts query failed.', err);
+    // vocab-allow: names the NWS alerts service in a console warning, upstream product
+    warnSourceFailure('NWS alerts query', err);
     // vocab-allow: names the NWS alerts service, upstream product
-    return { claims: [], ok: false, note: 'The NWS alerts service did not respond.' };
+    return { claims: [], ok: false, note: upstreamNote(err, 'The NWS alerts service') };
   }
 }
 
@@ -894,192 +1492,602 @@ export async function fetchNwsAlertClaims(
 // Near-term: CPC 6-10 day and 8-14 day outlooks (probability tilt)
 // ---------------------------------------------------------------------------
 
-interface OutlookValue {
-  readonly cat: string;
-  readonly prob: number;
-  /** `fcst_date`: when CPC issued the outlook, epoch ms; null when absent. */
-  readonly issued: number | null;
-  /** `start_date`: first day of the valid window, epoch ms. */
-  readonly validFrom: number | null;
-  /** `end_date`: last day of the valid window, epoch ms (inclusive). */
-  readonly validTo: number | null;
-}
-
 /**
- * The fields the extended-range outlook layers publish that the briefing can
- * state honestly: the tercile category and its probability, plus the issuance
- * and the valid window the service already sends with them (FSPEC-03). All
- * three date fields are epoch-millisecond UTC Date fields.
- */
-const CPC_OUT_FIELDS = 'cat,prob,fcst_date,start_date,end_date';
-
-/** Query one CPC outlook layer (0 = temperature, 1 = precipitation) at a point. */
-async function fetchCpcLayer(
-  base: string,
-  layer: 0 | 1,
-  lng: number,
-  lat: number,
-  signal: AbortSignal
-): Promise<OutlookValue | null> {
-  const url = `${base}/${layer}/query?${esriPointQuery(lng, lat, CPC_OUT_FIELDS).toString()}`;
-  const json: unknown = await fetchJson(url, GEOJSON_ACCEPT, signal);
-  const f = featuresOf(json)[0] ?? null;
-  if (!isObject(f) || !isObject(f.properties)) return null;
-  const cat = f.properties.cat;
-  const prob = f.properties.prob;
-  if (typeof cat !== 'string') return null;
-  return {
-    cat,
-    prob: typeof prob === 'number' ? prob : NaN,
-    issued: epochField(f.properties.fcst_date),
-    validFrom: epochField(f.properties.start_date),
-    validTo: epochField(f.properties.end_date)
-  };
-}
-
-/**
- * "Issued Sep 1, 2026; valid Sep 7 to Sep 11, 2026." from whichever of the
- * three date fields the service returned, and the empty string when it
- * returned none. An outlook must never state a window it was not given, so
- * each half is omitted independently rather than inferred from the other.
- */
-function outlookValiditySentence(v: OutlookValue | null): string {
-  if (!v) return '';
-  const parts: string[] = [];
-  if (v.issued !== null) parts.push(`Issued ${humanDayUtc(v.issued)}`);
-  if (v.validFrom !== null && v.validTo !== null) {
-    const sameYear =
-      new Date(v.validFrom).getUTCFullYear() === new Date(v.validTo).getUTCFullYear();
-    const from = sameYear ? humanDayUtcNoYear(v.validFrom) : humanDayUtc(v.validFrom);
-    parts.push(`valid ${from} to ${humanDayUtc(v.validTo)}`);
-  } else if (v.validFrom !== null) {
-    parts.push(`valid from ${humanDayUtc(v.validFrom)}`);
-  } else if (v.validTo !== null) {
-    parts.push(`valid through ${humanDayUtc(v.validTo)}`);
-  }
-  return parts.length > 0 ? ` ${parts.join('; ')}.` : '';
-}
-
-/** Render a category and probability into a lean phrase for one variable. */
-function leanPhrase(v: OutlookValue | null, variable: string): string | null {
-  if (!v) return null;
-  const odds = Number.isFinite(v.prob) ? ` (${v.prob}% odds)` : '';
-  if (v.cat === 'Above') return `above-normal ${variable}${odds}`;
-  if (v.cat === 'Below') return `below-normal ${variable}${odds}`;
-  return `near-normal ${variable}`;
-}
-
-/** Drought-and-fire interpretation of a temperature and precipitation lean. */
-function outlookInterpretation(temp: OutlookValue | null, precip: OutlookValue | null): string {
-  if (temp?.cat === 'Above' && precip?.cat === 'Below') {
-    return 'This hotter, drier tilt worsens near-term dryness and raises fire and heat risk.';
-  }
-  if (temp?.cat === 'Below' && precip?.cat === 'Above') {
-    return 'This cooler, wetter tilt eases near-term dryness.';
-  }
-  return '';
-}
-
-/**
- * Query the CPC 6-10 day and 8-14 day temperature and precipitation outlooks at
- * the point and surface each window's probability tilt as an outlook claim. The
- * lean is stated as a probability, never a deterministic value (the honest
- * outlook rule), and each claim carries the issuance and the valid window the
- * service publishes alongside the category. A window whose fetches fail is
- * skipped; the result is ok when at least one window resolved.
+ * The CPC 6-10 and 8-14 day outlook read at the point, which lives in
+ * `./cpc-extended` (S30D P3-TRUTH, repair round 2) and is reached through a
+ * dynamic import, as the ENSO read is (`loadEnsoClaims`, hydrate.ts), so its
+ * code stays out of the briefing's first-activation closure. The import is
+ * bounded by `settleLazy`: a briefing abort settles it as an aborted read,
+ * and a chunk that failed to load, or did not load within `TIMEOUT_MS`, read
+ * nothing at all, so the result is incomplete with no claim and no note.
+ * The cell then states no sentence: never the absence sentence (nothing was
+ * established) and never "did not respond" (no request was made).
  */
 export async function fetchCpcOutlookClaims(
   context: BoundarySelectionContext,
   signal: AbortSignal
 ): Promise<SourceResult> {
-  const { lng, lat } = context.lngLat;
-  const source = 'NOAA CPC extended-range outlooks';
-  const sourceUrl = 'https://www.cpc.ncep.noaa.gov/';
-
-  const windows: Array<{ label: string; base: string }> = [
-    { label: '6-10 day', base: URLS.cpc610OutlookMapServer },
-    { label: '8-14 day', base: URLS.cpc814OutlookMapServer }
-  ];
-
-  // Each settled claim carries its window's ordinal so chronological order
-  // never depends on the display copy (a wording change must not reorder).
-  const settled: Array<{ readonly ordinal: number; readonly claim: SourcedClaim }> = [];
-  let anyFailed = false;
-  // The first error-envelope answer seen across both windows, kept so a host
-  // that answered with an error is not reported as one that never answered
-  // (FSPEC-01). The per-variable catches below swallow the rejection to keep
-  // the sibling variable, so the envelope has to be recorded on the way past.
-  let serviceError: EsriServiceError | null = null;
-  const keepServiceError = (err: unknown): null => {
-    if (err instanceof EsriServiceError && serviceError === null) serviceError = err;
-    return null;
-  };
-  await Promise.all(
-    windows.map(async ({ label, base }, ordinal) => {
-      try {
-        // Fetch temperature and precipitation independently so one variable's
-        // HTTP failure does not discard the other; a window still emits the
-        // variable that succeeded (graceful degradation, honest-feedback rule).
-        const [temp, precip] = await Promise.all([
-          fetchCpcLayer(base, 0, lng, lat, signal).catch(keepServiceError),
-          fetchCpcLayer(base, 1, lng, lat, signal).catch(keepServiceError)
-        ]);
-        if (signal.aborted) return;
-        const parts = [leanPhrase(temp, 'temperature'), leanPhrase(precip, 'precipitation')].filter(
-          (p): p is string => p !== null
-        );
-        if (parts.length === 0) {
-          anyFailed = true;
-          return;
-        }
-        if (!temp || !precip) anyFailed = true;
-        const interp = outlookInterpretation(temp, precip);
-        // The two variables are layers of ONE issuance, so they carry the same
-        // fcst_date, start_date and end_date; whichever answered speaks for the
-        // window. An outlook claim with no forecast period is the one kind that
-        // must never lack one (DWH-06), so the dates are stated in the sentence
-        // and the issuance also dates the claim.
-        const dated = temp ?? precip;
-        const validity = outlookValiditySentence(dated);
-        const issued = dated?.issued ?? null;
-        // Foreground the temperature tercile bar (the heat-relevant variable).
-        const chartSvg = temp
-          ? cpcOutlookBarsSvg({ variable: 'temperature', cat: temp.cat, prob: temp.prob, window: label })
-          : undefined;
-        settled.push({
-          ordinal,
-          claim: makeClaim({
-            text: `CPC ${label} outlook: ${parts.join(', ')}.${interp ? ' ' + interp : ''}${validity}`,
-            source,
-            sourceUrl,
-            evidence: 'outlook',
-            dates:
-              issued === null
-                ? { retrieved: todayIso() }
-                : { issued: isoDayUtc(issued), retrieved: todayIso() },
-            uncertainty: { kind: 'categorical', text: 'stated as tercile odds (above, near, or below normal), not a deterministic value' },
-            ...(chartSvg ? { chartSvg } : {})
-          })
-        });
-      } catch (err) {
-        if (!signal.aborted) console.warn(`[impact] CPC ${label} outlook failed.`, err);
-        anyFailed = true;
-      }
-    })
-  );
-
+  const cpc = await settleLazy(() => import('./cpc-extended'), signal, 'CPC extended-range outlook load');
   if (signal.aborted) return { claims: [], ok: false };
-  // Keep windows in chronological order (6-10 then 8-14) regardless of which
-  // promise settled first, by the declared window ordinal (never by text).
-  const claims = settled.sort((a, b) => a.ordinal - b.ordinal).map((s) => s.claim);
-  if (claims.length === 0) {
+  return cpc ? cpc.readCpcOutlookClaims(context, signal) : { claims: [], ok: true, partial: true };
+}
+
+// ---------------------------------------------------------------------------
+// Season-ahead: CPC seasonal temperature outlook (DDM-P7-T07, DR-075 a)
+// ---------------------------------------------------------------------------
+
+/**
+ * The fields the CPC seasonal temperature outlook's Lead 1 layer (layer 0)
+ * publishes that the briefing can state honestly: the tercile category, its
+ * probability, the issuer's own season label, and the forecast issuance
+ * date. Verified 2026-09-09 (STEP 0, ddm-forecast-wirer): neither `cat` nor
+ * `valid_seas` carries a coded domain on the service; both are read as raw
+ * codes and expanded through the issuer's own legend/page reading below
+ * (ddm-science-verifier, 2026-09-09), never invented.
+ */
+const CPC_SEASONAL_TEMP_FIELDS = 'cat,prob,valid_seas,fcst_date';
+
+/**
+ * The issuer's own reading of its `cat` code, from the service's renderer
+ * legend (STEP 0's `uniqueValueGroups`,
+ * `I:\claude-temp\ddm-s18\DDM-P7-T07\layer0-description.json`): the raw
+ * codes `Normal` and `EC` are never shown to the public by the issuer, which
+ * labels them "Near Normal" and "Equal Chances"; this table carries the
+ * sentence's own lowercase hyphenated reading of that legend directly
+ * (`Above`/`Below` are already the issuer's words). `EC` renders its own
+ * branch below rather than a table entry (its sentence carries no percent).
+ * A code this table does not carry renders verbatim, never invented.
+ */
+const CPC_SEASONAL_CAT_LABEL: Readonly<Record<string, string>> = {
+  Above: 'above-normal',
+  Below: 'below-normal',
+  Normal: 'near-normal'
+};
+
+/**
+ * CPC's own "Mon-Mon-Mon YYYY" reading of its three-letter `valid_seas` code
+ * (ddm-science-verifier, 2026-09-09: CPC's page writes "Sep-Oct-Nov 2026",
+ * https://www.cpc.ncep.noaa.gov/products/predictions/long_range/seasonal_info.php).
+ * A code outside this fixed 12-entry table, or a `valid_seas` value that does
+ * not parse as `<code> <year>`, renders verbatim, never invented.
+ */
+const CPC_SEASON_CODE_EXPANSION: Readonly<Record<string, string>> = {
+  JFM: 'Jan-Feb-Mar',
+  FMA: 'Feb-Mar-Apr',
+  MAM: 'Mar-Apr-May',
+  AMJ: 'Apr-May-Jun',
+  MJJ: 'May-Jun-Jul',
+  JJA: 'Jun-Jul-Aug',
+  JAS: 'Jul-Aug-Sep',
+  ASO: 'Aug-Sep-Oct',
+  SON: 'Sep-Oct-Nov',
+  OND: 'Oct-Nov-Dec',
+  NDJ: 'Nov-Dec-Jan',
+  DJF: 'Dec-Jan-Feb'
+};
+
+function cpcSeasonalValidSeasLabel(validSeas: string): string {
+  const match = /^([A-Za-z]{3})(?:\s+(\d{4}))?$/.exec(validSeas.trim());
+  if (!match) return validSeas;
+  const expansion = CPC_SEASON_CODE_EXPANSION[match[1]!.toUpperCase()];
+  if (!expansion) return validSeas;
+  return match[2] ? `${expansion} ${match[2]}` : expansion;
+}
+
+/**
+ * Query the CPC seasonal temperature outlook (`cpcSeasonalTempOutlookMapServer`,
+ * Lead 1 = layer 0) at the point and surface its category, probability and
+ * the issuer's own season label as an outlook claim. This is a NOAA Climate
+ * Prediction Center product, never presented as an ENSO forecast (DR-019).
+ * The layer publishes no region-name attribute, so the claim states the
+ * geography the query answered for as "at the selected point" (matching the
+ * rest of this file's point-query claims). A failed fetch, an ArcGIS error
+ * envelope, or a point the service returns no feature (or a malformed one)
+ * for all report `ok: false` with a note naming the product, per the
+ * honesty contract above; none of them renders a claim.
+ */
+export async function fetchCpcSeasonalTempClaims(
+  context: BoundarySelectionContext,
+  signal: AbortSignal
+): Promise<SourceResult> {
+  const { lng, lat } = context.lngLat;
+  const source = 'NOAA Climate Prediction Center seasonal temperature outlook';
+  // The issuer's Seasonal Outlook landing page (ddm-science-verifier,
+  // 2026-09-09: verified 200).
+  const sourceUrl = 'https://www.cpc.ncep.noaa.gov/products/predictions/long_range/';
+  const base = URLS.cpcSeasonalTempOutlookMapServer;
+  const url = `${base}/0/query?${esriPointQuery(lng, lat, CPC_SEASONAL_TEMP_FIELDS).toString()}`;
+  try {
+    const json: unknown = await fetchJson(url, GEOJSON_ACCEPT, signal);
+    if (signal.aborted) return { claims: [], ok: false };
+    const f = featuresOf(json)[0] ?? null;
+    if (!isObject(f) || !isObject(f.properties)) {
+      return {
+        claims: [],
+        ok: false,
+        note: 'The NOAA CPC seasonal temperature outlook returned no reading for this point.'
+      };
+    }
+    const cat = f.properties.cat;
+    const validSeas = f.properties.valid_seas;
+    const prob = f.properties.prob;
+    if (
+      typeof cat !== 'string' ||
+      typeof validSeas !== 'string' ||
+      typeof prob !== 'number' ||
+      !Number.isFinite(prob)
+    ) {
+      return {
+        claims: [],
+        ok: false,
+        note: 'The NOAA CPC seasonal temperature outlook returned no reading for this point.'
+      };
+    }
+    // `fcst_date`'s field alias equals its field name on this service (STEP
+    // 0): the issuer publishes no descriptive alias for it. "Issued" below
+    // is this code's own inference from CPC's published near-mid-month
+    // release cadence plus the sampled value, not a reading of an issuer
+    // field description.
+    const issued = epochField(f.properties.fcst_date);
+    const issuedText = issued !== null ? ` Issued ${humanDayUtc(issued)}.` : '';
+    const season = cpcSeasonalValidSeasLabel(validSeas);
+    // The tercile as data, beside the sentence (types.ts `ClaimReading`): the
+    // service's own `cat` and `prob` and the season label the sentence
+    // states. A `cat` code outside the four the sentence table reads carries
+    // no reading, as it carries no expanded word.
+    const tercile: CpcTercileReading | null =
+      cat === 'Above' || cat === 'Below' || cat === 'Normal' || cat === 'EC'
+        ? { kind: 'cpc-tercile', variable: 'temperature', cat, prob, season }
+        : null;
+    const text =
+      cat === 'EC'
+        ? `NOAA Climate Prediction Center seasonal temperature outlook for ${season}: Equal Chances (no favored tercile), at ${pointReadPlace(context)}.${issuedText}`
+        : `NOAA Climate Prediction Center seasonal temperature outlook for ${season}: ${prob}% chance of ${
+            CPC_SEASONAL_CAT_LABEL[cat] ?? cat
+          } temperature, at ${pointReadPlace(context)}.${issuedText}`;
+    return {
+      claims: [
+        makeClaim({
+          text,
+          source,
+          sourceUrl,
+          product: 'cpcSeasonalTemp',
+          evidence: 'outlook',
+          dates:
+            issued === null
+              ? { retrieved: todayIso() }
+              : { issued: isoDayUtc(issued), retrieved: todayIso() },
+          uncertainty: {
+            kind: 'categorical',
+            text: 'a tercile category and its stated probability, not a deterministic outcome'
+          },
+          ...(tercile ? { reading: tercile } : {})
+        })
+      ],
+      ok: true
+    };
+  } catch (err) {
+    if (signal.aborted) return { claims: [], ok: false };
+    warnSourceFailure('CPC seasonal temperature outlook query', err);
     return {
       claims: [],
       ok: false,
-      note: upstreamNote(serviceError, 'The CPC extended-range outlooks')
+      note: upstreamNote(err, 'The NOAA CPC seasonal temperature outlook')
     };
   }
-  return { claims, ok: true, ...(anyFailed ? { note: 'One CPC outlook window did not respond.' } : {}) };
+}
+
+// ---------------------------------------------------------------------------
+// Near-term: SPC Day 1-8 Fire Weather Outlook (DDM-P7-T03, DR-022 a)
+// ---------------------------------------------------------------------------
+
+/**
+ * The SPC fire weather outlook layers this fetch reads at the selected
+ * point (verified 2026-09-09, verify-spc-nifc.md, S20): layer 1 is Day 1 and
+ * layer 4 is Day 2, both categorical on field `dn` (5 Elevated, 8 Critical,
+ * 10 Extremely Critical, SPC's own public product word per the science
+ * verdict; `SPC_FIREWX_CATEGORIES` carries the correction, so the map legend
+ * and this text agree). Layers 8, 11, 14, 17, 20, 23 are the Days 3-8
+ * probabilistic product on field `label` ("0.40", "0.70"), plus a live third
+ * value with `dn` 0 and `label` "Probability Too Low" that the service's own
+ * renderer does not document (stated honestly as a DDM-convention reading,
+ * never as no data and never as an invented risk category). All six Days
+ * 3-8 layers share one `issue` timestamp; every layer carries its own
+ * `valid` and `expire` window as a `YYYYMMDDHHMM` UTC string, matching
+ * `src/layers/spc-fire-weather.ts`'s own Day 1 field reading. NOAA's own
+ * serviceDescription and about.html disagree on the Day 1 cadence (S20), so
+ * no sentence here states a cadence: every window comes only from the
+ * feature's own `valid` and `expire`, never invented from the calendar.
+ */
+// The `day` each layer answers (1, 2) is never read back from this table:
+// `spcCategoricalClaim`'s two call sites below name their day literally, so
+// only `layer` is carried here (F11, S20 fix round: an unused `day` field
+// was deleted rather than kept dead).
+const SPC_CATEGORICAL_DAYS: ReadonlyArray<{ readonly layer: number }> = [
+  { layer: 1 },
+  { layer: 4 }
+];
+
+/** Days 3-8, layer id order (S20: 8 Day 3, 11 Day 4, 14 Day 5, 17 Day 6, 20 Day 7, 23 Day 8). */
+const SPC_PROBABILISTIC_DAYS: ReadonlyArray<{
+  readonly day: 3 | 4 | 5 | 6 | 7 | 8;
+  readonly layer: number;
+}> = [
+  { day: 3, layer: 8 },
+  { day: 4, layer: 11 },
+  { day: 5, layer: 14 },
+  { day: 6, layer: 17 },
+  { day: 7, layer: 20 },
+  { day: 8, layer: 23 }
+];
+
+const SPC_CATEGORICAL_OUT_FIELDS = 'dn,valid,expire';
+const SPC_PROBABILISTIC_OUT_FIELDS = 'dn,label,label2,valid,expire,issue';
+
+/** The issuer's SPC fire weather definitions page (dn categories, product names). */
+const SPC_ABOUT_URL = 'https://www.spc.noaa.gov/misc/about.html';
+/** The issuer's Days 3-8 probability definition (verify-spc-nifc.md S20 quote). */
+const SPC_PROBABILISTIC_INFO_URL = 'https://www.spc.noaa.gov/misc/SPC_Fire_Probabilistic_Information.pdf';
+
+/** One SPC layer query's outcome: `ok: false` is a transport or envelope
+ * failure (no claim is ever built from it); `ok: true, props: null` is a
+ * legitimate empty result (the layer drew no area over the point). */
+interface SpcLayerOutcome {
+  readonly ok: boolean;
+  readonly props: Record<string, unknown> | null;
+  readonly err?: unknown;
+}
+
+/**
+ * The field list threaded as an object property (`{ outFields }`) rather
+ * than a bare positional string, so `scripts/check-upstream-drift.mjs`'s
+ * static `outFields:` extraction can see each SPC layer's field list
+ * (F6, S20 fix round: the SPC 6-day and 12-day column-family drift-contract
+ * probe needs a real source-text anchor, not a positional argument).
+ */
+async function fetchSpcLayerOutcome(
+  base: string,
+  layer: number,
+  query: { readonly outFields: string },
+  lng: number,
+  lat: number,
+  signal: AbortSignal
+): Promise<SpcLayerOutcome> {
+  try {
+    const url = `${base}/${layer}/query?${esriPointQuery(lng, lat, query.outFields).toString()}`;
+    const json: unknown = await fetchJson(url, GEOJSON_ACCEPT, signal);
+    const f = featuresOf(json)[0] ?? null;
+    return { ok: true, props: isObject(f) && isObject(f.properties) ? f.properties : null };
+  } catch (err) {
+    return { ok: false, props: null, err };
+  }
+}
+
+/**
+ * SPC's `YYYYMMDDHHMM` UTC field into epoch milliseconds, or null when the
+ * field is missing or malformed. Mirrors `spcMomentUtc` in
+ * `src/layers/spc-fire-weather.ts` (module-private there, and that file is a
+ * different task's; kept as its own small parser here rather than imported).
+ */
+function parseSpcMoment(value: unknown): number | null {
+  if (typeof value !== 'string' || !/^\d{12}$/.test(value)) return null;
+  const ms = Date.UTC(
+    Number(value.slice(0, 4)),
+    Number(value.slice(4, 6)) - 1,
+    Number(value.slice(6, 8)),
+    Number(value.slice(8, 10)),
+    Number(value.slice(10, 12))
+  );
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/**
+ * ", valid <from> to <until>." from whichever of `valid`/`expire` parsed.
+ * Each half is stated only when the service gave it (the honest-outlook
+ * rule: never invent a window edge), and a feature with neither closes the
+ * sentence with a bare period. The moment grammar itself is `heatRiskMoment`
+ * above (F11, S20 fix round: a byte-identical `spcMomentText` duplicated it;
+ * deleted in favor of the one formatter), the same "Sep 8, 2026, 12:00 UTC"
+ * grammar `src/layers/spc-fire-weather.ts:118` uses for the same SPC
+ * valid/expire field (DR-037 i: one grammar per field, shared).
+ */
+function spcValidityClause(validMs: number | null, expireMs: number | null): string {
+  if (validMs !== null && expireMs !== null) {
+    return `, valid ${heatRiskMoment(validMs)} to ${heatRiskMoment(expireMs)}.`;
+  }
+  if (validMs !== null) return `, valid from ${heatRiskMoment(validMs)}.`;
+  if (expireMs !== null) return `, valid through ${heatRiskMoment(expireMs)}.`;
+  return '.';
+}
+
+/**
+ * The issuer's own `dn` word (`SPC_FIREWX_CATEGORIES`, corrected to
+ * "Extremely Critical" for `dn` 10), or `null` for a value the palette
+ * table does not carry: the caller drops the read rather than inventing a
+ * severity for an unrecognized code (F3, S20 fix round: a prior `Category
+ * <n>` fallback fabricated a risk sentence for a malformed `dn`).
+ */
+function spcCategoryWord(dn: number): string | null {
+  const entry = SPC_FIREWX_CATEGORIES.find((c) => c.dn === dn);
+  return entry ? entry.label : null;
+}
+
+/**
+ * One Day 1 or Day 2 categorical read, science verdict sentence shapes (a)
+ * and (b) (section 4). `outcome.ok === false` (a failed query) yields no
+ * claim at all here: the caller reports the day's absence from the cell
+ * only through the lane's own failure note, never through this sentence
+ * shape, so an outage can never read as an honest "no area is drawn".
+ * `outcome.props === null` (the layer legitimately drew nothing here) is
+ * the only path to the no-area sentence; a feature WITH an unrecognized or
+ * malformed `dn` (F3: `null`, `''`, or any value not in
+ * `SPC_FIREWX_CATEGORIES`) is dropped with a console warning instead,
+ * never folded into "no area is drawn" (an area WAS returned) and never
+ * printed as an invented "Category <n>" risk. One conflation remains and is
+ * stated rather than hidden: `fetchSpcLayerOutcome` also folds a returned
+ * feature whose `properties` is absent or not an object into `props: null`,
+ * so such a feature would read as no area drawn; ArcGIS GeoJSON always
+ * carries a properties object, so no live path reaches it.
+ */
+function spcCategoricalClaim(
+  day: 1 | 2,
+  outcome: SpcLayerOutcome,
+  source: string
+): SourcedClaim | null {
+  if (!outcome.ok) return null;
+  const product = `SPC Day ${day} Fire Weather Outlook`;
+  const props = outcome.props;
+  if (props === null) {
+    return makeClaim({
+      text: `${product}: no Elevated, Critical, or Extremely Critical area is drawn over this point for this day.`,
+      source,
+      sourceUrl: SPC_ABOUT_URL,
+      product: 'spc-fire-weather',
+      evidence: 'outlook',
+      dates: { retrieved: todayIso() },
+      // The day as data (types.ts `ClaimReading`): no `category`, because the
+      // layer drew no area over the point for this day.
+      reading: spcDaysReading([day])
+    });
+  }
+  // An issuance past its own expire time is not the near-term outlook: no claim, and the
+  // caller reads the day as unreadable (partial), as the map withholds it.
+  const expireMs = parseSpcMoment(props.expire);
+  if (expireMs !== null && expireMs <= Date.now()) return null;
+  const dn = typeof props.dn === 'number' ? props.dn : Number(props.dn);
+  const categoryWord = Number.isFinite(dn) ? spcCategoryWord(dn) : null;
+  if (categoryWord === null) {
+    console.warn(
+      `[impact] SPC Day ${day} outlook returned an unrecognized dn; dropped rather than invented.`,
+      props.dn
+    );
+    return null;
+  }
+  const validMs = parseSpcMoment(props.valid);
+  return makeClaim({
+    text: `${product}: ${categoryWord} risk from wind and relative humidity at this point${spcValidityClause(validMs, expireMs)}`,
+    source,
+    sourceUrl: SPC_ABOUT_URL,
+    product: 'spc-fire-weather',
+    evidence: 'outlook',
+    dates:
+      validMs !== null
+        ? { valid: isoDayUtc(validMs), retrieved: todayIso() }
+        : { retrieved: todayIso() },
+    uncertainty: {
+      kind: 'categorical',
+      text: 'a categorical fire-weather threat class, not a deterministic outcome'
+    },
+    // The class as data: the same `dn` `spcCategoryWord` just read (5, 8 or
+    // 10, the only values `SPC_FIREWX_CATEGORIES` carries) and the feature's
+    // own `valid` and `expire` window.
+    reading: spcDaysReading([day], { category: dn as 5 | 8 | 10 }, validMs, expireMs)
+  });
+}
+
+/**
+ * One SPC claim's day or days as data, beside its sentence (types.ts
+ * `ClaimReading`). `value` carries the Day 1 or Day 2 `dn`, or the Days 3 to 8
+ * `label`, exactly as the sentence read it; omitted, the claim says no area
+ * is drawn for those days. Each window edge is set only when the feature's
+ * own `valid` or `expire` parsed.
+ */
+function spcDaysReading(
+  days: readonly number[],
+  value: Pick<SpcFireDaysReading, 'category' | 'probability'> = {},
+  validMs: number | null = null,
+  expireMs: number | null = null
+): SpcFireDaysReading {
+  return {
+    kind: 'spc-fire-days',
+    days: [...days],
+    ...value,
+    ...(validMs !== null || expireMs !== null
+      ? {
+          window: {
+            ...(validMs !== null ? { from: validMs } : {}),
+            ...(expireMs !== null ? { to: expireMs } : {})
+          }
+        }
+      : {})
+  };
+}
+
+/** "Day 5", "Days 5 and 6", or "Days 5, 6, and 7" (the serial comma, F11:
+ * the verdict's own section 4(c) sentence uses one), for the compact fold. */
+function joinDayList(days: readonly number[]): string {
+  if (days.length === 1) return `Day ${days[0]}`;
+  if (days.length === 2) return `Days ${days[0]} and ${days[1]}`;
+  return `Days ${days.slice(0, -1).join(', ')}, and ${days[days.length - 1]}`;
+}
+
+/**
+ * Query the SPC Day 1-8 Fire Weather Outlook (`spcFireWeatherOutlookMapServer`)
+ * at the selected point and surface the near-term fire cell's claims: Day 1
+ * and Day 2 first, then the Days 3-8 probabilistic reads in day order,
+ * compactly (DDM-P7-T03, DR-022 a). Every sentence carries the issuer, the
+ * product name, and the valid window the service gave it (never a cadence
+ * claim, per the Day 1 cadence contradiction S20 found in NOAA's own
+ * metadata); a day with no drawn area says so honestly (never no data,
+ * never unavailable), and the live undocumented "Probability Too Low" value
+ * is stated as a DDM-convention reading, never as no data and never as an
+ * invented risk category. A day whose own query failed contributes no claim
+ * (never a false "no area" reading of an outage) and leaves the lane
+ * partial; the whole lane reads unavailable naming the product only when
+ * every one of the eight queries failed. This never speaks for the 2023 Wildfire Hazard Potential raster,
+ * which is not a forecast and is not read here.
+ */
+export async function fetchSpcFireOutlookClaims(
+  context: BoundarySelectionContext,
+  signal: AbortSignal
+): Promise<SourceResult> {
+  const { lng, lat } = context.lngLat;
+  const source = 'NOAA Storm Prediction Center';
+  const base = URLS.spcFireWeatherOutlookMapServer;
+
+  const [day1, day2, ...probOutcomes] = await Promise.all([
+    fetchSpcLayerOutcome(base, SPC_CATEGORICAL_DAYS[0]!.layer, { outFields: SPC_CATEGORICAL_OUT_FIELDS }, lng, lat, signal),
+    fetchSpcLayerOutcome(base, SPC_CATEGORICAL_DAYS[1]!.layer, { outFields: SPC_CATEGORICAL_OUT_FIELDS }, lng, lat, signal),
+    ...SPC_PROBABILISTIC_DAYS.map(({ layer }) =>
+      fetchSpcLayerOutcome(base, layer, { outFields: SPC_PROBABILISTIC_OUT_FIELDS }, lng, lat, signal)
+    )
+  ]);
+
+  if (signal.aborted) return { claims: [], ok: false };
+
+  const allOutcomes: readonly SpcLayerOutcome[] = [day1, day2, ...probOutcomes];
+  // B7: the eight queries run on the briefing's signal, so a cancel never gets here
+  // (the abort check above). One log per read: a timeout as a timeout, else the error.
+  const failure =
+    allOutcomes.find((o) => o.err instanceof EsriServiceError)?.err ??
+    allOutcomes.find((o) => isFetchTimeout(o.err))?.err ??
+    allOutcomes.find((o) => !o.ok)?.err;
+  if (failure !== undefined) warnSourceFailure('SPC fire weather outlook query', failure);
+  const anySucceeded = allOutcomes.some((o) => o.ok);
+  if (!anySucceeded) {
+    return {
+      claims: [],
+      ok: false,
+      note: upstreamNote(failure, 'The NOAA Storm Prediction Center Day 1-8 Fire Weather Outlook')
+    };
+  }
+
+  const claims: SourcedClaim[] = [];
+  const day1Claim = spcCategoricalClaim(1, day1, source);
+  if (day1Claim) claims.push(day1Claim);
+  const day2Claim = spcCategoricalClaim(2, day2, source);
+  if (day2Claim) claims.push(day2Claim);
+  // S30D P3-TRUTH: a day that answered with a value this briefing cannot read
+  // (an unrecognized `dn` here, an unrecognized label below) is dropped
+  // rather than invented, and the read is then incomplete, like a failed day.
+  let unreadable = (day1.ok && !day1Claim) || (day2.ok && !day2Claim);
+
+  const noFeatureDays: number[] = [];
+  for (let i = 0; i < SPC_PROBABILISTIC_DAYS.length; i += 1) {
+    const { day } = SPC_PROBABILISTIC_DAYS[i]!;
+    const outcome = probOutcomes[i]!;
+    // A failed query contributes nothing, not even to the "no area" fold
+    // (an outage is never a positive finding of absence, FSPEC-01).
+    if (!outcome.ok) continue;
+    const props = outcome.props;
+    if (props === null) {
+      noFeatureDays.push(day);
+      continue;
+    }
+    // An issuance past its own expire time states nothing; the read is incomplete.
+    const expireMs = parseSpcMoment(props.expire);
+    if (expireMs !== null && expireMs <= Date.now()) {
+      unreadable = true;
+      continue;
+    }
+    const product = `SPC Day ${day} Fire Weather Outlook`;
+    const label = typeof props.label === 'string' ? props.label.trim() : '';
+    const issuedMs = parseSpcMoment(props.issue);
+    const dates =
+      issuedMs !== null
+        ? { issued: isoDayUtc(issuedMs), retrieved: todayIso() }
+        : { retrieved: todayIso() };
+    if (label === '0.40' || label === '0.70') {
+      const pct = label === '0.40' ? 40 : 70;
+      const validMs = parseSpcMoment(props.valid);
+      claims.push(
+        makeClaim({
+          text: `${product}: ${pct}% probability of critical fire weather and/or lightning-based ignition within 12 miles of this point${spcValidityClause(validMs, expireMs)}`,
+          source,
+          sourceUrl: SPC_PROBABILISTIC_INFO_URL,
+          product: 'spc-fire-weather',
+          evidence: 'outlook',
+          dates,
+          uncertainty: {
+            kind: 'categorical',
+            text: 'a probability of occurrence within 12 miles of the point during the outlook period, not a deterministic outcome'
+          },
+          reading: spcDaysReading([day], { probability: label }, validMs, expireMs)
+        })
+      );
+    } else if (label === 'Probability Too Low') {
+      claims.push(
+        makeClaim({
+          text: `${product}: this point returns "Probability Too Low", a service value with no public SPC definition found; treated here as below the 10% threshold SPC does map, not as no-data.`,
+          source,
+          sourceUrl: SPC_PROBABILISTIC_INFO_URL,
+          product: 'spc-fire-weather',
+          evidence: 'outlook',
+          dates,
+          uncertainty: {
+            kind: 'not-quantified',
+            text: 'a live service value with no issuer-published definition found'
+          },
+          reading: spcDaysReading([day], { probability: label })
+        })
+      );
+    } else {
+      // No verified sentence exists for any other label the service might
+      // send; dropped rather than invented, and never folded into the
+      // "no area" sentence below (an area WAS drawn here, just not one of
+      // the three verified values).
+      unreadable = true;
+      console.warn(
+        `[impact] SPC Day ${day} outlook returned an unrecognized label; dropped rather than invented.`,
+        label
+      );
+    }
+  }
+
+  if (noFeatureDays.length > 0) {
+    claims.push(
+      makeClaim({
+        text: `SPC Day 3-8 Fire Weather Outlook: no area is drawn over this point for ${joinDayList(noFeatureDays)}.`,
+        source,
+        sourceUrl: SPC_ABOUT_URL,
+        product: 'spc-fire-weather',
+        evidence: 'outlook',
+        dates: { retrieved: todayIso() },
+        reading: spcDaysReading(noFeatureDays)
+      })
+    );
+  }
+
+  if (claims.length === 0) {
+    // Every query that answered found nothing claimable (for example every
+    // probabilistic label was unrecognized while both categorical layers
+    // also failed): report the same honest unavailable the total-failure
+    // branch above uses, naming the product, rather than an empty cell with
+    // no note.
+    return {
+      claims: [],
+      ok: false,
+      note: 'The NOAA Storm Prediction Center Day 1-8 Fire Weather Outlook returned no reading this briefing can state for this point.'
+    };
+  }
+
+  // F5 (S20 fix round) closed by S30D P3-TRUTH: a day whose own query failed,
+  // or whose answer could not be read, leaves the read partial, so the days
+  // that answered stand and the cell reads live (partial), never live
+  // (`fillCell` honours `partial`). No note rides with it yet: the tree has
+  // no sentence for some SPC days failing (the whole-lane note above would be
+  // false here), so the proposed text is in the P3-TRUTH report for the owner.
+  return { claims, ok: true, ...(unreadable || allOutcomes.some((o) => !o.ok) ? { partial: true } : {}) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1096,7 +2104,8 @@ export async function fetchCpcOutlookClaims(
 export async function fetchNwsForecastClaims(
   context: BoundarySelectionContext,
   signal: AbortSignal,
-  session: NwsRequestSession = createNwsRequestSession(signal)
+  session: NwsRequestSession = createNwsRequestSession(signal),
+  now: number = Date.now()
 ): Promise<SourceResult> {
   const source = 'NWS forecast'; // vocab-allow: names the NWS point forecast, upstream product
   const sourceUrl = 'https://www.weather.gov/';
@@ -1117,11 +2126,13 @@ export async function fetchNwsForecastClaims(
     );
     if (signal.aborted) return { claims: [], ok: false };
 
-    const periods =
-      isObject(fJson) && isObject(fJson.properties) && Array.isArray(fJson.properties.periods)
-        ? fJson.properties.periods
-        : [];
-    const first = periods.find(isObject);
+    const properties = isObject(fJson) && isObject(fJson.properties) ? fJson.properties : null;
+    const periods = properties && Array.isArray(properties.periods) ? properties.periods : [];
+    // A period whose own endTime has passed is not the coming period (point-heat.ts
+    // `currentOrFuture` drops ended grid intervals the same way); no endTime stays eligible.
+    const first = periods
+      .filter(isObject)
+      .find((p) => !(typeof p.endTime === 'string' && Date.parse(p.endTime) <= now));
     if (!first) throw new Error('no forecast periods');
 
     const name = typeof first.name === 'string' ? first.name : 'The coming period';
@@ -1130,7 +2141,25 @@ export async function fetchNwsForecastClaims(
     const short = typeof first.shortForecast === 'string' ? first.shortForecast : '';
     const tempStr = temp !== null ? `${temp} degrees ${unit}` : 'an unspecified temperature';
     // vocab-allow: renders the upstream NWS point forecast product
-    const text = `${name}: ${short || 'forecast available'}, near ${tempStr}. Watch this against the heat outlook; hot, dry spells deepen near-term dryness and fire danger.`;
+    const text = `${name}: ${short || 'forecast available'}, near ${tempStr}.`;
+
+    // The forecast product's own date: the period's own start (the day the
+    // read period covers) as `valid`, and the product's own `updateTime` (when
+    // NWS issued this forecast) as `issued`, each read straight off the
+    // upstream response and never invented when absent (Rule: never broaden
+    // certainty). `retrieved` still records the fetch day regardless.
+    // `startTime` carries the point's own offset, so its written day is the
+    // period's day; `updateTime` is a UTC instant, read as the viewer's local
+    // day as `todayIso` is.
+    const validDay = issuerCalendarDay(first.startTime);
+    const updateMs =
+      typeof properties?.updateTime === 'string' ? Date.parse(properties.updateTime) : NaN;
+    const issuedDay = Number.isFinite(updateMs) ? isoDayLocal(new Date(updateMs)) : undefined;
+    const dates = {
+      ...(validDay ? { valid: validDay } : {}),
+      ...(issuedDay ? { issued: issuedDay } : {}),
+      retrieved: todayIso()
+    };
 
     return {
       ok: true,
@@ -1140,25 +2169,43 @@ export async function fetchNwsForecastClaims(
           text,
           source,
           sourceUrl,
+          product: 'nwsForecast',
           evidence: 'outlook',
-          dates: { retrieved: todayIso() },
+          dates,
           // vocab-allow: names the NWS point forecast, upstream product
           uncertainty: { kind: 'not-quantified', text: 'a point weather forecast stated as a tendency; the NWS product publishes no uncertainty band here' }
+        }),
+        // DR-047 a: the DDM-authored heat-to-dryness sentence (item 7 of the
+        // briefing's causal list) is relabeled derived with a lineage, pending
+        // citation, as the USDM wildfire sentence above is; its words are unchanged.
+        makeClaim({
+          text: 'Watch this against the heat outlook; hot, dry spells deepen near-term dryness and fire danger.',
+          source,
+          sourceUrl,
+          product: 'nwsForecast',
+          evidence: 'derived',
+          dates,
+          // DRAFT wording (pending the owner's read-back): the lineage and uncertainty lines.
+          // vocab-allow: names the NWS point forecast, upstream product
+          lineage: ['the NWS point forecast for the coming period', 'a DDM-authored heat and dryness read, pending citation'],
+          lineageRef: 'ddm-drought-impact-modeling',
+          // vocab-allow: honesty disclaimer, denies being a forecast
+          uncertainty: { kind: 'typical', text: 'a general tendency, not a forecast for this place' }
         })
       ],
       heatRead: {
         key: 'nwsForecast',
         // vocab-allow: names the upstream NWS point forecast product
         label: 'NWS point forecast',
-        // vocab-allow: renders the upstream NWS point forecast product
-        text: `${name}: ${short || 'forecast available'}, near ${tempStr}.`,
+        text,
         sourceUrl
       }
     };
   } catch (err) {
     if (signal.aborted) return { claims: [], ok: false };
-    console.warn('[impact] NWS forecast query failed.', err);
+    // vocab-allow: names the NWS point forecast in a console warning, upstream product
+    warnSourceFailure('NWS forecast query', err);
     // vocab-allow: names the NWS point forecast, upstream product
-    return { claims: [], ok: false, note: 'The NWS point forecast did not respond.' };
+    return { claims: [], ok: false, note: upstreamNote(err, 'The NWS point forecast') };
   }
 }

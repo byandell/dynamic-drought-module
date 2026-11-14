@@ -50,10 +50,16 @@ communication tool," *Fire Ecology* 20:45, 2024,
 DOI 10.1186/s42408-024-00278-8) found viewers consistently over-trust
 fire visualizations even when a physics model produced them, and warned
 that a self-service web page is where that correction "cannot occur or
-can be overlooked" if it lives only in documentation. Consequently the 3D
-Fire control renders an always-visible non-prediction disclosure
-(`FIRE3D_NON_PREDICTION_NOTE`) beside the always-visible coverage note,
-never a dismissible tooltip and never documentation-only.
+can be overlooked" if it lives only in documentation. Consequently the
+non-prediction disclosure (`FIRE3D_NON_PREDICTION_NOTE`) and the coverage
+note stay in the interface, one press from the 3D Fire control: they are the
+body of its "3D information" disclosure, which is closed by default, and the
+Impact Briefing's Technical information states the same limit. The
+owner's rule of 2026-10-13 keeps small print off the main display, so the
+two notes are no longer drawn open under the button (visual uniformity wave
+1, 2026-11-13); they are never a hover-only tooltip and never
+documentation-only. The Fuel risk key's caveat reads in the same disclosure
+while the drape is drawn.
 
 Embeds are the sharpest case: they hide the sidebar chrome (the control's
 notes and the legend panel) while a URL-named `fire3d=true` still drives
@@ -63,6 +69,15 @@ active in an embed, the orchestrator therefore prints the disclosure, the
 coverage note, and each active context layer's vintage line directly on
 the map surface (`#fire3d-embed-note`, non-interactive, never
 dismissible).
+
+A phone is the third case (owner direction 2026-11-09, sprint; DR-pending).
+Its sidebar is a sheet that is usually closed, so the two notes stand on
+the map there too: one glass card under the key chip, present for as long
+as the scene is asked for, with no close control while the scene is on.
+The scene's activation gate admits a phone only while that card is mounted
+(`src/map/fire3d.ts`, `presentingShell`), so the scene and its disclosure
+cannot be separated by a slow or failed chunk. The card's heading is the
+view's own name, "3D context view".
 
 ## The perimeter ribbon is not a context layer
 
@@ -150,15 +165,9 @@ absence here is not evidence that none are present. Wording matters:
 belongs to the issuers, and a viewer looking at a sparse transmission
 network could otherwise conclude it is the whole grid.
 
-The remaining option, declined for now and recorded as a follow-up
-rather than a silent gap: OpenStreetMap `power=minor_line` and
-`power=line` could carry a volunteer-mapped distribution layer under
-ODbL. It would have to arrive as its own visibly distinct layer with its
-own legend row, its own attribution, and an explicit "incomplete,
-volunteer-mapped" disclosure, because its coverage varies enormously by
-locality. It must never be blended into the HIFLD layer: one issuer, one
-legend, per layer, and a mixed layer would let sparse volunteer coverage
-read as a federal statement of absence.
+A volunteer-mapped distribution layer was also considered and declined:
+it would need its own credit on the map, and the owner keeps credits off
+the main display (2026-11-13).
 
 A California-only CPUC High
 Fire Threat District layer was evaluated and declined: its license is a
@@ -167,28 +176,12 @@ affirmative open-data grant, and an uncaptioned state-specific layer
 would falsely imply lower risk where the true difference is that no
 equivalent dataset exists elsewhere.
 
-The structures context specifically: Overture Maps Foundation building
-footprints (ODbL), chosen over Microsoft's standalone footprint sets
-because Overture fuses them with OpenStreetMap and carries real height
-attributes largely derived from public USGS 3DEP lidar. Scope is the
-run's recorded fork: the full PNW terrain box holds 9,160,813 footprints,
-PROJECTED (never baked) at roughly 240 MB of z14-only vector tiles from
-the empirically measured 26 bytes per building, and roughly 380 MB at
-the shipped z13-14 scheme's measured 42 bytes per building; neither fits
-any same-origin Pages path. The committed
-bake therefore covers the central_oregon region framing only, the
-coverage note and legend both say so, and the extract script's --bbox
-parameter is the deployer path for any other region (the losing
-argument, a many-state split-archive scheme, loses on repository weight
-and clone cost). Height honesty is a two-layer split: published heights
-extrude verbatim in the measured tone; everything else draws visibly
-dimmer at a disclosed placeholder rule (three meters per published
-floor, otherwise four meters), because fill-extrusion opacity is not
-data-driven and a single tone would let placeholders pass as
-measurements. The bake never estimates a height the issuer did not
-publish. Azure and Bing 3D city meshes were disqualified outright
-(API-key-gated commercial services covering curated metros, not the
-rural and Tribal geography this project serves).
+The structures context (building footprints for central Oregon) now comes
+from USA Structures, 2023 edition, published under CC0 (DR-126), so it needs
+no credit on the map: one extrusion at a stated 4 m height in one tone, keyed
+only as "Buildings" while a building can draw. Azure and Bing 3D city meshes stay
+disqualified (API-key-gated commercial services covering curated metros,
+not the rural and Tribal geography this project serves).
 
 The hazard drape specifically: USFS Wildfire Hazard Potential 2023 from the
 same public service used by the flat `usfs-whp` catalog layer. WHP is a static

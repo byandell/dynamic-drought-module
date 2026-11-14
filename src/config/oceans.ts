@@ -2,13 +2,18 @@
  * Schematic ocean zones for the region shell minimap (S1; D-0.7.0-042,
  * D-0.7.0-051, D-0.7.0-053; spike round 4 item 7).
  *
- * The Pacific, Arctic, and Atlantic Oceans on the minimap are faint
- * click targets that ENTER THE ENSO CLUSTER: an ocean click switches
+ * The Pacific, Arctic, and Atlantic ocean views ENTER THE ENSO
+ * CLUSTER: choosing one switches
  * the display to the sea-surface-temperature anomaly surface AND frames
  * the camera to that ocean in one gesture (the only gesture that pairs
  * display with camera; D-0.7.0-053). Framing context and briefing place
  * are untouched; a hazard-cluster button switches back; returning to
- * ENSO later restores the temporal register, never the camera.
+ * ENSO later restores the temporal register; leaving ENSO restores the
+ * camera from before entering (F9, src/map/enso-camera.ts).
+ *
+ * The Pacific and Atlantic zones on the minimap are clickable; all three
+ * views stay in the framing dropdown's 'Ocean views' group
+ * (src/ui/sidebar.ts).
  *
  * PROVENANCE (D-0.7.0-051): these zones are SCHEMATIC UI AFFORDANCES.
  * They claim nothing about real ocean boundaries; they exist so a
@@ -29,12 +34,18 @@
 export type OceanKey = 'pacific' | 'arctic' | 'atlantic';
 
 export interface OceanDef {
-  /** Hover/assistive name for the schematic click zone. */
+  /** The ocean view's option text in the framing dropdown. */
   readonly label: string;
   /** Camera fit bounds, Leaflet order [[south, west], [north, east]]. */
   readonly bounds: readonly [readonly [number, number], readonly [number, number]];
   /** Symmetric fit padding in degrees. */
   readonly padding: number;
+  /**
+   * [lng, lat] the camera centres on when the fit would need a zoom below the
+   * map's floor (a small embed): MapLibre would otherwise clamp around the
+   * bounds' centre and push the Nino 3.4 box off the frame.
+   */
+  readonly floorCentre?: readonly [number, number];
   /** The honest label consumers must carry (D-0.7.0-051). */
   readonly provenance: string;
 }
@@ -47,19 +58,30 @@ export const OCEANS: Record<OceanKey, OceanDef> = {
   pacific: {
     label: 'Pacific Ocean',
     // Southern bound reaches below the equator so the Nino 3.4 region
-    // (5S to 5N, 170W to 120W) is inside the fit, per D-0.7.0-053.
+    // (5S to 5N, 170W to 120W) is inside the fit, per D-0.7.0-053, and
+    // 11 degrees past the box so the box sits above the bottom dock, where
+    // the toast and the other notices appear, while the 820x615 embed still
+    // fits above the zoom floor (tests/ocean-framing-fit.test.mjs).
     // The west bound stays inside -180 to avoid the antimeridian
     // normalization gap documented at REGIONS.alaska.
-    bounds: [[-10.0, -179.9], [62.0, -110.0]],
+    bounds: [[-16.0, -179.9], [62.0, -110.0]],
     padding: 1.0,
+    // Nino 3.4 centre, nudged to 8N so the equator band and Hawaii both show.
+    floorCentre: [-145, 8],
     provenance: SCHEMATIC_NOTE
   },
   arctic: {
     label: 'Arctic Ocean',
     // A Mercator-honest fit this far north is approximate by nature;
     // the zone exists to name and reach the high-latitude anomaly
-    // view, not to bound the ocean.
-    bounds: [[60.0, -179.9], [85.0, -30.0]],
+    // view, not to bound the ocean. The satellite imagery stops near
+    // 76.46 N (src/map/satellite.ts), and Mercator stretches the poles,
+    // so a wide fit showed a flat grey band above it: the frame is the
+    // Chukchi and Beaufort seas, taller than wide, so a landscape canvas
+    // fits it by height and its top stays inside the imagery.
+    // shortcut: a portrait canvas (a phone) fits by width and still shows
+    // grey above 76.46 N; give the fit a north clamp if that view matters.
+    bounds: [[58.0, -162.0], [74.5, -122.0]],
     padding: 1.0,
     provenance: SCHEMATIC_NOTE
   },
@@ -71,4 +93,11 @@ export const OCEANS: Record<OceanKey, OceanDef> = {
   }
 };
 
-export const OCEAN_KEYS: readonly OceanKey[] = ['pacific', 'arctic', 'atlantic'];
+/** Dropdown order: the OCEANS table's own order. */
+export const OCEAN_KEYS = Object.keys(OCEANS) as readonly OceanKey[];
+
+/** Ocean zones the minimap draws and makes clickable. The Arctic stays a
+ * dropdown and deep-link view only: the minimap is for the Pacific and
+ * Atlantic (owner, 2026-10-19). */
+export const MINIMAP_OCEAN_KEYS = ['pacific', 'atlantic'] as const satisfies readonly OceanKey[];
+export type MinimapOceanKey = (typeof MINIMAP_OCEAN_KEYS)[number];

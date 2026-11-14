@@ -1,11 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 import type { Polygon } from 'geojson';
 
+import { placeRefFromBoundary } from '../src/config/entities';
+import { postalCodeFromProperties } from '../src/config/geography';
 import { resolveLandscapeContext } from '../src/impact/landscape-consumer';
-import { loadLandscapeSignature } from '../src/impact/landscape';
+import { loadLandscapeSignatureAtUrl } from '../src/impact/landscape';
 import {
   resolveLandscapeSelection,
   selectedLandscapeEcoregion,
@@ -19,6 +21,7 @@ import {
   emptyCollectionBody,
   routeGeojson
 } from './tribal-fixtures';
+import { isStateCode } from '../src/impact/resources';
 
 const ARTIFACT = JSON.parse(
   readFileSync(
@@ -32,6 +35,17 @@ const ARTIFACT = JSON.parse(
   )
 ) as unknown;
 
+/** Mirrors `containingFromProperties` (src/impact/context.ts): derived from
+ * the literal's own properties only, never from `regionKey`. */
+function containingFromProperties(
+  properties: BoundarySelectionContext['properties']
+): BoundarySelectionContext['containing'] {
+  const code = postalCodeFromProperties(properties);
+  return code !== null && isStateCode(code)
+    ? { state: code, basis: 'feature-property' }
+    : { state: null, basis: 'none' };
+}
+
 function context(
   kind: BoundarySelectionContext['kind'],
   properties: BoundarySelectionContext['properties']
@@ -41,16 +55,17 @@ function context(
     title: 'Selected place',
     properties,
     lngLat: { lng: -122, lat: 46 },
-    regionKey: 'washington_state'
+    regionKey: 'washington_state',
+    containing: containingFromProperties(properties),
+    place: placeRefFromBoundary(kind, properties)
   };
 }
 
 function loadFixture(
-  opts?: Parameters<typeof loadLandscapeSignature>[0]
+  opts?: Parameters<typeof loadLandscapeSignatureAtUrl>[1]
 ) {
-  return loadLandscapeSignature({
+  return loadLandscapeSignatureAtUrl('https://example.invalid/landscape.json', {
     ...opts,
-    url: 'https://example.invalid/landscape.json',
     fetchJsonImpl: async () => ARTIFACT
   });
 }
@@ -282,5 +297,7 @@ test('the full briefing renders dated ecoregion context and source vintages', as
   );
   await expect(landscape).toContainText('Artifact dated 2026-07-24');
   await expect(landscape).toContainText('Vintage: FY2025');
-  await expect(landscape.locator('.impact-landscape-source a')).toHaveCount(6);
+  // Terrain, FBFM40 and the WHP DOI; the machine endpoints show as labels
+  // (tests/landscape-source-links.test.mjs).
+  await expect(landscape.locator('.impact-landscape-source a')).toHaveCount(3);
 });

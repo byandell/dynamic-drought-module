@@ -16,9 +16,15 @@ import {
   type PlaceSelection
 } from '../state/place-selection';
 import { registry } from '../state/registry';
+import { pointReadPlace } from '../impact/point-heat-format';
 import { escapeHtml } from '../util/escape';
 import { fetchJsonWithBudget } from '../util/fetch';
 import { isObject } from '../util/guards';
+import { heatRiskMoment as formatMoment } from '../util/iso-day';
+import { dateTok } from '../util/text-tokens';
+import { watchDesktopMapSeat } from './map-control-seat';
+import { DETAIL_SECTIONS } from '../config/detail-sections';
+import { getDetailSectionHost } from './detail-section-hosts';
 
 const FRAMES_EVENT = 'ddm:heatrisk-frames';
 const DAY_SELECT_EVENT = 'ddm:heatrisk-day-select';
@@ -51,6 +57,13 @@ export interface HeatRiskIdentify {
   readonly value: HeatRiskValue | null;
   readonly retrievedAt: number;
   readonly validThrough: number;
+  /**
+   * Whether `frame` came from the map's displayed selection (the layer is on
+   * and a day is showing) or was fetched independently from the catalog's own
+   * earliest advertised granule because no displayed frame was available
+   * (DR-014 a: the briefing describes the place, not the map).
+   */
+  readonly frameSource: 'selected' | 'catalog';
 }
 
 interface SequenceRead {
@@ -76,6 +89,41 @@ let pendingRead: {
 } | null = null;
 let activationGeneration = 0;
 let activationOpen = false;
+/**
+ * The moment `activationOpen` last flipped from true to false (a genuine
+ * deactivation, not a boot with the layer already off), or null when the
+ * layer has never been active. Drives the briefing fallback's settle wait
+ * below: a toggle off then quickly on must not cost a new /identify.
+ */
+let deactivatedAt: number | null = null;
+/**
+ * The briefing's independent-catalog fallback result, memoized per point and
+ * per catalog extent (the correction to the RACE finding: the layer-off
+ * fallback used to fire a brand-new catalog read plus an /identify on every
+ * call). Invalidated on a new advertised extent (the key includes it) and on
+ * a place-selection change (in `mountHeatRiskSequence`'s
+ * `onPlaceSelectionChange` handler, beside the `cachedRead` check). NOT
+ * invalidated by activation or deactivation: memoizing across a toggle is
+ * the whole point.
+ *
+ * DDM-P7-T05 F4: the memo above carried no age bound, and HeatRisk revises
+ * the current-day grid in place (the service can update today's raster
+ * class without moving the catalog's advertised extent), so an unbounded
+ * memo could serve an hour-old, now-wrong class forever once the extent
+ * stopped changing. Keying on the calendar day was the other option
+ * considered; a plain TTL is chosen instead because it bounds staleness
+ * with no extra UTC-day arithmetic and matches how the layer itself is
+ * read (a raster cell, re-read on a clock, not on a day boundary).
+ */
+const FALLBACK_CACHE_TTL_MS = 60 * 60 * 1000;
+
+let fallbackCache: {
+  readonly lng: number;
+  readonly lat: number;
+  readonly extentStart: number;
+  readonly extentEnd: number;
+  readonly identify: HeatRiskIdentify;
+} | null = null;
 
 function categoryFor(value: HeatRiskValue) {
   return HEATRISK_CATEGORIES[value]!;
@@ -145,19 +193,6 @@ function formatDate(validTime: number): string {
   }).format(new Date(validTime));
 }
 
-function formatMoment(time: number): string {
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZone: 'UTC',
-    timeZoneName: 'short'
-  }).format(new Date(time));
-}
-
 function readKey(
   sequenceFrames: readonly HeatRiskFrame[],
   lng: number,
@@ -165,6 +200,194 @@ function readKey(
   generation: number
 ): string {
   return `${generation}|${lng},${lat}|${sequenceFrames.map((frame) => frame.validTime).join(',')}`;
+}
+
+/** The issuer contract is seven distinct daily periods (mirrors heatrisk.ts). */
+export const REQUIRED_FRAME_COUNT = 7;
+
+/**
+ * DR-070 amended 2026-09-08, DR-071: the briefing's HeatRisk claim
+ * (src/impact/sources.ts fetchHeatRiskClaims) and the map layer's time bar
+ * (src/layers/heatrisk.ts frameStamp/framePhase) must agree on when a
+ * HeatRisk claim is "in force." A 24-hour period is in force, the outlook
+ * register, while `now` has not reached its end; once the period has ended
+ * the claim reads observed, the same "the spent claim the doctrine
+ * forbids" boundary framePhase draws (`now < end` covers both not-begun and
+ * in-progress, which framePhase and this both treat as one outlook phase;
+ * `now >= end` is ended). Exported so sources.ts reads the SAME boundary
+ * rather than a second copy of it.
+ */
+export function heatRiskClaimRegister(
+  periodEnd: number,
+  now: number
+): 'observed' | 'outlook' {
+  return now < periodEnd ? 'outlook' : 'observed';
+}
+
+/**
+ * Enumerate the catalog independently of the layer module's `frames` state,
+ * with the SAME integrity gate `src/layers/heatrisk.ts` runs at activation:
+ * a usable time extent, and exactly seven distinct granules, sorted, spanning
+ * that extent at a consistent 24-hour cadence. A catalog the map's own
+ * activation would reject must not quietly seed an independent claim; this
+ * duplicates the check rather than trusting one arbitrary row.
+ */
+function buildMetadataUrl(): string {
+  return `${URLS.nwsHeatRisk}?f=json`;
+}
+
+function buildFullCatalogUrl(): string {
+  const params = new URLSearchParams({
+    where: 'category=1',
+    outFields: 'name,idp_validtime',
+    returnGeometry: 'false',
+    orderByFields: 'idp_validtime ASC',
+    f: 'json'
+  });
+  return `${URLS.nwsHeatRisk}/query?${params.toString()}`;
+}
+
+function parseTimeExtent(json: unknown): readonly [number, number] | null {
+  if (!isObject(json) || !isObject(json.timeInfo)) return null;
+  const extent = json.timeInfo.timeExtent;
+  if (!Array.isArray(extent) || extent.length !== 2) return null;
+  const [start, end] = extent;
+  if (
+    typeof start !== 'number' ||
+    !Number.isFinite(start) ||
+    typeof end !== 'number' ||
+    !Number.isFinite(end) ||
+    start > end
+  ) {
+    return null;
+  }
+  return [start, end];
+}
+
+function parseCatalogFrames(
+  json: unknown,
+  extent: readonly [number, number]
+): readonly HeatRiskFrame[] | null {
+  if (
+    !isObject(json) ||
+    json.exceededTransferLimit === true ||
+    !Array.isArray(json.features)
+  ) {
+    return null;
+  }
+  const byTime = new Map<number, string>();
+  for (const feature of json.features) {
+    if (!isObject(feature) || !isObject(feature.attributes)) return null;
+    const validTime = feature.attributes.idp_validtime;
+    const name = feature.attributes.name;
+    if (
+      typeof validTime !== 'number' ||
+      !Number.isFinite(validTime) ||
+      !Number.isSafeInteger(validTime) ||
+      typeof name !== 'string' ||
+      name.length === 0
+    ) {
+      return null;
+    }
+    if (byTime.has(validTime)) return null;
+    byTime.set(validTime, name);
+  }
+  const advertised = Array.from(byTime, ([validTime, name]) => ({
+    validTime,
+    name
+  })).sort((a, b) => a.validTime - b.validTime);
+  if (
+    advertised.length !== REQUIRED_FRAME_COUNT ||
+    advertised[0]?.validTime !== extent[0] ||
+    advertised.at(-1)?.validTime !== extent[1] ||
+    advertised.some(
+      (frame, index) =>
+        index > 0 &&
+        frame.validTime - advertised[index - 1]!.validTime !== VALID_PERIOD_MS
+    )
+  ) {
+    return null;
+  }
+  return advertised.map((frame, index) => ({
+    day: index + 1,
+    validTime: frame.validTime,
+    name: frame.name
+  }));
+}
+
+/**
+ * The catalog's own advertised time extent: the cheap half of the fallback
+ * read (a single metadata fetch, no `/identify`). Callers use this to decide
+ * whether a memoized fallback result is still current before paying for the
+ * full catalog enumeration and the counted identify request.
+ */
+async function fetchCatalogExtent(
+  signal: AbortSignal
+): Promise<readonly [number, number] | null> {
+  const metadataJson = await fetchJsonWithBudget(
+    buildMetadataUrl(),
+    null,
+    signal,
+    FETCH_TIMEOUT_MS
+  );
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  return parseTimeExtent(metadataJson);
+}
+
+/**
+ * Fetch today's frame (the catalog's earliest advertised granule) straight
+ * from the catalog, with no dependency on the layer module's activation
+ * state, for an extent already read by `fetchCatalogExtent`. Used only when
+ * no displayed frame is available to read (the layer is off, or never turned
+ * on).
+ */
+async function fetchTodayFrame(
+  extent: readonly [number, number],
+  signal: AbortSignal
+): Promise<HeatRiskFrame | null> {
+  const catalogJson = await fetchJsonWithBudget(
+    buildFullCatalogUrl(),
+    null,
+    signal,
+    FETCH_TIMEOUT_MS
+  );
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+  const frames = parseCatalogFrames(catalogJson, extent);
+  return frames?.[0] ?? null;
+}
+
+/**
+ * The settle window a fallback read waits, after a genuine active-to-inactive
+ * transition, before treating the layer as durably off. A toggle off then
+ * quickly on must not cost the fallback's own /identify; the layer's own
+ * reactivation event re-runs the claim through the selected-frame path once
+ * it is open again.
+ */
+const DEACTIVATION_SETTLE_MS = 500;
+
+/**
+ * Wait out the remainder of the deactivation settle window, or resolve at
+ * once when there is none to wait (the layer was never active, or the window
+ * has already elapsed). Resolves early on abort; callers re-check
+ * `activationOpen` and `activationGeneration` immediately after, so an abort
+ * and a natural elapse are handled identically.
+ */
+function waitForDeactivationSettle(signal: AbortSignal): Promise<void> {
+  if (deactivatedAt === null || signal.aborted) return Promise.resolve();
+  const remaining = DEACTIVATION_SETTLE_MS - (Date.now() - deactivatedAt);
+  if (remaining <= 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer = 0;
+    const onAbort = (): void => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, remaining);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function buildIdentifyUrl(
@@ -299,6 +522,11 @@ function textAlternative(read: SequenceRead): string {
     .join('; ');
 }
 
+/** Every day read and every value 0: a verified absence, not a missing read (null stays unstated). */
+function allZero(values: readonly (HeatRiskValue | null)[]): boolean {
+  return values.length > 0 && values.every((value) => value === 0);
+}
+
 function selectedReadHtml(read: SequenceRead): string {
   const index = read.frames.findIndex((frame) => frame.day === selectedDay);
   const frame = read.frames[index];
@@ -339,10 +567,21 @@ function renderRead(read: SequenceRead): void {
     return;
   }
   const alternative = textAlternative(read);
+  // The rewrite below destroys the focused day cell; note it to hand focus back.
+  const active = document.activeElement;
+  const focusedDay =
+    active instanceof HTMLElement && host.contains(active)
+      ? active.dataset['heatriskSequenceDay']
+      : undefined;
   host.innerHTML =
     '<div class="heatrisk-sequence-heading">' +
-    `<strong>HeatRisk at the selected point for ${escapeHtml(selection.label)}</strong>` +
+    `<strong>HeatRisk at ${escapeHtml(pointReadPlace(selection.context))} for ${escapeHtml(selection.label)}</strong>` +
     '<span>7 days</span></div>' +
+    // The all-zero statement sits above the cells so it is read before the fold.
+    (allZero(read.values)
+      ? '<p class="heatrisk-sequence-selected" data-heatrisk-no-elevated>' +
+        '<strong>No elevated heat risk</strong> at this point on any of the seven days.</p>'
+      : '') +
     '<div class="heatrisk-sequence-grid" role="list">' +
     read.frames
       .map((frame, index) => sequenceCell(frame, read.values[index] ?? null))
@@ -352,32 +591,52 @@ function renderRead(read: SequenceRead): void {
     `<p id="heatrisk-sequence-alt" class="sr-only">Seven-day HeatRisk text alternative. ${escapeHtml(alternative)}.</p>` +
     '<p class="heatrisk-sequence-source">' +
     `<a href="${escapeHtml(URLS.nwsHeatRisk)}/info/iteminfo" target="_blank" rel="noopener">National Weather Service HeatRisk</a> · ` +
-    `Retrieved ${escapeHtml(formatMoment(read.retrievedAt))}. Selected valid period shown above.</p>`;
+    // DDM's read in the viewer's zone, as every other "Retrieved" stamp; the valid period above keeps NWS's UTC.
+    `Retrieved ${escapeHtml(dateTok(read.retrievedAt))}. Selected valid period shown above.</p>`;
   host.setAttribute(
     'aria-label',
-    `National Weather Service HeatRisk seven-day sequence at the selected point for ${selection.label}`
+    `National Weather Service HeatRisk seven-day sequence at ${pointReadPlace(selection.context)} for ${selection.label}`
   );
   host.setAttribute('aria-describedby', 'heatrisk-sequence-alt');
   host.hidden = false;
+  if (focusedDay) {
+    host
+      .querySelector<HTMLElement>(`[data-heatrisk-sequence-day="${focusedDay}"]`)
+      ?.focus({ preventScroll: true });
+  }
 }
 
 function renderState(copy: string): void {
   if (!host || !selection) return;
   host.innerHTML =
     '<div class="heatrisk-sequence-heading">' +
-    `<strong>HeatRisk at the selected point for ${escapeHtml(selection.label)}</strong>` +
+    `<strong>HeatRisk at ${escapeHtml(pointReadPlace(selection.context))} for ${escapeHtml(selection.label)}</strong>` +
     '</div>' +
     `<p class="heatrisk-sequence-state">${escapeHtml(copy)}</p>`;
   host.removeAttribute('aria-describedby');
   host.setAttribute(
     'aria-label',
-    `National Weather Service HeatRisk sequence at the selected point for ${selection.label}: ${copy}`
+    `National Weather Service HeatRisk sequence at ${pointReadPlace(selection.context)} for ${selection.label}: ${copy}`
   );
   host.hidden = false;
 }
 
 function hide(): void {
   if (host) host.hidden = true;
+}
+
+/**
+ * A read that failed because a newer read replaced it (its controller aborted,
+ * or the point, frames or activation moved on) says nothing about the issuer:
+ * the newer read owns the panel, so a stale AbortError never lands on
+ * "unavailable". A current read that fails on its own is a real failure.
+ */
+export function readFailureIsSuperseded(
+  controllerAborted: boolean,
+  readKeyValue: string,
+  currentKey: string | null
+): boolean {
+  return controllerAborted || currentKey !== readKeyValue;
 }
 
 async function refreshRead(): Promise<void> {
@@ -437,7 +696,17 @@ async function refreshRead(): Promise<void> {
     if (pendingRead?.promise === promise) pendingRead = null;
     renderRead(read);
   } catch (err) {
-    if (controller.signal.aborted) return;
+    const currentKey = selection
+      ? readKey(
+          frames,
+          selection.context.lngLat.lng,
+          selection.context.lngLat.lat,
+          activationGeneration
+        )
+      : null;
+    if (readFailureIsSuperseded(controller.signal.aborted, key, currentKey)) {
+      return;
+    }
     console.warn('[heatrisk-sequence] identify failed.', err);
     if (pendingRead?.promise === promise) pendingRead = null;
     renderState('unavailable');
@@ -458,12 +727,17 @@ function applyFrameDetail(detail: HeatRiskFrameDetail): void {
     detail.status === 'loading' && detail.frames.length === 0;
   let activationChanged = false;
   if (detail.status === 'inactive') {
+    const wasOpen = activationOpen;
     activationGeneration += 1;
     activationOpen = false;
     clearActivationRead();
+    // Only a genuine active-to-inactive transition starts the settle clock;
+    // a boot that arrives already inactive must not delay the fallback.
+    if (wasOpen) deactivatedAt = Date.now();
   } else if (!activationOpen || freshLoading) {
     activationGeneration += 1;
     activationOpen = true;
+    deactivatedAt = null;
     clearActivationRead();
     activationChanged = true;
   }
@@ -544,7 +818,18 @@ export function mountHeatRiskSequence(initial: HeatRiskFrameDetail): void {
   if (!mounted) {
     const dock = document.getElementById('map-bottom-dock');
     const foot = dock?.querySelector('.map-dock-foot') ?? null;
-    if (!dock || !foot) return;
+    if (!dock || !foot) {
+      // DDM-P7-T05 F9: index.html always ships the dock, so this should
+      // never fire in production; if it ever does, this module's mirror of
+      // the layer's activation never updates (activationOpen stays false),
+      // so identifyHeatRiskForBriefing answers the briefing from the
+      // independent-catalog fallback while the map may be displaying a
+      // different day.
+      console.warn(
+        '[heatrisk-sequence] map dock not found; the HeatRisk sequence will not mount and the briefing claim will read the catalog fallback instead of the displayed frame.'
+      );
+      return;
+    }
     host = document.createElement('section');
     host.id = 'heatrisk-sequence';
     host.className = 'heatrisk-sequence';
@@ -556,9 +841,43 @@ export function mountHeatRiskSequence(initial: HeatRiskFrameDetail): void {
     selection = getPlaceSelection();
     onPlaceSelectionChange((next) => {
       selection = next;
-      cachedRead = null;
+      // A new object for the SAME point (popup, then its briefing) keeps the finished read.
+      if (
+        !next ||
+        next.context.lngLat.lng !== cachedRead?.lng ||
+        next.context.lngLat.lat !== cachedRead?.lat
+      ) {
+        cachedRead = null;
+      }
+      fallbackCache = null;
       void refreshRead();
     });
+    // S30D D1 M11 (design record interface-chrome-popups-text.md section
+    // 2.6, "HeatRisk first"): right after the dock mount above, the SAME
+    // node moves into its Key drawer section on the desktop shell outside
+    // embeds; phones and embeds keep it here in the dock. Never rebuilt,
+    // so DDM-UI-011 (its DOM, focus and delegated click targets survive
+    // redundant raster-status events while an identify read is pending or
+    // cached) holds regardless of which seat it is in.
+    const mountedHost = host;
+    const sectionHost = getDetailSectionHost(
+      DETAIL_SECTIONS['heatrisk-sequence'].homeId
+    );
+    if (sectionHost) {
+      watchDesktopMapSeat({
+        node: mountedHost,
+        host: sectionHost,
+        home: dock,
+        placeHome: () => {
+          if (
+            mountedHost.parentElement !== dock ||
+            mountedHost.nextElementSibling !== foot
+          ) {
+            dock.insertBefore(mountedHost, foot);
+          }
+        }
+      });
+    }
     mounted = true;
   }
   applyFrameDetail(initial);
@@ -617,6 +936,143 @@ export async function identifySelectedHeatRisk(
     frame,
     value,
     retrievedAt,
-    validThrough: frame.validTime + VALID_PERIOD_MS
+    validThrough: frame.validTime + VALID_PERIOD_MS,
+    frameSource: 'selected'
   };
+}
+
+/**
+ * The outcome of {@link identifyHeatRiskForBriefing} (DDM-P7-T05 F3): a
+ * discriminated result rather than a bare `null`, so `src/impact/sources.ts`
+ * can tell apart the three different nulls the old signature collapsed into
+ * one honest-sounding note:
+ *
+ *   identified          a value was read, from the displayed frame or the
+ *                       catalog fallback; carries it
+ *   no-displayed-frame  the layer is on (`activationOpen`) but has no
+ *                       displayed frame to read (still loading past the
+ *                       wait, errored, or empty); the map itself already
+ *                       ran its own integrity gate and came up with nothing
+ *                       to show, so the briefing reports the same
+ *                       unavailable result the map does, quietly
+ *   catalog-failed      the independent catalog read itself failed (no
+ *                       usable time extent, or no consistent seven-granule
+ *                       cadence); the one case that earns the briefing's
+ *                       own "did not respond" note
+ *   superseded          the read was aborted, or a reactivation or a new
+ *                       place selection overtook it before it finished; the
+ *                       fresher read (the layer's own, or a later call to
+ *                       this function) answers instead, so this one reports
+ *                       nothing
+ */
+export type HeatRiskBriefingRead =
+  | { readonly kind: 'identified'; readonly identify: HeatRiskIdentify }
+  | { readonly kind: 'no-displayed-frame' }
+  | { readonly kind: 'catalog-failed' }
+  | { readonly kind: 'superseded' };
+
+/**
+ * Identify HeatRisk at a point for the near-term heat claim in the briefing,
+ * independent of whether the HeatRisk map layer is on (DR-014 a: the
+ * briefing describes the place, not the map, so it does not vanish when the
+ * map layer is off). When the layer is on and showing a frame, that frame is
+ * read, so the briefing matches what the map displays. Otherwise (the layer
+ * is off, still enumerating its catalog, or errored) this fetches the
+ * catalog's own earliest advertised granule directly, with the same abort
+ * signal and the same per-request catalog-time verification `fetchFrameValue`
+ * always performs.
+ *
+ * Three guards correct a RACE the plain fallback used to run (a toggle off
+ * then quickly on cost an extra /identify the old code never made):
+ * memoization (a result already read for this point and this catalog extent,
+ * within {@link FALLBACK_CACHE_TTL_MS}, is returned without a new
+ * /identify), a settle wait after a genuine deactivation (the layer's own
+ * reactivation, if it comes within `DEACTIVATION_SETTLE_MS`, is let win, and
+ * this reports `superseded` without fetching), and an abort/reactivation
+ * check after every await (a reactivated layer's own selected-frame path,
+ * not this fallback, answers the claim, and a stale fallback result is
+ * never cached over a fresher one).
+ */
+export async function identifyHeatRiskForBriefing(
+  lng: number,
+  lat: number,
+  signal: AbortSignal
+): Promise<HeatRiskBriefingRead> {
+  const selected = await identifySelectedHeatRisk(lng, lat, signal);
+  if (selected) return { kind: 'identified', identify: selected };
+  if (signal.aborted) return { kind: 'superseded' };
+  // Fall back to the catalog's own earliest granule only when the layer is
+  // truly inactive (off, or never turned on). A displayed layer that is
+  // loading, degraded, errored, or reports no data already ran the map's own
+  // seven-frame catalog integrity check (heatrisk.ts `extractFrames`) and
+  // came up with nothing honest to show; this briefing must not invent an
+  // independent read the map itself would not stand behind, so it reports
+  // the same unavailable result the map does instead.
+  if (activationOpen) return { kind: 'no-displayed-frame' };
+
+  const generation = activationGeneration;
+  const stillCurrent = (): boolean =>
+    !activationOpen && activationGeneration === generation;
+
+  // A layer that was never active needs no wait, so the briefing opens with
+  // the claim promptly; a layer that just went inactive gets its
+  // reactivation window before this pays for a request of its own.
+  await waitForDeactivationSettle(signal);
+  if (signal.aborted) return { kind: 'superseded' };
+  if (!stillCurrent()) return { kind: 'superseded' };
+
+  const extent = await fetchCatalogExtent(signal);
+  if (signal.aborted) return { kind: 'superseded' };
+  if (extent === null) {
+    // Mirrors heatrisk.ts:612-614's own refusal of the same shape of
+    // failure (kept as a duplicated, not shared, parser: see the module
+    // doc above `buildMetadataUrl`; a change to either copy's gate must be
+    // made to both).
+    console.warn('[heatrisk-sequence] service metadata carried no usable time extent.');
+    return { kind: 'catalog-failed' };
+  }
+  if (!stillCurrent()) return { kind: 'superseded' };
+
+  const cached = fallbackCache;
+  if (
+    cached &&
+    cached.lng === lng &&
+    cached.lat === lat &&
+    cached.extentStart === extent[0] &&
+    cached.extentEnd === extent[1] &&
+    Date.now() - cached.identify.retrievedAt < FALLBACK_CACHE_TTL_MS
+  ) {
+    return { kind: 'identified', identify: cached.identify };
+  }
+
+  const frame = await fetchTodayFrame(extent, signal);
+  if (signal.aborted) return { kind: 'superseded' };
+  if (frame === null) {
+    // Mirrors heatrisk.ts:626-628's own refusal of the same shape of
+    // failure (see the note on the extent check above: kept in sync by
+    // hand, not by sharing code, because heatrisk.ts is the map's own
+    // chunk).
+    console.warn('[heatrisk-sequence] catalog carried no consistent granule times.');
+    return { kind: 'catalog-failed' };
+  }
+  if (!stillCurrent()) return { kind: 'superseded' };
+  const value = await fetchFrameValue(frame, lng, lat, signal);
+  if (signal.aborted) return { kind: 'superseded' };
+  if (!stillCurrent()) return { kind: 'superseded' };
+
+  const identify: HeatRiskIdentify = {
+    frame,
+    value,
+    retrievedAt: Date.now(),
+    validThrough: frame.validTime + VALID_PERIOD_MS,
+    frameSource: 'catalog'
+  };
+  fallbackCache = {
+    lng,
+    lat,
+    extentStart: extent[0],
+    extentEnd: extent[1],
+    identify
+  };
+  return { kind: 'identified', identify };
 }

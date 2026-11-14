@@ -20,10 +20,13 @@
  *   - Activation is EXACT (no co-activation cascade): recipes list
  *     their pairs explicitly (both wildfire recipes name nifc-fires and
  *     hms-smoke); the composition below also expands `coActivateWith`
- *     defensively so the committed intent can never under-claim a pair.
+ *     defensively so the committed intent could never under-claim a pair.
+ *     Since the owner's ruling of 2026-09-28 (found-007) no layer declares
+ *     partners, so that expansion is a no-op kept for any future pair.
  *   - The committed temporal horizon lives in the timeline store
- *     (timeline.horizon, added by S3) and persists across cluster
- *     flips: a switch compares the same time.
+ *     (timeline.horizon, added by S3) and persists across cluster flips
+ *     when the destination can show it; otherwise it resolves to Current
+ *     (DR-190), using the same capability rule as a shared-link boot.
  *   - The frozen facades (layer-controller, registry, the config
  *     tables, the types) are composed, never modified.
  *
@@ -57,7 +60,7 @@
  *     an old-horizon recipe.
  */
 
-import { HAZARD_CLUSTERS } from '../config/clusters';
+import { HAZARD_CLUSTERS, TEMPORAL_HORIZON_KEYS } from '../config/clusters';
 import type { HazardClusterKey, TemporalHorizonKey } from '../config/clusters';
 import { DEFAULT_ON_KEYS, LAYER_DEFS, getLayerDef } from '../config/layers';
 import type { FramingKey } from '../config/framings';
@@ -73,8 +76,8 @@ import {
 } from './cluster-store';
 import { getFraming, onFramingChange } from './framing-store';
 import { registry } from './registry';
-import { timeline } from './timeline';
-import { checkedSnapshot } from '../ui/island/bridge';
+import { horizonSurfaceSignature, timeline } from './timeline';
+import { checkedSnapshot, isChecked } from '../ui/island/bridge';
 import { requestLayerOff, requestLayerOnExact } from '../ui/layer-toggle-command';
 
 /**
@@ -87,12 +90,15 @@ export interface CommittedShellSnapshot {
   /** Monotonic publish counter; a re-derivation bumps it. */
   readonly revision: number;
   /** The hazard view the user most recently chose. This remains stable when
-   * a failed surface honestly demotes the exact displayed set to `custom`. */
+   * the exact displayed set demotes to `custom` (a user customization, or a
+   * failed layer of a custom set; a failed layer of the committed
+   * composition no longer demotes, D1 M5 and found-073, see
+   * `isCommittedCompositionKey`). */
   readonly selectedHazard: HazardClusterKey;
   /** The committed cluster, or 'custom' once the granular intent has
    * diverged from any cluster's composition (D-0.7.0-044). */
   readonly cluster: HazardClusterKey | 'custom';
-  /** The committed temporal horizon (persists across cluster flips). */
+  /** The committed temporal horizon (retained when the next cluster supports it). */
   readonly horizon: TemporalHorizonKey;
   /** The active camera framing, or null for the ALL state. */
   readonly framing: FramingKey | null;
@@ -118,6 +124,9 @@ let committedIntent: ReadonlySet<string> | null = null;
 let committedHorizon: TemporalHorizonKey | null = null;
 /** User-facing hazard intent, separate from exact-set cluster honesty. */
 let selectedHazard: HazardClusterKey = getHazardCluster();
+/** The horizon held before a mode's entry horizon replaced it, kept while
+ * that imposed horizon stands and the person has not picked another. */
+let entryUndo: { held: TemporalHorizonKey; imposed: TemporalHorizonKey } | null = null;
 let current: CommittedShellSnapshot | null = null;
 /** True while requestCluster (or a service-internal store write) is
  * mid-transaction; subscriptions stand down so no intermediate state is
@@ -135,7 +144,8 @@ const listeners = new Set<() => void>();
  * hazard recipe for the horizon in activation order, with any
  * `coActivateWith` pair expanded defensively (recipes already list
  * their pairs explicitly; the controller cascade is never relied on
- * along this path). For 'drought' at 'current' this composes back to
+ * along this path; no layer declares partners since the owner's ruling
+ * of 2026-09-28, found-007, so the expansion adds nothing today). For 'drought' at 'current' this composes back to
  * exactly the default-on set, so the bare boot and the absent-cluster
  * boot are the same set by construction. An EMPTY recipe (Extreme Heat
  * at season-ahead) honestly yields the reference set alone.
@@ -156,6 +166,25 @@ export function composeClusterIntent(
     for (const partner of getLayerDef(key)?.coActivateWith ?? []) push(partner);
   }
   return out;
+}
+
+/** Whether `keys` shows `cluster` at `horizon`: its composition plus only the
+ * mode's optional layers (HazardClusterDef.optionalLayers); an optional surface
+ * stands in for the recipe's surface. With no optional layers this is set
+ * equality. */
+export function isModeDisplay(
+  cluster: HazardClusterKey,
+  horizon: TemporalHorizonKey,
+  keys: ReadonlySet<string>
+): boolean {
+  const base = composeClusterIntent(cluster, horizon);
+  const optional: readonly string[] = HAZARD_CLUSTERS[cluster].optionalLayers ?? [];
+  const isSurface = (key: string): boolean => getLayerDef(key)?.role === 'surface';
+  const optionalSurfaceOn = optional.some((key) => keys.has(key) && isSurface(key));
+  return (
+    base.every((key) => keys.has(key) || (optionalSurfaceOn && isSurface(key))) &&
+    [...keys].every((key) => base.includes(key) || optional.includes(key))
+  );
 }
 
 /** The committed cluster, horizon, and intent, deriving from the store
@@ -194,10 +223,12 @@ function resolveCommitted(): {
   // composed claim.
   if (checkedSnapshot().size > 0) {
     const on = onKeys();
-    const agrees =
-      on.size === composed.size && [...composed].every((key) => on.has(key));
-    if (!agrees) {
+    if (!isModeDisplay(cluster, horizon, on)) {
       return { cluster: 'custom', horizon, intent: on };
+    }
+    // Agreement can include the mode's optional layers, which the intent must name.
+    if (on.size !== composed.size || [...composed].some((key) => !on.has(key))) {
+      return { cluster, horizon, intent: on };
     }
   }
   return { cluster, horizon, intent: composed };
@@ -266,6 +297,31 @@ export function onCommittedSnapshotChange(fn: () => void): () => void {
   };
 }
 
+/**
+ * Whether a layer key is a member of the committed cluster's COMPOSITION:
+ * the intent `composeClusterIntent` resolved for it, which is the persistent
+ * reference set (hillshade, the boundaries, the state hairlines) plus the
+ * recipe at the resolved horizon with any `coActivateWith` pair expanded
+ * (none today: no layer declares partners since found-007, 2026-09-28). A
+ * 'custom' display (including a switch demoted by a reference extra) has no
+ * composition.
+ *
+ * The layer controller reads this when an activation fails (D1 M5,
+ * 2026-09-27; found-002 and found-003, the director's Tier 1 scope; widened
+ * from the recipe to the whole composition for found-073, the director's
+ * ruling of 2026-09-27): a failed member of the committed composition keeps
+ * its checkbox, so the checked set still equals the committed composition,
+ * no demotion runs, the hazard stays pressed, `cluster=` (or Drought's
+ * `layers=` list) stays in the URL unchanged, and Current Conditions stays
+ * enabled as the way back; the layer reads unavailable (its registry status
+ * stays 'error'). A failure outside the composition (a custom `layers=`
+ * set) keeps the uncheck-and-leave cleanup.
+ */
+export function isCommittedCompositionKey(key: string): boolean {
+  const { cluster, intent } = resolveCommitted();
+  return cluster !== 'custom' && intent.has(key);
+}
+
 /** Every key currently "on": checked intent union registered active
  * (the checkbox leads the registry while an activation is in flight). */
 function onKeys(): Set<string> {
@@ -278,22 +334,75 @@ function onKeys(): Set<string> {
 }
 
 /**
+ * The horizon a cluster can distinctly show. Shared-link boots (found-009)
+ * and mode switches (DR-190) use the same capability read as the shell's
+ * chips: an empty recipe or a signature repeated from an earlier horizon
+ * resolves to Current. The ordered config covers every mode and horizon.
+ * Custom layer sets keep their own horizon and do not use this resolver.
+ */
+export function resolveHorizonForCluster(
+  cluster: HazardClusterKey,
+  horizon: TemporalHorizonKey
+): TemporalHorizonKey {
+  if (horizon === 'current') return 'current';
+  const signature = horizonSurfaceSignature(cluster, horizon);
+  if (signature === null) return 'current';
+  const idx = TEMPORAL_HORIZON_KEYS.indexOf(horizon);
+  for (let i = 0; i < idx; i++) {
+    const earlier = TEMPORAL_HORIZON_KEYS[i];
+    if (earlier !== undefined && horizonSurfaceSignature(cluster, earlier) === signature) {
+      return 'current';
+    }
+  }
+  return horizon;
+}
+
+/**
+ * The horizon a move into `mode` lands on: `entry` (its entry horizon, passed
+ * only when the move commits the mode's own layers), else the held horizon.
+ * A horizon an earlier entry imposed (only ENSO's Season ahead now; an entry
+ * on Current is never handed back) is undone first while it still stands, so
+ * leaving that mode returns the person to the horizon they held before it.
+ * The mode switcher, the ocean door and the phone rail all enter through here.
+ */
+function enterHorizon(mode: HazardClusterKey, entry: TemporalHorizonKey | undefined): TemporalHorizonKey {
+  const held = entryUndo !== null && timeline.horizon === entryUndo.imposed ? entryUndo.held : timeline.horizon;
+  const next = entry === undefined ? held : resolveHorizonForCluster(mode, entry);
+  // An entry on Current is the general rule, not an imposition to hand back: recording it would restore a
+  // horizon from before it, on a screen showing Current, at a later demoted entry (review, 2026-11-13).
+  entryUndo = next === held || next === 'current' ? null : { held, imposed: next };
+  return next;
+}
+
+/** An on key a cluster switch never deactivates: a reference layer, or a key
+ * with no definition (a stale deep link's user-visible intent). */
+function survivesSwitch(key: string): boolean {
+  const def = getLayerDef(key);
+  return def === null || def.role === 'reference';
+}
+
+/**
  * Resolve, apply, and commit a hazard cluster (the S3 transaction):
  *
- *   1. Read the committed horizon from the timeline (it persists across
- *      cluster flips; the switch compares the same time).
+ *   1. Resolve the timeline's horizon for the destination cluster. A press
+ *      entering it from another hazard goes through `enterHorizon`: the
+ *      mode's `entryHorizon` when the entry commits its own composition (no
+ *      reference extra would demote it; an entry on Current holds for a
+ *      demoted custom set too), with any horizon the mode being
+ *      left imposed undone. Retain a supported horizon; otherwise commit
+ *      Current (DR-190).
  *   2. Resolve the intent: the persistent reference set union the
- *      horizon recipe (pairs expanded). An empty recipe commits the
- *      reference set plus an honest summary caveat, never a silently
- *      substituted surface.
+ *      resolved horizon recipe (pairs expanded).
  *   3. Deactivate the old display's exclusive non-reference members
  *      (currently-on keys outside the new intent) through the toggle
  *      door. Reference-role keys are NEVER deactivated here.
  *   4. Activate the new recipe through requestLayerOnExact (intent
  *      first, no cascade; the controller's per-key generation guard
- *      absorbs rapid re-flips). The caller is not await-blocked; the
- *      snapshot's coherence comes from step 6, not from activation
- *      settling.
+ *      absorbs rapid re-flips). A recipe member left checked by a failed
+ *      activation is re-requested (D1 M5), so pressing the committed
+ *      hazard again re-applies its recipe. The caller is not
+ *      await-blocked; the snapshot's coherence comes from step 6, not
+ *      from activation settling.
  *   5. Commit the claim to the store/URL. When the display after step 3
  *      IS exactly the composition, the claim is the clean cluster:
  *      setHazardCluster(key) (Drought serializes as absence per the
@@ -317,8 +426,20 @@ function applyCluster(
   key: HazardClusterKey,
   requestedOcean: OceanKey | null,
 ): void {
+  // A re-press, an ocean change inside the mode and a horizon re-resolve keep
+  // the held horizon; an entry from another hazard goes through enterHorizon.
+  let entry = selectedHazard === key ? undefined : HAZARD_CLUSTERS[key].entryHorizon;
+  // Current suits every set, so an entry on Current holds for a custom set too:
+  // Wildfire's Long Range must not carry into Drought because Places is on.
+  if (entry !== undefined && entry !== 'current') {
+    // An extra that will demote the commit to a custom set keeps the held horizon,
+    // whose chips stay usable; the entry horizon belongs to the mode's own set.
+    const composed = composeClusterIntent(key, resolveHorizonForCluster(key, entry));
+    if ([...onKeys()].some((onKey) => !composed.includes(onKey) && survivesSwitch(onKey))) entry = undefined;
+  }
+  const held = selectedHazard === key ? timeline.horizon : enterHorizon(key, entry);
   selectedHazard = key;
-  const horizon = timeline.horizon;
+  const horizon = resolveHorizonForCluster(key, held);
   const intent = composeClusterIntent(key, horizon);
   const intentSet: ReadonlySet<string> = new Set(intent);
   applying = true;
@@ -331,14 +452,36 @@ function applyCluster(
     const extras: string[] = [];
     for (const onKey of onKeys()) {
       if (intentSet.has(onKey)) continue;
-      const def = getLayerDef(onKey);
-      if (def === null || def.role === 'reference') {
+      if (survivesSwitch(onKey)) {
         extras.push(onKey);
         continue;
       }
       requestLayerOff(onKey);
     }
+    // Resolve the register before destination activation; the apply lock
+    // keeps the timeline subscription from publishing an intermediate recipe.
+    timeline.setHorizon(horizon);
+    // A composition member whose activation failed stays checked (D1 M5,
+    // found-073; see isCommittedCompositionKey), so requestLayerOnExact
+    // alone would skip it as
+    // already on and a press of the committed hazard would do nothing
+    // (found-003's "clicking Wildfire again does nothing"). Such a key is
+    // checked, not registered active, and holds the terminal 'error'
+    // status; it is withdrawn and re-requested through the same door, so
+    // the press re-applies the whole recipe. The controller's intent guard
+    // drops the queued teardown (the newer on-intent owns the key), and
+    // the apply lock keeps the two intermediate checkbox flips from
+    // demoting anything. A key that failed late (still registered active)
+    // is not re-requested here: its module owns its own retry.
+    const active = registry.getActiveKeys();
     for (const wanted of intent) {
+      if (
+        isChecked(wanted) &&
+        !active.has(wanted) &&
+        registry.getStatus(wanted) === 'error'
+      ) {
+        requestLayerOff(wanted);
+      }
       requestLayerOnExact(wanted);
     }
     if (extras.length === 0) {
@@ -359,8 +502,62 @@ function applyCluster(
   publish();
 }
 
+/** The hazard the person chose. Read this, not the store: the store reads Drought for every custom set. */
+export function getSelectedHazard(): HazardClusterKey {
+  return selectedHazard;
+}
+
+/** True while the committed composition is a person's custom layer set rather than a mode. */
+export function isCustomComposition(): boolean {
+  return committedCluster === 'custom';
+}
+
 export function requestCluster(key: HazardClusterKey): void {
   applyCluster(key, key === 'enso' ? getOceanFraming() : null);
+}
+
+/** Discard any explicit commitment and re-derive from the store (the
+ * `onHazardClusterChange` listener's body, shared with
+ * `restoreCommittedCluster` below so a same-value store write can still
+ * force the exact same re-derivation). `hazard` is set before the publish. */
+function resyncFromStore(hazard: HazardClusterKey = getHazardCluster()): void {
+  selectedHazard = hazard;
+  committedCluster = null;
+  committedIntent = null;
+  committedHorizon = null;
+  publish();
+}
+
+/**
+ * Restore a previously captured committed cluster (found-011, CODEMAP:1749;
+ * D1 M16): the Place studio's clean-display enforcement unchecks a
+ * committed composition member the studio sets aside (a hazard surface),
+ * which `reconcileClusterWithLayerIntent` reads as a customization and
+ * demotes the commitment to 'custom'; restoring the original checked
+ * intent afterward does not undo that demotion on its own, because
+ * `cluster-store`'s `setHazardCluster` only notifies on a VALUE change,
+ * and the cluster being restored to (commonly Drought, the ever-present
+ * store default) never actually left the store. This door restores the
+ * store claim, then unconditionally forces the exact re-derivation an
+ * actual store change would have triggered, so the studio round trip
+ * re-presses the hazard it captured even when the store value never
+ * moved. Suppresses the store's own notification while writing it (the
+ * `applying` guard already used by `requestHorizon`) so the resync below
+ * is the only one that runs, never a redundant second. `hazard` is the
+ * person's captured hazard: a custom set's store claim reads Drought.
+ */
+export function restoreCommittedCluster(
+  cluster: HazardClusterKey,
+  ocean: OceanKey | null,
+  hazard: HazardClusterKey = cluster
+): void {
+  applying = true;
+  try {
+    setHazardCluster(cluster, ocean);
+  } finally {
+    applying = false;
+  }
+  resyncFromStore(hazard);
 }
 
 /**
@@ -388,6 +585,26 @@ export function requestOcean(key: OceanKey): void {
  */
 export function requestHorizon(next: TemporalHorizonKey): void {
   if (timeline.horizon === next) return;
+  // A horizon the person picks is theirs: leaving the mode carries it.
+  entryUndo = null;
+  commitHorizon(next);
+}
+
+/**
+ * The phone rail's horizon after a preset for `mode` has replaced the layer
+ * set: the entry into that mode through `enterHorizon`, so an ENSO preset
+ * commits Season ahead and a later preset of Drought, Wildfire or Extreme Heat
+ * lands on Current Conditions (DR-190 as amended 2026-11-13). The
+ * preset's mode becomes the person's hazard; its layer set stays custom (DR-156).
+ */
+export function requestPresetHorizon(mode: HazardClusterKey): void {
+  selectedHazard = mode;
+  const next = enterHorizon(mode, HAZARD_CLUSTERS[mode].entryHorizon);
+  if (timeline.horizon !== next) commitHorizon(next);
+  else publish();
+}
+
+function commitHorizon(next: TemporalHorizonKey): void {
   if (committedCluster === null) {
     // Derived: when the boot honesty guard already reads the display as
     // 'custom' (a layers= deep link), the granular set keeps itself; the
@@ -418,9 +635,16 @@ export function requestHorizon(next: TemporalHorizonKey): void {
  * matches the committed composition (D-0.7.0-044: the moment the user
  * customizes, `cluster=` comes off and `layers=` goes on; the URL never
  * claims a cluster the display is not). Called by the sidebar on every
- * checkbox-intent flip; a terminal activation failure that unchecks a
- * recipe member also lands here, which is deliberate honesty (a
- * wildfire display missing its perimeters is not the Wildfire cluster).
+ * checkbox-intent flip. A terminal activation failure of a member of the
+ * committed composition, recipe or reference, no longer lands here (D1 M5,
+ * 2026-09-27, found-003; found-073): the controller keeps that box checked
+ * (`isCommittedCompositionKey`), the view stays committed, and the failed
+ * layer reads unavailable in the pill and in the summary caveat, which
+ * names it because it stays in the committed intendedKeys. A failure the
+ * controller does uncheck (any layer of a custom set) still lands here,
+ * and so does a user's own uncheck of a composition member: that display
+ * is no longer the cluster. A mode's optional layers
+ * (HazardClusterDef.optionalLayers) on top of its composition do not demote it.
  * Stands down while the service itself is applying a cluster, so the
  * transaction's own intermediate flips can never demote the cluster it
  * is committing (the S2-mechanics defect this service retires).
@@ -440,6 +664,32 @@ export function reconcileClusterWithLayerIntent(checked: ReadonlySet<string>): v
   const matches =
     checked.size === intent.size && [...intent].every((key) => checked.has(key));
   if (matches) return;
+  // A mode plus only its optional layers stays that mode (Fuel risk over Wildfire),
+  // and a custom set (committed, or derived from a link or a studio restore) that
+  // is the person's mode again at a horizon the mode shows returns to it.
+  const committed = committedCluster;
+  const custom = committed === 'custom' || (committed === null && selectedHazard !== getHazardCluster());
+  const mode = custom ? selectedHazard : (committed ?? getHazardCluster());
+  const horizon = committedHorizon ?? timeline.horizon;
+  // shortcut: ENSO stays custom, since its store write would refit the Pacific and
+  // drop the ocean; upgrade when the camera can tell that write from a press.
+  const canReturn = !custom || (mode !== 'enso' && resolveHorizonForCluster(mode, horizon) === horizon);
+  if (canReturn && isModeDisplay(mode, horizon, checked)) {
+    committedCluster = mode;
+    committedIntent = new Set(checked);
+    committedHorizon = horizon;
+    if (getHazardCluster() !== mode) {
+      applying = true;
+      try {
+        setHazardCluster(mode, null);
+      } finally {
+        applying = false;
+      }
+    }
+    if (disposer !== null) publish();
+    else current = null;
+    return;
+  }
   committedCluster = 'custom';
   committedIntent = new Set(checked);
   committedHorizon = null;
@@ -464,13 +714,16 @@ export function reconcileClusterWithLayerIntent(checked: ReadonlySet<string>): v
  * revision) on registry, timeline, framing, and external cluster-store
  * changes. Idempotent; returns a disposer. Every subscription stands
  * down while a transaction is applying (the final publish covers it).
+ * The boot (sidebar.ts applyUrlStateSync) passes the link's hazard, which a
+ * custom set carries in `hazard=` while the store reads Drought.
  */
-export function initClusterService(): () => void {
+export function initClusterService(hazard: HazardClusterKey = getHazardCluster()): () => void {
   if (disposer !== null) return disposer;
   // URL state is parsed after this module is evaluated. Seed the user-facing
-  // hazard from the parsed store here so a direct cluster= deep link does not
-  // inherit the module's earlier Drought default.
-  selectedHazard = getHazardCluster();
+  // hazard here so a direct deep link does not inherit the module's earlier
+  // Drought default.
+  selectedHazard = hazard;
+  entryUndo = null;
   current = null;
   const unsubscribers = [
     registry.on('change', () => {
@@ -508,14 +761,13 @@ export function initClusterService(): () => void {
       if (!applying) publish();
     }),
     onHazardClusterChange(() => {
-      if (applying) return;
-      // An external store write (the boot seed, the Place studio
-      // restore) is a new committed claim: re-derive from the store.
-      selectedHazard = getHazardCluster();
-      committedCluster = null;
-      committedIntent = null;
-      committedHorizon = null;
-      publish();
+      // An external store write (the boot seed) is a new committed
+      // claim: re-derive from the store. Stands down while applying
+      // (see requestCluster) so the transaction's own intermediate
+      // writes never race this resync; restoreCommittedCluster shares
+      // this same body under its own `applying` guard, not this event
+      // (a same-value store write emits nothing to react to).
+      if (!applying) resyncFromStore();
     })
   ];
   disposer = () => {

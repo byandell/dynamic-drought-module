@@ -1,5 +1,5 @@
-import { test, expect, type Page } from '@playwright/test';
-import { gotoApp, urlLayers, waitForLayerSettled } from './helpers';
+import { test, expect, type Page } from './offline-test';
+import { gotoApp, search, urlLayers, waitForLayerSettled } from './helpers';
 import {
   AIANNH_ROUTE,
   BIA_ROUTE,
@@ -8,13 +8,14 @@ import {
 } from './tribal-fixtures';
 
 /**
- * The mobile quick-view spine and the footer doors. Four icon-only hazard
- * controls occupy the lower-right thumb zone, with the one authoritative
- * Satellite control seated directly below them.
+ * The mobile quick-view spine and the footer doors. Four labelled hazard
+ * cells occupy the lower-right thumb zone, and the one authoritative
+ * Satellite control leads the view tools in the same right-edge column.
  *
  * Contract under test:
- * - The rail exists in the map-led closed and peek detents, yields to the
- *   half and full sheet detents, and stays absent on desktop and in embed
+ * - The rail answers on the map, sits inert under an open window (owner,
+ *   2026-11-13: every window is full screen) and stays absent on desktop
+ *   and in embed
  *   byte for byte (hard rule 8).
  * - A hazard tap routes through the ONE layer controller (applyPreset):
  *   the preset's layer set replaces the active set in the URL, so the
@@ -57,7 +58,7 @@ test.beforeEach(async ({ page }) => {
 test.describe('the mobile hazard rail (390x844)', () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test('the map-first boot shows four accessible icon controls followed geometrically by Satellite', async ({
+  test('the map-first boot shows four labelled hazard cells in a column and Satellite in the view tools', async ({
     page
   }) => {
     await gotoApp(page);
@@ -77,36 +78,40 @@ test.describe('the mobile hazard rail (390x844)', () => {
     await expect(buttons.nth(2)).toHaveAccessibleName(/drought/i);
     await expect(buttons.nth(3)).toHaveAccessibleName(/heat/i);
 
+    // Each cell in the phone's right-edge column shows one short word, and that word
+    // leads its accessible name (WCAG 2.5.3).
+    const hazardLabels = rail.locator('.hazard-rail-btn > .map-control-label');
+    await expect(hazardLabels).toHaveText(['ENSO', 'Fire', 'Drought', 'Heat']);
+    for (let i = 0; i < 4; i += 1) {
+      const label = hazardLabels.nth(i);
+      await expect(label).toBeVisible();
+      expect(await label.evaluate((n) => getComputedStyle(n).position)).toBe('static');
+      const lb = (await label.boundingBox())!;
+      const cb = (await buttons.nth(i).boundingBox())!;
+      expect(lb.width).toBeGreaterThan(1);
+      expect(lb.height).toBeGreaterThan(1);
+      expect(lb.x).toBeGreaterThanOrEqual(cb.x);
+      expect(lb.x + lb.width).toBeLessThanOrEqual(cb.x + cb.width);
+    }
+
+    // The one Satellite control leads the view tools (order 10) in the same
+    // column, outside the hazard rail. Its long word stays for assistive
+    // technology; the cell draws the short word SAT, which leads its name.
     const satellite = page.locator('.basemap-switcher-btn');
     await expect(satellite).toHaveCount(1);
     await expect(satellite).toBeVisible();
-    await expect(satellite).toHaveAccessibleName(/satellite imagery/i);
+    await expect(satellite).toHaveAccessibleName(/^SAT\b.*satellite imagery/i);
     await expect(page.locator('#hazard-rail .basemap-switcher-btn')).toHaveCount(0);
-
-    // Mobile labels remain in the accessibility tree but do not render as
-    // visible map text.
-    const labelStyles = await page
-      .locator('#hazard-rail .map-control-label, .basemap-switcher-btn .basemap-switcher-label')
-      .evaluateAll((labels) =>
-        labels.map((label) => {
-          const style = getComputedStyle(label);
-          return {
-            clip: style.clip,
-            height: style.height,
-            overflow: style.overflow,
-            position: style.position,
-            width: style.width
-          };
-        })
-      );
-    expect(labelStyles).toHaveLength(5);
-    for (const style of labelStyles) {
-      expect(style.position).toBe('absolute');
-      expect(style.width).toBe('1px');
-      expect(style.height).toBe('1px');
-      expect(style.overflow).toBe('hidden');
-      expect(style.clip).not.toBe('auto');
-    }
+    await expect(page.locator('#edge-body-view > .basemap-switcher-control')).toHaveCount(1);
+    await expect(page.locator('#edge-body-view > .basemap-switcher-control')).toHaveAttribute(
+      'data-edge-order',
+      '10'
+    );
+    await expect(satellite).toHaveAttribute('data-edge-word', 'SAT');
+    await expect(buttons.nth(0)).toHaveAccessibleName(/^ENSO\b/);
+    await expect(buttons.nth(1)).toHaveAccessibleName(/^Fire\b/);
+    await expect(buttons.nth(2)).toHaveAccessibleName(/^Drought\b/);
+    await expect(buttons.nth(3)).toHaveAccessibleName(/^Heat\b/);
 
     const lowerControls = [
       buttons.nth(0),
@@ -173,11 +178,11 @@ test.describe('the mobile hazard rail (390x844)', () => {
     // counterexamples): Share and Reset describe their action targets.
     await expect(page.locator('#share-btn')).toHaveAttribute(
       'title',
-      'Copy embed-ready link to clipboard'
+      'The link restores region or framing, layers, mode and horizon, not the map position or an open briefing'
     );
     await expect(page.locator('#reset-btn')).toHaveAttribute(
       'title',
-      'Reset to selected region bounds'
+      'Return to the default view'
     );
   });
 
@@ -190,10 +195,13 @@ test.describe('the mobile hazard rail (390x844)', () => {
     const ensoBtn = page.locator('#hazard-rail button[data-preset="hazard-enso"]');
     await ensoBtn.click();
 
+    // An entry into ENSO opens on its Season ahead outlook beside the SST.
     await expect
       .poll(async () => [...(await urlLayers(page))].sort())
-      .toEqual(['aiannh', 'sst-anomaly']);
+      .toEqual(['aiannh', 'cpc-seasonal-precip', 'sst-anomaly']);
+    await expect.poll(async () => new URLSearchParams(await search(page)).get('horizon')).toBe('season-ahead');
     await waitForLayerSettled(page, 'sst-anomaly');
+    await waitForLayerSettled(page, 'cpc-seasonal-precip');
     await expect(ensoBtn).toHaveAttribute('aria-pressed', 'true');
     await expect(
       page.locator('#hazard-rail button[data-preset="hazard-drought"]')
@@ -234,7 +242,7 @@ test.describe('the mobile hazard rail (390x844)', () => {
     ).toHaveAttribute('aria-pressed', 'false');
   });
 
-  test('the rail yields to the open sheet; a quick-view chip closes the sheet to the map', async ({
+  test('an open window covers the rail and the map controls; Back to map returns them', async ({
     page
   }) => {
     await gotoApp(page);
@@ -243,48 +251,54 @@ test.describe('the mobile hazard rail (390x844)', () => {
     const satellite = page.locator('.basemap-switcher-btn');
     const share = page.locator('#share-btn');
     const reset = page.locator('#reset-btn');
+    const back = page.locator('#sheet-close');
+    // Whether a control can take focus: false while it sits inert under an open window.
+    const focusable = (locator: typeof share): Promise<boolean> =>
+      locator.evaluate((button) => {
+        (button as HTMLButtonElement).focus();
+        return document.activeElement === button;
+      });
     await expect(rail).toBeVisible();
     await expect(satellite).toBeVisible();
     await expect(share).toBeVisible();
     await expect(reset).toBeVisible();
 
-    // The open sheet owns the rail's zone (the mockup's sheet covers its
-    // rail): at half and full the rail is gone; closing brings it back.
+    // Every window is full screen (owner, 2026-11-13): what it covers is
+    // inert until the reader goes back to the map.
     await page.locator('#mobile-footer-nav button[data-tab="layers"]').click();
-    await expect(app).toHaveAttribute('data-sheet-detent', 'half');
-    await expect(rail).toBeHidden();
-    await expect(satellite).toBeHidden();
-    await expect(share).toBeVisible();
-    await expect(reset).toBeVisible();
-    await satellite.evaluate((button) => (button as HTMLButtonElement).focus());
-    await expect(satellite).not.toBeFocused();
+    await expect(app).toHaveAttribute('data-sheet-detent', 'full');
+    await expect(back).toBeVisible();
+    expect(await focusable(satellite)).toBe(false);
+    expect(await focusable(share)).toBe(false);
+    expect(await focusable(rail.locator('.hazard-rail-btn').first())).toBe(false);
 
-    // A quick-view chip applies its preset AND closes the sheet (the
-    // mockup's rule 5: the map answers).
-    await page.locator('#preset-chips .preset-chip', { hasText: 'Fire risk' }).click();
+    await back.click();
     await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
     await expect(rail).toBeVisible();
     await expect(satellite).toBeVisible();
     await expect(share).toBeVisible();
     await expect(reset).toBeVisible();
+    expect(await focusable(satellite)).toBe(true);
+
+    // Back on the map, a rail button applies its preset and the map answers.
+    await page.locator('#hazard-rail button[data-preset="hazard-fire"]').click();
+    await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
     await expect
       .poll(async () => (await urlLayers(page)).has('spc-fire-weather'))
       .toBe(true);
 
-    // At full (Brief door) the map has receded and the rail stays gone.
-    await page.locator('#mobile-footer-nav button[data-tab="brief"]').click();
+    // The Brief door with no place chosen opens its window too, and the same
+    // Back to map returns the controls.
+    const briefDoor = page.locator('#mobile-footer-nav button[data-tab="brief"]');
+    await briefDoor.click();
     await expect(app).toHaveAttribute('data-sheet-detent', 'full');
-    await expect(rail).toBeHidden();
-    await expect(satellite).toBeHidden();
-    await expect(share).toBeHidden();
-    await expect(reset).toBeHidden();
-    await share.evaluate((button) => (button as HTMLButtonElement).focus());
-    await expect(share).not.toBeFocused();
-    await page.locator('#mobile-footer-nav button[data-tab="brief"]').click();
+    await expect(app).toHaveAttribute('data-sheet-tab', 'brief');
+    await expect(briefDoor).toHaveAttribute('aria-expanded', 'true');
+    expect(await focusable(share)).toBe(false);
+    await back.click();
     await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
-    await expect(rail).toBeVisible();
-    await expect(satellite).toBeVisible();
-    await expect(share).toBeVisible();
+    await expect(briefDoor).toHaveAttribute('aria-expanded', 'false');
+    expect(await focusable(share)).toBe(true);
     await expect(reset).toBeVisible();
   });
 
@@ -315,7 +329,7 @@ test.describe('the mobile hazard rail (390x844)', () => {
     const app = page.locator('#app');
 
     await page.locator('#mobile-footer-nav button[data-tab="alerts"]').click();
-    await expect(app).toHaveAttribute('data-sheet-detent', 'half');
+    await expect(app).toHaveAttribute('data-sheet-detent', 'full');
     await expect(app).toHaveAttribute('data-sheet-tab', 'alerts');
     await expect(page.locator('#sheet-alerts')).toBeVisible();
     // The pane is the sheet's only content (one sheet, one surface).
@@ -327,8 +341,8 @@ test.describe('the mobile hazard rail (390x844)', () => {
       .poll(async () => (await page.locator('#sheet-alerts-body').textContent())?.trim().length ?? 0)
       .toBeGreaterThan(0);
 
-    // Re-tapping the active door closes back to the map.
-    await page.locator('#mobile-footer-nav button[data-tab="alerts"]').click();
+    // Back to map closes the window (it covers the doors).
+    await page.locator('#sheet-close').click();
     await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
     await expect(app).not.toHaveAttribute('data-sheet-tab', /.+/);
   });

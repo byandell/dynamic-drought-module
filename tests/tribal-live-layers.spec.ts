@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './offline-test';
 import {
   gotoApp,
   layerCheckbox,
@@ -17,6 +17,19 @@ import {
   emptyCollectionBody,
   arcgisErrorBody
 } from './tribal-fixtures';
+import {
+  RAWS_ROUTE,
+  RAWS_FIXTURE_MARKER_ID,
+  RAWS_FIXTURE_OBSERVED_MS,
+  RAWS_MALFORMED_BODY,
+  rawsAffirmativeNullBody,
+  rawsHappyBody,
+  rawsNullWindBody,
+  rawsPeakOnlyWindBody,
+  rawsStrongWindBody,
+  rawsUnparseableDirectionBody
+} from './fixtures/raws-fixtures';
+import { dateTok } from '../src/util/text-tokens';
 
 /**
  * Unit G: the deterministic backbone for the live Tribal-geography layers
@@ -125,7 +138,7 @@ async function expectNoPopupAtMapCenter(page: Page): Promise<void> {
 }
 
 /** The three exact AIANNH popup descriptions, copied verbatim from
- * `buildAiannhPopupHtml` (src/ui/popups.ts) so a paraphrase cannot pass.
+ * `buildAiannhPopupModel` (src/ui/popups.ts) so a paraphrase cannot pass.
  * D-0.7.0-059 (research 4c, maintainer-approved): the Oklahoma Tribal
  * Statistical Area (D6) branch carries its own McGirt-aware wording, and
  * every branch ends with the absence-is-not-absence line. */
@@ -216,17 +229,20 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
         })
       );
       await routeGeojson(page, BIA_ROUTE, emptyCollectionBody());
-      await gotoApp(page, '?view=console&layers=aiannh');
+      await gotoApp(page, '?region=washington_state&view=console&layers=aiannh');
       await waitForLayerSettled(page, 'aiannh');
       await clickMapForPopup(page);
 
       // Exact field-by-field contract (never fragments on the whole popup):
-      // the agency line, the Type line, and the full caveat paragraph, all
-      // copied verbatim from src/ui/popups.ts.
+      // the issuer line (the frame's .popup-agency alias, since D1 M24), the
+      // Type row, and the full caveat paragraph as the frame's one
+      // representation note, all copied verbatim from src/ui/popups.ts.
       const popup = page.locator('.maplibregl-popup-content');
-      await expect(popup.locator('.popup-agency')).toHaveText('US Census Bureau · AIANNH (live)');
-      await expect(popup.locator('.popup-treaty-meta')).toHaveText(`Type: ${subtype.label}`);
-      await expect(popup.locator('.popup-description')).toHaveText(
+      await expect(popup.locator('.popup-agency')).toHaveText('Boundary from: U.S. Census Bureau (AIANNH)');
+      const typeRow = popup.locator('[data-detail="row"]', { has: page.locator('dt', { hasText: /^Type$/ }) });
+      await expect(typeRow).toHaveCount(1);
+      await expect(typeRow.locator('dd')).toHaveText(subtype.label);
+      await expect(popup.locator('[data-popup-slot="note"][data-representation^="aiannh:"]')).toHaveText(
         subtype.code === 'D6'
           ? AIANNH_OTSA_DESCRIPTION
           : subtype.legal
@@ -265,7 +281,7 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
       });
     });
     await routeGeojson(page, BIA_ROUTE, syntheticBiaBody());
-    await gotoApp(page, '?view=console&layers=aiannh');
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh');
     await waitForLayerSettled(page, 'aiannh');
     await expect(layerPill(page, 'aiannh')).toHaveText('live');
 
@@ -297,7 +313,7 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
       });
     });
     await routeGeojson(page, BIA_ROUTE, syntheticBiaBody());
-    await gotoApp(page, '?view=console&layers=aiannh');
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh');
     await waitForLayerSettled(page, 'aiannh');
     await expect(layerPill(page, 'aiannh')).toHaveText('live');
 
@@ -335,7 +351,7 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
         )
       });
     });
-    await gotoApp(page, '?view=console&layers=aiannh');
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh');
     await waitForLayerSettled(page, 'aiannh');
     await expect(layerPill(page, 'aiannh')).toHaveText('live');
 
@@ -372,7 +388,7 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
         )
       });
     });
-    await gotoApp(page, '?view=console&layers=bia-reservations');
+    await gotoApp(page, '?region=washington_state&view=console&layers=bia-reservations');
     await waitForLayerSettled(page, 'bia-reservations');
     await expect(layerPill(page, 'bia-reservations')).toHaveText('live');
 
@@ -436,10 +452,34 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
     // time, and the map-information credits line renders both, never a
     // blended one (owner direction 2026-08-31: the credits live in the
     // question-mark panel; the attribution control is gone).
+    // Value-only migration (S30D D1 M22; design record
+    // acknowledgements-table.md section 4.3): the credits line is the
+    // pointer now, and the two source attribution strings ('US Census
+    // AIANNH', src/layers/aiannh.ts; 'BIA AIAN-LAR',
+    // src/layers/bia-reservations.ts) no longer render anywhere. Each part
+    // is asserted at its new place: issuer and product together in each
+    // source's own Active sources item ('US Census · AIANNH (live)' and
+    // 'BIA · AIAN-LAR (live)', src/config/layers.ts), two items and never
+    // one blended item; and each issuer's own row in the Acknowledgements,
+    // the Census row naming the AIANNH product it credits (cite sheet c28).
     await page.locator('#map-info-btn').click();
-    const credits = page.locator('#map-info-attribution');
-    await expect(credits).toContainText('US Census AIANNH');
-    await expect(credits).toContainText('BIA AIAN-LAR');
+    const sourceItems = page.locator('#map-info-sources li');
+    const aiannhItem = sourceItems.filter({ hasText: 'US Census · AIANNH (live)' });
+    const biaItem = sourceItems.filter({ hasText: 'BIA · AIAN-LAR (live)' });
+    await expect(aiannhItem).toHaveCount(1);
+    await expect(biaItem).toHaveCount(1);
+    await expect(aiannhItem.filter({ hasText: 'AIAN-LAR' })).toHaveCount(0);
+    await expect(biaItem.filter({ hasText: 'AIANNH' })).toHaveCount(0);
+    await page.locator('#map-info-attribution button[data-open-acknowledgements]').click();
+    const acknowledgements = page.locator('#impact-panel .impact-acknowledgements');
+    const censusRow = acknowledgements.locator('[data-ack-id="census"]');
+    await expect(censusRow.locator('.ack-name')).toHaveText('U.S. Census Bureau');
+    await expect(censusRow).toContainText(
+      'TIGERweb, American Indian, Alaska Native, and Native Hawaiian Areas.'
+    );
+    await expect(acknowledgements.locator('[data-ack-id="bia"] .ack-name')).toHaveText(
+      'Bureau of Indian Affairs'
+    );
     await page.keyboard.press('Escape');
   });
 
@@ -451,8 +491,907 @@ test.describe('live Tribal-geography layers: deterministic backbone', () => {
     await expect(layerCheckbox(page, 'aiannh')).not.toBeChecked();
     // The deployer slot keeps its honest placeholder wording (Unit C).
     await waitForLayerSettled(page, 'tribal');
-    await expect(layerPill(page, 'tribal')).toHaveText(
-      'no data (see data/README.md)'
-    );
+    await expect(layerPill(page, 'tribal')).toHaveText('no data');
   });
 });
+
+/**
+ * DDM-P2-T10 (DR-094): resolving a Tribal Nation's agency representations
+ * once. Selecting a Nation in the Place studio issues ONE no-store AIAN-LAR
+ * request that serves both its geometry and its emphasis, never a second,
+ * redundant LARID-only request racing it. Both fixtures below are hand-built
+ * and obviously synthetic (hard rule 1): no real polygon, roster row, or
+ * crosswalk entry enters this file.
+ */
+test.describe('DDM-P2-T10: one AIAN-LAR request serves a Nation\'s geometry and its emphasis', () => {
+  const NATION_NAME = 'Synthetic One-Request Fixture Nation';
+  const LAR_NAME_ONE = 'Synthetic One-Request Fixture Area One';
+  const LAR_NAME_TWO = 'Synthetic One-Request Fixture Area Two';
+  const LAR_ID_ONE = 88001;
+  const LAR_ID_TWO = 88002;
+
+  function twoAreaBiaCollection(): {
+    type: 'FeatureCollection';
+    features: Array<{
+      type: 'Feature';
+      id: number;
+      properties: Record<string, unknown>;
+      geometry: unknown;
+    }>;
+  } {
+    return {
+      type: 'FeatureCollection',
+      features: [
+        {
+          type: 'Feature',
+          id: LAR_ID_ONE,
+          properties: {
+            LARID: LAR_ID_ONE,
+            LARNAME: LAR_NAME_ONE,
+            CLASSIFICATION: 'Fixture Classification',
+            GISACRES: 500,
+            REGION: 'Fixture Region'
+          },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [
+              [
+                [-123.4, 46.1],
+                [-123.0, 46.1],
+                [-123.0, 46.4],
+                [-123.4, 46.4],
+                [-123.4, 46.1]
+              ]
+            ]
+          }
+        },
+        {
+          type: 'Feature',
+          id: LAR_ID_TWO,
+          properties: {
+            LARID: LAR_ID_TWO,
+            LARNAME: LAR_NAME_TWO,
+            CLASSIFICATION: 'Fixture Classification',
+            GISACRES: 400,
+            REGION: 'Fixture Region'
+          },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [
+              [
+                [-121.5, 47.0],
+                [-121.1, 47.0],
+                [-121.1, 47.3],
+                [-121.5, 47.3],
+                [-121.5, 47.0]
+              ]
+            ]
+          }
+        }
+      ]
+    };
+  }
+
+  /** Answers BOTH request shapes the flow can make: the geojson geometry
+   * query (returnGeometry=true, f=geojson) and the ESRI-JSON attributes-only
+   * query (f=json) the pre-fix emphasis fetch used, exactly like the
+   * suite-wide stub in tests/tribal-fixtures.ts does for its own fixtures. */
+  async function stubOneRequestFixture(page: Page): Promise<void> {
+    await page.route('**/data/tribal-roster.json', (route) =>
+      route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          areas: [
+            { larName: LAR_NAME_ONE, displayName: NATION_NAME, provenance: 'bia-authoritative' },
+            { larName: LAR_NAME_TWO, displayName: NATION_NAME, provenance: 'bia-authoritative' }
+          ]
+        })
+      })
+    );
+    await page.route('**/data/tribal-larname-crosswalk.json', (route) =>
+      route.fulfill({
+        contentType: 'application/json',
+        body: JSON.stringify({
+          meta: {
+            rosterSource: 'Synthetic fixture roster',
+            landAreaSource: 'Synthetic fixture land areas'
+          },
+          matched: [
+            { tribe: NATION_NAME, larName: LAR_NAME_ONE },
+            { tribe: NATION_NAME, larName: LAR_NAME_TWO }
+          ],
+          rosterNoLar: []
+        })
+      })
+    );
+    await routeBoundary(page, BIA_ROUTE, async (route) => {
+      const url = new URL(route.request().url());
+      const collection = twoAreaBiaCollection();
+      const wantsEsriJson = url.searchParams.get('f') === 'json';
+      await route.fulfill({
+        contentType: wantsEsriJson ? 'application/json' : 'application/geo+json',
+        body: JSON.stringify(
+          wantsEsriJson
+            ? { features: collection.features.map((f) => ({ attributes: f.properties })) }
+            : collection
+        )
+      });
+    });
+    await routeGeojson(page, AIANNH_ROUTE, emptyCollectionBody());
+  }
+
+  /** The fetch `cache` mode is invisible to Playwright's own Request object
+   * (it is a RequestInit option, not a header); this records it the same way
+   * tests/trio-hardening.spec.ts does, by wrapping window.fetch before boot. */
+  async function captureFetchCacheModes(page: Page): Promise<void> {
+    await page.addInitScript(() => {
+      const modes: Record<string, string> = {};
+      (window as unknown as { __ddmFetchCacheModes: Record<string, string> }).__ddmFetchCacheModes =
+        modes;
+      const orig = window.fetch.bind(window);
+      window.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof Request
+              ? input.url
+              : String(input);
+        modes[url] = init?.cache ?? '(unset)';
+        return orig(input, init);
+      }) as typeof window.fetch;
+    });
+  }
+
+  async function fetchCacheMode(page: Page, url: string): Promise<string | undefined> {
+    return page.evaluate(
+      (u) =>
+        (window as unknown as { __ddmFetchCacheModes?: Record<string, string> })
+          .__ddmFetchCacheModes?.[u],
+      url
+    );
+  }
+
+  /** Only the LARNAME-scoped queries (the geometry request and, before the
+   * fix, the emphasis request); excludes the overlap listing's unrelated
+   * envelope query (`where=1=1`), which this task's acceptance does not
+   * govern. */
+  function larWhereRequests(urls: readonly string[]): string[] {
+    return urls.filter((url) => (new URL(url).searchParams.get('where') ?? '').includes('LARNAME'));
+  }
+
+  function emphasisStamp(page: Page): Promise<string> {
+    return page.evaluate(() => document.documentElement.dataset['ddmEmphasis'] ?? '');
+  }
+
+  test('selecting the Nation issues exactly one LARNAME-scoped, no-store AIAN-LAR request, and lights both representations', async ({
+    page
+  }) => {
+    await captureFetchCacheModes(page);
+    await stubOneRequestFixture(page);
+    await gotoApp(page, '?view=brief&layers=places&studio=place');
+
+    await page.locator('#place-studio-search').fill(NATION_NAME);
+    await expect(page.locator('#place-list .place-studio-option')).toHaveCount(1);
+
+    // Requests are counted from the selection onward: the studio's own
+    // bia-reservations reference layer (REFERENCE_KEYS for kind 'tribe')
+    // already made its own viewport query when the studio opened, before
+    // any Nation was chosen, and that query is a `where=1=1` envelope query
+    // the larWhereRequests filter above excludes anyway.
+    const biaRequestUrls: string[] = [];
+    page.on('request', (req) => {
+      if (req.url().includes('biamaps.geoplatform.gov')) biaRequestUrls.push(req.url());
+    });
+
+    await page.locator('#place-option-tribe-0').click();
+    await expect(page.locator('#place-selection-title')).toHaveText(NATION_NAME);
+
+    const expectedStamp = [`bia-reservations:${LAR_ID_ONE}`, `bia-reservations:${LAR_ID_TWO}`]
+      .sort()
+      .join(' ');
+    await expect.poll(() => emphasisStamp(page), { timeout: 15_000 }).toBe(expectedStamp);
+
+    const geometryRequestUrls = larWhereRequests(biaRequestUrls);
+    // TODAY (before the DDM-P2-T10 fix): this is 2, the studio's own
+    // geometry request AND display-snapshot's separate LARID-only emphasis
+    // request for the same selection.
+    expect(geometryRequestUrls).toHaveLength(1);
+
+    const geometryRequestUrl = geometryRequestUrls[0];
+    if (geometryRequestUrl === undefined) {
+      throw new Error('no LARNAME-scoped BIA request was captured');
+    }
+    const parsed = new URL(geometryRequestUrl);
+    expect(parsed.searchParams.get('returnGeometry')).toBe('true');
+    const where = parsed.searchParams.get('where') ?? '';
+    expect(where).toContain(LAR_NAME_ONE);
+    expect(where).toContain(LAR_NAME_TWO);
+
+    // no-store proof: recorded by the init-script wrapper above. The call
+    // site is also read directly (src/ui/island/place-studio.tsx
+    // resolveTribeSelection passes `{ cache: 'no-store' }`).
+    expect(await fetchCacheMode(page, geometryRequestUrl)).toBe('no-store');
+  });
+
+  test('no sovereign-boundary geometry lands in localStorage or sessionStorage after a Nation selection', async ({
+    page
+  }) => {
+    await stubOneRequestFixture(page);
+    await gotoApp(page, '?view=brief&layers=places&studio=place');
+    await page.locator('#place-studio-search').fill(NATION_NAME);
+    await page.locator('#place-option-tribe-0').click();
+    await expect(page.locator('#place-selection-title')).toHaveText(NATION_NAME);
+    await expect.poll(() => emphasisStamp(page), { timeout: 15_000 }).not.toBe('');
+
+    const offendingKeys = await page.evaluate(() => {
+      const hits: string[] = [];
+      for (const storage of [window.localStorage, window.sessionStorage]) {
+        for (let i = 0; i < storage.length; i += 1) {
+          const key = storage.key(i);
+          if (key === null) continue;
+          const value = storage.getItem(key) ?? '';
+          if (value.includes('coordinates') || value.includes('Polygon')) hits.push(key);
+        }
+      }
+      return hits;
+    });
+    expect(offendingKeys).toEqual([]);
+  });
+});
+
+/**
+ * DDM-P9-T05: the RAWS station popup reads the served relative humidity,
+ * wind, and fuel moisture, with their units and observation time, or says
+ * the station reported none for a field the service affirmatively left
+ * null.
+ *
+ * The station-registry viewport discovery query and the popup's own
+ * per-station hydration query (`fetchRawsStationConditions`) hit the same
+ * `**\/PublicView_RAWS/**` endpoint and parse the same `f=geojson` shape, so
+ * one route stub answers both; case (c) below tells them apart by the
+ * per-station query's `StationID=` filter, which the bbox discovery query
+ * never sends.
+ *
+ * Discovery only fires inside the RAWS viewport cap, so every case flies to
+ * the curated Ice Harbor Dam station first (mirrors
+ * tests/telemetry-raws-gate.spec.ts), which the fixture's coordinates sit
+ * inside.
+ *
+ * Since S30D D1 M26c the station popup renders through the popup frame: the
+ * first reading (relative humidity) is the head's value row, the other two
+ * are body reading rows, each a frame row holding its label, the served
+ * text verbatim and its issuer; the six-state word of a failed read sits in
+ * the head's value slot.
+ */
+
+/** One RAWS reading row of the framed station popup, by its label (the head value row or a body reading row). */
+function rawsReading(popup: ReturnType<Page['locator']>, label: string) {
+  return popup.locator('[data-popup-frame] :is([data-value-row], [data-detail="reading"])', { hasText: label });
+}
+
+/** The framed station popup's value slot state word (the six-state word of a read that did not complete). */
+function readState(popup: ReturnType<Page['locator']>) {
+  return popup.locator('[data-popup-frame] [data-popup-slot="value"] [data-state]');
+}
+test.describe('DDM-P9-T05: RAWS popup readings', () => {
+  /**
+   * Flying into the RAWS viewport cap fires EVERY discovery source at once
+   * (USGS, NRCS AWDB, NOAA CO-OPS, USBR AgriMet, CoCoRaHS), and the merge
+   * that produces the RAWS marker waits on all of them to settle. Aborting
+   * the other four (mirrors tests/popup-viewport.spec.ts's DEF-4 cases)
+   * keeps this suite's own RAWS assertion independent of those agencies'
+   * live latency, never the reason a RAWS-focused case is slow or flaky.
+   */
+  async function abortOtherDiscoverySources(page: Page): Promise<void> {
+    const abort = (route: import('./offline-test').Route): unknown => route.abort('failed');
+    await page.route('**/api.waterdata.usgs.gov/**', abort);
+    await page.route('**/wcc.sc.egov.usda.gov/**', abort);
+    await page.route('**/api.tidesandcurrents.noaa.gov/**', abort);
+    await page.route('**/mesonet.agron.iastate.edu/**', abort);
+    await page.route('**/ddm-proxy.atniclimate.workers.dev/**', abort);
+  }
+
+  async function flyToIceHarborDam(page: Page): Promise<void> {
+    await abortOtherDiscoverySources(page);
+    await gotoApp(page, '?layers=telemetry');
+    await waitForLayerSettled(page, 'telemetry');
+    await page.locator('#telemetry-reveal').click();
+    await page.locator('.telemetry-item', { hasText: 'Ice Harbor Dam' }).click();
+  }
+
+  function rawsMarker(page: Page) {
+    return page.locator(`.telemetry-marker[data-telemetry-station-id="${RAWS_FIXTURE_MARKER_ID}"]`);
+  }
+
+  test('shows relative humidity, wind, fuel moisture, and the served observation time', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsHappyBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+
+    const popup = page.locator('.maplibregl-popup');
+    const humidityRow = rawsReading(popup, 'Relative humidity');
+    await expect(async () => {
+      await marker.click();
+      await expect(humidityRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+
+    await expect(humidityRow).toContainText('21 %');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(windRow).toContainText('5 mph from 295 degrees');
+    const fuelRow = rawsReading(popup, 'Fuel moisture');
+    await expect(fuelRow).toContainText('7.3 (unk)');
+
+    // The observation time is the FIXTURE'S served ObservedDate, never the
+    // wall clock, and it is NIFC RAWS's (the old shared "As of ... (NIFC
+    // RAWS)" row): since D1 M26c each reading names its issuer and carries
+    // its own observation time, machine-readable in its <time datetime>
+    // (the frame shows it with its zone named), so a conversion that drifted
+    // from the served value fails here honestly rather than by coincidence.
+    const expectedAt = new Date(RAWS_FIXTURE_OBSERVED_MS).toISOString();
+    await expect(popup.locator('[data-popup-frame] [data-popup-region="head"] [data-popup-slot="clock"] time')).toHaveAttribute('datetime', expectedAt);
+    await expect(humidityRow.locator('[data-value-issuer]')).toHaveText('NIFC RAWS');
+    for (const row of [windRow, fuelRow]) {
+      await expect(row.locator('[data-reading-issuer]')).toHaveText('NIFC RAWS');
+      await expect(row.locator('time')).toHaveAttribute('datetime', expectedAt);
+    }
+  });
+
+  test('a field the service affirmatively reports as null reads "Station reported none", the others stay real', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsAffirmativeNullBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+
+    const popup = page.locator('.maplibregl-popup');
+    const fuelRow = rawsReading(popup, 'Fuel moisture');
+    await expect(async () => {
+      await marker.click();
+      await expect(fuelRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+
+    await expect(fuelRow).toContainText('Station reported none');
+    const humidityRow = rawsReading(popup, 'Relative humidity');
+    await expect(humidityRow).toContainText('94 %');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(windRow).toContainText('0 mph');
+  });
+
+  test('a transport failure leaves the slot unavailable, never "reported none"', async ({
+    page
+  }) => {
+    // The bbox discovery query (`where=1=1`) always gets the happy fixture
+    // so the marker renders; only the per-station hydration query (its
+    // `where` names the StationID) fails, isolating the popup's own live
+    // read from the marker's own honest discovery-time value.
+    await page.route(RAWS_ROUTE, (route) => {
+      // `StationID` also names an OUTPUT field on the bbox discovery query
+      // (`outFields=...StationID...`), so the discriminator has to be the
+      // `where` clause specifically, which only the per-station hydration
+      // query sets to a `StationID=` filter.
+      const where = new URL(route.request().url()).searchParams.get('where') ?? '';
+      if (where.startsWith('StationID=')) {
+        return route.fulfill({ status: 500, contentType: 'text/plain', body: 'synthetic failure' });
+      }
+      return route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsHappyBody())
+      });
+    });
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+
+    const popup = page.locator('.maplibregl-popup');
+    await expect(async () => {
+      await marker.click();
+      await expect(readState(popup)).toHaveText('unavailable', { timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+
+    await expect(popup).not.toContainText('Station reported none');
+  });
+
+  test('a malformed body leaves the slot unavailable, never "reported none"', async ({ page }) => {
+    await page.route(RAWS_ROUTE, (route) => {
+      // See the transport-failure case above: `StationID` also names an
+      // output field on the bbox discovery query, so the discriminator is
+      // the `where` clause, not a plain URL substring match.
+      const where = new URL(route.request().url()).searchParams.get('where') ?? '';
+      if (where.startsWith('StationID=')) {
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: RAWS_MALFORMED_BODY
+        });
+      }
+      return route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsHappyBody())
+      });
+    });
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+
+    const popup = page.locator('.maplibregl-popup');
+    await expect(async () => {
+      await marker.click();
+      await expect(readState(popup)).toHaveText('unavailable', { timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+
+    await expect(popup).not.toContainText('Station reported none');
+  });
+});
+
+/**
+ * DDM-P9-T06: the RAWS marker carries a wind symbol built from the SAME
+ * discovery response DDM-P9-T05 already reads (no second fetch: the bbox
+ * query's WindSpeedMPH/WindDirDegrees already ride in `RAWS_OUT_FIELDS`).
+ * The helpers below intentionally mirror the DDM-P9-T05 describe block's own
+ * (module-private) helpers rather than importing them, so this task's tests
+ * touch no line of that block.
+ */
+test.describe('DDM-P9-T06: RAWS wind symbol', () => {
+  async function abortOtherDiscoverySources(page: Page): Promise<void> {
+    const abort = (route: import('./offline-test').Route): unknown => route.abort('failed');
+    await page.route('**/api.waterdata.usgs.gov/**', abort);
+    await page.route('**/wcc.sc.egov.usda.gov/**', abort);
+    await page.route('**/api.tidesandcurrents.noaa.gov/**', abort);
+    await page.route('**/mesonet.agron.iastate.edu/**', abort);
+    await page.route('**/ddm-proxy.atniclimate.workers.dev/**', abort);
+  }
+
+  async function flyToIceHarborDam(page: Page): Promise<void> {
+    await abortOtherDiscoverySources(page);
+    await gotoApp(page, '?layers=telemetry');
+    await waitForLayerSettled(page, 'telemetry');
+    await page.locator('#telemetry-reveal').click();
+    await page.locator('.telemetry-item', { hasText: 'Ice Harbor Dam' }).click();
+  }
+
+  function rawsMarker(page: Page) {
+    return page.locator(`.telemetry-marker[data-telemetry-station-id="${RAWS_FIXTURE_MARKER_ID}"]`);
+  }
+
+  function windGlyph(page: Page) {
+    return rawsMarker(page).locator('svg[data-telemetry-wind-glyph]');
+  }
+
+  test('a served wind renders a glyph on the marker whose rotation and label match the served speed, direction, observation time, and issuer', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsHappyBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+
+    const glyph = windGlyph(page);
+    await expect(glyph).toHaveCount(1);
+    // The fixture serves "5 mph" and "295 degrees " (rawsHappyBody): the
+    // glyph's own accessible name carries both served strings verbatim,
+    // the issuer, and the observation time, and its rotation is the parsed
+    // leading number from the served direction string, never a re-derived
+    // value.
+    await expect(glyph).toHaveAttribute(
+      'aria-label',
+      /^Wind 5 mph from 295 degrees \(NIFC RAWS\), observed .+$/
+    );
+    const expectedAsOf = dateTok(RAWS_FIXTURE_OBSERVED_MS);
+    await expect(glyph).toHaveAttribute('aria-label', new RegExp(escapeRegExp(expectedAsOf)));
+    // The marker carries the rotation (map-aligned, minus the bearing of 0).
+    const transform = await marker.evaluate((el) => (el as HTMLElement).style.transform);
+    expect(transform).toContain('rotateZ(295deg)');
+
+    // DDM-P9-T06 fix F5 (opus-read.md): the served speed ("5 mph", the
+    // display mapping's own floor) is now visible in the glyph's drawn size,
+    // not only in the accessible name. 5 mph clamps to the mapping's
+    // minimum shaft length (6px): dot radius 8 + shaft 6 + arrowhead 8 +
+    // pad 2, doubled, is 48.
+    await expect(glyph).toHaveAttribute('width', '48');
+    await expect(glyph.locator('line')).toHaveCount(1);
+    await expect(glyph.locator('path')).toHaveCount(1);
+  });
+
+  test('a stronger served speed draws a visibly larger glyph than the weaker served speed above', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsStrongWindBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const glyph = windGlyph(page);
+    await expect(glyph).toHaveCount(1);
+    // 35 mph is the display mapping's own ceiling: dot radius 8 + shaft 22
+    // (the mapping's max) + arrowhead 8 + pad 2, doubled, is 80: larger than
+    // the 48 the "5 mph" case above draws, proving the drawn size scales
+    // with the served speed rather than being a fixed size regardless of
+    // the reading.
+    await expect(glyph).toHaveAttribute('width', '80');
+  });
+
+  test('a served direction with no numeric token renders no glyph, and the popup Wind row still carries the served string verbatim', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsUnparseableDirectionBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+    // DDM-P9-T06 fix F3 (opus-read.md): a speed AND a direction STRING are
+    // both served here ("4 mph" and "VRB"), but the direction has no
+    // numeric token, so drawing a glyph would have to either fake a
+    // due-north rotation or silently drop the direction half of the
+    // acceptance. Neither is acceptable: no glyph.
+    await expect(windGlyph(page)).toHaveCount(0);
+
+    const popup = page.locator('.maplibregl-popup');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(async () => {
+      await marker.click();
+      await expect(windRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    await expect(windRow).toContainText('4 mph from VRB');
+  });
+
+  test('a calm (0 mph) served speed draws no arrowhead, while the served strings still render verbatim', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsAffirmativeNullBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+    const glyph = windGlyph(page);
+    // rawsAffirmativeNullBody serves "0 mph" WITH a direction ("320
+    // degrees"): the glyph still exists (a direction was served, and the
+    // accessible name and title still need to carry it), but fix F5's
+    // opus-read.md caveat says a 0 mph arrow would assert a direction the
+    // near-zero speed does not meaningfully have, so no shaft and no
+    // arrowhead are drawn.
+    await expect(glyph).toHaveCount(1);
+    await expect(glyph.locator('line')).toHaveCount(0);
+    await expect(glyph.locator('path')).toHaveCount(0);
+    // dot radius 8 + no shaft + no arrowhead + pad 2, doubled, is 20.
+    await expect(glyph).toHaveAttribute('width', '20');
+
+    const popup = page.locator('.maplibregl-popup');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(async () => {
+      await marker.click();
+      await expect(windRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    // Withholding the drawn shape never withholds the served value.
+    await expect(windRow).toContainText('0 mph from 320 degrees');
+  });
+
+  test('a null served wind renders no glyph, and the popup Wind row reads "Station reported none"', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsNullWindBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+    await expect(windGlyph(page)).toHaveCount(0);
+
+    const popup = page.locator('.maplibregl-popup');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(async () => {
+      await marker.click();
+      await expect(windRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    await expect(windRow).toContainText('Station reported none');
+  });
+
+  test('a sustained speed with no sustained direction renders no glyph, and the popup Wind row carries the NWCG peak wording, never the invented word', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsPeakOnlyWindBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+    // No sustained direction served: the symbol's rotation would have
+    // nothing honest to draw from, so no glyph, matching the acceptance's
+    // "no value is interpolated" clause (a placeholder rotation would be an
+    // invented direction).
+    await expect(windGlyph(page)).toHaveCount(0);
+
+    const popup = page.locator('.maplibregl-popup');
+    const windRow = rawsReading(popup, 'Wind');
+    await expect(async () => {
+      await marker.click();
+      await expect(windRow).toBeVisible({ timeout: 2_000 });
+    }).toPass({ timeout: 15_000 });
+    await expect(windRow).toContainText('3 mph, peak 11 mph from 212 degrees over the previous 60 minutes');
+    // DDM-P9-T06 fix F11 (opus-read.md): the ONE sanctioned appearance of
+    // this literal string anywhere in the lane is this negative assertion,
+    // a permanent regression guard against the invented word ever coming
+    // back into the served-word popup text.
+    await expect(windRow).not.toContainText('gusting');
+  });
+
+  test('a transport failure on RAWS discovery makes the request, renders no marker and no glyph', async ({
+    page
+  }) => {
+    // DDM-P9-T06 fix F7 (opus-read.md): with every other discovery host
+    // also aborted below, `settleDiscoverySource`
+    // (src/config/station-registry.ts) already marks EVERY one of them
+    // `failed: true`, so the telemetry layer's degraded pill would read
+    // "live (partial)" whether or not the RAWS request below ever
+    // succeeded or failed; asserting the pill text here proves nothing
+    // about THIS failure specifically. No fixture anywhere in
+    // tests/fixtures or tests/helpers.ts serves an EMPTY successful body
+    // for the other four discovery hosts (grepped, none found), and
+    // writing new fixture families for other networks is not this task's
+    // to do, so the pill assertion is dropped rather than left vacuous; the
+    // RAWS-specific failure is proved directly instead, by observing the
+    // request itself.
+    let rawsRequested = false;
+    page.on('request', (req) => {
+      if (req.url().includes('/PublicView_RAWS/')) rawsRequested = true;
+    });
+    await abortOtherDiscoverySources(page);
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({ status: 500, contentType: 'text/plain', body: 'synthetic failure' })
+    );
+
+    await gotoApp(page, '?layers=telemetry');
+    await waitForLayerSettled(page, 'telemetry');
+    await page.locator('#telemetry-reveal').click();
+    await page.locator('.telemetry-item', { hasText: 'Ice Harbor Dam' }).click();
+
+    await expect.poll(() => rawsRequested, { timeout: 20_000 }).toBe(true);
+    await expect(rawsMarker(page)).toHaveCount(0);
+    await expect(page.locator('svg[data-telemetry-wind-glyph]')).toHaveCount(0);
+  });
+
+  test('no wind glyph exists anywhere except on the one station marker it belongs to (no interpolation between stations)', async ({
+    page
+  }) => {
+    await page.route(RAWS_ROUTE, (route) =>
+      route.fulfill({
+        contentType: 'application/geo+json',
+        body: JSON.stringify(rawsHappyBody())
+      })
+    );
+
+    await flyToIceHarborDam(page);
+
+    const marker = rawsMarker(page);
+    await expect(marker).toHaveCount(1, { timeout: 20_000 });
+    await expect(windGlyph(page)).toHaveCount(1);
+
+    // Every wind glyph anywhere in the document is a descendant of a
+    // `.telemetry-marker`: nothing is drawn off a station's own point (no
+    // field, no arrow between stations).
+    const totalGlyphs = await page.locator('svg[data-telemetry-wind-glyph]').count();
+    const glyphsInsideMarkers = await page
+      .locator('.telemetry-marker svg[data-telemetry-wind-glyph]')
+      .count();
+    expect(totalGlyphs).toBeGreaterThan(0);
+    expect(glyphsInsideMarkers).toBe(totalGlyphs);
+
+    // DDM-P9-T06 fix F9 (opus-read.md): strengthened from ">0" to an exact
+    // count. The fixture serves exactly one RAWS station, so the glyph
+    // count must equal the RAWS marker count (one), and that one glyph must
+    // sit inside that one marker specifically, not merely inside "a"
+    // marker somewhere.
+    const rawsMarkerCount = await rawsMarker(page).count();
+    expect(rawsMarkerCount).toBe(1);
+    expect(totalGlyphs).toBe(rawsMarkerCount);
+    await expect(rawsMarker(page).locator('svg[data-telemetry-wind-glyph]')).toHaveCount(1);
+  });
+});
+
+/**
+ * found-006 (D1 M14): the Brief-door Tribal Nations control becomes a real
+ * toggle. Boots explicit-empty (`layers=`) so the initial state is
+ * deterministic, mirroring tests/umbrella.spec.ts's own Brief-action cases.
+ */
+test.describe('found-006: the Brief-door Tribal Nations control is a real toggle', () => {
+  test('three presses of the Tribal Nations control give three asserted states with aria-pressed', async ({
+    page
+  }) => {
+    await gotoApp(page, '?view=brief&layers=');
+    const action = page.locator('#tribal-nations-brief-action');
+    const desc = page.locator('#tribal-nations-brief-action-desc');
+    await expect(action).toBeVisible();
+
+    // State 0 (boot): off. The description reads the activate sentence.
+    await expect(action).toHaveAccessibleName('Show Tribal Nations layers, 0 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('false');
+    await expect(desc).toHaveText('Turns on Tribal Lands and Reservation Boundaries.');
+    await expect
+      .poll(async () => {
+        const layers = await urlLayers(page);
+        return layers.has('aiannh') || layers.has('bia-reservations');
+      })
+      .toBe(false);
+
+    // State 1 (press 1): on. The description switches to the off sentence
+    // (found-006 repair: a pressed toggle's next press turns the set off).
+    await action.click();
+    await expect(action).toHaveAccessibleName('Hide Tribal Nations layers, 2 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('true');
+    await expect(desc).toHaveText('Turns off Tribal Lands and Reservation Boundaries.');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') && layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(true);
+
+    // State 2 (press 2): off again, proving the control has a real off half.
+    await action.click();
+    await expect(action).toHaveAccessibleName('Show Tribal Nations layers, 0 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('false');
+    await expect(desc).toHaveText('Turns on Tribal Lands and Reservation Boundaries.');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') || layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(false);
+
+    // State 3 (press 3): on again, proving the toggle round-trips rather
+    // than sticking after the first off.
+    await action.click();
+    await expect(action).toHaveAccessibleName('Hide Tribal Nations layers, 2 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('true');
+    await expect(desc).toHaveText('Turns off Tribal Lands and Reservation Boundaries.');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') && layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(true);
+  });
+});
+
+/**
+ * found-090 (D1 M14 gap): the phone at-hand Tribal Nations mirror becomes a
+ * real toggle, mirroring found-006's Brief-door proof but reached through
+ * the footer's Place door (the surface the at-hand row actually lives
+ * behind on a phone), the way tests/umbrella.spec.ts's 400px case reaches
+ * it. Boots explicit-empty (`layers=`) so the initial state is
+ * deterministic.
+ */
+test.describe('found-090: the phone at-hand Tribal Nations control is a real toggle', () => {
+  test.use({ viewport: { width: 390, height: 844 } });
+
+  test('three presses give three asserted states at 390x844', async ({ page }) => {
+    await gotoApp(page, '?view=console&layers=');
+    await page.locator('#mobile-footer-nav button[data-tab="place"]').click();
+    await expect(page.locator('#app')).toHaveAttribute('data-sheet-detent', 'full');
+    await expect(page.locator('#sheet-at-hand')).toBeVisible();
+
+    const action = page.locator('#tribal-nations-at-hand-action');
+    await expect(action).toBeVisible();
+
+    // State 0 (boot): off.
+    await expect(action).toHaveAccessibleName('Show Tribal Nations layers, 0 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('false');
+    await expect
+      .poll(async () => {
+        const layers = await urlLayers(page);
+        return layers.has('aiannh') || layers.has('bia-reservations');
+      })
+      .toBe(false);
+
+    // State 1 (press 1): on.
+    await action.click();
+    await expect(action).toHaveAccessibleName('Hide Tribal Nations layers, 2 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('true');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') && layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(true);
+
+    // State 2 (press 2): off again, proving the mirror has a real off half
+    // (before this fix, a second press was a no-op: both layers stayed on).
+    await action.click();
+    await expect(action).toHaveAccessibleName('Show Tribal Nations layers, 0 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('false');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') || layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(false);
+
+    // State 3 (press 3): on again, proving the toggle round-trips rather
+    // than sticking after the first off.
+    await action.click();
+    await expect(action).toHaveAccessibleName('Hide Tribal Nations layers, 2 of 2 selected');
+    expect(await action.getAttribute('aria-pressed')).toBe('true');
+    await expect
+      .poll(
+        async () => {
+          const layers = await urlLayers(page);
+          return layers.has('aiannh') && layers.has('bia-reservations');
+        },
+        { timeout: 25_000 }
+      )
+      .toBe(true);
+  });
+});
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}

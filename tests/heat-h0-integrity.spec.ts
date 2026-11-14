@@ -1,9 +1,12 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 
+import { HAZARD_CLUSTERS } from '../src/config/clusters';
+import { NWS_ALERT_LEGEND } from '../src/config/palette';
 import {
   gotoApp,
   layerCheckbox,
   layerPill,
+  search,
   selectRegion
 } from './helpers';
 
@@ -53,34 +56,25 @@ function rectangleFeature(
       expiration,
       wfo: 'SEW'
     },
+    // The lower 48, so a product stays in a phone view after a desktop boot:
+    // the phone Alerts pane lists only what is drawn in the current view.
     geometry: {
       type: 'Polygon',
       coordinates: [[
-        [-125, 45],
-        [-116, 45],
-        [-116, 50],
+        [-125, 25],
+        [-67, 25],
+        [-67, 50],
         [-125, 50],
-        [-125, 45]
+        [-125, 25]
       ]]
     }
   };
-}
-
-async function stubBasemap(page: Page): Promise<void> {
-  await page.route('https://tile.openstreetmap.org/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'image/png',
-      body: ONE_PIXEL_PNG
-    })
-  );
 }
 
 async function stubHeatRisk(
   page: Page,
   tileMode: 'success' | 'missing' | 'mixed' = 'success'
 ): Promise<void> {
-  await stubBasemap(page);
   let tileRequestCount = 0;
   await page.route(
     (url) => url.pathname.startsWith(HEATRISK_PATH),
@@ -130,7 +124,6 @@ async function stubNwsSnapshot(
   page: Page,
   truncated: boolean
 ): Promise<void> {
-  await stubBasemap(page);
   await page.route(
     (url) => url.pathname.endsWith(WWA_PATH),
     (route) =>
@@ -153,6 +146,9 @@ async function stubNwsSnapshot(
 async function expectCompactEmbedKey(page: Page): Promise<void> {
   const key = page.locator('#map-key');
   await expect(key).toBeVisible();
+  const toggle = key.locator('#map-key-details-toggle');
+  if (await toggle.getAttribute('aria-expanded') === 'false') await toggle.click();
+  await expect(key.locator('#map-key-content')).toBeVisible();
   const metrics = await key.evaluate((element) => {
     const box = element.getBoundingClientRect();
     return {
@@ -179,11 +175,10 @@ test('HeatRisk is live only at a contiguous United States map center', async ({
   );
 
   await expect(layerPill(page, 'heatrisk')).toHaveText('live');
+  // The coverage sentence lives in Technical information, not a floating legend.
   await expect(
     page.locator('.legend-section[data-legend="heatrisk"]')
-  ).toContainText(
-    'National Weather Service HeatRisk covers the contiguous United States only.'
-  );
+  ).toHaveCount(0);
 
   for (const region of ['alaska', 'hawaii'] as const) {
     await selectRegion(page, region);
@@ -192,7 +187,7 @@ test('HeatRisk is live only at a contiguous United States map center', async ({
     );
     await expect(
       page.locator('.legend-section[data-legend="heatrisk"]')
-    ).toContainText('No HeatRisk data at the map center.');
+    ).toHaveCount(0);
   }
 
   await selectRegion(page, 'washington_state');
@@ -203,23 +198,35 @@ test('an all-404 HeatRisk selected frame becomes unavailable', async ({
   page
 }) => {
   await stubHeatRisk(page, 'missing');
+  // found-103: gotoApp's boot-idle wait is bounded by the default 10 s expect
+  // timeout, but an all-404 selected frame only settles after its own retry
+  // schedule, which a loaded runner can stretch past that. Opt out of the
+  // boot-idle wait and wait on the settled unavailable state itself, the
+  // thing this case is about. The budget is the layer's own bound (the 10 s
+  // tile-success deadline plus its 10 s fetch timeout, src/layers/heatrisk.ts)
+  // with margin, so it cannot expire before the layer has had its full say.
   await gotoApp(
     page,
-    '?region=washington_state&layers=heatrisk&view=console'
+    '?region=washington_state&layers=heatrisk&view=console',
+    { bootIdle: false }
   );
 
   await expect(layerPill(page, 'heatrisk')).toHaveText('unavailable', {
-    timeout: 15_000
+    timeout: 25_000
   });
+  await expect(page.locator('html')).toHaveAttribute('data-ddm-boot', 'idle');
 });
 
 test('a mixed-success HeatRisk selected frame is live partial', async ({
   page
 }) => {
   await stubHeatRisk(page, 'mixed');
+  // A mixed verdict also waits for the tile watcher's deadline. Observe that
+  // verdict directly instead of racing it against gotoApp's boot-idle deadline.
   await gotoApp(
     page,
-    '?region=washington_state&layers=heatrisk&view=console'
+    '?region=washington_state&layers=heatrisk&view=console',
+    { bootIdle: false }
   );
 
   await expect(layerPill(page, 'heatrisk')).toHaveText('live (partial)', {
@@ -252,9 +259,8 @@ for (const embedViewport of [
         '#map-key [data-heatrisk-coverage]'
       );
       await expect(qualification).toContainText('no data');
-      await expect(qualification).toContainText(
-        'National Weather Service HeatRisk covers the contiguous United States only.'
-      );
+      // The coverage sentence reads in Technical information, not the key.
+      await expect(qualification).not.toContainText('contiguous United States');
       await expectCompactEmbedKey(page);
     });
 
@@ -269,7 +275,7 @@ for (const embedViewport of [
 
       await expect(
         page.locator('#map-key [data-nws-snapshot]')
-      ).toContainText('National Weather Service snapshot as of');
+      ).toHaveText(/^As of \d{1,2}:\d{2}\s?[AP]M, [A-Z][a-z]{2} \d{1,2}$/);
       await expectCompactEmbedKey(page);
     });
 
@@ -293,7 +299,6 @@ for (const embedViewport of [
 test('the National Weather Service snapshot prunes expired products and exposes truncation and as-of time', async ({
   page
 }) => {
-  await stubBasemap(page);
   const now = Date.now();
   await page.route(
     (url) => url.pathname.endsWith(WWA_PATH),
@@ -320,7 +325,7 @@ test('the National Weather Service snapshot prunes expired products and exposes 
   await expect(note).toContainText(
     'response reached its transfer limit'
   );
-  await expect(note).toContainText('Snapshot as of');
+  await expect(note).toContainText(/As of \d{1,2}:\d{2}\s?[AP]M, [A-Z][a-z]{2} \d{1,2}\./);
   await expect(note).toHaveAttribute('data-snapshot-as-of', /T/);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.locator('#mobile-footer-nav button[data-tab="alerts"]').click();
@@ -332,7 +337,6 @@ test('the National Weather Service snapshot prunes expired products and exposes 
 test('the NWS expiry timer removes a product before the next network refresh', async ({
   page
 }) => {
-  await stubBasemap(page);
   let requestCount = 0;
   // scheduleExpiryPrune (src/layers/nws-alerts.ts) schedules its setTimeout
   // from `nextExpiry - Date.now()` the moment this fetch response is
@@ -391,7 +395,6 @@ test('the NWS layer pauses while hidden and refreshes one stale snapshot on retu
       offset += milliseconds;
     };
   });
-  await stubBasemap(page);
   let requestCount = 0;
   await page.route(
     (url) => url.pathname.endsWith(WWA_PATH),
@@ -449,7 +452,6 @@ test('the NWS layer pauses while hidden and refreshes one stale snapshot on retu
 test('an invalid NWS MapServer body stays unavailable through activation cleanup', async ({
   page
 }) => {
-  await stubBasemap(page);
   await page.route(
     (url) => url.pathname.endsWith(WWA_PATH),
     (route) =>
@@ -466,10 +468,54 @@ test('an invalid NWS MapServer body stays unavailable through activation cleanup
   await expect(layerCheckbox(page, 'nws-alerts')).not.toBeChecked();
 });
 
+test('ENSO offers its flood, storm, wind and coastal products off by default; on, ENSO stays the mode and its key lists the ones in force', async ({
+  page
+}) => {
+  const asked: string[] = [];
+  // Two of ENSO's products, answered out of the set's order; nothing else is in force.
+  await page.route(
+    (url) => url.pathname.endsWith(WWA_PATH),
+    (route) => {
+      asked.push(new URL(route.request().url()).searchParams.get('where') ?? '');
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: collection([
+          rectangleFeature('Flood Watch', Date.now() + 3_600_000),
+          rectangleFeature('Flash Flood Warning', Date.now() + 3_600_000)
+        ])
+      });
+    }
+  );
+  const events = HAZARD_CLUSTERS.enso.alerts!.events;
+
+  await gotoApp(page, '?cluster=enso&view=console');
+  // Off by default: unchecked, named for the mode, and never read.
+  await expect(layerCheckbox(page, 'nws-alerts')).not.toBeChecked();
+  await expect(page.locator('label[for="layer-toggle-nws-alerts"] .layer-toggle-name')).toHaveText(
+    HAZARD_CLUSTERS.enso.alerts!.name
+  );
+  expect(asked).toEqual([]);
+
+  await layerCheckbox(page, 'nws-alerts').check();
+  await expect(layerPill(page, 'nws-alerts')).toHaveText('live');
+  expect(asked).toEqual([`prod_type IN (${events.map((event) => `'${event}'`).join(',')})`]);
+  // An optional layer: the mode stays ENSO and the link carries the layer beside it.
+  await expect.poll(async () => new URLSearchParams(await search(page)).get('layers')?.split(',') ?? []).toContain('nws-alerts');
+  expect(new URLSearchParams(await search(page)).get('cluster')).toBe('enso');
+
+  // The key lists only the products in force, verbatim, in the set's order (NWS_ALERT_LEGEND), and no other mode's.
+  const inForce = NWS_ALERT_LEGEND.filter((row) => ['Flood Watch', 'Flash Flood Warning'].includes(row.label)).map((row) => row.label);
+  expect(inForce).toEqual(['Flash Flood Warning', 'Flood Watch']);
+  const productKey = page.locator('#map-key [data-nws-products-key]');
+  await expect(productKey.locator('.map-key-item')).toHaveText(inForce);
+  await expect(productKey).not.toContainText('Red Flag Warning');
+  await expect(page.locator('.legend-section[data-legend="nws-alerts"] .legend li')).toHaveText(inForce);
+});
+
 test('an invalid NWS active-products body is unavailable, never an all-clear', async ({
   page
 }) => {
-  await stubBasemap(page);
   await page.route('**/USDM_current/FeatureServer/0/query?*', (route) =>
     route.fulfill({
       status: 200,
@@ -507,10 +553,21 @@ test('an invalid NWS active-products body is unavailable, never an all-clear', a
   const current = page.locator(
     '.impact-horizon[aria-labelledby="impact-horizon-title-current"]'
   );
-  await expect(current.locator('.impact-horizon-note')).toContainText(
-    'The NWS alerts service did not respond.'
-  );
+  // The failure note is the business of the two hazard rows the alerts query
+  // answers for, and of no others. Before the four-hazard by three-horizon
+  // matrix (DDM-P7-T02) this note sat on the horizon as a whole, where it
+  // spoke for the drought row as well.
+  for (const hazard of ['fire', 'heat'] as const) {
+    await expect(
+      current.locator(
+        `.impact-hazard[data-hazard="${hazard}"] .impact-horizon-note`
+      )
+    ).toContainText('The NWS alerts service did not respond.');
+  }
+  await expect(
+    current.locator('.impact-hazard[data-hazard="drought"]')
+  ).not.toContainText('The NWS alerts service did not respond.');
   await expect(current).not.toContainText(
-    'No active red-flag fire-weather or extreme-heat alerts'
+    'No active red-flag fire-weather or heat alerts'
   );
 });

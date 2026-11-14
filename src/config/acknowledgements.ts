@@ -1,0 +1,519 @@
+/**
+ * The acknowledgements rows (S30D D1 M22; task DDM-P7-T11; register items
+ * owner-1r-credits and found-027; M22 acknowledgements design sections
+ * 1.8 to 2.4, as amended by DR-147, DR-159 and DR-160 to DR-166).
+ *
+ * One row per issuer. Every `src/config/products.ts` product names its rows
+ * in `PRODUCT_CREDITS` below (a record over `ProductKey` of non-empty tuples
+ * typed against `AcknowledgementId`, so `tsc` rejects a product with no
+ * credit), and every non-catalog source the map or the briefing draws names
+ * its rows in `PROVIDERS` below.
+ *
+ * THE WORDS RULE (DR-147). A credit, changes or notice sentence here is the
+ * cited text exactly as the M22 cite batch (workflow wf_f7e3c5f0-9ec,
+ * source-reference ledger clause verdicts dated 2026-09-29) recorded it;
+ * `citeId` names the ledger slug it was recorded under, and a sentence with
+ * a null `citeId` never renders. A row with no cited sentence renders the
+ * issuer's name alone (DR-166, Q20: a REQUESTED or COURTESY credit still
+ * pending ships name-only and is listed on the owner card). A product whose
+ * REQUIRED sentence has not passed gets no row at all (DR-147): the British
+ * Columbia basin edition is held (DR-160) and has none here.
+ *
+ * `html`, where present, is the same sentence with its issuer-given links
+ * (first-party markup, rendered as-is); `tests/acknowledgements.spec.ts`
+ * asserts that its text content equals `text` exactly, so a link can never
+ * change a word.
+ *
+ * Only the lazy impact-panel runtime and the tests import this module (the
+ * station layer's legend reads the DR-159 notice from
+ * `src/config/ddm-notice.ts`, so its chunk never carries this table).
+ * `scripts/check-activation-budget.mjs` keeps it out of the eager entry.
+ */
+
+import { DDM_NOTICE_LABEL, RAWS_PUBLIC_VIEW_NOTICE } from './ddm-notice';
+import { GRANTS_GOV_ATTRIBUTION } from '../impact/grants';
+import type { ProductKey } from './products';
+
+/** Every row id, in no rendered order (the renderer groups and sorts). */
+export const ACKNOWLEDGEMENT_IDS = [
+  'noaa-nesdis',
+  'noaa-star',
+  'nasa',
+  'noaa-nws',
+  'noaa-cpc',
+  'noaa-wpc',
+  'noaa-spc',
+  'noaa-nhc',
+  'noaa-nwrfc',
+  'noaa-ncep',
+  'noaa-ospo',
+  'noaa-nidis',
+  'noaa-coops',
+  'usgs',
+  'usfs',
+  'usda-nrcs',
+  'usda-nw-climate-hub',
+  'landfire',
+  'mrlc',
+  'usbr',
+  'usace',
+  'nifc',
+  'census',
+  'bia',
+  'hifld',
+  'usa-structures',
+  'eia',
+  'epa',
+  'aafc',
+  'statcan',
+  'nrcan',
+  'usdm-partners',
+  'nadm',
+  'natural-earth',
+  'cocorahs-iem',
+  'grants-gov',
+  'deployer'
+] as const;
+
+export type AcknowledgementId = (typeof ACKNOWLEDGEMENT_IDS)[number];
+
+/**
+ * Sources the map or the briefing draws that are not `products.ts` products
+ * (design section 1.8, plus the two briefing and minimap inputs DR-165
+ * credits). Each leaves this table when its source becomes a product or
+ * leaves the tree.
+ */
+export const PROVIDER_KEYS = [
+  'basemap-ground',
+  'satellite-geocolor',
+  'enso-flow',
+  'terrain-archive',
+  'whp-3d',
+  'structures',
+  'dryness-ground',
+  'landscape-signature',
+  'minimap-drought-metric',
+  'grants-feed'
+] as const;
+
+export type ProviderKey = (typeof PROVIDER_KEYS)[number];
+
+export interface CreditSentence {
+  /** The cited words, verbatim (U+2013 kept where the issuer publishes it). */
+  readonly text: string;
+  /** The same words with their issuer-given links; text content === text. */
+  readonly html?: string;
+  /** The references-ledger slug the cite batch recorded; null never renders. */
+  readonly citeId: string | null;
+}
+
+export type AcknowledgementGroup =
+  | 'us-federal'
+  | 'canada'
+  | 'partnerships-and-other'
+  | 'deployer';
+
+export interface AcknowledgementRow {
+  readonly id: AcknowledgementId;
+  /** Styled text: the issuer's name, no colour, no emblem, no image. */
+  readonly name: string;
+  readonly group: AcknowledgementGroup;
+  /** The issuer's credit sentences; empty = name-only. */
+  readonly credits: readonly CreditSentence[];
+  /** DDM's statement of its changes, where the terms ask for one. */
+  readonly changes: readonly CreditSentence[];
+  /** DDM's own notices about the source (DR-159), labelled as DDM's. */
+  readonly notices: readonly CreditSentence[];
+  /** A licence the terms ask to link, rendered as an https anchor. */
+  readonly licence: { readonly name: string; readonly url: string } | null;
+  /** Q-LOGOS (DR-106): every verdict is styled text today; no image. */
+  readonly logo: { readonly verdict: 'styled-text' };
+}
+
+/** Section group headings, in rendered order (design section 1.9). */
+export const ACKNOWLEDGEMENT_GROUPS: readonly {
+  readonly key: AcknowledgementGroup;
+  readonly heading: string;
+}[] = [
+  { key: 'us-federal', heading: 'United States federal agencies' },
+  { key: 'canada', heading: 'Canadian governments' },
+  { key: 'partnerships-and-other', heading: 'Partnerships and other publishers' },
+  { key: 'deployer', heading: "This deployment's own data" }
+];
+
+const OGL_CANADA_URL = 'https://open.canada.ca/en/open-government-licence-canada';
+
+// The public-view RAWS notice and the DDM notice label (DR-159) live in
+// their own two-literal module so the station legend's chunk never carries
+// this table; re-exported here for every other reader.
+export { DDM_NOTICE_LABEL, RAWS_PUBLIC_VIEW_NOTICE };
+
+// ledger: nws-web-disclaimer (cite sheet c26), the shared NWS-family line
+const NWS_FAMILY_LINE: CreditSentence = {
+  text:
+    "Material from NOAA National Weather Service offices is in the public domain, unless specifically noted otherwise, and is not subject to copyright protection. DDM's display of it is not official NWS material and implies no endorsement by or affiliation with NOAA or the NWS.",
+  citeId: 'nws-web-disclaimer'
+};
+
+// ledger: aafc-canadian-drought-monitor; nadm-canadian-portion-ogl-canada (cite sheet c18)
+const OGL_CANADA_AAFC: CreditSentence = {
+  text:
+    'Agriculture and Agri-Food Canada. Contains information licensed under the Open Government Licence – Canada.',
+  html: `Agriculture and Agri-Food Canada. Contains information licensed under the <a href="${OGL_CANADA_URL}">Open Government Licence – Canada</a>.`,
+  citeId: 'aafc-canadian-drought-monitor'
+};
+
+const NONE: readonly CreditSentence[] = [];
+const STYLED = { verdict: 'styled-text' } as const;
+
+/** Name-only row (DR-166 Q20): the issuer's name, no sentence yet. */
+function nameOnly(
+  id: AcknowledgementId,
+  name: string,
+  group: AcknowledgementGroup = 'us-federal'
+): AcknowledgementRow {
+  return { id, name, group, credits: NONE, changes: NONE, notices: NONE, licence: null, logo: STYLED };
+}
+
+export const ACKNOWLEDGEMENTS: Readonly<Record<AcknowledgementId, AcknowledgementRow>> = {
+  'noaa-nesdis': nameOnly('noaa-nesdis', 'NOAA NESDIS Satellite Maps'),
+  // ledger: star-vhi names the issuer and no credit sentence; STAR's disclaimer shows beside its data (Technical information).
+  'noaa-star': nameOnly('noaa-star', 'NOAA NESDIS Center for Satellite Applications and Research (STAR)'),
+  nasa: nameOnly(
+    'nasa',
+    "NASA Global Imagery Browse Services (GIBS), part of NASA's Earth Science Data and Information System (ESDIS)"
+  ),
+  'noaa-nws': { ...nameOnly('noaa-nws', 'NOAA National Weather Service'), credits: [NWS_FAMILY_LINE] },
+  'noaa-cpc': { ...nameOnly('noaa-cpc', 'NOAA Climate Prediction Center'), credits: [NWS_FAMILY_LINE] },
+  'noaa-wpc': { ...nameOnly('noaa-wpc', 'NOAA Weather Prediction Center'), credits: [NWS_FAMILY_LINE] },
+  'noaa-spc': { ...nameOnly('noaa-spc', 'NOAA Storm Prediction Center'), credits: [NWS_FAMILY_LINE] },
+  // The tropical cyclones layer (ENSO B3): NHC and CPHC are NWS centres under
+  // the same weather.gov disclaimer the shared line cites.
+  'noaa-nhc': {
+    ...nameOnly('noaa-nhc', 'NOAA National Hurricane Center and Central Pacific Hurricane Center'),
+    credits: [NWS_FAMILY_LINE]
+  },
+  'noaa-nwrfc': {
+    // vocab-allow: the issuing office's own name (NOAA NWS Northwest River Forecast Center), an upstream name
+    ...nameOnly('noaa-nwrfc', 'NOAA NWS Northwest River Forecast Center'),
+    credits: [NWS_FAMILY_LINE]
+  },
+  'noaa-ncep': {
+    ...nameOnly('noaa-ncep', 'NOAA National Centers for Environmental Prediction'),
+    credits: [NWS_FAMILY_LINE]
+  },
+  'noaa-ospo': nameOnly('noaa-ospo', 'NOAA NESDIS Office of Satellite and Product Operations'),
+  'noaa-nidis': nameOnly(
+    'noaa-nidis',
+    'NOAA National Integrated Drought Information System (drought.gov)'
+  ),
+  'noaa-coops': nameOnly('noaa-coops', 'NOAA Tides and Currents (CO-OPS)'),
+  usgs: {
+    ...nameOnly('usgs', 'U.S. Geological Survey'),
+    credits: [
+      // DRAFT wording for the owner's citation check (the base map, DDM-P17-T12); held until the three ScienceBase titles are read; null citeId never renders (DR-147).
+      {
+        text:
+          'Base map lakes, reservoirs, wetlands, glaciers, rivers, canals and town names: U.S. Geological Survey, 1:1,000,000-Scale Waterbodies and Wetlands of the United States, 2014; 1:1,000,000-Scale Streams of the United States, 2014; Cities and Towns of the United States, 2014 (legacy National Atlas small-scale data, not maintained by USGS). USGS-authored data are in the U.S. public domain; USGS has not reviewed or endorsed this map.',
+        citeId: null
+      },
+      // ledger: usgs-nhd-tribal-streets (cite sheet: this pass)
+      {
+        text:
+          'Named streams and lakes inside Tribal areas: U.S. Geological Survey, The National Map, National Hydrography Dataset (NHD), read live. USGS retired the NHD on October 1, 2023. USGS has not reviewed or endorsed this map.',
+        citeId: 'usgs-nhd-tribal-streets'
+      },
+      // ledger: usgs-padus-4-1 (cite sheet: this pass)
+      {
+        text:
+          'Public and protected lands: U.S. Geological Survey Gap Analysis Project, 2025, Protected Areas Database of the United States (PAD-US) 4.1, https://doi.org/10.5066/P96WBCHS, read live by manager type.',
+        citeId: 'usgs-padus-4-1'
+      },
+      // ledger: usgs-3dep-landscape-signature (cite sheet c17)
+      {
+        text:
+          "Elevation, slope and aspect summaries computed by DDM from USGS 3D Elevation Program (3DEP) 1/3 arc-second seamless DEM, courtesy of the U.S. Geological Survey. DDM's changes: the roughly 10 m elevation grid was resampled onto a 30 m EPSG:5070 analysis grid and used to compute area-weighted mean elevation, Horn 3x3 slope and aspect, ten elevation-band area shares, and an eight-cardinal-plus-flat-plus-excluded aspect distribution for each ecoregion. These summaries are DDM's, not a USGS product, and USGS has not reviewed or endorsed them.",
+        citeId: 'usgs-3dep-landscape-signature'
+      }
+    ],
+    changes: [
+      // ledger: usgs-3dep-hillshade-pnw-changes (cite sheet c15)
+      {
+        text:
+          'Changes by DDM: elevation was requested from the USGS 3DEPElevation ImageServer on 2026-07-14 (3DEP data current as of 2026-05-19) as 512-pixel Web Mercator tiles for zoom levels 0 to 8 over 125°W to 110.5°W and 41.5°N to 49.5°N, quantized to whole meters, with ocean and source no-data cells set to 0 m, and stored as Terrarium-encoded PNG; the map computes its shading from these tiles. The USGS has not approved or endorsed these changes.',
+        citeId: 'usgs-3dep-hillshade-pnw-changes'
+      },
+      // ledger: usgs-3dep-terrain-archive-changes (cite sheet c16)
+      {
+        text:
+          'Changes by DDM: for the 3D Fire view, elevation was requested from the USGS 3DEPElevation ImageServer on 2026-09-10 as 512-pixel Web Mercator tiles for zoom levels 0 to 10 over 125°W to 110.5°W and 41.5°N to 49.5°N, quantized to whole meters and stored as Terrarium-encoded PNG; the scene exaggerates this relief 2.4 times vertically for display. When this archive is unavailable the scene uses the zoom 0 to 8 archive described above. The USGS has not approved or endorsed these changes.',
+        citeId: 'usgs-3dep-terrain-archive-changes'
+      }
+    ]
+  },
+  usfs: {
+    ...nameOnly('usfs', 'USDA Forest Service'),
+    credits: [
+      // ledger: usfs-administrative-forest-boundaries (cite sheet: this pass)
+      {
+        text:
+          "National Forest boundaries: USDA Forest Service, Administrative Forest Boundaries, Enterprise Data Warehouse. These boundaries are generalized by DDM for display. The Forest Service's data are not legal documents.",
+        citeId: 'usfs-administrative-forest-boundaries'
+      }
+    ]
+  },
+  'usda-nrcs': nameOnly('usda-nrcs', 'USDA Natural Resources Conservation Service'),
+  'usda-nw-climate-hub': nameOnly('usda-nw-climate-hub', 'USDA Northwest Climate Hub'),
+  landfire: {
+    ...nameOnly('landfire', 'LANDFIRE'),
+    credits: [
+      // DRAFT wording for the owner's citation check: ledger landfire-lf2023 new_text, LANDFIRE's own
+      // template from https://landfire.gov/data/citation; null citeId never renders (DR-147) until ddm-cite records it.
+      {
+        text:
+          'Fuel-model shares computed by DDM from LANDFIRE, 2024, LANDFIRE 2023 Scott and Burgan 40 Fire Behavior Fuel Models (FBFM40), CONUS, LF 2023 (release 240), U.S. Department of the Interior, Geological Survey, and U.S. Department of Agriculture. Accessed 25 July 2026 at https://doi.org/10.5066/P9BJP7OV.',
+        citeId: null
+      }
+    ]
+  },
+  mrlc: {
+    ...nameOnly('mrlc', 'Multi-Resolution Land Characteristics (MRLC) Consortium', 'partnerships-and-other'),
+    credits: [
+      // DRAFT wording for the owner's citation check: ledger usgs-annual-nlcd-collection-1 new_text, USGS's own
+      // citation from https://www.usgs.gov/centers/eros/how-do-i-cite-annual-nlcd-data (read 2026-11-06, which now
+      // names "ver. 1.2, June 2026"; the artifact records Collection 1.1); null citeId never renders (DR-147).
+      {
+        text:
+          "Forest, cropland, wetland and open-water shares computed by DDM from U.S. Geological Survey (USGS), 2024, Annual NLCD Collection 1 Science Products: U.S. Geological Survey data release, https://doi.org/10.5066/P94UXNTS, distributed via the Multi-Resolution Land Characteristics (MRLC) Consortium's geospatial services (land cover for 2024, accessed 25 July 2026).",
+        citeId: null
+      }
+    ]
+  },
+  usbr: nameOnly('usbr', 'Bureau of Reclamation'),
+  usace: nameOnly('usace', 'U.S. Army Corps of Engineers'),
+  nifc: {
+    ...nameOnly('nifc', 'National Interagency Fire Center'),
+    notices: [RAWS_PUBLIC_VIEW_NOTICE]
+  },
+  census: {
+    ...nameOnly('census', 'U.S. Census Bureau'),
+    credits: [
+      // ledger: census-cb-2023-state-20m (cite sheet c28)
+      {
+        text:
+          'Source: U.S. Census Bureau, 2023 Cartographic Boundary File, State and Equivalent Entities for United States, 1:20,000,000; TIGERweb, American Indian, Alaska Native, and Native Hawaiian Areas.',
+        citeId: 'census-cb-2023-state-20m'
+      },
+      // ledger: census-base-map-2025 (cite sheet: this pass)
+      {
+        text:
+          'Base map: U.S. Census Bureau, 2025 Cartographic Boundary Files, State and Equivalent and County and Equivalent, 1:500,000; TIGER/Line Shapefiles 2025, Primary and Secondary Roads and Rails; TIGERweb, Transportation, Local Roads (street names inside Tribal areas, read live).',
+        citeId: 'census-base-map-2025'
+      }
+    ]
+  },
+  bia: {
+    ...nameOnly('bia', 'Bureau of Indian Affairs'),
+    credits: [
+      // DRAFT wording for the owner's citation check: ledger bia-aian-lar's own optional Acknowledgements line,
+      // verbatim; null citeId never renders (DR-147) until ddm-cite records it.
+      {
+        text:
+          'Bureau of Indian Affairs, Office of Trust Services, Division of Land Titles and Records, Branch of Geospatial Support: American Indian and Alaska Native Land Area Representation (AIAN-LAR).',
+        citeId: null
+      },
+      // DRAFT wording for the owner's citation check: the notice's own title, number and date
+      // (https://www.federalregister.gov/d/2026-01899), the source of every Tribal Nation name; no ledger row yet.
+      {
+        text:
+          'Tribal Nation names: Bureau of Indian Affairs, Indian Entities Recognized by and Eligible To Receive Services From the United States Bureau of Indian Affairs, Federal Register document 2026-01899, January 30, 2026.',
+        citeId: null
+      }
+    ]
+  },
+  hifld: {
+    ...nameOnly('hifld', 'HIFLD (U.S. Government)'),
+    credits: [
+      // ledger: esri-fuc-transmission-lines-host (cite sheet c05; DR-163)
+      {
+        text:
+          'Transmission lines: U.S. Electric Power Transmission Lines (U.S. Government), archived copy last updated 2024-09-30, via the Esri Federal User Community.',
+        citeId: 'esri-fuc-transmission-lines-host'
+      }
+    ]
+  },
+  // USA Structures 2023 edition (Figshare, CC0; DR-126). Name-only until ddm-cite records a credit sentence.
+  'usa-structures': nameOnly(
+    'usa-structures',
+    'Oak Ridge National Laboratory (ORNL); Federal Emergency Management Agency (FEMA) Geospatial Response Office'
+  ),
+  // The EIA sentence (cite sheet c04, ledger eia-power-plants) carries the live
+  // reporting period, which this static table cannot hold, so it renders from
+  // the power layer's own legend (src/layers/power-3d.ts) in the Console legend
+  // and, while the plants draw, in the Impact Briefing's Technical information
+  // (src/ui/map-technical-information.ts); this row is the issuer's name.
+  eia: nameOnly('eia', 'U.S. Energy Information Administration'),
+  epa: nameOnly('epa', 'U.S. Environmental Protection Agency'),
+  aafc: {
+    ...nameOnly('aafc', 'Agriculture and Agri-Food Canada', 'canada'),
+    credits: [OGL_CANADA_AAFC],
+    licence: { name: 'Open Government Licence – Canada', url: OGL_CANADA_URL }
+  },
+  statcan: {
+    ...nameOnly('statcan', 'Statistics Canada', 'canada'),
+    credits: [
+      // ledger: statcan-2021-digital-boundary-files (cite sheet c19)
+      {
+        text:
+          'Nunavut analysis exclusion adapted from Statistics Canada, 2021 Digital Boundary Files. This does not constitute an endorsement by Statistics Canada of this product. Contains information licensed under the Open Government Licence – Canada.',
+        html: `Nunavut analysis exclusion adapted from Statistics Canada, 2021 Digital Boundary Files. This does not constitute an endorsement by Statistics Canada of this product. Contains information licensed under the <a href="${OGL_CANADA_URL}">Open Government Licence – Canada</a>.`,
+        citeId: 'statcan-2021-digital-boundary-files'
+      }
+    ],
+    licence: { name: 'Open Government Licence – Canada', url: OGL_CANADA_URL }
+  },
+  nrcan: {
+    ...nameOnly('nrcan', 'Natural Resources Canada', 'canada'),
+    credits: [
+      // ledger: nrcan-atlas-of-canada-1m (cite sheet: this pass)
+      {
+        text:
+          'Base map for Canada adapted from Natural Resources Canada, Atlas of Canada National Scale Data 1:1,000,000. Contains information licensed under the Open Government Licence – Canada.',
+        html: `Base map for Canada adapted from Natural Resources Canada, Atlas of Canada National Scale Data 1:1,000,000. Contains information licensed under the <a href="${OGL_CANADA_URL}">Open Government Licence – Canada</a>.`,
+        citeId: 'nrcan-atlas-of-canada-1m'
+      }
+    ],
+    licence: { name: 'Open Government Licence – Canada', url: OGL_CANADA_URL }
+  },
+  'usdm-partners': {
+    ...nameOnly('usdm-partners', 'U.S. Drought Monitor', 'partnerships-and-other'),
+    credits: [
+      // ledger: usdm (cite sheet c24; DR-166 adopts J9 Q10)
+      {
+        text:
+          'The U.S. Drought Monitor is jointly produced by the National Drought Mitigation Center at the University of Nebraska-Lincoln, the United States Department of Agriculture, the National Oceanic and Atmospheric Administration and the National Aeronautics and Space Administration. Map courtesy of NDMC.',
+        citeId: 'usdm'
+      }
+    ]
+  },
+  nadm: {
+    ...nameOnly('nadm', 'North American Drought Monitor', 'partnerships-and-other'),
+    credits: [
+      // ledger: nadm-ncei; nadm-eccc; nadm-smn-conagua (cite sheet c25; DR-166 adopts J9 Q11)
+      {
+        text:
+          'North American Drought Monitor (NADM), tri-national consensus. Sources: NOAA/NCEI, National Drought Mitigation Center, U.S. Department of Agriculture, Environment Canada, Agriculture and Agrifood Canada, National Meteorological Service of Mexico, Mexican National Commission of Water.',
+        citeId: 'nadm-ncei'
+      }
+    ]
+  },
+  'natural-earth': nameOnly('natural-earth', 'Natural Earth', 'partnerships-and-other'),
+  'cocorahs-iem': {
+    ...nameOnly('cocorahs-iem', 'CoCoRaHS, through the Iowa Environmental Mesonet', 'partnerships-and-other'),
+    credits: [
+      // ledger: cocorahs-data-usage-policy; iem-disclaimer (cite sheet c27)
+      {
+        text:
+          'Community Collaborative Rain, Hail and Snow Network (CoCoRaHS) station names and locations, Copyright © 1998-2025 Colorado Climate Center, licensed under Creative Commons Attribution 3.0 (https://creativecommons.org/licenses/by/3.0/); terms and disclaimer at https://www.cocorahs.org/content.aspx?page=datausagepolicy. Retrieved through the Iowa Environmental Mesonet, Iowa State University. DDM filters the list to the map view and shows each name and location unchanged.',
+        citeId: 'cocorahs-data-usage-policy'
+      }
+    ]
+  },
+  'grants-gov': {
+    ...nameOnly('grants-gov', 'Grants.gov (U.S. Department of Health and Human Services)'),
+    credits: [
+      // DRAFT for the owner's citation check: the sentence the API terms require wherever its rows show
+      // (https://www.grants.gov/api/terms-conditions). The briefing's Grants.gov subsection carries it beside the
+      // rows; here a null citeId never renders (DR-147) until ddm-cite records it.
+      { text: GRANTS_GOV_ATTRIBUTION, citeId: null }
+    ]
+  },
+  deployer: nameOnly('deployer', "This deployment's own data", 'deployer')
+};
+
+/** A non-empty list of the rows that credit one source. */
+export type CreditRows = readonly [AcknowledgementId, ...AcknowledgementId[]];
+
+/**
+ * Every `products.ts` product and the rows that credit it (design section
+ * 2.4 as amended by DR-160, DR-163 and DR-166). A record over `ProductKey`,
+ * so `tsc` rejects a product with no entry, and a non-empty tuple, so it
+ * rejects an entry with no row. 2026-09-30: this map lives here, outside
+ * `ProductDef`, because `src/config/products.ts` rides the evidence chunk
+ * that the point-heat briefing's first activation loads statically, and
+ * these rows pushed that closure over its DR-085 budget (33.9 kB against
+ * 33.8 kB); nothing that closure imports statically may import this module.
+ */
+export const PRODUCT_CREDITS: Readonly<Record<ProductKey, CreditRows>> = {
+  hydrography: ['usgs', 'nrcan', 'natural-earth'],
+  forests: ['usfs'],
+  railroads: ['census'],
+  dams: ['usace'],
+  'public-lands': ['usgs'],
+  ecoregions: ['epa'],
+  hillshade: ['usgs'],
+  drought: ['noaa-cpc'],
+  'gridded-index': ['noaa-nidis'],
+  usdm: ['usdm-partners'],
+  'cdm-drought': ['aafc'],
+  'nadm-drought': ['nadm', 'aafc'],
+  aiannh: ['census'],
+  tribal: ['deployer'],
+  treaty: ['deployer'],
+  'bia-reservations': ['bia'],
+  states: ['census'],
+  places: ['natural-earth', 'usgs'],
+  'power-infrastructure': ['hifld', 'eia'],
+  'nifc-fires': ['nifc'],
+  'nws-alerts': ['noaa-nws'],
+  'hms-smoke': ['noaa-ospo'],
+  heatrisk: ['noaa-nws', 'noaa-wpc'],
+  'spc-fire-weather': ['noaa-spc'],
+  'usfs-whp': ['usfs'],
+  'sst-anomaly': ['nasa'],
+  'tropical-cyclones': ['noaa-nhc'],
+  'cpc-seasonal-precip': ['noaa-cpc'],
+  'cpc-610-precip': ['noaa-cpc'],
+  'cpc-610-temp': ['noaa-cpc'],
+  'cpc-814-precip': ['noaa-cpc'],
+  'cpc-814-temp': ['noaa-cpc'],
+  telemetry: ['usgs', 'usda-nrcs', 'usbr', 'usace', 'nifc', 'noaa-coops', 'cocorahs-iem', 'noaa-nwrfc'],
+  dsci: ['usdm-partners'],
+  nwsForecast: ['noaa-nws'],
+  cpcExtended: ['noaa-cpc'],
+  cpcSeasonal: ['noaa-cpc'],
+  cpcSeasonalTemp: ['noaa-cpc'],
+  waterSupply: ['noaa-nwrfc'],
+  ensoIndex: ['noaa-cpc'],
+  ensoAuthority: ['noaa-cpc'],
+  ensoTendency: ['noaa-cpc', 'usda-nw-climate-hub'],
+  ensoNino34Monthly: ['noaa-cpc'],
+  ensoNino34Weekly: ['noaa-cpc'],
+  ensoOutlook: ['noaa-cpc']
+};
+
+/** Non-catalog sources and the rows that credit them (design section 2.4). */
+export const PROVIDERS: Readonly<
+  Record<ProviderKey, readonly [AcknowledgementId, ...AcknowledgementId[]]>
+> = {
+  // DDM's own base map (src/map/style.ts; scripts/build-base-tiles.mjs), drawn by default.
+  'basemap-ground': ['census', 'usgs', 'nrcan', 'natural-earth'],
+  'satellite-geocolor': ['noaa-nesdis'],
+  // The ENSO flow overlay (src/layers/enso-flow.ts): NOAA GFS and GFS-Wave
+  // read at runtime, and the committed NOAA RTOFS surface-current frame, all
+  // NCEP products (admission rtofs-currents-producer line 11). The overlay
+  // declares no map attribution: its credit is text in its own panel and key.
+  'enso-flow': ['noaa-ncep'],
+  'terrain-archive': ['usgs'],
+  'whp-3d': ['usfs'],
+  // The 3D Fire building footprints (src/layers/structures-3d.ts), central Oregon only.
+  structures: ['usa-structures'],
+  // The Wildfire 3D plant-stress ground: STAR's index, USGS Relative Greenness as the fallback.
+  'dryness-ground': ['noaa-star', 'usgs'],
+  // public/data/landscape-signature-pnw.json, the briefing's terrain, soil, land cover and fuels facts.
+  'landscape-signature': ['usgs', 'usda-nrcs', 'usfs', 'landfire', 'mrlc'],
+  // The minimap drought metric: CDM input and the Nunavut exclusion mask.
+  'minimap-drought-metric': ['aafc', 'statcan'],
+  // The briefing's open federal funding rows (src/impact/grants.ts), read live from the Grants.gov API.
+  'grants-feed': ['grants-gov']
+};

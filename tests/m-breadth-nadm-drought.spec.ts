@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 
 import {
   gotoApp,
@@ -8,11 +8,6 @@ import {
 
 const NADM_URL =
   'https://www.ncei.noaa.gov/pub/data/nidis/geojson/na/nadm/NADM-current.geojson';
-const TRANSPARENT_PNG = Buffer.from(
-  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
-  'base64'
-);
-
 function feature(category: string, yearMonth = '202606') {
   return {
     type: 'Feature',
@@ -44,16 +39,6 @@ function fixture(features = [feature('d0'), feature('d3')]) {
   };
 }
 
-async function routeBasemap(page: Page): Promise<void> {
-  await page.route('https://tile.openstreetmap.org/**', (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: 'image/png',
-      body: TRANSPARENT_PNG
-    })
-  );
-}
-
 async function routeNadm(
   page: Page,
   body: unknown,
@@ -71,11 +56,63 @@ async function routeNadm(
 }
 
 test.describe('North American Drought Monitor continental context', () => {
+  test('D3 NADM key agrees with actual rendered class paint', async ({ page }) => {
+    type NadmMap = {
+      getContainer(): HTMLElement;
+      getPaintProperty(layer: string, property: string): unknown;
+      queryRenderedFeatures(options: { layers: string[] }): Array<{ properties: { DROUGHTCAT?: string } }>;
+    };
+    type NadmWindow = Window & { __nadmMaps: NadmMap[] };
+    await page.addInitScript(() => {
+      const maps: NadmMap[] = [];
+      (window as unknown as NadmWindow).__nadmMaps = maps;
+      Object.defineProperty(Object.prototype, '_onWindowOnline', {
+        configurable: true,
+        set(this: NadmMap, value: unknown) {
+          Object.defineProperty(this, '_onWindowOnline', {
+            configurable: true, enumerable: true, writable: true, value
+          });
+          maps.push(this);
+        }
+      });
+    });
+    const body = fixture([0, 1, 2, 3, 4].map(dm => feature('d' + dm)));
+    body.features.forEach((entry, dm) => {
+      const west = -132 + dm * 3;
+      entry.geometry.coordinates = [[
+        [west, 50], [west + 2, 50], [west + 2, 56], [west, 56], [west, 50]
+      ]];
+    });
+    await routeNadm(page, body, []);
+    await gotoApp(page, '?embed=true&region=british_columbia&layers=nadm-drought');
+    await expect(layerPill(page, 'nadm-drought')).toHaveText('live');
+    await page.locator('#map-key-details-toggle').click();
+    await expect.poll(() => page.evaluate(() => {
+      const map = (window as unknown as NadmWindow).__nadmMaps.find(candidate => candidate.getContainer()?.id === 'map');
+      return [...new Set(map?.queryRenderedFeatures({ layers: ['nadm-drought-fill'] })
+        .map(entry => entry.properties.DROUGHTCAT) ?? [])].sort();
+    })).toEqual(['d0', 'd1', 'd2', 'd3', 'd4']);
+    const paint = await page.evaluate(() => {
+      const map = (window as unknown as NadmWindow).__nadmMaps.find(candidate => candidate.getContainer()?.id === 'map')!;
+      return map.getPaintProperty('nadm-drought-fill', 'fill-color');
+    });
+    expect(paint).toEqual([
+      'match', ['downcase', ['to-string', ['get', 'DROUGHTCAT']]],
+      'd0', '#FFFF00', 'd1', '#FCD27E', 'd2', '#FFAA00',
+      'd3', '#E60000', 'd4', '#730000', 'rgba(0,0,0,0)'
+    ]);
+    const keyColors = await page.locator('#map-key-content .map-key-swatch').evaluateAll(nodes =>
+      nodes.map(node => getComputedStyle(node).backgroundColor));
+    expect(keyColors).toEqual([
+      'rgb(255, 255, 0)', 'rgb(252, 210, 126)', 'rgb(255, 170, 0)',
+      'rgb(230, 0, 0)', 'rgb(115, 0, 0)'
+    ]);
+  });
+
   test('fetches only the direct .geojson and surfaces consensus month and lag', async ({
     page
   }) => {
     const requests: string[] = [];
-    await routeBasemap(page);
     await routeNadm(page, fixture(), requests);
 
     await gotoApp(
@@ -107,7 +144,9 @@ test.describe('North American Drought Monitor continental context', () => {
     await expect(page.locator('#time-bar')).toContainText(
       'Consensus month June 2026'
     );
-    await expect(page.locator('#map-key')).toBeHidden();
+    await expect(page.locator('#map-key')).toBeVisible();
+    await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-expanded', 'false');
+    await expect(page.locator('#map-key-content')).toBeHidden();
 
     await page.emulateMedia({ media: 'print' });
     await expect(page.locator('#time-bar')).toContainText(
@@ -119,7 +158,6 @@ test.describe('North American Drought Monitor continental context', () => {
   test('popup names the consensus product and never infers a polygon issuer', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeNadm(page, fixture([feature('d3')]), []);
     await gotoApp(
       page,
@@ -136,7 +174,7 @@ test.describe('North American Drought Monitor continental context', () => {
     await expect(popup).toContainText(
       'North American Drought Monitor · tri-national consensus product'
     );
-    await expect(popup).toContainText('Consensus month: June 2026');
+    await expect(popup).toContainText('Consensus month Jun 2026');
     await expect(popup).toContainText(
       'source publishes no country or issuing-agency attribute'
     );
@@ -148,7 +186,6 @@ test.describe('North American Drought Monitor continental context', () => {
   test('does not require every class to be occupied in a valid published response', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeNadm(page, fixture([feature('d2')]), []);
     await gotoApp(
       page,
@@ -165,7 +202,6 @@ test.describe('North American Drought Monitor continental context', () => {
   test('mixed or malformed consensus months fail unavailable, not no drought', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeNadm(
       page,
       fixture([feature('d0', '202606'), feature('d1', '202607')]),
@@ -181,13 +217,17 @@ test.describe('North American Drought Monitor continental context', () => {
     await expect(
       page.locator('#legend-panel [data-legend="nadm-drought"]')
     ).toHaveCount(0);
-    await expect(page.locator('#map-key')).toBeHidden();
+    // Value-only migration (S30D D1 M10; interface-chrome-popups-text.md
+    // section 2.4, "the chip never hides"): with no key eligible the chip
+    // falls back to the committed mode's own word instead of going
+    // `hidden`. The committed mode here is Drought (no `cluster=` param).
+    await expect(page.locator('#map-key')).toBeVisible();
+    await expect(page.locator('#map-key .map-key-chip-label')).toHaveText('Drought');
   });
 
   test('an empty valid collection reports no data instead of unavailable', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeNadm(page, fixture([]), []);
     await gotoApp(
       page,
@@ -206,7 +246,6 @@ test.describe('North American Drought Monitor continental context', () => {
   test('malformed polygon coordinates leave no ready state and a later retry can recover', async ({
     page
   }) => {
-    await routeBasemap(page);
     // Two consumers share the 'nadm-current' fetch key (the layer and the
     // drought minimap, src/state/minimap-drought.ts) and each invalidates it
     // on a malformed payload. Which one fetches first, and whether the other
@@ -267,7 +306,6 @@ test.describe('North American Drought Monitor continental context', () => {
   test('fetch failure is unavailable and cannot serialize as a clean month', async ({
     page
   }) => {
-    await routeBasemap(page);
     await routeNadm(page, null, [], 503);
     await gotoApp(
       page,

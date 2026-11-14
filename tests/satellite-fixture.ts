@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
 import { PNG } from 'pngjs';
 
@@ -13,6 +14,14 @@ export const SATELLITE_FRAME: SatelliteFrame = Object.freeze({
   name: 'MERGEDGC.10-minute.fixture_previous.color',
   startTime: FIXTURE_NOW - 24 * 60_000,
   endTime: FIXTURE_NOW - 15 * 60_000
+});
+
+/** A third, older frame, so a walk back across two bad frames can be shown. */
+export const SATELLITE_OLDER_FRAME: SatelliteFrame = Object.freeze({
+  objectId: 9024,
+  name: 'MERGEDGC.10-minute.fixture_older.color',
+  startTime: FIXTURE_NOW - 34 * 60_000,
+  endTime: FIXTURE_NOW - 25 * 60_000
 });
 
 export const SATELLITE_NEW_FRAME: SatelliteFrame = Object.freeze({
@@ -38,6 +47,9 @@ function makeProbeTile(): Buffer {
 }
 
 const VALID_TILE = makeProbeTile();
+
+/** The service's own placeholder, recorded 2026-11-11 (tests/fixtures/satellite/README.md): a resampled black and white grid, served as JPEG. */
+const PLACEHOLDER_TILE = readFileSync(new URL('./fixtures/satellite/placeholder-tile.jpg', import.meta.url));
 
 function frameObjectId(requestUrl: string): number | null {
   const encodedRule = new URL(requestUrl).searchParams.get('mosaicRule');
@@ -78,6 +90,8 @@ export interface SatelliteStubController {
   setFrames(frames: readonly SatelliteFrame[]): void;
   failProbeFrame(objectId: number): void;
   failRenderedFrame(objectId: number): void;
+  /** Answer the frame's probe and map tiles with HTTP 200 and the placeholder image. */
+  servePlaceholderFrame(objectId: number, where?: 'probe' | 'tiles' | 'both'): void;
 }
 
 const stubbedPages = new WeakMap<Page, SatelliteStubController>();
@@ -91,6 +105,8 @@ export async function stubRecentSatellite(
   let frames = [...(options.frames ?? [SATELLITE_FRAME])];
   const failedProbeFrameIds = new Set(options.failedProbeFrameIds ?? []);
   const failedRenderedFrameIds = new Set(options.failedRenderedFrameIds ?? []);
+  const placeholderProbeFrameIds = new Set<number>();
+  const placeholderRenderedFrameIds = new Set<number>();
   const probeFrameIds: number[] = [];
   const renderedFrameIds: number[] = [];
 
@@ -133,10 +149,13 @@ export async function stubRecentSatellite(
       ) {
         return route.abort();
       }
+      const placeholder =
+        objectId !== null &&
+        (isProbe ? placeholderProbeFrameIds : placeholderRenderedFrameIds).has(objectId);
       return route.fulfill({
         status: 200,
-        contentType: 'image/png',
-        body: VALID_TILE
+        contentType: placeholder ? 'image/jpeg' : 'image/png',
+        body: placeholder ? PLACEHOLDER_TILE : VALID_TILE
       });
     }
   );
@@ -152,6 +171,10 @@ export async function stubRecentSatellite(
     },
     failRenderedFrame(objectId): void {
       failedRenderedFrameIds.add(objectId);
+    },
+    servePlaceholderFrame(objectId, where = 'both'): void {
+      if (where !== 'tiles') placeholderProbeFrameIds.add(objectId);
+      if (where !== 'probe') placeholderRenderedFrameIds.add(objectId);
     }
   };
   stubbedPages.set(page, controller);

@@ -1,0 +1,309 @@
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { stripTypeScriptTypes } from 'node:module';
+import test from 'node:test';
+
+// Exercise the shipped function bodies with recording DOM/map dependencies.
+// Only the sidebar's dynamic import is replaced by a controllable promise;
+// the real browser cases cover MapLibre's event and camera ordering.
+function functionBody(path, name) {
+  const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+  const body = source.match(new RegExp(`^(?:export )?(?:async )?function ${name}\\([\\s\\S]*?^}`, 'm'))?.[0];
+  assert.ok(body, `${name} is still a source function with its own closing line`);
+  return stripTypeScriptTypes(body.replace(/^export\s+/, ''));
+}
+
+const bindSource = functionBody('../src/layers/telemetry.ts', 'bindPopups');
+const flySource = functionBody('../src/layers/telemetry.ts', 'flyToStation');
+const listSource = functionBody('../src/ui/sidebar.ts', 'buildTelemetryList')
+  .replace("import('../layers/telemetry')", 'loadTelemetry()');
+
+function setup(reducedMotion = false) {
+  const adopted = [];
+  const openHandlers = [];
+  const pendingMoves = [];
+  const markerElement = { kind: 'marker' };
+  const popup = { on(type, fn) { if (type === 'open') openHandlers.push(fn); } };
+  let opens = true;
+  const marker = {
+    getElement: () => markerElement,
+    getPopup: () => popup,
+    getLngLat: () => ({ lng: -120, lat: 47 }),
+    togglePopup: () => { if (opens) for (const fn of openHandlers) fn(); }
+  };
+  const markersByStationId = new Map([['fixture', marker]]);
+  const document = {
+    activeElement: { kind: 'body' },
+    createElement: () => ({ handlers: {}, addEventListener(type, fn) { this.handlers[type] = fn; } }),
+    getElementById: () => ({ appendChild(item) { document.item = item; } })
+  };
+  const map = {
+    getZoom: () => 8,
+    flyTo: () => { if (reducedMotion) for (const fn of pendingMoves.splice(0)) fn(); },
+    once(type, fn) { assert.equal(type, 'moveend'); pendingMoves.push(fn); }
+  };
+  let resolveImport;
+  const loading = new Promise((resolve) => { resolveImport = resolve; });
+  const dependencies = {
+    activeMarkers: [marker], markersByStationId, popupOrigins: new WeakMap(),
+    stationByMarker: new WeakMap([[marker, { id: 'fixture' }]]),
+    abortControllers: new WeakMap(), document, AbortController,
+    adoptExternalResponse: (...args) => { adopted.push(args); return { paint() {} }; },
+    buildTelemetryPopupModel: () => ({}), hydrateTelemetryPopup: async () => null,
+    prefersReducedMotion: () => reducedMotion, ensureTelemetryActive() {}, escapeHtml: (text) => text,
+    loadTelemetry: () => loading
+  };
+  const functions = new Function(...Object.keys(dependencies), `${bindSource}\n${flySource}\n${listSource}\nreturn { bindPopups, flyToStation, buildTelemetryList };`)(...Object.values(dependencies));
+  functions.bindPopups(map);
+  return {
+    ...functions, adopted, document, map, markerElement, markersByStationId,
+    nativeOpen: () => { for (const fn of openHandlers) fn(); },
+    moveend: () => { for (const fn of pendingMoves.splice(0)) fn(); },
+    closeInstead: () => { opens = false; },
+    resolveImport: () => resolveImport({ flyToStation: functions.flyToStation })
+  };
+}
+
+test('the Water & Snow click retains its exact button across a delayed telemetry import and map movement', async () => {
+  const h = setup();
+  h.buildTelemetryList(h.map, [{ id: 'fixture', name: 'Fixture', color: '#000', agency: 'Fixture', type: 'fixture', description: 'Fixture' }]);
+  const item = h.document.item;
+  h.document.activeElement = item;
+  item.handlers.click();
+  h.document.activeElement = { kind: 'another control while import is pending' };
+  h.resolveImport();
+  await Promise.resolve();
+  h.document.activeElement = { kind: 'another control while camera is moving' };
+  h.moveend();
+  assert.equal(h.adopted.length, 1);
+  assert.ok(h.adopted[0][2] === item, 'the adoption retains the initiating Water & Snow button');
+  h.nativeOpen();
+  assert.ok(h.adopted[1][2] === h.markerElement, 'a later native open does not inherit the list opener');
+});
+
+test('a list toggle that only closes the popup does not leak its opener into a later native open', () => {
+  const h = setup();
+  const item = { kind: 'list button' };
+  h.closeInstead();
+  h.flyToStation(h.map, 'fixture', item);
+  h.moveend();
+  assert.equal(h.adopted.length, 0);
+  h.nativeOpen();
+  assert.ok(h.adopted[0][2] === h.markerElement);
+});
+
+test('a station removed during the flight does not open or adopt a popup', () => {
+  const h = setup();
+  h.flyToStation(h.map, 'fixture', { kind: 'list button' });
+  h.markersByStationId.clear();
+  h.moveend();
+  assert.equal(h.adopted.length, 0);
+});
+
+test('a reduced-motion flight opens after its synchronous camera movement', () => {
+  const h = setup(true);
+  const item = { kind: 'list button' };
+  h.flyToStation(h.map, 'fixture', item);
+  assert.equal(h.adopted.length, 1);
+  assert.ok(h.adopted[0][2] === item);
+  h.moveend();
+  assert.equal(h.adopted.length, 1, 'no delayed opener survives the jump');
+});
+
+function renderSetup() {
+  const activeMarkers = [];
+  const markersByStationId = new Map();
+  const abortControllers = new WeakMap();
+  const bound = [];
+  class Marker {
+    constructor({ element }) { this.element = element; this.removed = false; }
+    setLngLat() { return this; }
+    addTo() { return this; }
+    setPopup(popup) { this.popup = popup; return this; }
+    getPopup() { return this.popup; }
+    remove() { this.removed = true; this.popup.open = false; }
+  }
+  const dependencies = {
+    activeMarkers, markersByStationId, abortControllers,
+    stationByMarker: new WeakMap(), markerViews: new WeakMap(), popupOrigins: new WeakMap(),
+    document: { createElement: () => ({ dataset: {}, style: { setProperty() {} }, setAttribute() {}, appendChild() {} }) },
+    maplibregl: { Marker, Popup: class { open = false; } },
+    markerAccessibleLabel: () => 'Fixture', glyphEligibleWind: () => null, readRawsWindFields: () => null,
+    bindPopups: (_map, markers = activeMarkers) => { bound.push(...markers); }, showStationLegend() {}
+  };
+  const source = readFileSync(new URL('../src/layers/telemetry.ts', import.meta.url), 'utf8');
+  // On the red base removal is inline in clearMarkers; after the repair it is shared.
+  const remove = source.includes('function removeMarker(') ? functionBody('../src/layers/telemetry.ts', 'removeMarker') : '';
+  const functions = new Function(...Object.keys(dependencies), `${remove}\n${functionBody('../src/layers/telemetry.ts', 'telemetryMarkerOptions')}\n${functionBody('../src/layers/telemetry.ts', 'clearMarkers')}\n${functionBody('../src/layers/telemetry.ts', 'renderStations')}\nreturn { renderStations, clearMarkers };`)(...Object.values(dependencies));
+  const station = { id: 'fixture', coords: [47, -120], color: '#000' };
+  const view = { station, freshness: 'unknown', primaryParameterCategory: 'water', networkLabel: 'Fixture' };
+  const render = (views) => functions.renderStations({}, views);
+  render([view]);
+  const marker = markersByStationId.get(station.id);
+  marker.popup.open = true;
+  const controller = new AbortController();
+  abortControllers.set(marker, controller);
+  return { ...functions, render, view, marker, controller, activeMarkers, markersByStationId, bound };
+}
+
+test('an unchanged station keeps its open popup, pending read and single binding through refresh', () => {
+  const h = renderSetup();
+  // Discovery rebuilds every station object per refresh: equal content, new identity.
+  const rebuilt = { ...h.view.station, coords: [...h.view.station.coords] };
+  assert.notEqual(rebuilt, h.view.station);
+  h.render([{ ...h.view, station: rebuilt }]);
+  assert.ok(h.markersByStationId.get('fixture') === h.marker);
+  assert.equal(h.marker.popup.open, true);
+  assert.equal(h.controller.signal.aborted, false);
+  assert.deepEqual(h.bound, [h.marker]);
+  h.clearMarkers();
+  assert.equal(h.controller.signal.aborted, true);
+  assert.equal(h.marker.removed, true);
+  assert.equal(h.activeMarkers.length, 0);
+  assert.equal(h.markersByStationId.size, 0);
+});
+
+test('an absent station is removed and its pending popup read is aborted', () => {
+  const h = renderSetup();
+  h.render([]);
+  assert.equal(h.controller.signal.aborted, true);
+  assert.equal(h.marker.removed, true);
+  assert.equal(h.activeMarkers.length, 0);
+  assert.equal(h.markersByStationId.size, 0);
+});
+
+for (const change of ['station', 'freshness', 'primaryParameterCategory', 'networkLabel']) {
+  test(`a changed ${change} replaces the marker and aborts its obsolete popup read`, () => {
+    const h = renderSetup();
+    const value = change === 'station' ? { ...h.view.station, usgsSite: 'new-handle' } : 'changed';
+    h.render([{ ...h.view, [change]: value }]);
+    const replacement = h.markersByStationId.get('fixture');
+    assert.notEqual(replacement, h.marker);
+    assert.equal(h.controller.signal.aborted, true);
+    assert.equal(h.marker.removed, true);
+    assert.deepEqual(h.activeMarkers, [replacement]);
+    assert.deepEqual(h.bound, [h.marker, replacement]);
+  });
+}
+
+test('a wind marker turns with the map: map-aligned, upright, rotated by the served direction', () => {
+  // MapLibre then draws rotateZ(rotation - bearing) on every map turn.
+  const options = new Function(`${functionBody('../src/layers/telemetry.ts', 'telemetryMarkerOptions')}\nreturn telemetryMarkerOptions;`)();
+  const element = { kind: 'marker' };
+  assert.deepEqual(options(element, { windDirectionDeg: 295 }), { element, rotationAlignment: 'map', pitchAlignment: 'viewport', rotation: 295 });
+  assert.deepEqual(options(element, null), { element });
+  const source = readFileSync(new URL('../src/layers/telemetry.ts', import.meta.url), 'utf8');
+  assert.match(source, /new maplibregl\.Marker\(telemetryMarkerOptions\(el, glyphWind\)\)/);
+  assert.ok(!source.includes('rotate(${wind.windDirectionDeg}deg)'), 'the glyph no longer rotates itself');
+});
+
+test('a progress paint never removes a marker: only the final answer does, and teardown forgets it', async () => {
+  const h = renderSetup();
+  const record = (id) => ({ station: { id, coords: [47, -120], color: '#000' } });
+  let discover;
+  const dependencies = {
+    renderStations: h.renderStations, AbortController, console, clearTimeout,
+    reportStatus() {}, curatedTelemetryEntries: () => [], updateCapNote() {}, hideCapNote() {},
+    viewportBounds: () => ({}), viewportCenter: () => [47, -120],
+    mergeTelemetryStations: (_curated, records) => [...new Map(records.map((r) => [r.station.id, r])).values()],
+    capDiscoveredStations: (entries) => ({ entries, totalDiscovered: entries.length }),
+    markerViewForEntry: (entry) => ({ station: entry.station, freshness: 'unknown', primaryParameterCategory: 'water', networkLabel: 'Fixture' }),
+    discoverStationsForViewport: (request) => discover(request)
+  };
+  // One instance: the module variable spans runs, as it does in the browser.
+  const { run, cancelActivation } = new Function(...Object.keys(dependencies), `let currentDiscoveryController = null; let moveendDebounce = null; let lastFinalRecords = [];
+${functionBody('../src/layers/telemetry.ts', 'runDiscoveryForCurrentViewport')}
+${functionBody('../src/layers/telemetry.ts', 'cancelActivation')}
+return { run: runDiscoveryForCurrentViewport, cancelActivation };`)(...Object.values(dependencies));
+  const map = { getBounds: () => ({ contains: () => true }) };
+  const progressThenFinal = async (progress, final, check) => {
+    let failure = null;
+    discover = async (request) => {
+      request.onProgress(progress);
+      // run() catches a throw from here, so carry the failure out instead.
+      try { check(); } catch (error) { failure = error; }
+      return { status: 'ok', records: final, failedSources: [] };
+    };
+    await run(map);
+    if (failure) throw failure;
+  };
+  discover = async () => ({ status: 'ok', records: [record('fixture'), record('other')], failedSources: [] });
+  await run(map);
+  assert.equal(h.markersByStationId.size, 2);
+  const other = h.markersByStationId.get('other');
+  await progressThenFinal([record('other')], [record('fixture'), record('other')], () => {
+    assert.ok(h.markersByStationId.get('fixture') === h.marker, 'the source that has not answered keeps its marker');
+    assert.equal(h.marker.popup.open, true);
+    assert.equal(h.controller.signal.aborted, false);
+    assert.deepEqual(h.bound, [h.marker, other], 'and no marker is bound twice');
+  });
+  await progressThenFinal([record('other')], [record('other')], () => {});
+  assert.equal(h.marker.removed, true, 'the final answer removes the marker it no longer holds');
+  assert.equal(h.markersByStationId.has('fixture'), false);
+  cancelActivation();
+  await progressThenFinal([record('third')], [record('third')], () => {
+    assert.equal(h.markersByStationId.has('other'), false, 'after teardown a progress paint does not resurrect the old answer');
+  });
+});
+
+test('a view with no station in it reads no data, though the featured seeds still render elsewhere', async () => {
+  const statuses = [];
+  const seed = { station: { id: 'seed', coords: [47, -120] }, isCuratedSeed: true };
+  const dependencies = {
+    renderStations() {}, AbortController, console,
+    reportStatus: (state) => statuses.push(state), curatedTelemetryEntries: () => [seed],
+    updateCapNote() {}, hideCapNote() {}, viewportBounds: () => ({}), viewportCenter: () => [0, 0],
+    mergeTelemetryStations: (curated, records) => [...curated.map((station) => ({ station })), ...records],
+    capDiscoveredStations: (entries) => ({ entries, totalDiscovered: 0 }), markerViewForEntry: (entry) => entry,
+    discoverStationsForViewport: async () => ({ status: 'ok', records: [], failedSources: [] })
+  };
+  const run = new Function(...Object.keys(dependencies), `let currentDiscoveryController = null; let lastFinalRecords = [];
+${functionBody('../src/layers/telemetry.ts', 'runDiscoveryForCurrentViewport')}
+return runDiscoveryForCurrentViewport;`)(...Object.values(dependencies));
+  // contains takes [lng, lat], as MapLibre's LngLatBounds does.
+  const view = (west, east, south, north) => ({
+    getBounds: () => ({ contains: ([lng, lat]) => lng >= west && lng <= east && lat >= south && lat <= north })
+  });
+  await run(view(-117, -116, 39, 40)); // open Nevada: no station here
+  await run(view(-121, -119, 46, 48)); // the seed's own view
+  assert.deepEqual(statuses, ['loading', 'no-data', 'loading', 'ready']);
+});
+
+function windGlyphBuilder() {
+  const created = [];
+  const node = (tag) => {
+    const el = { tag, attributes: {}, style: {}, children: [],
+      setAttribute(name, value) { this.attributes[name] = value; }, appendChild(child) { this.children.push(child); } };
+    created.push(el);
+    return el;
+  };
+  const source = readFileSync(new URL('../src/layers/telemetry.ts', import.meta.url), 'utf8');
+  const constants = source.match(/^const (?:SVG_NS|WIND_GLYPH_\w+) = .*;$/gm).join('\n');
+  const dependencies = { document: { createElementNS: (_ns, tag) => node(tag) }, parseLeadingNumber: Number.parseFloat, dateTok: (d) => `tok:${d.toISOString()}` };
+  const names = ['buildRawsWindGlyph', 'buildRawsWindAccessibleName', 'formatRawsObservedTime', 'windGlyphShaftLengthPx', 'clampWindSpeedForShaft'];
+  const build = new Function(...Object.keys(dependencies),
+    `${constants}\n${names.map((name) => functionBody('../src/layers/telemetry.ts', name)).join('\n')}\nreturn buildRawsWindGlyph;`)(...Object.values(dependencies));
+  return { build, created };
+}
+
+test('a stale RAWS wind arrow draws the way its stale dot does: dimmed, with a dashed shaft', () => {
+  const wind = { windSpeedServed: '25 mph', windDirectionServed: '315 degrees', windDirectionDeg: 315, windObservedAtIso: '2026-11-02T15:00:00.000Z' };
+  const { build } = windGlyphBuilder();
+  const fresh = build(wind, '#ef4444', true);
+  assert.equal(fresh.style.opacity, undefined);
+  assert.equal(fresh.children.find((c) => c.tag === 'line').attributes['stroke-dasharray'], undefined);
+  const stale = build(wind, '#ef4444', false);
+  assert.equal(stale.style.opacity, '0.7', 'the stale dot\'s own opacity (app.css data-telemetry-freshness="stale")');
+  assert.ok(stale.children.find((c) => c.tag === 'line').attributes['stroke-dasharray'], 'the stale dot\'s border is dashed');
+  const source = readFileSync(new URL('../src/layers/telemetry.ts', import.meta.url), 'utf8');
+  assert.match(source, /buildRawsWindGlyph\(glyphWind, station\.color, view\.freshness === 'fresh'\)/, 'the marker passes its own freshness');
+});
+
+test('the RAWS marker title names the observation time with the house date token, zone named', async () => {
+  const { dateTok } = await import('../src/util/text-tokens.ts');
+  const format = new Function('dateTok', `${functionBody('../src/layers/telemetry.ts', 'formatRawsObservedTime')}\nreturn formatRawsObservedTime;`)(dateTok);
+  const iso = '2026-11-06T22:00:00.000Z';
+  assert.equal(format(iso), dateTok(new Date(iso)));
+  assert.equal(format(null), 'an unknown time');
+  assert.equal(format('not a time'), 'not a time');
+});

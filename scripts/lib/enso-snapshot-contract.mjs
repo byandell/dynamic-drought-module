@@ -49,6 +49,39 @@ const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
 const DIRECTIONS = new Set(['strengthening', 'weakening', 'steady']);
 const THRESHOLD_SIDES = new Set(['above', 'below', 'within']);
 
+/** CPC's historical episode rule: five consecutive overlapping seasons. */
+export const RUN_LENGTH = 5;
+// The trailing-three-season change that counts as a trajectory rather than
+// noise. Not a CPC number: it is this application's own band, chosen so a
+// season-over-season wobble inside the preliminary revision window does not
+// flip the word. Stated here so it is auditable, and never presented to a
+// reader as an issuer rule. The builder and this contract share it.
+export const DIRECTION_BAND = 0.2;
+export const DIRECTION_SPAN = 3;
+/**
+ * The trajectory word for a change between two index values. The change is
+ * rounded to the data's two-decimal precision first, so a printed +0.20 is
+ * never judged inside the band (0.97 - 0.77 is 0.19999999999999996).
+ */
+export function directionOf(change) {
+  const rounded = Math.round(change * 100) / 100;
+  return rounded >= DIRECTION_BAND ? 'strengthening' : rounded <= -DIRECTION_BAND ? 'weakening' : 'steady';
+}
+export const SEASON_NAMES = Object.freeze([
+  'DJF',
+  'JFM',
+  'FMA',
+  'MAM',
+  'AMJ',
+  'MJJ',
+  'JJA',
+  'JAS',
+  'ASO',
+  'SON',
+  'OND',
+  'NDJ'
+]);
+
 function isObject(value) {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -76,7 +109,7 @@ function isPhase(value) {
 function isSeasonalIndexPoint(value) {
   return (
     isObject(value) &&
-    typeof value.seas === 'string' &&
+    SEASON_NAMES.includes(value.seas) &&
     Number.isInteger(value.year) &&
     typeof value.anom === 'number' &&
     Number.isFinite(value.anom) &&
@@ -214,6 +247,59 @@ function stateProblems(series, label) {
       problems.push(`${label}.latest.exceedsThreshold does not follow from the newest season`);
     }
   }
+  // isIndexSeries guarantees at least RUN_LENGTH (> DIRECTION_SPAN) values.
+  const values = series.values;
+  const tail = values.slice(-RUN_LENGTH);
+  const episode = tail.every((point) => point.anom >= state.threshold)
+    ? 'el-nino'
+    : tail.every((point) => point.anom <= -state.threshold)
+      ? 'la-nina'
+      : 'neutral';
+  if (state.episode !== episode) {
+    problems.push(`${label}.state.episode (${state.episode}) does not follow from the last ${RUN_LENGTH} seasons`);
+  }
+  const direction = directionOf(values[values.length - 1].anom - values[values.length - DIRECTION_SPAN].anom);
+  if (state.direction !== direction) {
+    problems.push(`${label}.state.direction (${state.direction}) does not follow from the last ${DIRECTION_SPAN} seasons`);
+  }
+  return problems;
+}
+
+const SEASONAL_KEYS = ['seas', 'year', 'anom', 'preliminary'];
+/** Per series: the point fields `latest` must repeat, and the step between ordinals. */
+const SERIES_ORDER = {
+  oni: { keys: SEASONAL_KEYS, ordinal: (p) => p.year * 12 + SEASON_NAMES.indexOf(p.seas), step: 1 },
+  roni: { keys: SEASONAL_KEYS, ordinal: (p) => p.year * 12 + SEASON_NAMES.indexOf(p.seas), step: 1 },
+  nino34: { keys: ['year', 'month', 'total', 'climAdjust', 'anom'], ordinal: (p) => p.year * 12 + p.month - 1, step: 1 },
+  nino34Weekly: {
+    keys: ['year', 'month', 'day', 'total', 'anom'],
+    ordinal: (p) => Date.UTC(p.year, p.month - 1, p.day) / 86_400_000,
+    step: 7
+  },
+  // SOI carries the rest of the latest year as null months, so `latest` is
+  // the last populated month, not the last value.
+  soi: { keys: ['year', 'month', 'value'], ordinal: (p) => p.year * 12 + p.month - 1, step: 1 }
+};
+
+/**
+ * The builder parses each series in consecutive order and takes `latest`
+ * from the end of it; a hand edit or a drifted builder must not ship a
+ * headline from a point the series does not end on. Shape-checked series only.
+ */
+function orderProblems(series, label) {
+  const { keys, ordinal, step } = SERIES_ORDER[label];
+  const problems = [];
+  const values = series.values;
+  for (let index = 1; index < values.length; index += 1) {
+    if (ordinal(values[index]) - ordinal(values[index - 1]) !== step) {
+      problems.push(`${label}.values are not consecutive at index ${index}`);
+      break;
+    }
+  }
+  const last = label === 'soi' ? values.findLast((point) => point.value !== null) : values.at(-1);
+  if (!last || keys.some((key) => series.latest[key] !== last[key])) {
+    problems.push(`${label}.latest is not the ${label === 'soi' ? 'last populated' : 'last'} value`);
+  }
   return problems;
 }
 
@@ -243,6 +329,48 @@ function isNino34Series(value) {
     Array.isArray(value.values) &&
     value.values.length > 0 &&
     value.values.every(isNino34Point)
+  );
+}
+
+/**
+ * One weekly Nino 3.4 observation (DR-031 a). Shaped like `isNino34Point` with
+ * a day added and `climAdjust` dropped: the weekly file publishes SST and SSTA
+ * only, with no climatological-adjustment column. The date is the CENTRE of the
+ * week, as the file's first line states.
+ */
+function isNino34WeeklyPoint(value) {
+  return (
+    isObject(value) &&
+    Number.isInteger(value.year) &&
+    typeof value.month === 'number' &&
+    Number.isInteger(value.month) &&
+    value.month >= 1 &&
+    value.month <= 12 &&
+    typeof value.day === 'number' &&
+    Number.isInteger(value.day) &&
+    value.day >= 1 &&
+    value.day <= 31 &&
+    typeof value.total === 'number' &&
+    Number.isFinite(value.total) &&
+    typeof value.anom === 'number' &&
+    Number.isFinite(value.anom)
+  );
+}
+
+/**
+ * At least two points are required, because the consumer's whole statement is a
+ * trajectory between two observations. A one-point series would leave nothing
+ * to compare and is a malformed block, not a short one.
+ */
+function isNino34WeeklySeries(value) {
+  return (
+    isObject(value) &&
+    typeof value.sourceUrl === 'string' &&
+    hasValidPublished(value) &&
+    isNino34WeeklyPoint(value.latest) &&
+    Array.isArray(value.values) &&
+    value.values.length >= 2 &&
+    value.values.every(isNino34WeeklyPoint)
   );
 }
 
@@ -278,30 +406,8 @@ function isSoiSeries(value) {
   );
 }
 
-function isPlumePoint(value) {
-  return (
-    isObject(value) &&
-    typeof value.seas === 'string' &&
-    typeof value.laNina === 'number' &&
-    typeof value.neutral === 'number' &&
-    typeof value.elNino === 'number'
-  );
-}
-
-function isProbabilities(value) {
-  return (
-    isObject(value) &&
-    typeof value.sourceUrl === 'string' &&
-    typeof value.baseline === 'string' &&
-    (typeof value.issued === 'string' || value.issued === null) &&
-    Array.isArray(value.seasons) &&
-    value.seasons.length >= 2 &&
-    value.seasons.every(isPlumePoint)
-  );
-}
-
 /** The optional series keys a snapshot may carry beyond the required pair. */
-export const OPTIONAL_SERIES = ['nino34', 'soi', 'probabilities'];
+export const OPTIONAL_SERIES = ['nino34', 'nino34Weekly', 'soi'];
 
 /**
  * The CPC rule pages the state block cites, exported so the builder and the
@@ -481,11 +587,15 @@ export function validateEnsoSnapshot(parsed) {
   if (parsed.nino34 !== undefined && !isNino34Series(parsed.nino34)) {
     warnings.push('nino34 is present but malformed (the consumer would drop it)');
   }
+  if (parsed.nino34Weekly !== undefined && !isNino34WeeklySeries(parsed.nino34Weekly)) {
+    warnings.push('nino34Weekly is present but malformed (the consumer would drop it)');
+  }
   if (parsed.soi !== undefined && !isSoiSeries(parsed.soi)) {
     warnings.push('soi is present but malformed (the consumer would drop it)');
   }
-  if (parsed.probabilities !== undefined && !isProbabilities(parsed.probabilities)) {
-    warnings.push('probabilities is present but malformed (the consumer would drop it)');
+  // No issuer publishes machine-readable ENSO odds (DDM-D06), so no block is accepted.
+  if (parsed.probabilities !== undefined) {
+    errors.push('probabilities is present, but no ENSO probability block is accepted until an issuer feed exists');
   }
   if (parsed.sourceQuotes !== undefined && !isSourceQuotes(parsed.sourceQuotes)) {
     warnings.push('sourceQuotes is present but malformed (each quote needs text, source, and an https url)');
@@ -503,6 +613,16 @@ export function validateEnsoSnapshot(parsed) {
       continue;
     }
     warnings.push(...stateProblems(series, label));
+  }
+  const shapeOk = { oni: isIndexSeries, roni: isIndexSeries, nino34: isNino34Series, nino34Weekly: isNino34WeeklySeries, soi: isSoiSeries };
+  for (const [label, isShaped] of Object.entries(shapeOk)) {
+    const series = parsed[label];
+    if (series === undefined || !isShaped(series)) continue;
+    warnings.push(...orderProblems(series, label));
+    // ISO days compare as strings; a source cannot be published after it was read.
+    if (isIsoDay(parsed.retrieved) && series.published !== undefined && series.published > parsed.retrieved) {
+      warnings.push(`${label}.published (${series.published}) is after retrieved (${parsed.retrieved})`);
+    }
   }
   return { errors, warnings };
 }

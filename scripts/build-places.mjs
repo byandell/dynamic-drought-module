@@ -6,8 +6,8 @@
  * United States places. Municipal names and point locations are public
  * reference data, not sovereign-jurisdiction polygons (the no-redistribution
  * hard rule protects Tribal, Treaty, and sovereign-jurisdiction data; this
- * bundles neither). The raster basemap's baked-in labels cannot be toggled, so a
- * small bundled symbol source is the only honest municipal-labels delivery.
+ * bundles neither). A small bundled symbol source, beside the place names
+ * the base map (scripts/build-base-tiles.mjs) already carries.
  *
  * SCALERANK is Natural Earth's zoom-density field (0 = always shown,
  * larger = only at closer zooms); the layer's text filter keys off it so
@@ -41,7 +41,8 @@ import { fileURLToPath } from 'node:url';
 
 const SOURCE_URL =
   'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_populated_places_simple.geojson';
-const RETRIEVED = '2026-07-12';
+// The source is a moving branch, so the stamp is the day this build read it.
+const RETRIEVED = new Date().toISOString().slice(0, 10);
 
 const CROSSWALK_PATH = fileURLToPath(
   new URL('./data/hi-gnis-crosswalk.json', import.meta.url)

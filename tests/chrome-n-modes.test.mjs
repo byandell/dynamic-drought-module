@@ -1,0 +1,524 @@
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { registerHooks } from 'node:module';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+// src/config/chip-labels.ts imports `./clusters` extensionless; the same
+// resolve hook tests/quick-views-retired.test.mjs installs for presets.ts's
+// `./clusters` import, so a plain `node --test` still needs no DOM stub.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (
+      specifier.startsWith('.') &&
+      !/\.[a-z]+$/i.test(specifier) &&
+      typeof context.parentURL === 'string' &&
+      context.parentURL.endsWith('.ts')
+    ) {
+      const candidate = new URL(`${specifier}.ts`, context.parentURL);
+      if (existsSync(fileURLToPath(candidate))) {
+        return nextResolve(`${specifier}.ts`, context);
+      }
+    }
+    return nextResolve(specifier, context);
+  }
+});
+
+/**
+ * S30D D1 M10 (register owner-1h, found-016, found-018, found-019; task
+ * DDM-P10-T11; design record interface-chrome-popups-text.md section 2.4,
+ * 2.8; DR-113): the chip's label resolves for every HAZARD_CLUSTER_KEYS
+ * entry, and its code carries no cluster literal.
+ *
+ * The label table (KEY_ELIGIBLE_LABELS) used to live as a private const
+ * inside src/ui/map-key.ts, a module with many runtime imports (the
+ * registry, config/palette, DOM globals) a plain `node --test` cannot load
+ * without a resolve hook and a DOM stub. It now lives in
+ * src/config/chip-labels.ts, which has one runtime import
+ * (src/config/clusters.ts, itself import-free: its sole import is
+ * `import type`, erased by Node 24's type stripping), so this file loads
+ * both with no resolve hook, the same pattern
+ * tests/map-chrome-contract.test.mjs and tests/quick-views-retired.test.mjs
+ * establish (checked below by import, not by re-deriving the mechanism).
+ *
+ * Predicted red on the pre-M10 tree: the module import of
+ * src/config/chip-labels.ts fails (it does not exist), and the source
+ * scan of src/ui/map-key.ts finds the family ternary at the old
+ * `map-key.ts:1136` ("family === 'fire' ? 'FIRE' : family === 'heat' ?
+ * 'HEAT RISK' : family === 'enso' ? 'ENSO' : ...").
+ */
+
+const ROOT = new URL('..', import.meta.url);
+
+const { HAZARD_CLUSTER_KEYS, HAZARD_CLUSTERS } = await import(
+  new URL('src/config/clusters.ts', ROOT).href
+);
+const { KEY_ELIGIBLE_LABELS, chipFallbackLabel } = await import(
+  new URL('src/config/chip-labels.ts', ROOT).href
+);
+const { chipStateForStatus, aggregateChipState, chipStateFromStatuses, imageryFailureState } = await import(
+  new URL('src/config/chip-state.ts', ROOT).href
+);
+
+test('every HAZARD_CLUSTER_KEYS entry resolves a chip label (DR-113, N modes)', () => {
+  assert.ok(HAZARD_CLUSTER_KEYS.length >= 4, 'the cluster set unexpectedly shrank');
+  for (const mode of HAZARD_CLUSTER_KEYS) {
+    const label = chipFallbackLabel(mode);
+    assert.equal(typeof label, 'string');
+    assert.ok(label.length > 0, `${mode} resolved an empty chip label`);
+    // The fallback label is the committed mode's own button word
+    // (D-0.7.0-042): the chip never has to invent one.
+    assert.equal(label, HAZARD_CLUSTERS[mode].title);
+  }
+});
+
+test('every HAZARD_CLUSTER_KEYS entry declares a defaultBasemap (N modes)', () => {
+  for (const mode of HAZARD_CLUSTER_KEYS) {
+    assert.ok(
+      ['satellite', 'default'].includes(HAZARD_CLUSTERS[mode].defaultBasemap),
+      `${mode} declares no defaultBasemap of 'satellite' or 'default'`
+    );
+  }
+});
+
+test('KEY_ELIGIBLE_LABELS names every value-carrying key with a non-empty word, and NWS alerts replaced Products', () => {
+  assert.ok(Object.keys(KEY_ELIGIBLE_LABELS).length > 0);
+  for (const [key, label] of Object.entries(KEY_ELIGIBLE_LABELS)) {
+    assert.equal(typeof label, 'string', key);
+    assert.ok(label.length > 0, `${key} resolved an empty label`);
+  }
+  assert.equal(
+    KEY_ELIGIBLE_LABELS['nws-alerts'],
+    'NWS alerts',
+    "'Products' becomes 'NWS alerts' (D1.md M10 Notes, check:vocabulary)"
+  );
+});
+
+test('map-key.ts carries no cluster literal in its chip label path (the retired family ternary)', async () => {
+  const text = await readFile(new URL('src/ui/map-key.ts', ROOT), 'utf8');
+  // The exact shape the old ternary took: three cluster-family literals
+  // feeding a single element's visible text. Any one of these strings
+  // appearing as a quoted literal assigned to the toggle is the regression
+  // this microtask removes (D1.md M10 Notes: "the ternary at :1136 ...
+  // go"); the label now comes from the shared KeySpec/chip-labels table.
+  assert.doesNotMatch(
+    text,
+    /family\s*===\s*'fire'\s*\?\s*'FIRE'/,
+    'the retired family ternary is back in map-key.ts'
+  );
+  assert.doesNotMatch(
+    text,
+    /textContent\s*=\s*family/,
+    'a family-keyed textContent assignment (the retired chip-label ternary) is back'
+  );
+  // Products the literal string (not the shared table's 'nws-alerts' key)
+  // should not remain as a chip fallback label.
+  assert.doesNotMatch(
+    text,
+    /label:\s*'Products'/,
+    "a hard-coded 'Products' fallback label is back (should read KEY_ELIGIBLE_LABELS['nws-alerts'])"
+  );
+});
+
+/**
+ * Repair round on M10 (director's review): the chip's six-state glyph used
+ * to be read back from a KeySpec's own rendered text (`chipStateFromSpec`,
+ * a substring match on `ariaLabel`/`itemsHtml` in src/ui/map-key.ts), which
+ * the hillshade "no data" coverage note or a partially-loading multi-layer
+ * key (the fire key) could falsify. It now reads `registry.getStatus` for
+ * the product key(s) the chosen KeySpec actually describes, through the
+ * pure functions in src/config/chip-state.ts this file imports directly
+ * (no resolve hook needed: its one import, `LayerStatus` from
+ * src/types/layer.ts, is `import type`, erased by Node's type stripping).
+ *
+ * Predicted red on the pre-repair tree: the module import of
+ * src/config/chip-state.ts fails (it does not exist), and the source scan
+ * below finds `chipStateFromSpec` still live in src/ui/map-key.ts.
+ */
+
+test('chipStateForStatus maps every LayerStatus to its chip state', () => {
+  assert.equal(chipStateForStatus('ready'), 'live');
+  assert.equal(chipStateForStatus('degraded'), 'live-partial');
+  assert.equal(chipStateForStatus('error'), 'unavailable');
+  assert.equal(chipStateForStatus('no-data'), 'no-data');
+  assert.equal(chipStateForStatus('zoom-in'), 'zoom-in');
+  assert.equal(chipStateForStatus('loading'), 'loading');
+  // An unset status (activated, no setStatus call yet) reads as 'loading',
+  // never a silent 'live'.
+  assert.equal(chipStateForStatus(undefined), 'loading');
+});
+
+test('imageryFailureState: a finished satellite lookup never reads loading', async () => {
+  // Verified absence (service answered, no recent frame) -> no data;
+  // failed fetch, error envelope, timeout or probe -> unavailable.
+  assert.equal(imageryFailureState(true), 'no-data');
+  assert.equal(imageryFailureState(false), 'unavailable');
+  // The wiring: both parse throws are the absence class, the revert writes
+  // the terminal chip text before it hides the chip.
+  const src = await readFile(new URL('src/map/satellite.ts', ROOT), 'utf8');
+  assert.equal((src.match(/new NoRecentFrameError\(/g) ?? []).length, 2);
+  assert.match(src, /imageryFailureState\(error instanceof NoRecentFrameError\)/);
+  assert.match(src, /showChip\(state, null\);\s+deactivate\(map\);/);
+});
+
+test('satellite revert is silent on boot and toasts only for a pressed SAT', async () => {
+  const sat = await readFile(new URL('src/map/satellite.ts', ROOT), 'utf8');
+  const sw = await readFile(new URL('src/map/basemap-switcher.ts', ROOT), 'utf8');
+  // The chip and store still land on the terminal state; only the toast is gated.
+  assert.match(sat, /revertBasemapForFailure\(\);\s+if \(!announceRevert\) return;\s+showToast\(/);
+  assert.match(sat, /announceRevert = announce;/);
+  // Only the SAT button announces; a mode default, boot, URL restore and 3D release do not.
+  assert.match(sw, /announce = false/);
+  assert.match(sw, /void applyBasemapMode\(map, mode, announce\);/);
+  assert.match(sw, /requestBasemapMode\(map, next, true\);/);
+  // Any third argument up to the statement's `;`, so a nested second argument cannot hide it.
+  const announces = /requestBasemapMode\([^;]*,[^;]*,[^;]*;/;
+  assert.match('requestBasemapMode(map, defaultBasemapFor(key), true);', announces);
+  assert.doesNotMatch('requestBasemapMode(map, defaultBasemapFor(key));', announces);
+  for (const path of ['src/ui/sidebar.ts', 'src/ui/island/shell.tsx', 'src/ui/island/minimap.tsx', 'src/ui/island/fire3d-control.tsx']) {
+    const caller = await readFile(new URL(path, ROOT), 'utf8');
+    assert.doesNotMatch(caller, announces, `${path} must not announce`);
+  }
+  assert.equal((sw.match(/applyBasemapMode\(map, 'satellite'\)/g) ?? []).length, 1);
+  assert.match(sw, /if \(announce\) showToast\(/);
+  const sidebar = await readFile(new URL('src/ui/sidebar.ts', ROOT), 'utf8');
+  assert.match(sidebar, /void applyBasemapMode\(map, 'satellite'\);/);
+});
+
+test('a failed imagery load leaves basemap= out of the URL; an explicit plain choice writes it', async () => {
+  globalThis.fetch = () => { throw new Error('unexpected network in URL unit test'); };
+  const { syncUrl } = await import(new URL('src/state/url.ts', ROOT).href);
+  const store = await import(new URL('src/state/basemap-store.ts', ROOT).href);
+  const { installFakeBrowser } = await import('./map-harness.ts');
+  const cluster = HAZARD_CLUSTER_KEYS.find((key) => HAZARD_CLUSTERS[key].defaultBasemap === 'satellite');
+  assert.ok(cluster, 'no mode opens on satellite');
+  const written = () => {
+    const browser = installFakeBrowser({ search: '' });
+    try {
+      syncUrl({ region: null, layers: new Set(), embed: false, view: 'console', cluster, basemap: store.getBasemapMode() });
+      return new URLSearchParams(browser.search()).get('basemap');
+    } finally { browser.restore(); }
+  };
+  store.setBasemapMode('satellite');
+  store.revertBasemapForFailure();
+  assert.equal(store.getBasemapMode(), 'default');
+  assert.equal(written(), null);
+  store.setBasemapMode('default');
+  assert.equal(written(), 'default');
+});
+
+test('aggregateChipState: all ready -> live', () => {
+  assert.equal(aggregateChipState(['live', 'live']), 'live');
+});
+
+test('aggregateChipState: all loading -> loading', () => {
+  assert.equal(aggregateChipState(['loading', 'loading']), 'loading');
+});
+
+test('aggregateChipState: all error -> unavailable', () => {
+  assert.equal(aggregateChipState(['unavailable', 'unavailable']), 'unavailable');
+});
+
+test('aggregateChipState: ready plus loading -> live-partial (painted plus not-painted)', () => {
+  assert.equal(aggregateChipState(['live', 'loading']), 'live-partial');
+});
+
+test('aggregateChipState: error plus no-data -> unavailable (most specific non-painted state)', () => {
+  assert.equal(aggregateChipState(['unavailable', 'no-data']), 'unavailable');
+});
+
+test('aggregateChipState: empty list -> undefined (no product key backs the spec, no seventh state)', () => {
+  assert.equal(aggregateChipState([]), undefined);
+});
+
+test('chipStateFromStatuses composes chipStateForStatus with aggregateChipState', () => {
+  assert.equal(chipStateFromStatuses(['ready', 'loading']), 'live-partial');
+  assert.equal(chipStateFromStatuses([]), undefined);
+});
+
+/**
+ * S30D D1 M11 (register owner-1h; task DDM-P10-T11; design record
+ * interface-chrome-popups-text.md section 2.6, "Sections for N modes";
+ * DR-113): every HAZARD_CLUSTER_KEYS entry resolves its detailSections,
+ * an ARRAY (possibly empty) whose every key exists in DETAIL_SECTIONS.
+ * The registry itself never names a hazard: each DetailSectionDef's own
+ * shape (key, heading, nodeId, homeId, pointScoped) is checked, and
+ * Heat's declared 'heatrisk-sequence' section is confirmed present (the
+ * one section v1 declares).
+ *
+ * Predicted red on the pre-M11 tree: the module import of
+ * src/config/detail-sections.ts fails (it does not exist), and
+ * `HAZARD_CLUSTERS[mode].detailSections` is `undefined` for every mode
+ * including 'heat' (the field does not exist on HazardClusterDef yet).
+ */
+const { DETAIL_SECTIONS } = await import(
+  new URL('src/config/detail-sections.ts', ROOT).href
+);
+
+test('every HAZARD_CLUSTER_KEYS entry resolves its detailSections (DR-113)', () => {
+  assert.ok(HAZARD_CLUSTER_KEYS.length >= 4, 'the cluster set unexpectedly shrank');
+  let sawHeatSection = false;
+  for (const mode of HAZARD_CLUSTER_KEYS) {
+    const def = HAZARD_CLUSTERS[mode];
+    const sections = def.detailSections ?? [];
+    assert.ok(Array.isArray(sections), `${mode}.detailSections is not an array`);
+    for (const key of sections) {
+      const entry = DETAIL_SECTIONS[key];
+      assert.ok(entry, `${mode} declares detail section '${key}', which DETAIL_SECTIONS does not carry`);
+      assert.equal(entry.key, key);
+      assert.equal(typeof entry.heading, 'string');
+      assert.ok(entry.heading.length > 0, `${key}'s heading is empty`);
+      assert.equal(typeof entry.nodeId, 'string');
+      assert.ok(entry.nodeId.length > 0, `${key}'s nodeId is empty`);
+      assert.equal(typeof entry.homeId, 'string');
+      assert.ok(entry.homeId.length > 0, `${key}'s homeId is empty`);
+      assert.equal(typeof entry.pointScoped, 'boolean');
+      if (mode === 'heat' && key === 'heatrisk-sequence') sawHeatSection = true;
+    }
+  }
+  assert.ok(sawHeatSection, "heat's HeatRisk sequence section (HeatRisk first) did not resolve");
+});
+
+test('map-key.ts carries no cluster literal in its section-visibility path (DR-113)', async () => {
+  const text = await readFile(new URL('src/ui/map-key.ts', ROOT), 'utf8');
+  // The drawer's per-cluster gating reads HAZARD_CLUSTERS[cluster] and
+  // DETAIL_SECTIONS, not a hard-coded cluster name; this is the shape of
+  // a regression that would hard-code 'heat' where the active cluster
+  // belongs.
+  assert.doesNotMatch(
+    text,
+    /activeSections\s*=\s*\[['"]heatrisk-sequence['"]\]/,
+    'the drawer section list is hard-coded instead of read from HAZARD_CLUSTERS[activeCluster].detailSections'
+  );
+  assert.match(
+    text,
+    /HAZARD_CLUSTERS\[activeCluster\]\.detailSections/,
+    'map-key.ts no longer reads detailSections from the active HAZARD_CLUSTERS entry'
+  );
+  // Audit round 2 (R2-5): a reference layer demotes the set to custom and the
+  // store to 'drought', so the section follows the shell's selected hazard
+  // (as view-shell.ts does) and re-renders on every snapshot publish.
+  assert.match(text, /const activeCluster = getCommittedSnapshot\(\)\.selectedHazard;/);
+  assert.match(text, /onCommittedSnapshotChange\(update\)/);
+});
+
+// Audit round 2 (R2-10): the degraded boot reaches loadMapKey twice
+// (src/main.ts bootMapFreeChrome, then wireMapDependentChrome), and a second
+// run used to double every window and registry listener it did not dispose.
+test('initMapKey runs once: a second call returns before wiring anything', async () => {
+  const text = await readFile(new URL('src/ui/map-key.ts', ROOT), 'utf8');
+  const body = text.slice(text.indexOf('export function initMapKey(): void {'));
+  assert.match(body, /^export function initMapKey\(\): void \{\s*if \(mapKeyBooted\) return;\s*mapKeyBooted = true;/);
+  assert.doesNotMatch(text, /disposeMapKey/, 'the partial dispose scaffolding is back');
+});
+
+test('map-key.ts derives the chip glyph from registry.getStatus, not from KeySpec text (the retired substring matcher)', async () => {
+  const text = await readFile(new URL('src/ui/map-key.ts', ROOT), 'utf8');
+  assert.doesNotMatch(
+    text,
+    /function chipStateFromSpec/,
+    'the retired text-substring chip-state matcher is back in map-key.ts'
+  );
+  assert.doesNotMatch(
+    text,
+    /text\.includes\('unavailable'\)/,
+    "the retired chip-state substring check ('unavailable' in ariaLabel/itemsHtml) is back"
+  );
+  assert.match(
+    text,
+    /chipStateFromKeys/,
+    'map-key.ts no longer derives the chip state from the registry-backed chipStateFromKeys helper'
+  );
+});
+
+/**
+ * S30D D1 M24 (register owner-1k; task DDM-P11-T04; D1.md:145, "The place
+ * Conditions block reads a per-cluster `placeConditionRow` (DR-113)"; the
+ * director's Tier 1 call 3, 2026-10-01): every HAZARD_CLUSTER_KEYS entry
+ * DECLARES its placeConditionRow as an own property; a non-null value is a
+ * row the table carries (with its layer keys); a null is deferred with a
+ * recorded reason (ENSO's row moves to the ocean sprint, the owner's answer
+ * of 2026-10-01); the block's row list is the table-ordered union of the
+ * declared rows; and src/ui/popup-conditions.ts carries no literal row list
+ * and no cluster-key literal (the block is mode-agnostic: a row is listed
+ * whenever its layer is on).
+ *
+ * Predicted red on a94eee5: the module import of
+ * src/config/place-condition-rows.ts fails (ERR_MODULE_NOT_FOUND).
+ */
+const { PLACE_CONDITION_ROWS, PLACE_CONDITION_ROW_KEYS, PLACE_CONDITION_ROW_DEFERRED, placeConditionRowKeys } =
+  await import(new URL('src/config/place-condition-rows.ts', ROOT).href);
+
+test('every HAZARD_CLUSTER_KEYS entry resolves a placeConditionRow (DR-113)', async () => {
+  assert.ok(HAZARD_CLUSTER_KEYS.length >= 4, 'the cluster set unexpectedly shrank');
+  assert.ok(PLACE_CONDITION_ROW_KEYS.length > 0, 'the place-condition row table is empty');
+  const declared = [];
+  for (const mode of HAZARD_CLUSTER_KEYS) {
+    const def = HAZARD_CLUSTERS[mode];
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(def, 'placeConditionRow'),
+      `${mode} does not declare a placeConditionRow (a row key, or null with a deferral)`
+    );
+    const row = def.placeConditionRow;
+    if (row === null) {
+      const reason = Object.prototype.hasOwnProperty.call(PLACE_CONDITION_ROW_DEFERRED, mode)
+        ? PLACE_CONDITION_ROW_DEFERRED[mode]
+        : undefined;
+      assert.equal(typeof reason, 'string', `${mode} has no placeConditionRow and no recorded deferral`);
+      assert.ok(reason.trim().length > 0, `${mode}'s deferral reason is empty`);
+      continue;
+    }
+    assert.ok(
+      Object.prototype.hasOwnProperty.call(PLACE_CONDITION_ROWS, row),
+      `${mode} names place-condition row '${row}', which PLACE_CONDITION_ROWS does not carry`
+    );
+    const entry = PLACE_CONDITION_ROWS[row];
+    assert.equal(entry.key, row);
+    assert.ok(Array.isArray(entry.layerKeys) && entry.layerKeys.length > 0, `${row} reads no layer`);
+    for (const key of entry.layerKeys) assert.equal(typeof key, 'string');
+    declared.push(row);
+  }
+  // A deferral is recorded only for a mode that really declares none.
+  for (const mode of Object.keys(PLACE_CONDITION_ROW_DEFERRED)) {
+    assert.ok(HAZARD_CLUSTER_KEYS.includes(mode), `a deferral names '${mode}', which is not a mode`);
+    assert.equal(HAZARD_CLUSTERS[mode].placeConditionRow, null, `${mode} has a row and a deferral`);
+  }
+  // The block's rows: the union of the declared rows, in table order.
+  const union = PLACE_CONDITION_ROW_KEYS.filter((key) => declared.includes(key));
+  assert.deepEqual(placeConditionRowKeys(HAZARD_CLUSTERS, HAZARD_CLUSTER_KEYS), union);
+  // Mode-agnostic and N-mode: a synthetic table of any size enumerates the same way.
+  const synthetic = { a: { placeConditionRow: union[union.length - 1] }, b: { placeConditionRow: null }, c: { placeConditionRow: union[0] } };
+  assert.deepEqual(placeConditionRowKeys(synthetic, ['a', 'b', 'c']), union.length > 1 ? [union[0], union[union.length - 1]] : [union[0]]);
+  assert.deepEqual(placeConditionRowKeys(synthetic, ['b']), []);
+
+  const text = await readFile(new URL('src/ui/popup-conditions.ts', ROOT), 'utf8');
+  const code = text.replace(/\/\*[\s\S]*?\*\//g, ' ').replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1');
+  assert.doesNotMatch(
+    code,
+    /\[\s*NADM_KEY\s*,\s*USDM_KEY\s*,\s*ALERTS_KEY\s*,\s*FIRES_KEY\s*\]/,
+    'the literal condition-layer list is back in popup-conditions.ts (derive it from the declared rows)'
+  );
+  // The NIFC incident-type class 'wildfire' (src/config/wildfire-presentation.ts
+  // classifyNifcIncidentType) shares a spelling with a cluster key and is not
+  // one; its one comparison is set aside before the cluster-literal scan.
+  // The CPC Drought Outlook's layer key 'drought' (src/config/layers.ts) is
+  // likewise a layer, not a mode; its one restatement is set aside too.
+  const clusterScan = code
+    .replace(/classifyNifcIncidentType\([^)]*\)\s*===\s*'wildfire'/g, '')
+    .replace(/const OUTLOOK_KEY = 'drought';/, '');
+  for (const mode of HAZARD_CLUSTER_KEYS) {
+    assert.doesNotMatch(
+      clusterScan,
+      new RegExp(`['"\`]${mode}['"\`]`),
+      `popup-conditions.ts carries the cluster-key literal '${mode}' (DR-113: read the cluster table)`
+    );
+  }
+  assert.match(code, /placeConditionRowKeys\(/, 'popup-conditions.ts does not assemble its rows from placeConditionRowKeys');
+});
+
+test('the place briefing door is named without a mode word (DR-113)', async () => {
+  const text = await readFile(new URL('src/ui/sidebar.ts', ROOT), 'utf8');
+  // assert.ok, not doesNotMatch: a failure must not print the whole file.
+  assert.ok(!/See what the \w+ means/.test(text), 'the door names one mode in every mode');
+  // Visual uniformity wave 1, D6: the door reads "Open briefing"; its name starts with those words and adds the place.
+  // Repair R2: the door also shows the place's name, on its own line above those words.
+  assert.ok(text.includes("action.textContent = 'Open briefing';"));
+  assert.ok(text.includes('name.textContent = place.label;'));
+  assert.ok(text.includes("'aria-label', `Open briefing for ${place.label}`"));
+});
+
+// Audit 7 finding 2: the chip's fallback sentence ("No classed layer is drawn")
+// is true only when no surface layer is drawn, so every surface layer a recipe
+// can draw must have a label and a branch in map-key.ts.
+test('every surface-role layer in a cluster recipe has a key label and branch', async () => {
+  const { LAYER_DEFS } = await import(new URL('src/config/layers.ts', ROOT).href);
+  const surfaces = new Set(LAYER_DEFS.filter((d) => d.role === 'surface').map((d) => d.key));
+  const mapKey = await readFile(new URL('src/ui/map-key.ts', ROOT), 'utf8');
+  const recipeKeys = new Set(
+    HAZARD_CLUSTER_KEYS.flatMap((mode) => Object.values(HAZARD_CLUSTERS[mode].recipes).flat())
+  );
+  const drawn = [...recipeKeys].filter((key) => surfaces.has(key));
+  assert.ok(drawn.includes('drought'), 'the CPC outlook is a recipe surface');
+  for (const key of drawn) {
+    assert.ok(KEY_ELIGIBLE_LABELS[key], `${key} is a recipe surface with no KEY_ELIGIBLE_LABELS entry`);
+    assert.ok(mapKey.includes(`'${key}'`), `${key} is a recipe surface with no branch in map-key.ts`);
+  }
+});
+
+// The phone hazard rail (DR-113): its cells are generated from the mode table,
+// one per HAZARD_CLUSTER_KEYS entry, instead of hand-written in index.html.
+// The rail keeps its own order (ENSO, Fire, Drought, Heat), which differs from
+// the desktop column's (the HAZARD_CLUSTERS table order).
+test('the hazard rail is generated with one cell per mode, keeping the former markup (DR-113)', async () => {
+  const { HAZARD_RAIL_ICONS, hazardRailCells, hazardRailMarkup } = await import(
+    new URL('src/ui/hazard-rail.ts', ROOT).href
+  );
+  const { MOBILE_HAZARD_PRESETS } = await import(new URL('src/config/presets.ts', ROOT).href);
+  assert.deepEqual([...Object.keys(HAZARD_RAIL_ICONS)].sort(), [...HAZARD_CLUSTER_KEYS].sort());
+  const cells = hazardRailCells();
+  assert.deepEqual(cells.map((c) => c.preset.mode), Object.keys(HAZARD_RAIL_ICONS), 'a mode has no rail preset');
+  for (const { preset } of cells) {
+    assert.ok(MOBILE_HAZARD_PRESETS.includes(preset));
+  }
+
+  // The four cells index.html carried by hand before 2026-11-13, verbatim.
+  const svg = (paths) => `<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${paths}</svg>`;
+  const cell = (key, paths, label) => `<button type="button" class="hazard-rail-btn" data-preset="${key}">${svg(paths)}<span class="map-control-label">${label}</span></button>`;
+  const former = [
+    cell('hazard-enso', '<path d="M3 8c2.25-3 4.75-3 7 0s4.75 3 7 0 3.5-2.5 4-2.5"/><path d="M3 14c2.25-3 4.75-3 7 0s4.75 3 7 0 3.5-2.5 4-2.5"/><path d="M5 19c1.5-1.5 3-1.5 4.5 0s3 1.5 4.5 0"/>', 'ENSO'),
+    cell('hazard-fire', '<path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/>', 'Fire'),
+    cell('hazard-drought', '<path d="M12 21.5a6.5 6.5 0 0 0 6.5-6.5c0-1.9-.9-3.6-2.8-5.1S12.5 6 12 3c-.5 3-1.8 5.4-3.7 6.9S5.5 13.1 5.5 15a6.5 6.5 0 0 0 6.5 6.5z"/>', 'Drought'),
+    cell('hazard-heat', '<path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/>', 'Heat')
+  ];
+  // A later mode adds a cell; the former cells keep their markup and order.
+  const generated = hazardRailMarkup().match(/<button[\s\S]*?<\/button>/g) ?? [];
+  assert.equal(generated.length, HAZARD_CLUSTER_KEYS.length);
+  assert.deepEqual(generated.filter((b) => former.some((f) => f.includes(b.match(/data-preset="[^"]+"/)[0]))), former);
+
+  // The rail's container stays in index.html; its cells live only in the table.
+  const html = await readFile(new URL('index.html', ROOT), 'utf8');
+  assert.ok(html.includes('<div id="hazard-rail" class="hazard-rail" role="group" aria-label="Quick hazard views"></div>'));
+  assert.ok(!html.includes('data-preset='), 'a hand-written rail cell is back in index.html');
+  const sidebar = await readFile(new URL('src/ui/sidebar.ts', ROOT), 'utf8');
+  assert.ok(sidebar.includes('rail.innerHTML = hazardRailMarkup();'), 'wireHazardRail no longer generates the cells');
+});
+
+// The owner's live review: NOAA's frozen satellite catalog drew a metadata
+// lookup on every Reset and mode switch. A failed lookup now holds automatic
+// requests off for ten minutes; a SAT press always looks again.
+test('a failed satellite lookup is not repeated automatically for ten minutes; a SAT press looks again', async () => {
+  const { setSatelliteActive } = await import(new URL('src/map/satellite.ts', ROOT).href);
+  const store = await import(new URL('src/state/basemap-store.ts', ROOT).href);
+  const savedFetch = globalThis.fetch;
+  const savedDocument = globalThis.document;
+  let lookups = 0;
+  const stale = Date.now() - 48 * 3600e3;
+  globalThis.document = { getElementById: () => null };
+  globalThis.fetch = async () => {
+    lookups++;
+    return new Response(JSON.stringify({ features: [{ attributes: {
+      objectid: 1, name: 'MERGEDGC.10-minute.stale.color', start_time: stale - 540e3, end_time: stale
+    } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const map = { getLayer: () => undefined, getSource: () => undefined, removeLayer() {}, removeSource() {} };
+  try {
+    store.setBasemapMode('satellite');
+    await setSatelliteActive(map, true, false);
+    assert.equal(lookups, 1);
+    assert.equal(store.getBasemapMode(), 'default');
+    assert.equal(store.isImageryUnavailable(), true);
+
+    store.setBasemapMode('satellite');
+    await setSatelliteActive(map, true, false);
+    assert.equal(lookups, 1, 'an automatic request inside the hold made a lookup');
+    assert.equal(store.getBasemapMode(), 'default');
+
+    await setSatelliteActive(map, true, true);
+    assert.equal(lookups, 2, 'a SAT press did not look again');
+  } finally {
+    globalThis.fetch = savedFetch;
+    if (savedDocument === undefined) delete globalThis.document;
+    else globalThis.document = savedDocument;
+  }
+});

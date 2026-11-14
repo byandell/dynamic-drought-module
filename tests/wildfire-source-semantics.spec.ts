@@ -1,18 +1,14 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './offline-test';
 
+import { WHP_3D_SHADE_CATEGORIES } from '../src/config/whp-shade';
 import {
-  DRAPE_OPACITY,
   FBFM40_PRESENTATION,
   POWER_LINE_COLOR,
   POWER_LINE_WIDTHS,
   POWER_LINES_QUALIFICATION,
   POWER_PLANTS_QUALIFICATION,
   POWER_SHARED_QUALIFICATION,
-  STRUCTURES_PRESENTATION,
-  STRUCTURES_QUALIFICATION,
   buildPowerLinePaint,
-  buildStructuresMeasuredPaint,
-  buildStructuresPlaceholderPaint,
   HMS_DENSITY_PRESENTATION,
   HMS_OVERVIEW_QUALIFICATION,
   HMS_VOLUME_HEIGHT_SCALE_METERS,
@@ -45,15 +41,17 @@ import {
   activate as activateNifc,
   cancelActivation as cancelNifc,
   deactivate as deactivateNifc,
-  WILDFIRE_PULSE_PAINT_TARGETS
+  WILDFIRE_PULSE_PAINT_INTERVAL_MS,
+  WILDFIRE_PULSE_PAINT_TARGETS,
+  WILDFIRE_PULSE_SOFTWARE_TERRAIN_PAINT_INTERVAL_MS,
+  WILDFIRE_PULSE_TERRAIN_PAINT_INTERVAL_MS,
+  wildfirePulsePaintIntervalMs
 } from '../src/layers/nifc-fires';
 import {
   activate as activateSpc,
   cancelActivation as cancelSpc,
   deactivate as deactivateSpc
 } from '../src/layers/spc-fire-weather';
-import { FIRE3D_COVERAGE_NOTE } from '../src/config/fire3d-presentation';
-import { STRUCTURES_EMBED_LINE } from '../src/map/fire3d-context';
 import { registry } from '../src/state/registry';
 import {
   buildFireKey,
@@ -67,7 +65,8 @@ const VALID_POLYGON_COLLECTION = {
   features: [
     {
       type: 'Feature',
-      properties: {},
+      // dn 5 is a real SPC category (Elevated), so the SPC layer draws it; NIFC and HMS ignore it.
+      properties: { dn: 5 },
       geometry: {
         type: 'Polygon',
         coordinates: [
@@ -175,6 +174,9 @@ function installAnimationBrowser(reducedMotion: boolean): {
     configurable: true,
     value: {
       matchMedia: () => ({ matches: reducedMotion }),
+      // The smoke and outlook layers schedule a refresh; no case here waits for one.
+      setTimeout: () => 0,
+      clearTimeout: () => undefined,
       requestAnimationFrame: (callback: (timestamp: number) => void) => {
         const id = nextFrameId++;
         frames.set(id, callback);
@@ -441,6 +443,233 @@ test('reduced motion keeps wildfire paint static and schedules no pulse', async 
   }
 });
 
+// ---------------------------------------------------------------------------
+// Decision A (owner, 2026-09-11): the pulse's cadence on terrain
+// ---------------------------------------------------------------------------
+
+test('the pulse cadence is 60 ms flat, 250 ms on terrain, 500 ms on terrain with a software renderer', () => {
+  expect(WILDFIRE_PULSE_PAINT_INTERVAL_MS).toBe(60);
+  expect(WILDFIRE_PULSE_TERRAIN_PAINT_INTERVAL_MS).toBe(250);
+  expect(WILDFIRE_PULSE_SOFTWARE_TERRAIN_PAINT_INTERVAL_MS).toBe(500);
+
+  // The flat map keeps 60 ms whatever the renderer.
+  for (const rendererClass of ['hardware', 'software', 'unknown'] as const) {
+    expect(
+      wildfirePulsePaintIntervalMs({ terrainPresent: false, rendererClass })
+    ).toBe(WILDFIRE_PULSE_PAINT_INTERVAL_MS);
+  }
+  expect(
+    wildfirePulsePaintIntervalMs({ terrainPresent: true, rendererClass: 'hardware' })
+  ).toBe(WILDFIRE_PULSE_TERRAIN_PAINT_INTERVAL_MS);
+  // An unknown renderer is not treated as software.
+  expect(
+    wildfirePulsePaintIntervalMs({ terrainPresent: true, rendererClass: 'unknown' })
+  ).toBe(WILDFIRE_PULSE_TERRAIN_PAINT_INTERVAL_MS);
+  expect(
+    wildfirePulsePaintIntervalMs({ terrainPresent: true, rendererClass: 'software' })
+  ).toBe(WILDFIRE_PULSE_SOFTWARE_TERRAIN_PAINT_INTERVAL_MS);
+});
+
+/** A stand-in for the map's own GL context that reports SwiftShader. */
+const SWIFTSHADER_PAINTER = {
+  context: {
+    gl: {
+      RENDERER: 0x1f01,
+      getParameter: (name: number) =>
+        name === 0x9246 ? 'Google SwiftShader' : 'WebKit WebGL',
+      getExtension: () => ({ UNMASKED_RENDERER_WEBGL: 0x9246 })
+    }
+  }
+};
+
+/**
+ * Activate NIFC on a fresh fake map, feed the pulse one frame per
+ * timestamp, and record the colour committed at each frame that committed
+ * (frames that did not commit are absent from the result). `beforeFrame`
+ * may change the scene between frames.
+ */
+async function runPulse(
+  extraMap: Record<string, unknown>,
+  timestamps: readonly number[],
+  beforeFrame?: (timestamp: number) => void
+): Promise<Map<number, unknown>> {
+  const originalFetch = globalThis.fetch;
+  const browser = installAnimationBrowser(false);
+  const harness = fakeMapHarness();
+  Object.assign(harness.map as object, extraMap);
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify(MIXED_FIRE_COLLECTION), {
+      status: 200,
+      headers: { 'content-type': 'application/geo+json' }
+    });
+  const committed = new Map<number, unknown>();
+  try {
+    await activateNifc(harness.map);
+    for (const timestamp of timestamps) {
+      beforeFrame?.(timestamp);
+      const before = harness.paintChanges.length;
+      browser.takeNextFrame()(timestamp);
+      const writes = harness.paintChanges.slice(before);
+      if (writes.length === 0) continue;
+      // Every present target gets the same colour in one commit.
+      expect(new Set(writes.map(({ value }) => value)).size).toBe(1);
+      committed.set(timestamp, writes[0]?.value);
+    }
+  } finally {
+    deactivateNifc(harness.map);
+    registry.deactivate('nifc-fires');
+    globalThis.fetch = originalFetch;
+    browser.restore();
+  }
+  return committed;
+}
+
+/** The colour the pulse owes at `timestamp` when its first frame ran at `firstFrameAt`. */
+function pulseColorAt(timestamp: number, firstFrameAt: number): string {
+  return interpolateWildfirePulseColor(
+    timestamp - firstFrameAt + WILDFIRE_PULSE_DURATION_MS / 4
+  );
+}
+
+test('on terrain the pulse commits at the slower cadence, and back on the flat map it returns to 60 ms without a restart', async () => {
+  const t0 = 1_000;
+
+  // Terrain present, renderer unknown (the fake map has no painter): 250 ms.
+  let terrain: { source: string } | null = { source: 'terrain' };
+  const hardware = await runPulse(
+    { getTerrain: () => terrain },
+    [t0, t0 + 60, t0 + 100, t0 + 249, t0 + 250, t0 + 400, t0 + 500, t0 + 560],
+    (timestamp) => {
+      // Leave 3D after the 500 ms commit: the next frame, 60 ms later,
+      // commits at once on the flat cadence.
+      if (timestamp === t0 + 560) terrain = null;
+    }
+  );
+  expect([...hardware.keys()]).toEqual([t0, t0 + 250, t0 + 500, t0 + 560]);
+  for (const [timestamp, color] of hardware) {
+    // The phase never restarted: every commit is the colour elapsed time
+    // since the FIRST frame owes, across the cadence change.
+    expect(color).toBe(pulseColorAt(timestamp, t0));
+  }
+
+  // Terrain present on a software renderer: 500 ms.
+  const software = await runPulse(
+    { getTerrain: () => ({ source: 'terrain' }), painter: SWIFTSHADER_PAINTER },
+    [t0, t0 + 250, t0 + 499, t0 + 500, t0 + 750, t0 + 1_000]
+  );
+  expect([...software.keys()]).toEqual([t0, t0 + 500, t0 + 1_000]);
+});
+
+test('the pulse colour at a given elapsed time does not depend on the cadence', async () => {
+  const t0 = 2_000;
+  const frames = Array.from({ length: 41 }, (_unused, index) => t0 + index * 50);
+
+  const flat = await runPulse({ getTerrain: () => null }, frames);
+  const onTerrain = await runPulse(
+    { getTerrain: () => ({ source: 'terrain' }) },
+    frames
+  );
+  const onSoftware = await runPulse(
+    { getTerrain: () => ({ source: 'terrain' }), painter: SWIFTSHADER_PAINTER },
+    frames
+  );
+
+  // Three cadences, three different commit counts over the same two seconds.
+  expect(flat.size).toBeGreaterThan(onTerrain.size);
+  expect(onTerrain.size).toBeGreaterThan(onSoftware.size);
+  // Wherever two cadences commit at the same moment they commit the same
+  // colour, and it is the colour elapsed time owes.
+  for (const [timestamp, color] of onSoftware) {
+    expect(onTerrain.get(timestamp)).toBe(color);
+    expect(flat.get(timestamp)).toBe(color);
+    expect(color).toBe(pulseColorAt(timestamp, t0));
+  }
+  for (const [timestamp, color] of onTerrain) {
+    expect(color).toBe(pulseColorAt(timestamp, t0));
+  }
+});
+
+test('the pulse reads its paint targets once, re-reads them when the ribbon source changes or a layer goes, and never probes absent slabs per commit', async () => {
+  const originalFetch = globalThis.fetch;
+  const browser = installAnimationBrowser(false);
+  const harness = fakeMapHarness();
+  const sourceDataListeners = new Set<(event: { sourceId?: string }) => void>();
+  let layerLookups = 0;
+  const probedLayer = harness.map.getLayer.bind(harness.map);
+  Object.assign(harness.map as object, {
+    getLayer: (id: string) => {
+      layerLookups += 1;
+      return probedLayer(id);
+    },
+    on: (type: string, listener: (event: { sourceId?: string }) => void) => {
+      if (type === 'sourcedata') sourceDataListeners.add(listener);
+    },
+    off: (type: string, listener: (event: { sourceId?: string }) => void) => {
+      if (type === 'sourcedata') sourceDataListeners.delete(listener);
+    }
+  });
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify(MIXED_FIRE_COLLECTION), {
+      status: 200,
+      headers: { 'content-type': 'application/geo+json' }
+    });
+  const ribbonTargets = WILDFIRE_PULSE_PAINT_TARGETS.filter((target) =>
+    target.layerId.startsWith('nifc-perimeter-ribbon')
+  );
+  const writtenLayers = (from: number): string[] =>
+    harness.paintChanges.slice(from).map(({ layerId }) => layerId);
+
+  try {
+    await activateNifc(harness.map);
+    expect(sourceDataListeners.size).toBe(1);
+
+    // First commit: one read of all eight targets.
+    layerLookups = 0;
+    browser.takeNextFrame()(1_000);
+    expect(layerLookups).toBe(WILDFIRE_PULSE_PAINT_TARGETS.length);
+
+    // Later commits confirm only the two present targets; the six absent
+    // slabs are not probed again.
+    layerLookups = 0;
+    browser.takeNextFrame()(1_100);
+    expect(layerLookups).toBe(2);
+
+    // The ribbon arrives (its source and six slabs in one step) and its
+    // sourcedata event marks the list stale: the next commit paints all eight.
+    for (const target of ribbonTargets) {
+      harness.map.addLayer({ id: target.layerId, type: 'fill-extrusion' } as never);
+    }
+    for (const listener of sourceDataListeners) listener({ sourceId: 'nifc-perimeter-ribbon' });
+    let from = harness.paintChanges.length;
+    browser.takeNextFrame()(1_200);
+    expect(writtenLayers(from)).toEqual(
+      WILDFIRE_PULSE_PAINT_TARGETS.map(({ layerId }) => layerId)
+    );
+
+    // An unrelated source's event does not invalidate the list.
+    for (const listener of sourceDataListeners) listener({ sourceId: 'hms-smoke' });
+    layerLookups = 0;
+    browser.takeNextFrame()(1_300);
+    expect(layerLookups).toBe(WILDFIRE_PULSE_PAINT_TARGETS.length);
+
+    // A slab removed with no event is caught by the commit itself: the list
+    // is re-read and the missing layer is never painted.
+    harness.map.removeLayer(ribbonTargets[0]!.layerId);
+    from = harness.paintChanges.length;
+    browser.takeNextFrame()(1_400);
+    expect(writtenLayers(from)).not.toContain(ribbonTargets[0]!.layerId);
+    expect(writtenLayers(from)).toHaveLength(WILDFIRE_PULSE_PAINT_TARGETS.length - 1);
+
+    deactivateNifc(harness.map);
+    expect(sourceDataListeners.size).toBe(0);
+  } finally {
+    deactivateNifc(harness.map);
+    registry.deactivate('nifc-fires');
+    globalThis.fetch = originalFetch;
+    browser.restore();
+  }
+});
+
 test('selected-area NIFC copy names the bounding box, keeps categories distinct, and reports a full page as a floor', () => {
   // DR-024 b: the query covers a bounding box wider than the boundary, so
   // the sentence names the box and never "this area".
@@ -463,12 +692,12 @@ test('selected-area NIFC copy names the bounding box, keeps categories distinct,
   // A page returned at the record cap is a lower bound, and says so.
   const floor = buildNifcAreaPerimeterClaim(Array(50).fill('WF'), { truncated: true });
   expect(floor).toBe(
-    '50 current mapped NIFC wildfire perimeters intersect the bounding box around this selection. The service returned its 50-record maximum, so this count is a lower bound.'
+    '50 current mapped NIFC wildfire perimeters intersect the bounding box around this selection. The service returned the 50 records this briefing asks for, so this count is a lower bound.'
   );
   expect(buildNifcAreaPerimeterClaim(['WF'], { truncated: false })).not.toContain('lower bound');
 });
 
-test('HMS uses one cool veil and an explicit unclassified fallback', () => {
+test('HMS uses a warm taupe ramp darker with density and an explicit unclassified fallback', () => {
   const light = resolveHmsDensityPresentation('Light');
   const medium = resolveHmsDensityPresentation('medium');
   const heavy = resolveHmsDensityPresentation('HEAVY');
@@ -481,9 +710,8 @@ test('HMS uses one cool veil and an explicit unclassified fallback', () => {
   expect(unknown).toBe(HMS_DENSITY_PRESENTATION.Unknown);
   expect(missing).toBe(HMS_DENSITY_PRESENTATION.Unknown);
 
-  expect(light.color).toBe('#93a8c4');
-  expect(medium.color).toBe('#93a8c4');
-  expect(heavy.color).toBe('#93a8c4');
+  expect([light.color, medium.color, heavy.color]).toEqual(['#aa9c8d', '#908477', '#766d62']);
+  expect(new Set([light.color, medium.color, heavy.color, unknown.color]).size).toBe(4);
   expect([light.opacity, medium.opacity, heavy.opacity]).toEqual([
     0.08,
     0.17,
@@ -670,9 +898,9 @@ test('the WHP drape key mirrors the issuer legend exactly, including its two non
   // hazard rating of zero.
   expect(USFS_WHP_PRESENTATION.qualification).toMatch(/non-hazard classes/i);
 
-  // The drape stays translucent context under perimeters and smoke.
-  expect(DRAPE_OPACITY).toBeGreaterThan(0);
-  expect(DRAPE_OPACITY).toBeLessThanOrEqual(0.6);
+  // The Wildfire 3D drape stays translucent context under perimeters and
+  // smoke: its whitest class is 80% white (DR-199), never opaque.
+  expect(WHP_3D_SHADE_CATEGORIES.map((category) => category.opacity)).toEqual([0, 0.1, 0.2, 0.4, 0.8, 0, 0]);
 });
 
 test('the power context maps issuer voltage classes to width only, with the archive caveat pinned', () => {
@@ -730,80 +958,6 @@ test('the power context maps issuer voltage classes to width only, with the arch
   );
   expect(POWER_SHARED_QUALIFICATION).toMatch(
     /not evidence that none are present/i
-  );
-});
-
-test('the committed structures archive and every in-app disclosure agree on release, share, and region', async () => {
-  // The archive's own attribution (written by the bake from the extract's
-  // provenance sidecar) is the ground truth; the UI constants may never
-  // drift from it, or the legend misdescribes the artifact.
-  const { readFileSync } = await import('node:fs');
-  const { PMTiles } = await import('pmtiles');
-  const bytes = readFileSync('public/data/structures-central-oregon.pmtiles');
-  const reader = new PMTiles({
-    getKey: () => 'test',
-    getBytes: async (offset: number, length: number) => {
-      const slice = bytes.subarray(offset, offset + length);
-      return {
-        data: slice.buffer.slice(slice.byteOffset, slice.byteOffset + slice.byteLength)
-      };
-    }
-  });
-  const meta = (await reader.getMetadata()) as { attribution: string };
-  const attribution = meta.attribution;
-
-  const release = /release (\d{4}-\d{2}-\d{2}\.\d+)/.exec(attribution)?.[1];
-  const share = /(\d+)% of footprints/.exec(attribution)?.[1];
-  expect(release).toBeTruthy();
-  expect(share).toBeTruthy();
-  expect(attribution).toContain('central Oregon pilot coverage only');
-
-  expect(STRUCTURES_QUALIFICATION).toContain(`release ${release}`);
-  expect(STRUCTURES_QUALIFICATION).toContain(`${share} percent`);
-  expect(STRUCTURES_QUALIFICATION).toMatch(/central Oregon pilot coverage only/i);
-  expect(FIRE3D_COVERAGE_NOTE).toMatch(/central Oregon/);
-  expect(STRUCTURES_EMBED_LINE).toMatch(/central Oregon/);
-});
-
-test('the structures context separates published heights from disclosed placeholders', () => {
-  // Two visibly different tones: the placeholder read must never pass as
-  // a measured one.
-  expect(STRUCTURES_PRESENTATION.measuredColor).not.toBe(
-    STRUCTURES_PRESENTATION.placeholderColor
-  );
-
-  // Published heights extrude verbatim; placeholders follow the disclosed
-  // rule (three meters per published floor, otherwise the fixed
-  // placeholder), never an estimate dressed as data.
-  const measured = buildStructuresMeasuredPaint();
-  expect(measured['fill-extrusion-height']).toEqual(['get', 'h']);
-  expect(measured['fill-extrusion-color']).toBe(
-    STRUCTURES_PRESENTATION.measuredColor
-  );
-  const placeholder = buildStructuresPlaceholderPaint();
-  expect(placeholder['fill-extrusion-height']).toEqual([
-    'case',
-    ['has', 'f'],
-    ['*', ['get', 'f'], STRUCTURES_PRESENTATION.metersPerFloor],
-    STRUCTURES_PRESENTATION.placeholderMeters
-  ]);
-  expect(placeholder['fill-extrusion-color']).toBe(
-    STRUCTURES_PRESENTATION.placeholderColor
-  );
-  // fill-extrusion-opacity is not data-driven, so both layers share one
-  // constant translucency (the smoke-volume constraint).
-  expect(measured['fill-extrusion-opacity']).toBe(
-    placeholder['fill-extrusion-opacity']
-  );
-
-  // The qualification pins the license, the pilot coverage, the height
-  // split, and what the footprints are NOT.
-  expect(STRUCTURES_QUALIFICATION).toMatch(/ODbL/);
-  expect(STRUCTURES_QUALIFICATION).toMatch(/release 2026-07-22\.0/);
-  expect(STRUCTURES_QUALIFICATION).toMatch(/central Oregon pilot coverage only/i);
-  expect(STRUCTURES_QUALIFICATION).toMatch(/placeholder height/i);
-  expect(STRUCTURES_QUALIFICATION).toMatch(
-    /not parcel, occupancy, or condition records/i
   );
 });
 
@@ -974,12 +1128,34 @@ test('ArcGIS polygon parser rejects malformed and error-shaped HTTP 200 bodies',
   expect(truncated.truncated).toBe(true);
 });
 
+test('ArcGIS polygon parser preserves both transfer-limit placements without masking truncation', () => {
+  const cases = [
+    { fields: {}, truncated: false },
+    { fields: { exceededTransferLimit: false }, truncated: false },
+    { fields: { exceededTransferLimit: true }, truncated: true },
+    { fields: { properties: { exceededTransferLimit: false } }, truncated: false },
+    { fields: { properties: { exceededTransferLimit: true } }, truncated: true },
+    { fields: { exceededTransferLimit: false, properties: { exceededTransferLimit: true } }, truncated: true },
+    { fields: { exceededTransferLimit: true, properties: { exceededTransferLimit: false } }, truncated: true }
+  ];
+  for (const { fields, truncated } of cases) {
+    const body = { ...VALID_POLYGON_COLLECTION, ...fields };
+    const parsed = parseArcGisPolygonFeatureCollection(body, 'Test source');
+    expect(parsed.collection).toBe(body);
+    expect(parsed.collection.features).toHaveLength(1);
+    expect(parsed.truncated).toBe(truncated);
+  }
+  for (const flag of ['true', 1, null]) {
+    expect(() => parseArcGisPolygonFeatureCollection({
+      ...VALID_POLYGON_COLLECTION,
+      properties: { exceededTransferLimit: flag }
+    }, 'Test source')).toThrow();
+  }
+});
+
 test('NIFC, HMS, and SPC map invalid responses to unavailable and truncation to live partial', async () => {
   const originalFetch = globalThis.fetch;
-  const documentDescriptor = Object.getOwnPropertyDescriptor(
-    globalThis,
-    'document'
-  );
+  const browser = installAnimationBrowser(false);
   // `label` is the source name each module hands the shared ArcGIS parser,
   // so it is the name that reaches the log when the parse rejects a body.
   const modules = [
@@ -1028,9 +1204,31 @@ test('NIFC, HMS, and SPC map invalid responses to unavailable and truncation to 
       renders: false,
       reason: 'ArcGIS error 400: bad query'
     },
+    ...[
+      { name: 'nested true', fields: { properties: { exceededTransferLimit: true } }, malformed: false },
+      { name: 'nested malformed', fields: { properties: { exceededTransferLimit: 'true' } }, malformed: true },
+      { name: 'top false cannot mask nested true', fields: { exceededTransferLimit: false, properties: { exceededTransferLimit: true } }, malformed: false },
+      { name: 'nested false cannot mask top true', fields: { exceededTransferLimit: true, properties: { exceededTransferLimit: false } }, malformed: false },
+      { name: 'nested false cannot mask malformed top', fields: { exceededTransferLimit: 'true', properties: { exceededTransferLimit: false } }, malformed: true }
+    ].map(({ name, fields, malformed }) => ({
+      name: 'SPC no-area singleton with ' + name,
+      body: {
+        type: 'FeatureCollection',
+        ...fields,
+        features: [{
+          type: 'Feature', geometry: null,
+          properties: { dn: 0, valid: '202610071200', expire: '202610081200' }
+        }]
+      },
+      status: 'error' as const,
+      renders: false,
+      reason: malformed
+        ? 'response was not a valid FeatureCollection.'
+        : 'response contained an invalid polygon feature.'
+    })),
     {
       name: 'transfer-truncated FeatureCollection',
-      body: { ...VALID_POLYGON_COLLECTION, exceededTransferLimit: true },
+      body: { ...VALID_POLYGON_COLLECTION, properties: { exceededTransferLimit: true } },
       status: 'degraded',
       renders: true,
       reason: null
@@ -1041,10 +1239,6 @@ test('NIFC, HMS, and SPC map invalid responses to unavailable and truncation to 
 
   try {
     warnings = captureWarnings();
-    Object.defineProperty(globalThis, 'document', {
-      configurable: true,
-      value: { getElementById: () => null }
-    });
 
     for (const module of modules) {
       for (const response of responses) {
@@ -1091,16 +1285,44 @@ test('NIFC, HMS, and SPC map invalid responses to unavailable and truncation to 
       module.deactivate(fakeMapHarness().map);
       registry.deactivate(module.key);
     }
-    if (documentDescriptor) {
-      Object.defineProperty(globalThis, 'document', documentDescriptor);
-    } else {
-      Reflect.deleteProperty(globalThis, 'document');
+    browser.restore();
+  }
+});
+
+test('SPC complete no-area singleton accepts absent or false transfer flags at either location', async () => {
+  const originalFetch = globalThis.fetch;
+  const browser = installAnimationBrowser(false);
+  const harness = fakeMapHarness();
+  try {
+    for (const fields of [
+      {},
+      { exceededTransferLimit: false },
+      { properties: { exceededTransferLimit: false } },
+      { exceededTransferLimit: false, properties: { exceededTransferLimit: false } }
+    ]) {
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        type: 'FeatureCollection', ...fields,
+        features: [{ type: 'Feature', geometry: null,
+          properties: { dn: 0, valid: '202610071200', expire: '202610081200' } }]
+      }), { status: 200, headers: { 'content-type': 'application/geo+json' } });
+      await activateSpc(harness.map);
+      expect(registry.getStatus('spc-fire-weather')).toBe('no-data');
+      expect(harness.sources.size).toBe(1);
+      expect(harness.layers.size).toBe(0);
+      deactivateSpc(harness.map);
+      registry.deactivate('spc-fire-weather');
     }
+  } finally {
+    globalThis.fetch = originalFetch;
+    deactivateSpc(harness.map);
+    registry.deactivate('spc-fire-weather');
+    browser.restore();
   }
 });
 
 test('Wildfire network layers synchronously cancel pending activation', async () => {
   const originalFetch = globalThis.fetch;
+  const browser = installAnimationBrowser(false);
   const fakeMap = {
     getSource: () => undefined,
     getLayer: () => undefined,
@@ -1138,17 +1360,20 @@ test('Wildfire network layers synchronously cancel pending activation', async ()
       const fetchEntered = new Promise<void>((resolve) => {
         noteFetchEntered = resolve;
       });
-      let fetchSignal: AbortSignal | null = null;
+      // A typed holder, not a bare `let`: assigned inside the fetch override
+      // closure below, which TypeScript cannot see from the read site at the
+      // bottom of this loop body, and would otherwise narrow to `never`.
+      const held: { fetchSignal: AbortSignal | null } = { fetchSignal: null };
 
       globalThis.fetch = async (_input, init) => {
-        fetchSignal = init?.signal ?? null;
+        held.fetchSignal = init?.signal ?? null;
         noteFetchEntered?.();
 
         return await new Promise<Response>((_resolve, reject) => {
           const rejectAbort = (): void =>
             reject(new DOMException('Aborted', 'AbortError'));
-          if (fetchSignal?.aborted) rejectAbort();
-          else fetchSignal?.addEventListener('abort', rejectAbort, { once: true });
+          if (held.fetchSignal?.aborted) rejectAbort();
+          else held.fetchSignal?.addEventListener('abort', rejectAbort, { once: true });
         });
       };
 
@@ -1157,7 +1382,7 @@ test('Wildfire network layers synchronously cancel pending activation', async ()
       module.cancel();
 
       // This assertion occurs without yielding after the off intent.
-      expect(fetchSignal?.aborted, module.key).toBe(true);
+      expect(held.fetchSignal?.aborted, module.key).toBe(true);
 
       await activation;
       registry.deactivate(module.key);
@@ -1168,5 +1393,6 @@ test('Wildfire network layers synchronously cancel pending activation', async ()
       module.cancel();
       registry.deactivate(module.key);
     }
+    browser.restore();
   }
 });

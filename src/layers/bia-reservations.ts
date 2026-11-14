@@ -26,17 +26,24 @@
  * Source: `URLS.biaLarFeatureServer` (verified 2026-05-30; see urls.ts).
  *
  * Clipping: the national dataset is large, so the query is clipped to the
- * current map viewport (overscanned by OVERSCAN_FACTOR on each side) with an
+ * current map viewport (overscanned on each side, src/util/bbox.ts) with an
  * Environmental Systems Research Institute (ESRI) spatial envelope rather
  * than fetching the full national FeatureCollection. The region selection
  * drives the viewport, so toggling this layer on after selecting a region
  * pulls only that region's boundaries.
  *
+ * Generalization: the query carries a half-pixel `maxAllowableOffset` for
+ * the integer zoom bucket plus `geometryPrecision`, the same pair as
+ * `aiannh.ts`. Full-detail shapes for the national boot view were about
+ * 16 MB of JSON (6 MB on the wire, audit 10); half a pixel is below what
+ * the screen can show.
+ *
  * Caching: successful responses are kept in an in-memory, session-scoped
- * cache (`responseCache`) keyed by a bucketed bounds string coarser than the
- * query envelope (`buildCacheKey`), so a deactivate then re-activate against
- * substantially the same view renders instantly with no network call. A real
- * region change still misses the cache and fetches fresh.
+ * cache (`responseCache`). Any entry of the same zoom bucket whose coverage
+ * envelope contains the view is served (`findCoveringResponse`), so a pan
+ * inside the overscan and a deactivate then re-activate render instantly
+ * with no network call. A real region change still misses the cache and
+ * fetches fresh.
  * The cache is never committed anywhere and adds nothing to the repository;
  * it is a browser-session optimization, not a data-bundling change (the
  * no-redistribution hard rule is unaffected).
@@ -58,7 +65,7 @@
  * service is logged, not silently treated as complete.
  *
  * Cancellation (the cancellation invariant): the fetch goes through
- * `fetchWithBudget` with a per-call timeout and a master abort signal that
+ * `fetchBufferedWithBudget` with a per-call timeout and a master abort signal that
  * fires on `deactivate` or on a superseding `activate`. A late response to a
  * superseded or torn-down activation is dropped, not rendered. A cache hit
  * renders synchronously and never touches the abort signal.
@@ -72,10 +79,15 @@ import {
   RESERVATION_FILL_COLOR,
   RESERVATION_OUTLINE_COLOR
 } from '../config/palette';
-import { buildBiaReservationPopupHtml } from '../ui/popups';
-import { buildBoundaryContext, resolveBoundaryTitle } from '../impact/context';
+import { buildBiaReservationPopupModel } from '../ui/popups';
+import { buildPlaceConditionsHtml } from '../ui/popup-conditions';
+import { biaNationNames, buildBoundaryContext, loadBiaNationNames, resolveBoundaryTitle } from '../impact/context';
 import { registerClickTarget } from '../map/interaction-coordinator';
-import { fetchWithBudget } from '../util/fetch';
+import type { LayerActivation } from '../config/layers';
+import { fetchBufferedWithBudget, linkAbort } from '../util/fetch';
+import { buildQueryEnvelope, envelopeCovers, toCoverageEnvelope } from '../util/bbox';
+import { assertFeatureCollection, isTruncated } from '../util/geojson-checks';
+import { isoDayLocal } from '../util/iso-day';
 import { registry } from '../state/registry';
 
 const LAYER_KEY = 'bia-reservations';
@@ -98,15 +110,6 @@ const BEFORE_ID = 'first-symbol';
 const FETCH_TIMEOUT_MS = 15_000;
 
 /**
- * Overscan margin applied to the query envelope, as a fraction of the
- * viewport's width and height on each side. Fetching a bit beyond the
- * visible viewport lets small pans render correctly at their edges instead
- * of clipping at the exact prior bounds, and increases the odds a minor pan
- * still hits the response cache below.
- */
-const OVERSCAN_FACTOR = 0.25;
-
-/**
  * Cache-key bounds precision, in decimal degrees, coarser than the five
  * decimal places used for the actual query envelope (roughly 11 km at PNW
  * latitudes). Chosen so ordinary pans and re-toggles of the same region
@@ -122,6 +125,15 @@ const CACHE_MAX_ENTRIES = 24;
  * pans, programmatic fit chains) collapse into one refetch.
  */
 const REFRESH_DEBOUNCE_MS = 400;
+
+/**
+ * Geometry generalization tolerance in screen pixels, converted to degrees
+ * for `maxAllowableOffset` at the zoom bucket (the `aiannh.ts` value).
+ */
+const OFFSET_PIXEL_TOLERANCE = 0.5;
+
+/** Decimal places requested for coordinates (`geometryPrecision`), about one meter. */
+const GEOMETRY_PRECISION = 5;
 
 /**
  * E1 composition targets (D-0.7.0-041 part 2, review E1.3; D-0.7.0-043
@@ -158,6 +170,16 @@ const RETRIEVED_ON_PROPERTY = '__DDM_RETRIEVED_ON';
 let masterController: AbortController | null = null;
 
 /**
+ * The controller-owned activation signal (DDM-P1-T02): handed in by
+ * `activate`, linked to every `masterController` this module creates, the
+ * initial load and each viewport refresh alike, so the layer controller's
+ * abort on deactivate or supersession reaches a held request at once,
+ * without waiting for the serialized teardown. Null when activated without
+ * the seam (a direct call), where `cancelActivation` alone does the job.
+ */
+let activationSignal: AbortSignal | null = null;
+
+/**
  * Request-identity token: each fetch takes `++requestSeq` and drops its
  * response if the module has moved on. Belt to the abort signal's braces; a
  * response that raced past the abort still cannot render superseded data.
@@ -180,6 +202,9 @@ let refreshTimer: number | null = null;
  */
 let lastAppliedStatus: Extract<Status, 'ready' | 'no-data' | 'degraded'> | null = null;
 
+/** The collection the source currently holds; null when nothing is rendered. */
+let appliedData: FeatureCollection | null = null;
+
 /**
  * One cached response: the validated collection plus the COVERAGE envelope
  * (the queried envelope shrunk inward one grid quantum; see
@@ -192,10 +217,12 @@ let lastAppliedStatus: Extract<Status, 'ready' | 'no-data' | 'degraded'> | null 
 interface CachedResponse {
   readonly envelope: readonly [number, number, number, number];
   readonly geojson: FeatureCollection;
+  readonly zoomBucket: number;
 }
 
 /**
- * Session-scoped response cache, keyed by `buildCacheKey`. Module-level so
+ * Session-scoped response cache, keyed by `buildCacheKey`, in insertion
+ * order (oldest first, the eviction order). Module-level so
  * it outlives individual activate/deactivate cycles; cleared only on page
  * reload. Never written to disk or the repository; see the Caching
  * paragraph in the module docblock above.
@@ -211,97 +238,77 @@ function resolveBeforeId(map: maplibregl.Map): string | undefined {
 }
 
 /**
- * Bucketed cache key for the current viewport (see CACHE_KEY_PRECISION). No
- * zoom component: this query has no zoom-keyed generalization parameter, so
- * one response serves every zoom of the same bounds. The key is a fast-path
- * bucket only; a hit must ALSO pass the `envelopeCovers` coverage check.
+ * Integer zoom bucket used for BOTH the cache key and the generalization
+ * tolerance, so one cache entry never mixes generalization levels.
  */
-function buildCacheKey(map: maplibregl.Map): string {
+function resolveZoomBucket(map: maplibregl.Map): number {
+  return Math.floor(map.getZoom());
+}
+
+/**
+ * Bucketed cache key for the current viewport (see CACHE_KEY_PRECISION),
+ * with the zoom bucket because the generalization tolerance is zoom-keyed.
+ * It names an entry for storage and eviction; lookup is by coverage
+ * (`findCoveringResponse`).
+ */
+function buildCacheKey(map: maplibregl.Map, zoomBucket: number): string {
   const b = map.getBounds();
-  return [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+  const bounds = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
     .map((n) => n.toFixed(CACHE_KEY_PRECISION))
     .join(',');
+  return `z${zoomBucket}:${bounds}`;
 }
 
 /**
- * Inverse of the five-decimal precision the query URL serializes envelope
- * coordinates at. The envelope is quantized OUTWARD to this grid (floor the
- * west/south edges, ceil the east/north edges) so the cached envelope and
- * the envelope actually sent to the service are the same numbers: a
- * coverage hit then proves the service was really asked for the whole
- * visible view, with no sliver between the raw and serialized edges (Codex
- * Unit B re-verify, finding 3 residual, 2026-07-15).
+ * The newest cached response of this zoom bucket whose coverage envelope
+ * contains the whole view, or undefined. A hit moves to the newest slot so
+ * the entry being panned inside is the last to be evicted.
  */
-const ENVELOPE_QUANTUM = 1e5;
-
-/** The overscanned query envelope for the current viewport, `[w, s, e, n]`. */
-function buildQueryEnvelope(map: maplibregl.Map): [number, number, number, number] {
-  const b = map.getBounds();
-  const west = b.getWest();
-  const south = b.getSouth();
-  const east = b.getEast();
-  const north = b.getNorth();
-  const marginX = (east - west) * OVERSCAN_FACTOR;
-  const marginY = (north - south) * OVERSCAN_FACTOR;
-  return [
-    Math.floor((west - marginX) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.floor((south - marginY) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.ceil((east + marginX) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM,
-    Math.ceil((north + marginY) * ENVELOPE_QUANTUM) / ENVELOPE_QUANTUM
-  ];
-}
-
-/** Whether a cached query envelope fully contains the current visible view. */
-function envelopeCovers(
-  envelope: readonly [number, number, number, number],
-  map: maplibregl.Map
-): boolean {
-  const b = map.getBounds();
-  return (
-    envelope[0] <= b.getWest() &&
-    envelope[1] <= b.getSouth() &&
-    envelope[2] >= b.getEast() &&
-    envelope[3] >= b.getNorth()
-  );
-}
-
-/**
- * Shrink a query envelope inward by one grid quantum to form the COVERAGE
- * envelope stored with the cached response. The binary64 value `k / 1e5` can
- * sit a sub-ULP outside the exact decimal the URL carried, so comparing
- * against the query envelope itself left an equality-edge false-positive
- * path (Codex Unit B second re-verify, LOW, 2026-07-15). One quantum
- * (about one meter) of lost cache reuse is an acceptable false negative; a
- * passing coverage check now can never claim area outside the service
- * request.
- */
-function toCoverageEnvelope(
-  envelope: readonly [number, number, number, number]
-): [number, number, number, number] {
-  const q = 1 / ENVELOPE_QUANTUM;
-  return [envelope[0] + q, envelope[1] + q, envelope[2] - q, envelope[3] - q];
+function findCoveringResponse(map: maplibregl.Map, zoomBucket: number): CachedResponse | undefined {
+  const view = map.getBounds();
+  for (const [key, entry] of [...responseCache].reverse()) {
+    if (entry.zoomBucket === zoomBucket && envelopeCovers(entry.envelope, view)) {
+      responseCache.delete(key);
+      responseCache.set(key, entry);
+      return entry;
+    }
+  }
+  return undefined;
 }
 
 /** Store a response in the cache, evicting the oldest entry if at capacity. */
 function cacheResponse(
   key: string,
   envelope: readonly [number, number, number, number],
-  geojson: FeatureCollection
+  geojson: FeatureCollection,
+  zoomBucket: number
 ): void {
   if (responseCache.size >= CACHE_MAX_ENTRIES && !responseCache.has(key)) {
     const oldestKey = responseCache.keys().next().value;
     if (oldestKey !== undefined) responseCache.delete(oldestKey);
   }
-  responseCache.set(key, { envelope: toCoverageEnvelope(envelope), geojson });
+  responseCache.set(key, { envelope: toCoverageEnvelope(envelope), geojson, zoomBucket });
+}
+
+/**
+ * Degrees of longitude per CSS pixel at the given zoom bucket (512-pixel
+ * world tiles), scaled by OFFSET_PIXEL_TOLERANCE, for `maxAllowableOffset`.
+ */
+function resolveMaxAllowableOffset(zoomBucket: number): number {
+  return (360 / (512 * Math.pow(2, zoomBucket))) * OFFSET_PIXEL_TOLERANCE;
 }
 
 /**
  * Build the GeoJSON query URL, clipped to the given overscanned envelope.
  * The envelope is `xmin,ymin,xmax,ymax` in the `inSR` (WGS 84 longitude /
  * latitude). `outFields` is limited to the five fields the popup and the
- * impact briefing read, to keep the payload small.
+ * impact briefing read, and geometry is generalized server-side to half a
+ * pixel at the zoom bucket, to keep the payload small.
  */
-function buildQueryUrl(envelope: readonly [number, number, number, number]): string {
+function buildQueryUrl(
+  envelope: readonly [number, number, number, number],
+  zoomBucket: number
+): string {
   const params = new URLSearchParams({
     where: '1=1',
     geometry: envelope.map((n) => n.toFixed(5)).join(','),
@@ -311,51 +318,11 @@ function buildQueryUrl(envelope: readonly [number, number, number, number]): str
     spatialRel: 'esriSpatialRelIntersects',
     outFields: 'LARID,LARNAME,CLASSIFICATION,GISACRES,REGION',
     returnGeometry: 'true',
+    geometryPrecision: String(GEOMETRY_PRECISION),
+    maxAllowableOffset: resolveMaxAllowableOffset(zoomBucket).toFixed(6),
     f: 'geojson'
   });
   return `${URLS.biaLarFeatureServer}/query?${params.toString()}`;
-}
-
-/**
- * Validate that a parsed response is a genuine GeoJSON FeatureCollection and
- * not an ArcGIS error body or other malformed shape. Throws on failure so the
- * caller's existing catch block reports `'error'`, matching every other
- * failure path in this module. A response the service flags as truncated
- * (`exceededTransferLimit`) is logged, not silently treated as complete;
- * full pagination is a larger change than this validation pass covers.
- */
-function assertFeatureCollection(raw: unknown): FeatureCollection {
-  if (raw && typeof raw === 'object' && 'error' in raw) {
-    const err = (raw as { error?: { code?: number; message?: string } }).error;
-    throw new Error(
-      `ArcGIS error ${err?.code ?? '(unknown code)'}: ${err?.message ?? 'unknown error'}`
-    );
-  }
-  if (
-    !raw ||
-    typeof raw !== 'object' ||
-    (raw as { type?: string }).type !== 'FeatureCollection' ||
-    !Array.isArray((raw as { features?: unknown }).features)
-  ) {
-    throw new Error('AIAN-LAR response was not a GeoJSON FeatureCollection.');
-  }
-  return raw as FeatureCollection;
-}
-
-/**
- * Whether the service flagged this response as truncated
- * (`exceededTransferLimit`). A truncated body renders (partial data beats
- * none) but reports `degraded` ("live (partial)") and is NEVER admitted to
- * the coverage-envelope cache: a cached envelope asserts "the service
- * answered this whole envelope", which a truncated response cannot claim
- * (R2-trio, the 2026-07-15 planning true-up, D-0.7.0-037).
- */
-function isTruncated(raw: unknown): boolean {
-  return Boolean(
-    raw &&
-      typeof raw === 'object' &&
-      (raw as { exceededTransferLimit?: boolean }).exceededTransferLimit
-  );
 }
 
 /**
@@ -388,6 +355,7 @@ function clearRenderedFeatures(map: maplibregl.Map): void {
   const existing = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
   if (existing) existing.setData(EMPTY_FEATURE_COLLECTION);
   lastAppliedStatus = null;
+  appliedData = null;
 }
 
 /**
@@ -409,19 +377,21 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
   }
   const token = ++requestSeq;
 
-  const cacheKey = buildCacheKey(map);
-  const cached = responseCache.get(cacheKey);
-  if (cached && envelopeCovers(cached.envelope, map)) {
+  const zoomBucket = resolveZoomBucket(map);
+  const cacheKey = buildCacheKey(map, zoomBucket);
+  const cached = findCoveringResponse(map, zoomBucket);
+  if (cached) {
     applyFeatureCollection(map, cached.geojson);
     return;
   }
 
   masterController = new AbortController();
   const signal = masterController.signal;
+  const unlink = linkAbort(masterController, activationSignal);
 
   reportStatus('loading');
 
-  const envelope = buildQueryEnvelope(map);
+  const envelope = buildQueryEnvelope(map.getBounds());
   let geojson: FeatureCollection;
   let truncated = false;
   try {
@@ -429,8 +399,8 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
     // transport level: the upstream sends max-age=0 + public + ETag
     // (storable, revalidate-on-use), so without this the browser HTTP
     // cache may persist sovereign-boundary responses across page loads.
-    const resp = await fetchWithBudget(
-      buildQueryUrl(envelope),
+    const resp = await fetchBufferedWithBudget(
+      buildQueryUrl(envelope, zoomBucket),
       { cache: 'no-store' },
       signal,
       FETCH_TIMEOUT_MS
@@ -440,22 +410,30 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
     }
     const raw: unknown = await resp.json();
     geojson = stampRetrievalDate(
-      assertFeatureCollection(raw),
-      new Date().toISOString().slice(0, 10)
+      assertFeatureCollection(raw, 'AIAN-LAR'),
+      isoDayLocal(new Date())
     );
     truncated = isTruncated(raw);
   } catch (err) {
-    // Aborted or superseded means a newer request owns the view; drop
-    // silently per invariant 5.
-    if (signal.aborted || token !== requestSeq) return;
+    unlink();
+    // Aborted or superseded means a newer request owns the view; drop it
+    // per invariant 5, saying so once at debug level and nowhere louder.
+    if (signal.aborted || token !== requestSeq) {
+      console.debug(`[bia-reservations] request ${token} dropped: aborted or superseded before it settled`);
+      return;
+    }
     console.warn('[bia-reservations] AIAN-LAR fetch failed.', err);
     clearRenderedFeatures(map);
     reportStatus('error');
     return;
   }
 
+  unlink();
   // A late response to a superseded or torn-down request must not render.
-  if (signal.aborted || token !== requestSeq) return;
+  if (signal.aborted || token !== requestSeq) {
+    console.debug(`[bia-reservations] request ${token} dropped: a late response after intent changed`);
+    return;
+  }
 
   if (truncated) {
     console.warn(
@@ -464,7 +442,7 @@ async function fetchAndApply(map: maplibregl.Map): Promise<void> {
     applyFeatureCollection(map, geojson, { partial: true });
     return;
   }
-  cacheResponse(cacheKey, envelope, geojson);
+  cacheResponse(cacheKey, envelope, geojson, zoomBucket);
   applyFeatureCollection(map, geojson);
 }
 
@@ -483,11 +461,20 @@ function applyFeatureCollection(
   opts?: { partial?: boolean }
 ): void {
   const existing = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  if (existing && geojson === appliedData) {
+    // A pan inside the cached area: the source already holds this object.
+    // Only a status a cancelled fetch moved is put back.
+    if (lastAppliedStatus && registry.getStatus(LAYER_KEY) !== lastAppliedStatus) {
+      reportStatus(lastAppliedStatus);
+    }
+    return;
+  }
   if (existing) {
     existing.setData(geojson);
   } else {
     addSourceAndLayers(map, geojson);
   }
+  appliedData = geojson;
   lastAppliedStatus = opts?.partial
     ? 'degraded'
     : (geojson.features ?? []).length === 0
@@ -600,7 +587,11 @@ function detachRefresh(map: maplibregl.Map): void {
  * exists the call only (re)ensures the refresh handler, so the URL-restore
  * path cannot stack duplicates.
  */
-export async function activate(map: maplibregl.Map): Promise<void> {
+export async function activate(
+  map: maplibregl.Map,
+  activation?: LayerActivation
+): Promise<void> {
+  activationSignal = activation?.signal ?? null;
   attachRefresh(map);
   if (map.getSource(SOURCE_ID)) {
     return;
@@ -643,6 +634,7 @@ export function cancelActivation(): void {
  */
 export function deactivate(map: maplibregl.Map): void {
   detachRefresh(map);
+  activationSignal = null;
   if (masterController) {
     masterController.abort();
     masterController = null;
@@ -650,6 +642,7 @@ export function deactivate(map: maplibregl.Map): void {
   // Invalidate any response that already raced past its abort check.
   requestSeq++;
   lastAppliedStatus = null;
+  appliedData = null;
   if (map.getLayer(FILL_LAYER_ID)) map.removeLayer(FILL_LAYER_ID);
   if (map.getLayer(OUTLINE_LAYER_ID)) map.removeLayer(OUTLINE_LAYER_ID);
   if (map.getSource(SOURCE_ID)) map.removeSource(SOURCE_ID);
@@ -663,14 +656,19 @@ export function deactivate(map: maplibregl.Map): void {
  * not-yet-existing layer id.
  */
 export function bindPopups(map: maplibregl.Map): void {
+  // The Nation's name for each LARNAME, from the one map the briefing title
+  // shares (impact/context loadBiaNationNames, the roster's provenance gate).
+  // Until it loads, a popup titles the land area as before; a failed read is
+  // retried by the next click's label, so the map is read at click time.
+  loadBiaNationNames().catch(() => {});
   registerClickTarget({
     kind: 'reservation-boundary',
     layerIds: [FILL_LAYER_ID],
     label: (feature) => resolveBoundaryTitle('bia-reservation', feature.properties ?? null),
-    respond: (feature, click) => {
+    respond: (feature, click, map) => {
       const props: GeoJsonProperties = feature.properties ?? null;
       return {
-        content: buildBiaReservationPopupHtml(props),
+        model: buildBiaReservationPopupModel(props, buildPlaceConditionsHtml(map, click.point, feature), biaNationNames()),
         selection: buildBoundaryContext('bia-reservation', props, feature.geometry, click.lngLat),
         // An id-less feature clears any prior emphasis (the old
         // emphasizePlace contract) rather than lighting an unknown one.

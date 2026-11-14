@@ -1,12 +1,15 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './offline-test';
 
 import worker, {
   buildCacheKey,
+  buildClientResponse,
   buildUpstreamRequest,
   fetchUpstreamWithTimeout,
+  MAX_UPSTREAM_BYTES,
   isAllowedRoute,
   normalizeAccept,
   parseAndValidateUpstream,
+  rateLimitKey,
   permitsEdgeCaching,
   prepareResponseForEdgeCache,
   restoreResponseFromEdgeCache
@@ -99,8 +102,86 @@ test('the exact current DDM read routes are allowed', () => {
     expect(isAllowedRoute(parsed), target).toBe(true);
     const result = parseAndValidateUpstream(proxyRequest([target]));
     expect(result, target).toBeInstanceOf(URL);
+    // The one normalization is a sorted, form-encoded query (%20 reads as +).
+    parsed.searchParams.sort();
     expect((result as URL).toString()).toBe(parsed.toString());
   }
+});
+
+test('the image-export route is pinned to 256x256 PNG tiles', () => {
+  const base =
+    'https://imagery.geoplatform.gov/iipp/rest/services/Fire_Aviation/USFS_EDW_RMRS_WildfireHazardPotentialClassified/ImageServer/exportImage';
+  const appQuery =
+    'bbox=-1,-1,1,1&bboxSR=3857&imageSR=3857&size=256,256&format=png&transparent=true&f=image';
+  expect(isAllowedRoute(new URL(`${base}?${appQuery}`))).toBe(true);
+  for (const query of [
+    'size=4000,4000&f=image',
+    'SIZE=4000,4000&f=image',
+    'size=256,256&size=4000,4000&f=image',
+    'format=tiff&f=image',
+    `${appQuery}&x=1`
+  ]) {
+    expect(isAllowedRoute(new URL(`${base}?${query}`)), query).toBe(false);
+  }
+});
+
+test('each route accepts only the query parameter names the client sends', () => {
+  const refused = [
+    'https://api.weather.gov/alerts/active?point=38.5,-97.5&x=1',
+    'https://api.weather.gov/points/38.5,-97.5?x=1',
+    'https://api.weather.gov/gridpoints/TOP/31,80/forecast?units=si',
+    'https://www.usbr.gov/gp/agrimet/data_files/AgrimetSites.js?v=2',
+    'https://www.nwrfc.noaa.gov/water_supply/ws_report_csv.cgi?Type=ALL&type=ALL',
+    'https://usdmdataservices.unl.edu/api/StateStatistics/GetDSCI?aoi=53&cb=1'
+  ];
+  for (const target of refused) {
+    expect(isAllowedRoute(new URL(target)), target).toBe(false);
+  }
+  const clientShaped = [
+    'https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/data?stationTriplets=679:WA:SNTL&elements=WTEQ&duration=DAILY&beginDate=2026-01-01&endDate=2026-01-02',
+    'https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/stations?stationTriplets=*:*:SNTL&activeOnly=true&returnStationElements=false',
+    'https://www.usbr.gov/pn-bin/webarccsv.pl?parameter=OWY%20AF&syer=2026&smnth=1&sdy=1&eyer=2026&emnth=1&edy=2&format=2',
+    'https://www.nwrfc.noaa.gov/water_supply/ws_report_csv.cgi?Type=ALL&Source=ALL&Wyr=2026&WyrDate=2026-01-02&Flavor=ESP10',
+    'https://usdmdataservices.unl.edu/api/StateStatistics/GetDSCI?aoi=53&startdate=1/1/2026&enddate=1/7/2026&statisticsType=1',
+    'https://imagery.geoplatform.gov/iipp/rest/services/Fire_Aviation/USFS_EDW_RMRS_WildfireHazardPotentialClassified/ImageServer/exportImage?bbox=1,2,3,4&bboxSR=3857&imageSR=3857&size=256,256&format=png&transparent=true&f=image&interpolation=RSP_NearestNeighbor'
+  ];
+  for (const target of clientShaped) {
+    expect(isAllowedRoute(new URL(target)), target).toBe(true);
+  }
+});
+
+test('the rate limit keys an IPv6 client on its /64', () => {
+  expect(rateLimitKey('203.0.113.7')).toBe('203.0.113.7');
+  expect(rateLimitKey('2001:db8:aa:bb:1:2:3:4')).toBe('2001:db8:aa:bb::/64');
+  expect(rateLimitKey('2001:DB8:aa:bb::9')).toBe('2001:db8:aa:bb::/64');
+  expect(rateLimitKey('2001:db8::1')).toBe('2001:db8:0:0::/64');
+  expect(rateLimitKey('::ffff:203.0.113.7')).toBe('::ffff:203.0.113.7');
+});
+
+test('the rate limiter refuses with 429 and a Retry-After', async () => {
+  let keyed: string | undefined;
+  const response = await worker.fetch(
+    proxyRequest(['https://api.weather.gov/points/38.5,-97.5'], {
+      headers: { 'CF-Connecting-IP': '203.0.113.7' }
+    }),
+    {
+      RATE_LIMITER: {
+        async limit({ key }: { key: string }) {
+          keyed = key;
+          return { success: false };
+        }
+      }
+    },
+    {} as WorkerContext
+  );
+  expect(keyed).toBe('203.0.113.7');
+  expect(response.status).toBe(429);
+  expect(response.headers.get('Retry-After')).toBe('60');
+  expect(response.headers.get('Cache-Control')).toBe('no-store');
+  expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  await expect(response.json()).resolves.toMatchObject({
+    error: 'rate_limited'
+  });
 });
 
 test('former host-wide and off-path routes are rejected', async () => {
@@ -160,6 +241,23 @@ test('the proxy requires exactly one URL and rejects unsafe URL components', asy
   );
   expect(defaultPort).toBeInstanceOf(URL);
   expect((defaultPort as URL).port).toBe('');
+});
+
+test('a fragment, a parameter order or a repeated name cannot open a new cache slot', async () => {
+  const keyOf = (target: string): string =>
+    buildCacheKey(parseAndValidateUpstream(proxyRequest([target])) as URL, '*/*').url;
+  const plain = keyOf('https://api.weather.gov/points/45.6,-118.7');
+  expect(keyOf('https://api.weather.gov/points/45.6,-118.7#x1')).toBe(plain);
+  expect(keyOf('https://api.weather.gov/points/45.6,-118.7#x2')).toBe(plain);
+  const awdb = 'https://wcc.sc.egov.usda.gov/awdbRestApi/services/v1/stations';
+  expect(keyOf(`${awdb}?activeOnly=true&stationTriplets=*:*:SNTL`)).toBe(
+    keyOf(`${awdb}?stationTriplets=*:*:SNTL&activeOnly=true`)
+  );
+  await expectPolicyError(
+    proxyRequest(['https://api.weather.gov/alerts/active?point=44.1,-117.3&point=44.1,-117.3']),
+    400,
+    'repeated_query_name'
+  );
 });
 
 test('only GET, HEAD, and OPTIONS are exposed through CORS', async () => {
@@ -519,6 +617,18 @@ test('the upstream request forwards only normalized Accept and the fixed User-Ag
     { headers: { Accept: `application/json,${'x'.repeat(600)}` } }
   );
   expect(normalizeAccept(oversizedAccept)).toBe('*/*');
+
+  // Accept collapses to a fixed set, so it cannot be a cache-busting key.
+  const acceptOf = (accept: string) =>
+    normalizeAccept(
+      proxyRequest(['https://api.weather.gov/points/38.5,-97.5'], {
+        headers: { Accept: accept }
+      })
+    );
+  expect(acceptOf('application/json')).toBe('application/json');
+  expect(acceptOf('application/json; x=1')).toBe('application/json');
+  expect(acceptOf('image/png')).toBe('image/png');
+  expect(acceptOf('text/x-random-1')).toBe('*/*');
 });
 
 test('allowed redirects are followed with exact bytes and safe headers', async () => {
@@ -614,20 +724,91 @@ test('the upstream deadline remains active through body consumption', async () =
   await expect(pending).rejects.toMatchObject({ name: 'TimeoutError' });
 });
 
+test('the proxy byte limit accepts the exact boundary without changing bytes or headers', async () => {
+  const bytes = new Uint8Array(MAX_UPSTREAM_BYTES);
+  bytes[0] = 255;
+  bytes[bytes.length - 1] = 127;
+  const response = await fetchUpstreamWithTimeout(
+    new Request('https://api.weather.gov/points/38.5,-97.5'),
+    1000,
+    (async () => new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } })) as typeof fetch
+  );
+  expect(response.headers.get('Content-Type')).toBe('application/octet-stream');
+  expect(Buffer.from(await response.arrayBuffer()).equals(Buffer.from(bytes))).toBe(true);
+});
+
+test('oversized bodies with missing or dishonest lengths are cancelled, rejected and never cached', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
+  let cacheWrites = 0;
+  Object.defineProperty(globalThis, 'caches', {
+    configurable: true,
+    value: { default: { match: async () => undefined, put: async () => { cacheWrites++; } } }
+  });
+  try {
+    for (const contentLength of [null, '1']) {
+      let pulls = 0;
+      let cancelled = false;
+      const signals: AbortSignal[] = [];
+      globalThis.fetch = (async (_request: Request, init?: RequestInit) => {
+        if (init?.signal) signals.push(init.signal);
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulls++;
+            controller.enqueue(new Uint8Array(pulls === 1 ? MAX_UPSTREAM_BYTES : 1));
+          },
+          cancel() { cancelled = true; }
+        }, { highWaterMark: 0 }), {
+          headers: contentLength === null ? {} : { 'Content-Length': contentLength }
+        });
+      }) as typeof fetch;
+      const response = await fetchWorker(
+        proxyRequest(['https://api.weather.gov/points/38.5,-97.5']),
+        { waitUntil() { throw new Error('oversized response must not be cached'); } }
+      );
+      expect(response.status).toBe(502);
+      await expect(response.json()).resolves.toMatchObject({ error: 'upstream_unreachable' });
+      await expect.poll(() => cancelled, { timeout: 1000 }).toBe(true);
+      expect(pulls).toBe(2);
+      expect(signals[0]?.aborted).toBe(true);
+    }
+    expect(cacheWrites).toBe(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalCaches) Object.defineProperty(globalThis, 'caches', originalCaches);
+    else Reflect.deleteProperty(globalThis, 'caches');
+  }
+});
+
+test('the deadline cancels a stalled body even when the stream ignores the fetch signal', async () => {
+  let cancelled = false;
+  await expect(fetchUpstreamWithTimeout(
+    new Request('https://api.weather.gov/points/38.5,-97.5'), 25,
+    (async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }))) as typeof fetch
+  )).rejects.toMatchObject({ name: 'TimeoutError' });
+  expect(cancelled).toBe(true);
+});
+
 test('a full proxy read preserves bytes and swallows cache.put rejection', async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = Object.getOwnPropertyDescriptor(globalThis, 'caches');
   const bytes = new Uint8Array([137, 80, 78, 71, 0, 255, 10]);
   const background: Promise<unknown>[] = [];
-  let upstreamRequest: Request | null = null;
-  let cachedKey: Request | null = null;
-  let cachedResponse: Response | null = null;
+  // A typed holder, not bare `let`s: all three are assigned inside closures
+  // (the fake cache's `put`, the fetch override) that TypeScript cannot see
+  // from the top-level read sites further down, and would otherwise narrow
+  // each binding to `never`.
+  const seen: {
+    upstreamRequest: Request | null;
+    cachedKey: Request | null;
+    cachedResponse: Response | null;
+  } = { upstreamRequest: null, cachedKey: null, cachedResponse: null };
 
   const fakeCache = {
     match: async () => undefined,
     put: async (key: Request, response: Response) => {
-      cachedKey = key;
-      cachedResponse = response;
+      seen.cachedKey = key;
+      seen.cachedResponse = response;
       throw new Error('simulated cache rejection');
     }
   };
@@ -637,7 +818,7 @@ test('a full proxy read preserves bytes and swallows cache.put rejection', async
     value: { default: fakeCache }
   });
   globalThis.fetch = (async (request: Request) => {
-    upstreamRequest = request;
+    seen.upstreamRequest = request;
     return new Response(bytes, {
       status: 200,
       headers: {
@@ -670,19 +851,29 @@ test('a full proxy read preserves bytes and swallows cache.put rejection', async
     );
 
     expect(response.status).toBe(200);
+    // The pinned WHP tile is a fixed map: the browser keeps it for a day.
+    expect(response.headers.get('Cache-Control')).toBe(
+      'public, max-age=86400, immutable'
+    );
     expect(response.headers.get('Set-Cookie')).toBeNull();
     expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
     expect(response.headers.get('Access-Control-Allow-Credentials')).toBeNull();
+    expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
     expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual(
       Array.from(bytes)
     );
-    expect(upstreamRequest).not.toBeNull();
-    expect([...(upstreamRequest as Request).headers.keys()].sort()).toEqual([
+    if (seen.upstreamRequest === null) {
+      throw new Error('the fetch override never saw an upstream request');
+    }
+    expect([...seen.upstreamRequest.headers.keys()].sort()).toEqual([
       'accept',
       'user-agent'
     ]);
-    expect(cachedKey?.headers.get('Accept')).toBe('image/png');
-    expect(cachedResponse?.headers.get('Cache-Control')).toBe(
+    if (seen.cachedKey === null || seen.cachedResponse === null) {
+      throw new Error('cache.put was never called');
+    }
+    expect(seen.cachedKey.headers.get('Accept')).toBe('image/png');
+    expect(seen.cachedResponse.headers.get('Cache-Control')).toBe(
       'public, max-age=60'
     );
     await expect(Promise.all(background)).resolves.toBeDefined();
@@ -694,6 +885,19 @@ test('a full proxy read preserves bytes and swallows cache.put rejection', async
       Reflect.deleteProperty(globalThis, 'caches');
     }
   }
+});
+
+test('exportImage 200 with a JSON error body keeps the short cache header', () => {
+  const url = new URL(
+    'https://imagery.geoplatform.gov/iipp/rest/services/Fire_Aviation/USFS_EDW_RMRS_WildfireHazardPotentialClassified/ImageServer/exportImage?f=image'
+  );
+  const json = new Response('{"error":{"code":500}}', {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' }
+  });
+  expect(buildClientResponse(json, url).headers.get('Cache-Control')).toBe(
+    'public, max-age=60'
+  );
 });
 
 test('the cache key carries normalized Accept', () => {
@@ -788,8 +992,9 @@ test('the edge cache refuses non-200, Vary star, and private responses', () => {
  * byte-transparency assertions deterministic.
  *
  * NOT COVERED. Nothing here starts miniflare, `wrangler dev`, or the deployed
- * edge, so the platform layer is untested by this file: the `RATE_LIMITER`
- * binding and its fail-open path, the real `caches.default` storage and its
+ * edge, so the platform layer is untested by this file: the real `RATE_LIMITER`
+ * binding (only the refusal branch is run, against a fake) and its fail-open
+ * path, the real `caches.default` storage and its
  * time-to-live, Cloudflare's own header handling, and whether the published
  * Worker is these bytes at all. That last question is a live probe, not a unit
  * test; the Worker's `WORKER_REVISION` is a claim by the source, not evidence

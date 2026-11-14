@@ -53,15 +53,33 @@
  */
 
 import { writeFile, mkdir } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { dirname, join } from 'node:path';
-import { rejectEnsoSnapshot, CPC_RULE_URLS } from './lib/enso-snapshot-contract.mjs';
+import { fetchBufferedWithBudget } from '../src/util/fetch.ts';
+import {
+  rejectEnsoSnapshot,
+  CPC_RULE_URLS,
+  RUN_LENGTH,
+  DIRECTION_SPAN,
+  SEASON_NAMES,
+  directionOf
+} from './lib/enso-snapshot-contract.mjs';
 
 const ONI_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/oni.ascii.txt';
 const RONI_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/RONI.ascii.txt';
-const NINO34_URL =
-  'https://www.cpc.ncep.noaa.gov/products/analysis_monitoring/ensostuff/detrend.nino34.ascii.txt';
+// The data/indices copy is the one CPC keeps current (Last-Modified 2026-11-03,
+// newest row October 2026). The same name under products/analysis_monitoring/
+// ensostuff/ stopped at June 2026 (Last-Modified 2026-08-05). Checked 2026-11-11.
+const NINO34_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/detrend.nino34.ascii.txt';
 const SOI_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/soi';
+// DR-031 (a): the weekly Nino-region file. Wire the 9120 file and ONLY the 9120
+// file. Its sibling wksst8110.for still answers HTTP 200 with 102 kB, but its
+// last data row is 27JAN2021 and its Last-Modified is 2021-02-09, so choosing
+// the name that matches the base period quoted in older docs would ship a
+// five-year-old number behind a healthy status code. Verified live 2026-09-07:
+// 9120 Last-Modified 2026-09-07, 8110 Last-Modified 2021-02-09. Recorded at
+// DR-031 citations (13#13) and report 13 ENSOSCI-05.
+const NINO34_WEEKLY_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/wksst9120.for';
 
 // Named fallback only: NOAA Physical Sciences Laboratory nina34.data
 // (https://psl.noaa.gov/data/correlation/nina34.data) uses a differing
@@ -79,30 +97,16 @@ const SOI_URL = 'https://www.cpc.ncep.noaa.gov/data/indices/soi';
 // restore a plume.
 const RECENT_SEASONS = 36;
 const RECENT_MONTHS = 36;
+// A year of weekly observations: enough for the consumer to describe a recent
+// trajectory without carrying the whole 1981-to-now file into the bundle.
+const RECENT_WEEKS = 52;
 const THRESHOLD = 0.5;
-const RUN_LENGTH = 5;
-// The trailing-three-season change that counts as a trajectory rather than
-// noise. Not a CPC number: it is this application's own band, chosen so a
-// season-over-season wobble inside the preliminary revision window does not
-// flip the word. Stated here so it is auditable, and never presented to a
-// reader as an issuer rule.
-const DIRECTION_BAND = 0.2;
-const DIRECTION_SPAN = 3;
+// RUN_LENGTH, DIRECTION_BAND (this application's own trajectory band, not a
+// CPC number), DIRECTION_SPAN and SEASON_NAMES live in the contract, which
+// recomputes the state block from them.
 const SOI_MISSING = -999.9;
-const SEASON_NAMES = [
-  'DJF',
-  'JFM',
-  'FMA',
-  'MAM',
-  'AMJ',
-  'MJJ',
-  'JJA',
-  'JAS',
-  'ASO',
-  'SON',
-  'OND',
-  'NDJ'
-];
+// Match the Tribal roster producer's whole-response budget.
+const FETCH_TIMEOUT_MS = 30_000;
 const SEASONS = new Set(SEASON_NAMES);
 const MONTH_NAMES = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
 const SOI_HEADER = `YEAR ${MONTH_NAMES.join(' ')}`;
@@ -126,7 +130,7 @@ function publishedDay(resp, url) {
 }
 
 async function fetchText(url) {
-  const resp = await fetch(url);
+  const resp = await fetchBufferedWithBudget(url, null, null, FETCH_TIMEOUT_MS);
   if (!resp.ok) throw new Error(`fetch failed: HTTP ${resp.status} for ${url}`);
   return {
     text: await resp.text(),
@@ -158,7 +162,7 @@ function assertChronologicalKeys(records, keyOf, ordinalOf, label) {
  * checks make an upstream schema change fail the build instead of quietly
  * emitting a partial series.
  */
-function parseSeasonIndex(text, expectedHeader, label) {
+export function parseSeasonIndex(text, expectedHeader, label) {
   const lines = text.replace(/\r/g, '').split('\n');
   const headerIndex = lines.findIndex((line) => normalized(line) === expectedHeader);
   if (headerIndex < 0) {
@@ -244,11 +248,7 @@ function thresholdSide(latest) {
  */
 function seasonDirection(values) {
   if (values.length < DIRECTION_SPAN) return 'steady';
-  const change =
-    values[values.length - 1].anom - values[values.length - DIRECTION_SPAN].anom;
-  if (change >= DIRECTION_BAND) return 'strengthening';
-  if (change <= -DIRECTION_BAND) return 'weakening';
-  return 'steady';
+  return directionOf(values[values.length - 1].anom - values[values.length - DIRECTION_SPAN].anom);
 }
 
 /**
@@ -289,7 +289,7 @@ async function fetchSeasonIndex(url, expectedHeader, label) {
   };
 }
 
-function parseNino34(text) {
+export function parseNino34(text) {
   const lines = text.replace(/\r/g, '').split('\n');
   const expectedHeader = 'YR MON TOTAL ClimAdjust ANOM';
   const headerIndex = lines.findIndex((line) => normalized(line) === expectedHeader);
@@ -347,6 +347,95 @@ async function fetchNino34() {
 }
 
 /**
+ * Parse the CPC weekly Nino-region file (DR-031 a).
+ *
+ * Two column headers are asserted, not one, so a reordered or renamed region
+ * fails the build instead of silently reading Nino 3 as Nino 3.4. The regions
+ * appear in the order Nino1+2, Nino3, Nino34, Nino4, each contributing an SST
+ * and an SSTA column, so Nino 3.4 is numeric tokens 4 and 5 of eight.
+ *
+ * The date is stripped before numeric extraction. The row reads
+ * ` 02SEP2026     25.3 4.6     28.4 3.5     29.4 2.7     29.6 1.0`, and the
+ * day-month-year token would otherwise contribute two spurious numbers. After
+ * the date is removed, the same numeric-token extraction the SOI parser uses
+ * handles the fused negative columns this file also emits (`20.6-0.1` has no
+ * space), while the strict count of exactly 8 keeps fusion tolerance from
+ * hiding a shifted schema.
+ *
+ * DATE MEANING: the file's own first line says "Weekly SST data starts week
+ * centered on 2Sept1981", so each date is the CENTRE of its week, not its
+ * start. The emitted field is documented as the centred date.
+ */
+export function parseNino34Weekly(text) {
+  const lines = text.replace(/\r/g, '').split('\n');
+  const regionHeader = 'Nino1+2 Nino3 Nino34 Nino4';
+  const columnHeader = 'Week SST SSTA SST SSTA SST SSTA SST SSTA';
+  const regionIndex = lines.findIndex((line) => normalized(line) === regionHeader);
+  const columnIndex = lines.findIndex((line) => normalized(line) === columnHeader);
+  if (regionIndex < 0 || columnIndex !== regionIndex + 1) {
+    throw new Error(
+      `weekly Nino 3.4 schema check failed: expected "${regionHeader}" followed by "${columnHeader}"`
+    );
+  }
+
+  const records = [];
+  for (const raw of lines.slice(columnIndex + 1)) {
+    const line = raw.trim();
+    if (!line) continue;
+    const dated = /^(\d{2})([A-Z]{3})(\d{4})\s+(.*)$/.exec(line);
+    if (dated === null) {
+      throw new Error(`weekly Nino 3.4 schema check failed: malformed row "${line}"`);
+    }
+    const day = Number(dated[1]);
+    const month = MONTH_NAMES.indexOf(dated[2]) + 1;
+    const year = Number(dated[3]);
+    const tokens = dated[4].match(/[+-]?\d+(?:\.\d+)?/g) ?? [];
+    if (tokens.length !== 8) {
+      throw new Error(
+        `weekly Nino 3.4 schema check failed: expected 8 numeric columns in "${line}"`
+      );
+    }
+    const total = Number(tokens[4]);
+    const anom = Number(tokens[5]);
+    if (
+      month < 1 ||
+      day < 1 ||
+      day > 31 ||
+      !Number.isInteger(year) ||
+      !Number.isFinite(total) ||
+      !Number.isFinite(anom)
+    ) {
+      throw new Error(`weekly Nino 3.4 schema check failed: malformed row "${line}"`);
+    }
+    records.push({ year, month, day, total, anom });
+  }
+
+  if (records.length < RECENT_WEEKS) {
+    throw new Error(`weekly Nino 3.4 schema check failed: only ${records.length} records`);
+  }
+  // Weeks are exactly seven days apart, so the shared consecutive-ordinal check
+  // works once the ordinal is the week number since the epoch. A skipped or
+  // duplicated week fails here rather than shifting the trajectory read.
+  assertChronologicalKeys(
+    records,
+    (record) => `${record.year}-${record.month}-${record.day}`,
+    (record) => Math.round(Date.UTC(record.year, record.month - 1, record.day) / 604_800_000),
+    'weekly Nino 3.4'
+  );
+  return records;
+}
+
+async function fetchNino34Weekly() {
+  const fetched = await fetchText(NINO34_WEEKLY_URL);
+  const all = parseNino34Weekly(fetched.text);
+  return {
+    published: fetched.published,
+    latest: all[all.length - 1],
+    values: all.slice(-RECENT_WEEKS)
+  };
+}
+
+/**
  * Parse one SOI year-by-month block. Numeric token extraction, instead of
  * whitespace splitting, deliberately handles fused negative columns such as
  * "-2.4-999.9". Exactly 13 numeric tokens are still required on every year
@@ -387,7 +476,7 @@ function parseSoiBlock(lines, start, end, label) {
   return rows;
 }
 
-function parseSoi(text) {
+export function parseSoi(text) {
   const lines = text.replace(/\r/g, '').split('\n');
   const headerIndexes = [];
   for (let index = 0; index < lines.length; index += 1) {
@@ -446,6 +535,31 @@ async function fetchSoi() {
     published: fetched.published,
     ...parseSoi(fetched.text)
   };
+}
+
+/**
+ * Without a Last-Modified date the app ages a series from `retrieved`, which
+ * every run resets, so a frozen upstream would keep a present-tense read
+ * forever. Only then must the newest data itself be recent: the newest RONI
+ * season ended at most four months ago (RONI posts monthly), and the newest
+ * weekly Nino 3.4 week is at most 21 days old (it posts weekly).
+ */
+export function assertRecentWhenUndated(roni, nino34Weekly, now = new Date()) {
+  if (!roni.published) {
+    // A season label carries its centre month's year, so DJF 2026 ends in February 2026.
+    const endMonth = roni.latest.year * 12 + SEASON_NAMES.indexOf(roni.latest.seas) + 1;
+    const behind = now.getUTCFullYear() * 12 + now.getUTCMonth() - endMonth;
+    if (behind > 4) {
+      throw new Error(`RONI has no Last-Modified date and its newest season (${roni.latest.seas} ${roni.latest.year}) ended ${behind} months ago`);
+    }
+  }
+  if (!nino34Weekly.published) {
+    const { year, month, day } = nino34Weekly.latest;
+    const days = (now.getTime() - Date.UTC(year, month - 1, day)) / 86_400_000;
+    if (days > 21) {
+      throw new Error(`weekly Nino 3.4 has no Last-Modified date and its newest week (${year}-${month}-${day}) is ${Math.floor(days)} days old`);
+    }
+  }
 }
 
 function withPublished(published) {
@@ -531,11 +645,13 @@ const ONI_METHOD = {
 };
 
 async function main() {
-  // Sequential fetches keep the four-request refresh bounded and polite.
+  // Sequential fetches keep the five-request refresh bounded and polite.
   const roni = await fetchSeasonIndex(RONI_URL, 'SEAS YR ANOM', 'RONI');
   const oni = await fetchSeasonIndex(ONI_URL, 'SEAS YR TOTAL ANOM', 'ONI');
   const nino34 = await fetchNino34();
+  const nino34Weekly = await fetchNino34Weekly();
   const soi = await fetchSoi();
+  assertRecentWhenUndated(roni, nino34Weekly);
 
   const snapshot = {
     retrieved: new Date().toISOString().slice(0, 10),
@@ -578,6 +694,18 @@ async function main() {
       latest: nino34.latest,
       values: nino34.values
     },
+    nino34Weekly: {
+      source: 'NOAA CPC weekly Nino 3.4 sea surface temperature anomaly',
+      sourceUrl: NINO34_WEEKLY_URL,
+      attribution: 'NOAA Climate Prediction Center (CPC), public domain U.S. Government work',
+      description:
+        'Weekly Nino 3.4 sea surface temperature and anomaly on the 1991-2020 base period. Each date is the centre of its week, as the file states on its own first line. Retained as an observed trajectory read and never used as an ENSO phase declaration, which CPC makes from three-month averages.',
+      basePeriod: '1991-2020',
+      dateMeaning: 'week centre',
+      ...withPublished(nino34Weekly.published),
+      latest: nino34Weekly.latest,
+      values: nino34Weekly.values
+    },
     soi: {
       source: 'NOAA CPC Southern Oscillation Index (SOI)',
       sourceUrl: SOI_URL,
@@ -615,12 +743,15 @@ async function main() {
       `RONI latest=${roni.latest.seas} ${roni.latest.year} ${roni.latest.anom} preliminary=${roni.latest.preliminary}; ` +
       `ONI comparison latest=${oni.latest.seas} ${oni.latest.year} ${oni.latest.anom} preliminary=${oni.latest.preliminary}; ` +
       `Nino 3.4 latest=${nino34.latest.year}-${String(nino34.latest.month).padStart(2, '0')} ${nino34.latest.anom}; ` +
+      `weekly Nino 3.4 latest=${nino34Weekly.latest.year}-${String(nino34Weekly.latest.month).padStart(2, '0')}-${String(nino34Weekly.latest.day).padStart(2, '0')} ${nino34Weekly.latest.anom} (${nino34Weekly.values.length} weeks); ` +
       `standardized SOI latest=${soi.latest.year}-${String(soi.latest.month).padStart(2, '0')} ${soi.latest.value}; ` +
       'no probabilistic plume.'
   );
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+}

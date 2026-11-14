@@ -1,10 +1,302 @@
 # Release notes
 
-## Unreleased (after v0.6.26)
+## v0.8.0
 
-Merged to `main` after the `v0.6.26` tag. No new package version or tag has
-been assigned to this work.
+- 2026-09-27: the default view frames the contiguous United States, not the
+  Pacific Northwest. A link or an embed with no `region=` parameter now opens
+  on the national framing; an old link or embed that relied on the prior
+  Washington default is accepted as changed (DR-109). An embedder that wants
+  to keep the Washington framing and the Brief door adds
+  `region=washington_state&view=brief` to its `src`. Reset still returns the
+  camera to whatever region is selected (national by default) and, fixed in
+  the same pass, no longer closes an open briefing or clears a selected
+  place when that region is one of the regions without validated impact
+  synthesis; an explicit change into such a region still closes the
+  briefing.
+- 2026-09-28: the fire perimeter and smoke plume checkboxes now each control
+  only their own layer (the Wildfire mode still shows both).
 
+## v0.7.8
+
+Startup and delivery reliability.
+
+- 2026-10-19: a place deep link is marked ready only after its place briefing opens.
+- 2026-10-19: deployment checks keep a deadline through downloaded response bodies and send
+  the published site's origin when checking Worker access. The CI-input tests also run on
+  native Windows with Git Bash. Build dependencies receive compatible security updates.
+- 2026-10-19: the terrain Worker advertises its supported methods when refusing a request.
+- 2026-10-19: smoke legend colors also render in the oldest supported browsers.
+- 2026-10-19: publication no longer repeats the candidate's full browser suite. The gate
+  and browser matrix also stop repeating pure tests, and targeted empty shards skip
+  browser setup. Checks on the published build and live site remain.
+- 2026-10-19: live verification fails when its proof crashes or returns an invalid receipt,
+  even if the earlier version check succeeded.
+- 2026-10-19: hydrography no longer tries an Overpass mirror that now requires whitelisting.
+
+- 2026-10-19: three browser tests that passed only on a second try now hold on the first: the
+  map-chunk failure case reads the built file from disk instead of fetching it a second time,
+  the ocean temperature repaint case waits until the map has finished loading before it starts,
+  and the satellite refresh case holds the new picture's tiles unanswered so its own time limit
+  is the only thing that decides the outcome.
+- 2026-10-19: partway through a block, a targeted run on GitHub tests only the block's own
+  browser specs, in about five minutes. Its name says it is not a landing run; only a full run
+  decides a landing.
+- 2026-10-19: `npm run spec:impact` lists any test that still names on-screen text, an id or a
+  class the block deleted, and the tests the block touched; `npm run test:touched` runs those
+  tests once on the developer's machine, and `npm run spec:impact -- --dispatch` starts the
+  targeted GitHub run of them.
+- 2026-10-19: a pull request that changes only the Worker (the weekly dependency updates) runs
+  the build checks and the Worker checks and skips the browser suite.
+
+## v0.7.7
+
+The owner's live review of 2026-10-19, start and getting around, with presentation notes on
+every mode, plus the fixes the review's checks found.
+
+- 2026-10-19: a full-site link opens Brief unless it says `view=console`. An embed that names
+  layers, a region, a mode, an ocean or a framing still opens the map view it did before.
+- 2026-10-19: Reset returns to the default view: the national framing (the Pacific in ENSO; an
+  embed's own region), the mode's base map, and the sidebar open on desktop. Mode, horizon and
+  layers stay. This replaces the 2026-09-27 behaviour noted under v0.8.0, where Reset returned
+  to whatever region was selected.
+- 2026-10-19: the Quick views chip row is removed; each mode opens with its own layers. The
+  phone hazard rail is unchanged.
+- 2026-10-19: the More time button is removed. Console keeps the full time rail; a link that
+  carries a past week or day still restores it. Entering Brief pauses ocean temperature playback.
+- 2026-10-19: Share view sits at the top right of the map in Brief, as in Console.
+- 2026-10-19: sidebar controls hold still between modes. In Brief, Conditions in view sits at
+  the bottom beside Layer legends in every mode; in Console it sits below the mode panel.
+- 2026-10-19: the minimap fills its card, has no viewport rectangle, places the Hawaii inset
+  nearer the mainland, and makes the Pacific and Atlantic clickable (each opens ENSO on that
+  ocean). The Arctic stays in the framing list.
+- 2026-10-19: Wildfire's Fuel risk is white shading of increasing opacity on every map, and
+  Wildfire stays the mode with Fuel risk on, at every horizon and in a shared link. In 3D the
+  white shading steps aside for the 3D fuel risk drape, which is never drawn inside current fire
+  perimeters, at every horizon (Long Range in 3D now shows the Pacific Northwest drape); entering
+  or leaving 3D changes no layer choice and no link. The USFS colours are a Layer
+  Studio row, "Wildfire Hazard Potential (USFS colors)". The USFS service now paints its no-data
+  areas black; both rows clear them, so no tile goes missing and no dark wash covers the ocean
+  or Canada.
+- 2026-10-19: smoke plumes draw in a warm taupe ramp, darker with density, and the legend draws
+  each class as the map does.
+- 2026-10-19: Extreme Heat no longer draws HeatRisk's "Little to None" class, so the heat
+  classes stand out; their edges are slightly softened.
+- 2026-10-19: the Drought outlook (Near Term and Long Range) is a solid colour fill in the
+  issuer's categories.
+- 2026-10-19: the map key names each National Weather Service heat product once (Extreme Heat
+  Warning, Extreme Heat Watch), shows the read time as "As of 1:14 AM, Oct 19", and moves its
+  coverage and timing notes to Technical information, with the fire-perimeter and currents notes
+  and the reasons a time horizon is unavailable.
+- 2026-10-19: in ENSO, the light moving paths take the inverse colour of the map beneath them
+  with a dark edge, and the Nino 3.4 label stays above them. The ENSO key has buttons that open
+  the Nino 3.4 box and each active storm from the keyboard.
+- 2026-10-19: search lists Tribal land areas first, then States, Cities and Layers. It finds
+  Tribes the BIA land-area service does not cover, from the Census Bureau's Tribal areas, such
+  as The Muscogee (Creek) Nation, and shows the Nation's formal name when picked. Major cities
+  come from the place names the map already ships. Enter opens a row only when the typed name
+  matches it unambiguously.
+- 2026-10-19: NOAA's satellite map server stopped updating on 2026-10-08. The SAT button says
+  so when pressed; a mode that opens on satellite falls back to the default map quietly, and the
+  app does not look again for ten minutes.
+- 2026-10-19: the ocean currents frame is rebuilt from the 2026-10-19 00Z NOAA RTOFS run; it
+  reads as current until 2026-11-02 01:00 UTC.
+
+## v0.7.6
+
+- 2026-10-17: shared links include a test-preview screenshot and an ATNI Climate
+  description through Open Graph and large-image social card metadata. The preview
+  is shared across map views; opening a link retains its region, mode, and view.
+
+## v0.7.0
+
+`v0.7.0` is the package version and, since 2026-09-11, the release tag. It
+collects everything merged to `main` after `v0.6.26`, newest first. The tag
+waited on one task, DDM-P1-T04, the first entry below: a search that fails to
+download now costs search and nothing else.
+
+- 2026-09-11: a failed search download costs search, not the sidebar. The
+  layer catalog, the conditions strip and the main-screen controls used to
+  arrive on the same download as the search box, so a search download that
+  failed left a map with no catalog at all. They arrive separately now, and a
+  failed search shows an empty search slot and nothing else, in the console
+  catalog, the Layers studio, the Brief head and the phone sheet alike. A
+  control panel whose own download fails is also no longer lost for the rest
+  of the visit: the next time the app needs it, at a mode switch, it asks for
+  it again at a fresh address. That last part is not a detail. A browser
+  remembers a download that failed and refuses to repeat it, so asking again
+  for the same address returns the same failure without ever reaching the
+  network, which is measured here rather than assumed. What did not close:
+  nothing retries on its own. The second attempt rides the next time the app
+  needs the panel, and a download that failed because a file it depends on
+  failed still needs a reload.
+- 2026-09-11: terrain that says which archive it drew, a wildfire pulse that
+  respects it, and a briefing a display command can no longer lose. The 3D
+  scene's coverage sentence now names the terrain archive that actually
+  loaded, the deeper zoom 10 archive served by the terrain Worker or the
+  bundled zoom 8 copy it falls back to, because the probe reads the archive's
+  whole header rather than inferring it. The wildfire pulse paints on one
+  clock, every 60 ms on a flat map, every 250 ms with terrain and every
+  500 ms with terrain on a software renderer, so the scene stops spending its
+  frames on the pulse. A briefing queued behind a display command is no
+  longer dropped when the command runs. And every network read the app makes
+  stays time-bounded until its body has arrived, not only until its headers
+  do. Behind these, the verification got more honest: the tablet collision
+  audit compares the rectangles a person can actually see, clipped by every
+  scrolling ancestor, which retired a false intermittent; each activation
+  budget is a ratified measurement plus 8 percent; and the 3D test cases
+  answer the terrain host locally instead of reaching the live Worker. What
+  did not close: the proposed entry contract for the 3D Fire scene is
+  recorded with only its first decision built, and the intermittent
+  boot-idle stall has its first step only, a seam that lets a test see which
+  layers and transports hold the boot open.
+- 2026-09-10: the 3D scene reads the terrain archive to its own deepest zoom.
+  The terrain source declared a maximum zoom of 8, and a declared option
+  overrides the archive's header, so a deeper archive would have been read to
+  zoom 8 and no further. The declaration is gone and the header's own zooms
+  stand.
+- 2026-09-10: five fixes from an adversarial review of the visual pass. A
+  place's conditions card no longer reports a warning that lies outside the
+  place, the 3D coverage sentence describes the view's footprint rather than
+  its centre, each framing coverage clause renders only where that clause is
+  true, the briefing's response head keeps its caveat, and a hazard chosen
+  from inside Place studio survives leaving the studio.
+- 2026-09-10: the visual pass, nineteen owner findings. The Impact Briefing
+  widens to a scaling clamp, point heat moves into the heat row, and its mail
+  and print actions are inert until they work. Both studios dock beside the
+  sidebar on a readable glass surface, and for the first time the sidebar
+  stays reachable by keyboard and screen reader while a studio is open. The
+  minimap's coverage sentence moves to the on-map key, and the console
+  minimap stops mounting and fetching where it is not shown. Five console
+  Drought defects are fixed, including a lightened outlook hatch that keeps
+  its Section 508 stroke geometry. The six boundary popups become conditions
+  cards whose warning treatment appears only on evidence. And the 3D scene
+  can draw a deeper terrain archive for the Pacific Northwest, served from
+  Cloudflare storage by its own Worker, with a tested fallback to the bundled
+  copy. Two requests were deliberately not built as asked: the hatched
+  outlook fill stays hatched, because the hatch is the outlook's primary
+  channel and is load-bearing for Section 508, and the owner ratified the
+  lightened version instead; and Tribal-over-state click precedence needed no
+  change, since a live probe resolved Colville, Yakama and Coeur d'Alene over
+  the state as the precedence table already says.
+- 2026-09-09: the Fire rows read an issuer, and the wind on a station
+  marker has a shape. The near-term fire cell reads the NOAA Storm
+  Prediction Center Day 1 to 8 Fire Weather Outlook at the selected point,
+  stating each window from the feature's own valid and expire times and
+  naming its geography as at this point, or within 12 miles of this point.
+  It uses the issuer's own category words, so the highest categorical area
+  reads Extremely Critical rather than the shorter word the map renderer
+  uses, and a category code the service does not define is dropped rather
+  than given a meaning it does not have. The season-ahead fire cell now
+  names its product and says why it is not read: the National Wildland
+  Significant Fire Potential Outlook, which the geographic area
+  coordination centers also call the National Monthly and Seasonal
+  Significant Fire Potential Outlook, is published as a PDF only, with no
+  data endpoint on any National Interagency Fire Center or coordination
+  center host. Coverage is claimed only where it was verified: the
+  contiguous United States row of the fire outlook table, and no other. The
+  six remaining geographies read unavailable by stated convention rather
+  than by assumption, and Canada is not claimed at all. Each Remote
+  Automatic Weather Station marker now carries a wind arrow scaled to the
+  speed the station served, coloured to the network's own swatch, titled
+  with the observation time, and drawing nothing when the served direction
+  cannot be parsed. The legend states the convention the arrow follows.
+  What did not close: the long-range fire cell closes on its unavailable
+  arm only. There is no season-ahead fire forecast in this release, and
+  there will not be one until that outlook is published as something other
+  than a PDF.
+- 2026-09-09: terrain shading states its coverage, and four defects found
+  outside any task's boundary are fixed. The 3D scene's terrain note names
+  the United States Geological Survey 3D Elevation Program and the extent
+  the archive's own header pins, so a reader can tell where the shading is
+  real and where it stops. The hazard drape stays legible above it, drawn
+  in order and resampled nearest, so a category boundary does not blur into
+  its neighbour. Separately: the sea-surface temperature stamp no longer
+  names the frame it is leaving while it loads the next one; a boot that
+  stalls now names the layers still pending instead of failing without
+  saying why; a failed search chunk on the mobile sheet resets its mount
+  instead of leaving the sheet half-built; and the Climate Prediction
+  Center's Equal Chances category is rendered as the issuer defines it,
+  equal chances of above-, near-, or below-normal conditions with no
+  favoured category, rather than folded into a near-normal tilt it does not
+  mean.
+- 2026-09-09: seven closures, and an empty cell now describes the place
+  rather than the software. Where a briefing cell has nothing to show, it
+  used to say the product was not wired into this briefing, which told a
+  reader about the state of the build rather than about their location.
+  Every such cell now states that no read is available for this selection
+  and names the product it would have read. The season-ahead heat cell is
+  no longer one of them: it reads the NOAA Climate Prediction Center
+  seasonal temperature outlook live, in the issuer's own legend words, and
+  is never presented as an ENSO forecast. A horizon chip whose map recipe
+  repeats another horizon's, or is empty, is disabled with its reason
+  instead of offering a click that does nothing, and the on-map key carries
+  the time bar's register, so the bar, the stamp and the key state time in
+  one grammar. Every hazard minimap either carries a condition or says it
+  is navigation only and names the metric it lacks, shows the main map's
+  viewport, and builds no geometry while it is hidden. A popup can be
+  reached by touch at phone and tablet widths, is dismissed by Escape, and
+  its briefing door names the place it opens. A Remote Automatic Weather
+  Station popup renders the relative humidity, wind and fuel moisture the
+  issuer already serves, or says the station reported none. The Fire 3D
+  controller chunk no longer loads on a plain desktop Drought boot, only
+  when the committed cluster is wildfire or a deep link asks for the scene.
+  And the citation acceptance test reads a tracked public manifest, so it
+  tells the truth in public CI instead of depending on a ledger this
+  repository does not carry. What did not close: the horizon-chip work is
+  partial, with the visible reason line and the desktop Drought key
+  deferred.
+- 2026-09-08: four closures from the integration cycle. A layer whose
+  activation fails, whether the failure throws or is reported by the layer
+  itself, now corrects the sidebar checkbox and the share URL, shows
+  `unavailable`, and announces the failure once to assistive technology.
+  Before this the two paths diverged: a thrown failure lost its
+  `unavailable` status and read as off, and a failure the layer reported
+  itself was announced twice. A briefing claim now shows the
+  issuer's method or basis beneath its source: the U.S. Drought Monitor
+  percentile ranges as the National Drought Mitigation Center publishes
+  them, and the National Weather Service HeatRisk definition as a 24-hour
+  forecast. Each claim that names a legend section carries a legend link
+  that reaches it, turning the layer on when it is off and disclosing the
+  replacement. The near-term heat claim states its evidence whether or not
+  the HeatRisk layer is displayed: when the layer is off the briefing reads
+  the National Weather Service catalog's first available day rather than
+  reporting nothing, and the claim's register reads `outlook` while the
+  frame is in force and `observed` once the period has ended, matching the
+  time bar. At this date the season-ahead heat cell still read
+  `unavailable` and named the Climate Prediction Center seasonal
+  temperature outlook as the product not yet wired; it was wired the
+  following day, and the 2026-09-09 entry above describes what it reads
+  now. The entry chunk sits at 31 kB against its 45 kB budget with no code
+  change.
+- 2026-09-08: the repository is the application only. Every planning ledger,
+  session record, roadmap file and harness entry point left the public tree
+  for a private planning record maintained by ATNI Climate;
+  `scripts/check-public-tree.mjs` now forbids those paths outright and the
+  gate fails if one is ever tracked again. Task and decision ids cited in
+  comments and test docblocks still refer to that record. In the same change
+  the license moved from PolyForm Strict 1.0.0 to the DDM Community License
+  1.0 (`LICENSE`): use, modification and redistribution are permitted for
+  noncommercial purposes under share-alike terms, with attribution to ATNI
+  Climate and Patrick A. Freeland, data provenance carried with every
+  redistribution, adherence to the Tiered Sovereign Data Framework, and the
+  tool's service to Tribes and Indigenous Peoples stated as a condition.
+  `CITATION.cff` gives the citation, `llms.txt` and `robots.txt` on the
+  published site state the same conditions for automated readers, and a
+  tracked `commit-msg` hook keeps authorship in git's author field only.
+- 2026-09-03: the gridded drought index states where it comes from and where
+  it stops. Each SPI window now resolves through the slug prefix NOAA NIDIS
+  publishes the ACIS "Grid 1" dataset under rather than through a literal, the
+  legend keeps showing each product's own valid date read from that product's
+  `info.json`, and both the catalog row and the legend now say the raster
+  stack covers the contiguous United States only. drought.gov gives that
+  dataset's Data Coverage as "Contiguous U.S." and every wired window
+  publishes the same extent, which excludes Alaska, Hawaii, Puerto Rico, and
+  the Pacific territories. The docblock claim that SPEI and EDDI are not
+  published under this prefix is corrected: they are, as `speih` and `eddih`;
+  they stay unoffered because how far the selector expands is an open product
+  question, not because the issuer withholds them. The selector is unchanged
+  at five SPI windows, and coverage is stated as a fact, never by repurposing
+  a layer state.
 - 2026-09-03: gate transcription. DDM-D02, DDM-D06, and DDM-D10 in
   `docs/ROADMAP.yaml` now record the DR-036, DR-034, and DR-006 answers; the
   `needs_decision` lines those answers had blocked are updated or removed.
@@ -39,6 +331,48 @@ been assigned to this work.
   recommended preset holds every rule the tree already satisfies at zero, and
   the thirteen rules that fire today (463 diagnostics, counted in `biome.jsonc`
   beside each) are switched off for DDM-P15-T05 to burn down.
+- 2026-09-03: a time change no longer leaves the map blank and unexplained.
+  Changing the HeatRisk valid date removed the old frame and then announced
+  the new one as live, so the map went blank while the on-map key still
+  showed a full scale; the key now carries a `loading` row and the on-map
+  indicator stands for exactly as long as that frame's tiles are in flight.
+  Changing the drought horizon between the two CPC outlook registers kept the
+  previous polygons on screen with nothing saying they were superseded; the
+  indicator now names the register being fetched. Both statements are
+  withdrawn the moment the surface reaches `live`, `live (partial)`,
+  `unavailable`, or `no data`, and a superseded request is still aborted, so
+  a failed switch reads as its honest verdict rather than as stale data.
+- 2026-09-03: a device that cannot hold the 3D Fire scene is told so. The
+  capability and geometry gate withdrew the 3D toggle silently, so a window
+  too short for the tilted camera met an interface indistinguishable from
+  one where the 3D view had never been built. One sentence now stands where
+  the button would have been, naming only what was observed. Views that
+  never offer the toggle, and viewports below the desktop breakpoint, stay
+  silent. A second sentence, for a browser without WebGL 2, is carried by
+  the same control but is not reachable in any browser today: the control
+  mounts only once a map exists, and MapLibre 6 builds no map without
+  WebGL 2, so that browser is answered earlier by the boot's renderer notice
+  (the sidebar-builds-first entry below).
+- 2026-09-03: the tablet band, 721 to 1024 pixels (DDM-P10-T01, gate
+  DDM-D02). Tablet is a third layout band rather than a small desktop: the
+  sidebar column is fluid from 300 to 340 pixels instead of a 340 pixel
+  constant, and a coarse pointer on the desktop shell gets a 44 pixel target
+  floor on the sidebar, the map controls, the temporal rail, the briefing's
+  close control and a map popup's close corner. Two geometry collisions are
+  closed with them: the bottom dock no longer runs underneath an open impact
+  briefing between 721 and 984 pixels, and the briefing keeps its gap
+  off the sidebar at every width in the band. Dock inset, dock lift, the
+  map-information diameter and the touch floor are new custom properties.
+  Desktop geometry at 1025 pixels and wider is unchanged for a fine
+  pointer; the touch floor is a pointer query with no upper width bound,
+  so a coarse pointer on a wide desktop takes the same 44 pixel targets.
+- 2026-09-03: the impact briefing is one four-hazard by three-horizon matrix.
+  Each of the three horizon sections now holds a Drought, Fire, Heat, and ENSO
+  row, and each of the twelve cells carries its own claims, its own status, and
+  its own note. A cell with nothing to show names the product it is missing and
+  why, so no cell renders blank, and no hazard row wears the issuer or the
+  validity date of the hazard beside it. The Place Studio overlap engine moved
+  from `src/impact/` to `src/ui/island/`.
 
 ### 2026-08-31: heat readings in plain language (pull request 53, `5e0a889`)
 
@@ -255,6 +589,28 @@ the minimap evicts only when that verdict fails, and a pure spec pins the
 agreement case by case. The malformed-payload browser contract gained the
 dedupe bound the shared key promises: at most one fetch per consumer.
 
+### 2026-09-03: the Worker gains a dependency watch and a compatibility pin
+
+Two delivery-infrastructure changes that landed with the Overture re-pin and
+had no entry of their own.
+
+DR-005 a gives the optional Cloudflare Worker's own dependency tree the watch
+the application's already had: Dependabot gains a `/workers/proxy` npm entry,
+and `validate.yml`'s existing gate job gains a Worker audit step rather than a
+new trigger. The first Dependabot run against the new entry fired within a
+minute of the merge and completed successfully.
+
+DR-010 a sets `compatibility_flags = ["no_nodejs_compat"]` in
+`workers/proxy/wrangler.toml`. Cloudflare enables `nodejs_compat` and
+`nodejs_compat_v2` by default for compatibility dates of 2026-08-04 or later.
+The Worker's date is 2026-05-09, before that line, but it is a deliberately
+minimal Cross-Origin Resource Sharing shim that must not silently acquire the
+whole Node.js built-in surface the first time a routine date bump crosses it.
+This is a source change only: **the Worker was not published.** `DEVELOPER.md`
+records the rollback handle for whenever it is, the confirmed live version
+`10af1660-5b74-4520-80a1-32c80108fc48`, revision
+`2026-08-29-options-policy-v4`.
+
 ### 2026-09-03: the Overture buildings extract re-pinned ahead of its bucket expiry
 
 `scripts/extract-overture-buildings.py`'s `DEFAULT_RELEASE` moves from
@@ -287,6 +643,43 @@ scene with it transfers exactly what a scene without it does. It appears only
 while the 3D scene is active and the perimeter layer is live, it leaves when
 either does, and it never writes the perimeter layer's status or changes a
 sentence in the Impact Briefing.
+
+### 2026-09-03: the sidebar builds before the map does (DR-065, DDM-P14-T02)
+
+Every generated control in the sidebar used to wait on the map's `load` event,
+so a browser without WebGL 2, a graphics context that failed to start, or a
+boot slower than the eight-second bound left an empty region dropdown and an
+empty quick-view row beside a map that was not painting. That is the shape
+the NIDIS demonstration reported as the layer studio and the place studio
+"not working": an interface that looked finished and did nothing. It is one
+of three field reports the decision register files under DR-065; the other
+two, an iPad's quick-view toggles not resetting and inconsistent studio
+navigation on desktop and phone, are not explained by this change and are
+held under their own browser contracts instead
+(`tests/preset-toggle-cycles.spec.ts`, `tests/studio-navigation-cycles.spec.ts`).
+The region
+dropdown, the quick-view chips, the impact-briefing trigger and the mobile
+hazard rail are now generated from the static region, framing and preset
+tables at DOM ready, before the renderer is probed at all, and every boot path
+reaches them. Until the map is ready they are visibly and audibly disabled and
+one line beside them says why in plain words, with a second sentence when the
+bounded wait expires and a third when the browser cannot show a map at all.
+Each states only what was observed; none names a cause or promises a fix, and
+the line is removed rather than rewritten once the map is ready.
+
+The disabled state is a control affordance and not a seventh layer state: the
+six honest layer states are untouched, and the new `<html data-ddm-controls>`
+stamp reads `waiting`, `no-map` or `ready`, none of which borrows a word from
+them. Disabled buttons keep their accessible names and their place in the tab
+order so the reason stays reachable, and the layer catalog still arrives with
+the map, because a checkbox for a layer that cannot exist yet would be a
+promise the page cannot keep.
+
+This also makes a published claim true. `README.md` tells readers that a
+browser without WebGL 2 "shows the sidebar and an honest not-rendering notice
+instead of a map." The notice was real, and the sidebar's frame was on screen,
+but every control inside it was an empty container, so the sentence promised
+more than the build delivered. It now describes what actually happens.
 
 ## v0.6.26
 

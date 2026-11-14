@@ -1,0 +1,271 @@
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { registerHooks } from 'node:module';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * Audit finding 15: the WHP raster covers the conterminous United States only,
+ * and the service answers a transparent 200 tile everywhere else, so a reader
+ * framed on Alaska, Hawaii or Canada read "ready" over a blank map. Drives the
+ * REAL layer module with a fake map: no browser, no network.
+ *
+ * Runs under plain `node --test` (Node 24 strips types).
+ */
+
+const STUBS = {
+  '/ui/time-bar': 'export function setTimeBar() {} export function clearTimeBar() {}',
+  '/layers/whp-image-shade-protocol': 'export function registerWhpImageShadeProtocol() {}'
+};
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    const stub = Object.entries(STUBS).find(([suffix]) => specifier.endsWith(suffix));
+    if (stub) {
+      return { url: `data:text/javascript,${encodeURIComponent(stub[1])}`, shortCircuit: true };
+    }
+    if (
+      specifier.startsWith('.') &&
+      !/\.[a-z]+$/i.test(specifier) &&
+      typeof context.parentURL === 'string' &&
+      context.parentURL.endsWith('.ts') &&
+      existsSync(fileURLToPath(new URL(`${specifier}.ts`, context.parentURL)))
+    ) {
+      return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  }
+});
+
+const { registry } = await import('../src/state/registry.ts');
+const whp = await import('../src/layers/usfs-whp.ts');
+const classes = await import('../src/layers/usfs-whp-classes.ts');
+
+class FakeMap {
+  center = { lng: -120.5, lat: 44 };
+  sources = new Map();
+  layers = new Map();
+  listeners = new Map();
+  getCenter() {
+    return this.center;
+  }
+  /** A regional view four degrees wide and three high around the centre. */
+  getBounds() {
+    const { lng, lat } = this.center;
+    return { getWest: () => lng - 2, getEast: () => lng + 2, getSouth: () => lat - 1.5, getNorth: () => lat + 1.5 };
+  }
+  getTerrain() {
+    return null;
+  }
+  getSource(id) {
+    return this.sources.get(id);
+  }
+  addSource(id, spec) {
+    this.sources.set(id, { ...spec });
+  }
+  removeSource(id) {
+    this.sources.delete(id);
+  }
+  getLayer(id) {
+    return this.layers.get(id);
+  }
+  addLayer(spec) {
+    this.layers.set(spec.id, spec);
+  }
+  removeLayer(id) {
+    this.layers.delete(id);
+  }
+  getLayoutProperty(id, name) {
+    return this.layers.get(id)?.layout?.[name];
+  }
+  setLayoutProperty(id, name, value) {
+    const layer = this.layers.get(id);
+    layer.layout = { ...layer.layout, [name]: value };
+  }
+  on(event, handler) {
+    const set = this.listeners.get(event) ?? new Set();
+    set.add(handler);
+    this.listeners.set(event, set);
+    return this;
+  }
+  off(event, handler) {
+    this.listeners.get(event)?.delete(handler);
+    return this;
+  }
+  emit(event, payload = {}) {
+    for (const handler of [...(this.listeners.get(event) ?? [])]) handler(payload);
+  }
+  /** One transparent 200 tile, then the map settling. */
+  loadEmptyTile() {
+    const tile = { tileID: { key: 't1' } };
+    this.emit('sourcedataloading', { sourceId: 'usfs-whp', dataType: 'source', tile });
+    this.emit('sourcedata', { sourceId: 'usfs-whp', dataType: 'source', tile });
+    this.emit('idle');
+  }
+  /** MapLibre's frame after the layer is shown again: the source is used again (Style.update). */
+  giveBack() {
+    this.emit('sourcedata', { sourceId: 'usfs-whp', dataType: 'source', sourceDataType: 'visibility' });
+  }
+  moveTo(lng, lat) {
+    this.center = { lng, lat };
+    this.emit('moveend');
+  }
+}
+
+async function withMap(body) {
+  const map = new FakeMap();
+  registry.deactivate('usfs-whp');
+  registry.setStatus('usfs-whp', 'loading');
+  try {
+    await whp.activate(map);
+    await body(map);
+  } finally {
+    whp.deactivate(map);
+    registry.deactivate('usfs-whp');
+  }
+}
+
+test('a view centred in the contiguous United States still reads ready', async () => {
+  await withMap((map) => {
+    map.loadEmptyTile();
+    assert.equal(registry.getStatus('usfs-whp'), 'ready');
+  });
+});
+
+test('a view centred on Alaska reads no-data over its empty tiles, and ready again on return', async () => {
+  await withMap((map) => {
+    map.moveTo(-150, 64);
+    map.loadEmptyTile();
+    assert.equal(registry.getStatus('usfs-whp'), 'no-data');
+    map.moveTo(-120.5, 44);
+    assert.equal(registry.getStatus('usfs-whp'), 'ready');
+    map.moveTo(-157.8, 21.3);
+    assert.equal(registry.getStatus('usfs-whp'), 'no-data');
+  });
+});
+
+test('a coast view centred offshore with United States land in view reads ready (R6-14)', async () => {
+  await withMap((map) => {
+    // The Olympic coast, centred just off the hull; the eastern quarters are Washington land.
+    map.moveTo(-124.95, 47.6);
+    map.loadEmptyTile();
+    assert.equal(registry.getStatus('usfs-whp'), 'ready');
+  });
+});
+
+test('Fuel risk is white-shaded on a flat map; the classes row keeps issuer colours', async () => {
+  const map = new FakeMap();
+  try {
+    await whp.activate(map);
+    await classes.activate(map);
+    assert.ok(map.sources.get('usfs-whp').tiles[0].startsWith('whp-image-shade://'));
+    assert.ok(map.sources.get('usfs-whp-classes').tiles[0].startsWith('whp-image-classes://'));
+    assert.ok(map.layers.has('usfs-whp-classes'));
+    classes.deactivate(map);
+    assert.ok(!map.sources.has('usfs-whp-classes'));
+    assert.ok(map.sources.has('usfs-whp'));
+  } finally {
+    whp.deactivate(map);
+    classes.deactivate(map);
+    registry.deactivate('usfs-whp');
+    registry.deactivate('usfs-whp-classes');
+  }
+});
+
+test('a layer the 3D drape hides before its first frame is not reported unavailable at the deadline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withMap((map) => {
+    // whp-3d.ts mounts its drape, then hides the flat layer in the same task; a hidden source requests no tiles.
+    map.addLayer({ id: 'whp-2023' });
+    map.setLayoutProperty('usfs-whp', 'visibility', 'none');
+    t.mock.timers.tick(10_000);
+    // Terminal, not stuck at 'loading': the drape draws the row, so boot idle and quiescence settle.
+    assert.equal(registry.getStatus('usfs-whp'), 'ready');
+    // Given back by the drape, its first tile closes the open cycle as ready.
+    map.setLayoutProperty('usfs-whp', 'visibility', 'visible');
+    map.loadEmptyTile();
+    assert.equal(registry.getStatus('usfs-whp'), 'ready');
+  });
+});
+
+test('hidden under a drape stood down for the USFS colours row, Fuel risk takes that row\'s verdict, never ready', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  registry.activate('usfs-whp-classes');
+  registry.setStatus('usfs-whp-classes', 'loading');
+  try {
+    await withMap((map) => {
+      // Mounted but stood down: whp-3d.ts hides both the drape and the flat layer, so nothing draws Fuel risk.
+      map.addLayer({ id: 'whp-2023', layout: { visibility: 'none' } });
+      map.setLayoutProperty('usfs-whp', 'visibility', 'none');
+      t.mock.timers.tick(10_000);
+      assert.equal(registry.getStatus('usfs-whp'), 'loading');
+      // The same service, the one drawn copy, reaches its deadline unavailable.
+      registry.setStatus('usfs-whp-classes', 'error');
+      assert.equal(registry.getStatus('usfs-whp'), 'error');
+      // The colours row goes off, the drape stands up and draws this edition: the next settle reads ready.
+      registry.deactivate('usfs-whp-classes');
+      map.setLayoutProperty('whp-2023', 'visibility', 'visible');
+      map.emit('idle');
+      assert.equal(registry.getStatus('usfs-whp'), 'ready');
+    });
+  } finally {
+    registry.deactivate('usfs-whp-classes');
+  }
+});
+
+test('a layer given back by the 3D drape whose every tile fails reads unavailable', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withMap((map) => {
+    map.setLayoutProperty('usfs-whp', 'visibility', 'none');
+    t.mock.timers.tick(10_000);
+    map.setLayoutProperty('usfs-whp', 'visibility', 'visible');
+    map.giveBack();
+    // A failed tile fires no sourcedata; the deadline is its only read.
+    map.emit('sourcedataloading', { sourceId: 'usfs-whp', dataType: 'source', tile: { tileID: { key: 't1' } } });
+    t.mock.timers.tick(10_000);
+    assert.equal(registry.getStatus('usfs-whp'), 'error');
+  });
+});
+
+test('a layer given back by the 3D drape over tiles it already holds reads its own verdict again, with no new tile read', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  registry.activate('usfs-whp-classes');
+  registry.setStatus('usfs-whp-classes', 'error');
+  try {
+    await withMap((map) => {
+      // A tile loads, then the stood-down drape hides the layer before its verdict, which then lands hidden.
+      const tile = { tileID: { key: 't1' } };
+      map.emit('sourcedataloading', { sourceId: 'usfs-whp', dataType: 'source', tile });
+      map.emit('sourcedata', { sourceId: 'usfs-whp', dataType: 'source', tile });
+      map.addLayer({ id: 'whp-2023', layout: { visibility: 'none' } });
+      map.setLayoutProperty('usfs-whp', 'visibility', 'none');
+      map.emit('idle');
+      assert.equal(registry.getStatus('usfs-whp'), 'error', 'hidden, it borrows the colours row');
+      // The scene exits with the colours row still on: whp-3d.ts removes the drape and shows the layer.
+      map.removeLayer('whp-2023');
+      map.setLayoutProperty('usfs-whp', 'visibility', 'visible');
+      map.giveBack();
+      map.emit('idle');
+      assert.equal(registry.getStatus('usfs-whp'), 'ready', 'its own held tile is the verdict, not the borrowed one');
+    });
+  } finally {
+    registry.deactivate('usfs-whp-classes');
+  }
+});
+
+test('a visible layer with no tile at the deadline still reads unavailable', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  await withMap(() => {
+    t.mock.timers.tick(10_000);
+    assert.equal(registry.getStatus('usfs-whp'), 'error');
+  });
+});
+
+test('deactivate drops the move listener', async () => {
+  const map = new FakeMap();
+  await whp.activate(map);
+  whp.deactivate(map);
+  registry.deactivate('usfs-whp');
+  const left = [...map.listeners.values()].reduce((n, set) => n + set.size, 0);
+  assert.equal(left, 0);
+});

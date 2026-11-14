@@ -4,10 +4,9 @@
  *
  * Source: `URLS.usaceCwmsData` (scout-proposed, verifier-confirmed
  * 2026-07-01). The host serves a genuine wildcard
- * `Access-Control-Allow-Origin: *`, so the DIRECT fetch is the route; the
- * Worker remains a verified resilience path but is not wired here because
- * the direct route needs a custom `Accept` header that the Worker forwards
- * anyway if ever needed.
+ * `Access-Control-Allow-Origin: *`, so the DIRECT fetch is the route. The
+ * Worker is not a path for CWMS: it has no CWMS route, and its
+ * `normalizeAccept` would reduce the version-2 `Accept` to a plain variant.
  *
  * Load-bearing caveats from verification, handled here:
  *   - Every request needs `Accept: application/json;version=2`.
@@ -24,7 +23,7 @@
  */
 
 import { URLS } from '../config/urls';
-import { fetchWithBudget } from './fetch';
+import { fetchBufferedWithBudget } from './fetch';
 import type { StationValue, TelemetryFreshness } from '../types/station';
 import type { CwmsSource } from '../types/station';
 import { isObject } from './guards';
@@ -68,7 +67,7 @@ async function fetchTimeseriesWindow(
     begin: begin.toISOString(),
     end: end.toISOString()
   });
-  const resp = await fetchWithBudget(
+  const resp = await fetchBufferedWithBudget(
     `${URLS.usaceCwmsData}/timeseries?${params.toString()}`,
     { headers: ACCEPT_V2 },
     signal,
@@ -88,7 +87,7 @@ async function discoverTimeseriesId(
   signal: AbortSignal | null
 ): Promise<string | null> {
   const params = new URLSearchParams({ office, like });
-  const resp = await fetchWithBudget(
+  const resp = await fetchBufferedWithBudget(
     `${URLS.usaceCwmsData}/catalog/TIMESERIES?${params.toString()}`,
     { headers: ACCEPT_V2 },
     signal,

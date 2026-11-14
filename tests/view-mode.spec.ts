@@ -1,8 +1,12 @@
-import { test, expect } from '@playwright/test';
+import { continueLocalRoute } from './offline-test';
+import { test, expect } from './offline-test';
 import { gotoApp, search, urlLayers } from './helpers';
 import { stubRecentSatellite } from './satellite-fixture';
 import { routeAllTribalFixtures } from './tribal-fixtures';
-import { installMinimapAnalysisStubs } from './minimap-fixtures';
+import {
+  installMinimapAnalysisStubs,
+  minimapAnalysisStubLog
+} from './minimap-fixtures';
 
 /**
  * U1 the two doors (D-ARCH-002), REWRITTEN for S2 (D-0.7.0-041): the
@@ -13,9 +17,10 @@ import { installMinimapAnalysisStubs } from './minimap-fixtures';
  * stand: BRIEF leads with the briefing search and keeps the catalog as
  * the drill-down; CONSOLE is the full map-and-layers instrument. The
  * mode round-trips through `view=` (URL as state), and URLs without it
- * follow the legacy-URL rule (D-0.7.0-017): layers= or region (without
- * select=) means the sharer meant the map (console); bare URLs and
- * select= deep links open Brief; embeds default to Brief.
+ * open Brief on the full site (owner, 2026-10-19): only view=console
+ * opens the console. An embed naming layers= or region (without
+ * select=) keeps the older display-link rule and opens the console;
+ * other embeds default to Brief.
  */
 test.describe('U1 the two doors (view mode)', () => {
   test('a bare URL opens Brief with NO unsolicited briefing (D-0.7.0-041)', async ({ page }) => {
@@ -41,23 +46,66 @@ test.describe('U1 the two doors (view mode)', () => {
     await expect(page.locator('#layer-toggles .layer-group')).toHaveCount(4);
   });
 
-  test('a URL naming layers= opens the console (the sharer meant the map)', async ({
+  test('a full-site link naming region= and layers= opens Brief (owner, 2026-10-19)', async ({
     page
   }) => {
-    await gotoApp(page, '?region=washington_state&layers=usdm');
+    await gotoApp(page, '?region=washington_state&layers=usdm', { derivedView: true });
 
-    await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
-    await expect(page.locator('#brief-head')).toBeHidden();
+    await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
+    await expect(page.locator('#brief-head')).toBeVisible();
     // No briefing panel was auto-opened (it is created lazily on first open).
     await expect(page.locator('#impact-panel')).toHaveCount(0);
     await expect
       .poll(async () => new URLSearchParams(await search(page)).get('view'))
-      .toBe('console');
+      .toBe('brief');
   });
 
-  test('an explicit view= wins over the legacy rule', async ({ page }) => {
+  // The unmodified display links (no view=, no compatibility pin): every
+  // full-site family opens Brief and keeps its own state in the canonical URL.
+  for (const [query, kept] of [
+    ['?cluster=wildfire', { cluster: 'wildfire' }],
+    ['?cluster=enso&ocean=atlantic', { cluster: 'enso', ocean: 'atlantic' }],
+    ['?framing=pacific-coast', { framing: 'pacific-coast' }],
+    ['?select=state:WA', {}]
+  ] as const) {
+    test(`a full-site ${query} link opens Brief and survives a reload (owner, 2026-10-19)`, async ({
+      page
+    }) => {
+      await gotoApp(page, query, { derivedView: true });
+      for (const pass of ['boot', 'reload']) {
+        await expect(page.locator('#app'), pass).toHaveClass(/\bview-brief\b/);
+        await expect
+          .poll(async () => {
+            const params = new URLSearchParams(await search(page));
+            return Object.fromEntries(
+              ['view', ...Object.keys(kept)].map((key) => [key, params.get(key)])
+            );
+          }, { message: pass })
+          .toEqual({ view: 'brief', ...kept });
+        // The reload reads the synced (shared) URL, not the original link.
+        if (pass === 'boot') await page.reload({ waitUntil: 'domcontentloaded' });
+      }
+    });
+  }
+
+  test('an embed display link keeps the console unless it names select= (embed rule)', async ({
+    page
+  }) => {
+    await gotoApp(page, '?embed=true&cluster=wildfire', { derivedView: true });
+    await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
+
+    await gotoApp(page, '?embed=true&cluster=wildfire&select=state:WA', { derivedView: true });
+    await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
+  });
+
+  test('an explicit view= wins over the derived door', async ({ page }) => {
     await gotoApp(page, '?layers=usdm&view=brief');
     await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
+
+    await gotoApp(page, '?region=washington_state&layers=usdm&view=console', {
+      derivedView: true
+    });
+    await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
 
     await gotoApp(page, '?view=console');
     await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
@@ -95,40 +143,45 @@ test.describe('U1 the two doors (view mode)', () => {
   }) => {
     // Regression for the U1 adversarial-review major, re-anchored on the
     // select= deep link (the boot answer it originally raced is retired,
-    // D-0.7.0-041): two async briefing opens whose boundary fetches
-    // resolve out of order must resolve to the LAST-DECLARED intent,
-    // never to whichever fetch lands first. Setup: the FIRST us-states
-    // fetch (the deep link's Washington) is held for 1.5 seconds; the
-    // user picks Oregon in that window; the held deep-link fetch then
-    // resolves and must YIELD.
+    // D-0.7.0-041): the deep link and picker share the boundary transport,
+    // but only the LAST-DECLARED intent may act when it resolves. Hold it
+    // until the user has picked Oregon, then prove Washington yields.
     let first = true;
+    let releaseBoundary!: () => void;
+    const boundaryGate = new Promise<void>((resolve) => {
+      releaseBoundary = resolve;
+    });
     await page.route('**/data/us-states.geojson', async (route) => {
       if (first) {
         first = false;
-        await new Promise((r) => setTimeout(r, 1500));
+        await boundaryGate;
       }
-      await route.continue();
+      await continueLocalRoute(route);
     });
 
-    await gotoApp(page, '?select=state:WA');
-    // Pick Oregon in the Brief head search (U3) while the deep link's
-    // boundary fetch is still held.
-    await page.locator('#brief-search [data-ddm-search]').fill('oregon');
-    await page.locator('#brief-search [data-search-kind="place"][data-search-id="OR"]').click();
+    try {
+      // A settled boot waits for shared transport; waiting for boot-idle
+      // here would finish the deep link before the competing picker intent.
+      await gotoApp(page, '?select=state:WA', { bootIdle: false });
+      await expect.poll(() => first).toBe(false);
+      await expect(page.locator('#impact-panel.open')).toHaveCount(0);
+      await page.locator('#brief-search [data-ddm-search]').fill('oregon');
+      await page.locator('#brief-search [data-search-kind="place"][data-search-id="OR"]').click();
+      await expect(page.locator('#impact-panel.open')).toHaveCount(0);
+    } finally {
+      releaseBoundary();
+    }
 
-    // Summary-first (D-0.7.0-070): the pick sets the SELECTION (the
-    // briefing opens only through the panel link), so the newest-intent
-    // contract now reads: the summary shows the user's pick and the held
+    // A search pick opens its briefing (owner 2026-11-13), so the
+    // newest-intent contract reads: the user's pick opens, and the held
     // deep-link open YIELDS entirely (no Washington panel ever).
     await expect(page.locator('#brief-place-name')).toHaveText('Oregon', {
       timeout: 15_000
     });
-    await expect(page.locator('#impact-panel.open')).toHaveCount(0);
-
-    // Give the held deep-link fetch time to resolve, then confirm it
-    // yielded: still the user's pick, still no panel.
-    await page.waitForTimeout(2_000);
-    await expect(page.locator('#impact-panel.open')).toHaveCount(0);
+    await expect(page.locator('#impact-panel.open')).toBeVisible();
+    await expect(page.locator('#impact-panel-title')).toHaveText('Oregon');
+    await expect(page.locator('html')).toHaveAttribute('data-ddm-boot', 'idle');
+    await expect(page.locator('#impact-panel-title')).toHaveText('Oregon');
     await expect(page.locator('#brief-place-name')).toHaveText('Oregon');
   });
 
@@ -189,5 +242,32 @@ test.describe('U1 the two doors (view mode)', () => {
     await expect(page.locator('#app')).toHaveClass(/\bembed\b/);
     await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
     await expect(page.locator('#impact-panel')).toHaveCount(0);
+  });
+
+  test('console does not need the minimap: it is hidden and stops the retained analysis fetches; Brief keeps both (owner ask, 2026-09-10)', async ({
+    page
+  }) => {
+    await gotoApp(page, '?view=console');
+    await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
+    await expect(page.locator('.shell-minimap-map')).toBeHidden();
+    await expect(page.locator('.shell-minimap-popover-wrap')).toBeHidden();
+
+    // A hidden widget that keeps fetching is a performance defect, not a
+    // fix: the default boot is the 'drought' cluster (the default
+    // display, src/state/cluster-store.ts), which is exactly the
+    // condition that used to start `retainMinimapDrought`'s NCEI/StatCan
+    // analysis fetch on every non-brief-embed boot regardless of door.
+    // Give it a real chance to have started before asserting its absence.
+    await page.waitForTimeout(1_500);
+    expect(minimapAnalysisStubLog(page)).toEqual([]);
+
+    // The widget is Brief's, not retired outright: switching doors
+    // restores both the visible minimap and its live analysis fetch.
+    await page.locator('.view-switch [data-view="brief"]').click();
+    await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
+    await expect(page.locator('.shell-minimap-map')).toBeVisible();
+    await expect
+      .poll(() => minimapAnalysisStubLog(page).length)
+      .toBeGreaterThan(0);
   });
 });

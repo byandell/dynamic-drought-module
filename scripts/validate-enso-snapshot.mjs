@@ -56,11 +56,25 @@ const SERIES = (over = {}) => ({
   state: STATE(),
   phase: 'neutral',
   latest: P(),
-  values: [P(), P(), P(), P(), P()],
+  values: ['DJF', 'JFM', 'FMA', 'MAM', 'AMJ'].map((seas) => P({ seas })),
   ...over
 });
 /** A minimal fully valid snapshot (indices-only; optional blocks absent). */
 const VALID = () => ({ retrieved: '2026-07-28', oni: SERIES(), roni: SERIES() });
+/** Three consecutive weekly points, seven days apart, ending on `latest`. */
+const W = (month, day, anom) => ({ year: 2026, month, day, total: 29.4, anom });
+const WEEKLY = () => ({
+  sourceUrl: 'https://www.cpc.ncep.noaa.gov/data/indices/wksst9120.for',
+  latest: W(9, 2, 2.7),
+  values: [W(8, 19, 2.5), W(8, 26, 2.6), W(9, 2, 2.7)]
+});
+/** Standardized SOI: the rest of the latest year is null, as the builder emits it. */
+const SOI = () => ({
+  sourceUrl: 'https://www.cpc.ncep.noaa.gov/example',
+  block: 'standardized',
+  latest: { year: 2026, month: 6, value: -1.4 },
+  values: [{ year: 2026, month: 5, value: -1.1 }, { year: 2026, month: 6, value: -1.4 }, { year: 2026, month: 7, value: null }]
+});
 
 const SELF_TEST = [
   // Pass cases.
@@ -122,14 +136,64 @@ const SELF_TEST = [
     make: () => ({ ...VALID(), nino34: { sourceUrl: 'x', latest: { year: 2026 }, values: [] } })
   },
   {
+    name: 'valid snapshot carrying the weekly Nino 3.4 block (DR-031 a)',
+    mustPass: true,
+    make: () => ({
+      ...VALID(),
+      nino34Weekly: {
+        sourceUrl: 'https://www.cpc.ncep.noaa.gov/data/indices/wksst9120.for',
+        latest: { year: 2026, month: 9, day: 2, total: 29.4, anom: 2.7 },
+        values: [
+          { year: 2026, month: 8, day: 26, total: 29.4, anom: 2.6 },
+          { year: 2026, month: 9, day: 2, total: 29.4, anom: 2.7 }
+        ]
+      }
+    })
+  },
+  {
+    name: 'present malformed nino34Weekly, point missing day (strict transport rejects)',
+    mustPass: false,
+    make: () => ({
+      ...VALID(),
+      nino34Weekly: {
+        sourceUrl: 'x',
+        latest: { year: 2026, month: 9, total: 29.4, anom: 2.7 },
+        values: [{ year: 2026, month: 9, total: 29.4, anom: 2.7 }]
+      }
+    })
+  },
+  {
+    name: 'present nino34Weekly with a single point (nothing to compare, strict transport rejects)',
+    mustPass: false,
+    make: () => ({
+      ...VALID(),
+      nino34Weekly: {
+        sourceUrl: 'x',
+        latest: { year: 2026, month: 9, day: 2, total: 29.4, anom: 2.7 },
+        values: [{ year: 2026, month: 9, day: 2, total: 29.4, anom: 2.7 }]
+      }
+    })
+  },
+  {
     name: 'present malformed soi (strict transport rejects)',
     mustPass: false,
     make: () => ({ ...VALID(), soi: { sourceUrl: 'x', block: 'raw', latest: { year: 2026, month: 6, value: 1 }, values: [] } })
   },
   {
-    name: 'present malformed probabilities (strict transport rejects)',
+    name: 'any probabilities block, even well formed (rejected until an issuer feed exists)',
     mustPass: false,
-    make: () => ({ ...VALID(), probabilities: { sourceUrl: 'x', baseline: 'b', issued: null, seasons: [] } })
+    make: () => ({
+      ...VALID(),
+      probabilities: {
+        sourceUrl: 'https://example.org',
+        baseline: 'b',
+        issued: null,
+        seasons: [
+          { seas: 'DJF', laNina: 10, neutral: 60, elNino: 30 },
+          { seas: 'JFM', laNina: 10, neutral: 60, elNino: 30 }
+        ]
+      }
+    })
   },
   { name: 'not valid JSON', mustPass: false, raw: '{nope' },
   // ENSOSCI-01 regression classes. Each red fixture below reproduces one way
@@ -145,7 +209,13 @@ const SELF_TEST = [
         s[key] = SERIES({
           state: STATE({ conditions: 'el-nino', direction: 'strengthening', emerging: true }),
           latest,
-          values: [P({ anom: -0.9 }), P({ anom: -0.4 }), P({ anom: -0.04 }), P({ anom: 0.49 }), latest]
+          values: [
+            P({ seas: 'JFM', anom: -0.9 }),
+            P({ seas: 'FMA', anom: -0.4 }),
+            P({ seas: 'MAM', anom: -0.04 }),
+            P({ anom: 0.49 }),
+            latest
+          ]
         });
       }
       return s;
@@ -242,6 +312,84 @@ const SELF_TEST = [
       s.roni = SERIES({ authority: { product: 'x', url: CPC_RULE_URLS.discussion, cadence: 'monthly' } });
       return s;
     }
+  },
+  // Audit 6 finding 3: one-change copies the shape checks accepted. Each
+  // number the headline reads must agree with the series under it.
+  {
+    name: 'valid snapshot with weekly Nino 3.4, SOI and published days',
+    mustPass: true,
+    make: () => ({ ...VALID(), roni: SERIES({ published: '2026-07-28' }), nino34Weekly: WEEKLY(), soi: SOI() })
+  },
+  {
+    name: 'roni.latest is not the last value',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.latest = P({ seas: 'MAM' }); return s; }
+  },
+  {
+    name: 'roni.values in reverse order',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.values.reverse(); s.roni.latest = s.roni.values.at(-1); return s; }
+  },
+  {
+    name: 'roni.values missing a season',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.values.splice(2, 1); s.roni.values.unshift(P({ seas: 'NDJ', year: 2025 })); return s; }
+  },
+  {
+    name: 'roni.values with a duplicated season',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.values[2] = { ...s.roni.values[1] }; return s; }
+  },
+  {
+    name: 'roni seas is not one of the twelve season names',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.values[1].seas = 'XYZ'; return s; }
+  },
+  {
+    // 0.97 - 0.77 is 0.19999999999999996 in floating point; at the data's
+    // precision it is the 0.2 band, so the direction is strengthening.
+    name: 'a 0.77 to 0.97 rise is strengthening at the 0.2 band edge',
+    mustPass: true,
+    make: () => {
+      const s = VALID();
+      const latest = P({ anom: 0.97 });
+      s.roni = SERIES({
+        state: STATE({ conditions: 'el-nino', direction: 'strengthening', emerging: true }),
+        latest,
+        values: [P({ seas: 'DJF', anom: 0.1 }), P({ seas: 'JFM', anom: 0.2 }), P({ seas: 'FMA', anom: 0.77 }), P({ seas: 'MAM', anom: 0.87 }), latest]
+      });
+      return s;
+    }
+  },
+  {
+    name: 'roni.state.direction disagrees with the last three seasons',
+    mustPass: false,
+    make: () => { const s = VALID(); s.roni.state.direction = 'strengthening'; return s; }
+  },
+  {
+    name: 'nino34Weekly missing a week',
+    mustPass: false,
+    make: () => { const w = WEEKLY(); w.values.splice(1, 1); return { ...VALID(), nino34Weekly: w }; }
+  },
+  {
+    name: 'nino34Weekly.latest year 2019',
+    mustPass: false,
+    make: () => { const w = WEEKLY(); w.latest = { ...w.latest, year: 2019 }; return { ...VALID(), nino34Weekly: w }; }
+  },
+  {
+    name: 'soi.latest dated 2030, after every value',
+    mustPass: false,
+    make: () => ({ ...VALID(), soi: { ...SOI(), latest: { year: 2030, month: 1, value: 1 } } })
+  },
+  {
+    name: 'roni published 2099, after retrieved',
+    mustPass: false,
+    make: () => ({ ...VALID(), roni: SERIES({ published: '2099-01-01' }) })
+  },
+  {
+    name: 'retrieved 2020, before every published day',
+    mustPass: false,
+    make: () => ({ ...VALID(), retrieved: '2020-01-01', roni: SERIES({ published: '2026-07-28' }) })
   }
 ];
 

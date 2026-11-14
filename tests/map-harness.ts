@@ -65,12 +65,37 @@ export interface FakeMapHarness {
    */
   setZoom(next: number): void;
   getZoom(): number;
+  /**
+   * Move the view center and fire `moveend`, the way a real pan settles
+   * (fire3d.ts's coverage tracking watches this event). Defaults to
+   * FIRE3D_TERRAIN_COVERAGE's own declared center so a spec that never
+   * calls this behaves as an ordinary in-coverage activation, unchanged
+   * from before this method existed.
+   */
+  setCenter(next: { lng: number; lat: number }): void;
+  /**
+   * Set the view box `getBounds` reports directly and fire `moveend`. The
+   * centre follows the box's middle, so a spec that sets bounds does not
+   * leave the two disagreeing. Use this for a view that straddles a coverage
+   * edge, which is the case a centre alone cannot describe.
+   */
+  setBounds(next: {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+  }): void;
+  /** Widen or narrow the derived view box around the centre, in degrees. */
+  setViewHalfSpan(next: number): void;
 }
 
 export function fakeMapHarness(initial?: {
   readonly pitch?: number;
   readonly bearing?: number;
   readonly zoom?: number;
+  readonly center?: { readonly lng: number; readonly lat: number };
+  /** Half the width/height of the reported view box, degrees. Default 0.05. */
+  readonly viewHalfSpan?: number;
 }): FakeMapHarness {
   const sources = new Map<string, Record<string, unknown>>();
   const layerOrder: string[] = [];
@@ -89,6 +114,26 @@ export function fakeMapHarness(initial?: {
   // The default sits above every zoom gate in the application, so a spec
   // that does not care about zoom behaves as it always did.
   let zoom = initial?.zoom ?? 8;
+  // Defaults to the bundled terrain archive's own declared center
+  // (public/data/hillshade-dem-pnw.pmtiles metadata: [-119, 45.5]), so a
+  // spec that never calls setCenter keeps behaving as an ordinary
+  // in-coverage activation, exactly as before FIRE3D_TERRAIN_COVERAGE
+  // tracking existed.
+  let center = { lng: initial?.center?.lng ?? -119, lat: initial?.center?.lat ?? 45.5 };
+  // Half the width and half the height of the view box getBounds reports, in
+  // degrees. Small by default (a tight view around the centre) so every spec
+  // written before getBounds existed still reads as a fully covered view
+  // wherever its centre used to read as covered, and as fully uncovered
+  // wherever its centre used to read as uncovered.
+  let viewHalfSpan = initial?.viewHalfSpan ?? 0.05;
+  // An explicit box wins over the derived one, for the straddling cases the
+  // centre-plus-span form cannot express as clearly.
+  let explicitBounds: {
+    west: number;
+    south: number;
+    east: number;
+    north: number;
+  } | null = null;
 
   const applyCameraOptions = (options: Record<string, unknown>): void => {
     if (typeof options['pitch'] === 'number') camera.pitch = options['pitch'];
@@ -100,19 +145,6 @@ export function fakeMapHarness(initial?: {
   const map = {
     getSource: (id: string) => sources.get(id),
     addSource: (id: string, spec: Record<string, unknown>) => {
-      // Model the real GeoJSONSource read-back seam. MapLibre's own
-      // `getData()` resolves with the object the source was given (it reads
-      // `_data.geojson`, not the worker's tiles), and a presentation
-      // companion that re-presents another layer's geometry uses it rather
-      // than importing that layer's module (src/layers/nifc-perimeter-ribbon.ts).
-      // Defined non-enumerably so `toEqual`/`toMatchObject` assertions over
-      // the recorded source specs are unaffected.
-      if (spec['type'] === 'geojson' && !('getData' in spec)) {
-        Object.defineProperty(spec, 'getData', {
-          enumerable: false,
-          value: () => Promise.resolve(spec['data'])
-        });
-      }
       sources.set(id, spec);
     },
     removeSource: (id: string) => {
@@ -170,6 +202,30 @@ export function fakeMapHarness(initial?: {
     getPitch: () => camera.pitch,
     getBearing: () => camera.bearing,
     getZoom: () => zoom,
+    getCenter: () => ({ ...center }),
+    /**
+     * The visible footprint, in MapLibre's `LngLatBounds` accessor shape.
+     * Derived from the centre and `viewHalfSpan` so an existing spec that
+     * only calls `setCenter` keeps behaving as it did, while a spec that
+     * needs a view straddling a coverage edge can widen the span or set an
+     * explicit box with `setBounds`. Read by fire3d.ts's
+     * `readTerrainCoverage`, which is what makes the three coverage
+     * readings testable at all.
+     */
+    getBounds: () => {
+      const box = explicitBounds ?? {
+        west: center.lng - viewHalfSpan,
+        south: center.lat - viewHalfSpan,
+        east: center.lng + viewHalfSpan,
+        north: center.lat + viewHalfSpan
+      };
+      return {
+        getWest: () => box.west,
+        getSouth: () => box.south,
+        getEast: () => box.east,
+        getNorth: () => box.north
+      };
+    },
     easeTo: (options: Record<string, unknown>) => {
       cameraCalls.push({ kind: 'easeTo', options });
       applyCameraOptions(options);
@@ -212,7 +268,36 @@ export function fakeMapHarness(initial?: {
         listener({});
       }
     },
-    getZoom: () => zoom
+    getZoom: () => zoom,
+    setCenter: (next: { lng: number; lat: number }) => {
+      center = { ...next };
+      explicitBounds = null;
+      for (const listener of [...(listeners.get('moveend') ?? [])]) {
+        listener({});
+      }
+    },
+    setBounds: (next: {
+      west: number;
+      south: number;
+      east: number;
+      north: number;
+    }) => {
+      explicitBounds = { ...next };
+      center = {
+        lng: (next.west + next.east) / 2,
+        lat: (next.south + next.north) / 2
+      };
+      for (const listener of [...(listeners.get('moveend') ?? [])]) {
+        listener({});
+      }
+    },
+    setViewHalfSpan: (next: number) => {
+      viewHalfSpan = next;
+      explicitBounds = null;
+      for (const listener of [...(listeners.get('moveend') ?? [])]) {
+        listener({});
+      }
+    }
   };
 }
 
@@ -257,6 +342,7 @@ export function installFakeBrowser(
     search: options.search ?? ''
   };
   const widthListeners = new Set<() => void>();
+  const events = new EventTarget();
 
   const matchMedia = (query: string) => {
     const isWidth = query.includes('min-width');
@@ -286,7 +372,10 @@ export function installFakeBrowser(
         }
       },
       setTimeout: globalThis.setTimeout.bind(globalThis),
-      clearTimeout: globalThis.clearTimeout.bind(globalThis)
+      clearTimeout: globalThis.clearTimeout.bind(globalThis),
+      addEventListener: events.addEventListener.bind(events),
+      removeEventListener: events.removeEventListener.bind(events),
+      dispatchEvent: events.dispatchEvent.bind(events)
     }
   });
   Object.defineProperty(globalThis, 'document', {
@@ -377,7 +466,81 @@ export function captureWarnings(): CapturedWarnings {
   };
 }
 
-/** A minimal valid PMTiles v3 header prefix (magic + spec version 3). */
-export const PMTILES_V3_HEADER_PREFIX = new Uint8Array([
-  0x50, 0x4d, 0x54, 0x69, 0x6c, 0x65, 0x73, 0x03
-]);
+/** The shape of a synthetic PMTiles v3 header; every field has a bundled-archive default. */
+export interface PmtilesHeaderShape {
+  readonly minZoom?: number;
+  readonly maxZoom?: number;
+  readonly tileDataOffset?: number;
+  readonly tileDataLength?: number;
+  /** 2 is PNG, the terrarium raster-dem archives' type. */
+  readonly tileType?: number;
+  /** [west, south, east, north] in degrees. */
+  readonly bounds?: readonly [number, number, number, number];
+}
+
+/**
+ * The bundled hillshade archive's own header numbers (read from
+ * public/data/hillshade-dem-pnw.pmtiles on 2026-09-10: tile data at offset
+ * 1133 for 35,251,077 bytes, a 35,252,210-byte object, zoom 0 to 8, the
+ * PNW box). A fixture built with no overrides describes that archive.
+ */
+const BUNDLED_HEADER_SHAPE: Required<PmtilesHeaderShape> = {
+  minZoom: 0,
+  maxZoom: 8,
+  tileDataOffset: 1133,
+  tileDataLength: 35_251_077,
+  tileType: 2,
+  bounds: [-125, 41.5, -110.5, 49.5]
+};
+
+/**
+ * A complete 127-byte PMTiles v3 header (magic, version 3, and the fields
+ * src/util/pmtiles-probe.ts reads at their spec offsets), so a stub answers
+ * the probe the way a real archive does. Before 2026-09-10 the fixture was
+ * the eight-byte magic alone, which is exactly the truncated shape the
+ * hardened probe now rejects.
+ */
+export function pmtilesV3Header(shape: PmtilesHeaderShape = {}): Uint8Array {
+  const s = { ...BUNDLED_HEADER_SHAPE, ...shape };
+  const bytes = new Uint8Array(127);
+  bytes.set([0x50, 0x4d, 0x54, 0x69, 0x6c, 0x65, 0x73, 0x03], 0);
+  const view = new DataView(bytes.buffer);
+  view.setBigUint64(56, BigInt(s.tileDataOffset), true);
+  view.setBigUint64(64, BigInt(s.tileDataLength), true);
+  view.setUint8(99, s.tileType);
+  view.setUint8(100, s.minZoom);
+  view.setUint8(101, s.maxZoom);
+  const [west, south, east, north] = s.bounds;
+  view.setInt32(102, Math.round(west * 1e7), true);
+  view.setInt32(106, Math.round(south * 1e7), true);
+  view.setInt32(110, Math.round(east * 1e7), true);
+  view.setInt32(114, Math.round(north * 1e7), true);
+  return bytes;
+}
+
+/** The whole-object size a header of this shape implies. */
+export function pmtilesObjectSize(shape: PmtilesHeaderShape = {}): number {
+  const s = { ...BUNDLED_HEADER_SHAPE, ...shape };
+  return s.tileDataOffset + s.tileDataLength;
+}
+
+/**
+ * The response a ranged header probe gets from a healthy server: 206 with a
+ * Content-Range whose total matches the header's own extent. Pass `total`
+ * to model a server holding a different number of bytes (a truncated
+ * upload), which the probe must reject.
+ */
+export function pmtilesHeaderResponse(
+  shape: PmtilesHeaderShape = {},
+  options: { readonly total?: number } = {}
+): Response {
+  const total = options.total ?? pmtilesObjectSize(shape);
+  // Wrapped in a fresh Uint8Array: `pmtilesV3Header` returns
+  // `Uint8Array<ArrayBufferLike>`, and `Response`'s BodyInit wants the
+  // narrower `Uint8Array<ArrayBuffer>`; copying into a new typed array
+  // backed by a real ArrayBuffer satisfies that honestly (same bytes).
+  return new Response(new Uint8Array(pmtilesV3Header(shape)), {
+    status: 206,
+    headers: { 'Content-Range': `bytes 0-126/${total}` }
+  });
+}

@@ -1,7 +1,7 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from './offline-test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { gotoApp } from './helpers';
+import { gotoApp, showFullDetail } from './helpers';
 
 const SNAPSHOT_PATH = join(process.cwd(), 'public', 'data', 'enso-indices.json');
 
@@ -78,6 +78,19 @@ function snapshotInState(
       }
     }
   };
+}
+
+/**
+ * Serve the bundled snapshot with its monthly Nino 3.4 file published today,
+ * so a case about how the monthly claim renders does not depend on CPC having
+ * issued it within the 60-day cadence gate (audit round 5, R5-32).
+ */
+async function routeFreshMonthlySnapshot(page: Page): Promise<void> {
+  const base = readSnapshot();
+  const snapshot = { ...base, nino34: { ...base.nino34, published: new Date().toISOString().slice(0, 10) } };
+  await page.route('**/data/enso-indices.json', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(snapshot) })
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -160,12 +173,14 @@ test.describe('ENSO observed-state repair', () => {
     expect(snapshot.roni.latest.preliminary).toBe(true);
     expect(snapshot.oni.latest.preliminary).toBe(true);
 
+    await routeFreshMonthlySnapshot(page);
     await gotoApp(page, '?select=state:WA');
 
     await expect(page.locator('#enso-driver')).toHaveCount(0);
 
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
     const derived = panel.locator('.impact-claim-derived', {
       hasText: 'operational RONI'
     });
@@ -224,10 +239,12 @@ test.describe('ENSO observed-state repair', () => {
   test('briefing labels Nino 3.4 analyzed, keeps SOI supporting, and renders no plume', async ({
     page
   }) => {
+    await routeFreshMonthlySnapshot(page);
     await gotoApp(page, '?select=state:WA');
 
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
 
     const derived = panel.locator('.impact-claim-derived', {
       hasText: 'operational RONI'
@@ -311,6 +328,7 @@ test.describe('ENSO observed-state repair', () => {
     await gotoApp(page, '?select=state:WA');
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
 
     const derived = panel.locator('.impact-claim-derived', {
       hasText: 'operational RONI'
@@ -352,13 +370,15 @@ test.describe('ENSO observed-state repair', () => {
       route.fulfill({
         status: 200,
         contentType: 'application/json',
-        body: JSON.stringify(snapshotInState('la-nina', 'la-nina', 'weakening', -1.1))
+        // The stored direction is the raw sign: a rise toward zero, which is a weakening La Nina.
+        body: JSON.stringify(snapshotInState('la-nina', 'la-nina', 'strengthening', -1.1))
       })
     );
 
     await gotoApp(page, '?select=state:WA');
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
 
     const derived = panel.locator('.impact-claim-derived', {
       hasText: 'operational RONI'
@@ -389,13 +409,14 @@ test.describe('ENSO observed-state repair', () => {
     await gotoApp(page, '?select=state:WA');
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
 
     const derived = panel.locator('.impact-claim-derived', {
       hasText: 'operational RONI'
     });
     await expect(derived.first()).toBeVisible({ timeout: 30_000 });
     await expect(derived.first()).toContainText('ENSO conditions are neutral');
-    await expect(derived.first()).toContainText('onset thresholds');
+    await expect(derived.first()).toContainText('CPC thresholds');
     // The uncited forecast-skill assertion is gone; the redirection stays.
     await expect(panel).not.toContainText('offers little long-range signal');
     const tendency = panel.locator('.impact-claim', {

@@ -25,6 +25,9 @@ export interface NwsPointMetadata {
   readonly forecastUrl: string | null;
   readonly office: string | null;
   readonly gridId: string | null;
+  /** The grid cell's column and row on that office's grid (points gridX, gridY). */
+  readonly gridX: number | null;
+  readonly gridY: number | null;
 }
 
 export interface NwsRequestSession {
@@ -69,12 +72,16 @@ export function createNwsRequestSession(
       const existing = inFlight.get(url);
       if (existing) return existing;
 
-      const request = fetchJsonWithBudget(
-        nwsRequestUrl(url),
-        { headers: NWS_ACCEPT },
-        signal,
-        NWS_TIMEOUT_MS
-      )
+      const requestUrl = nwsRequestUrl(url);
+      const read = (target: string): Promise<unknown> =>
+        fetchJsonWithBudget(target, { headers: NWS_ACCEPT }, signal, NWS_TIMEOUT_MS);
+      const request = read(requestUrl)
+        // api.weather.gov allows CORS: a failed Worker read (limit, outage)
+        // is retried direct once, unless the briefing itself was abandoned.
+        .catch((err: unknown) => {
+          if (signal.aborted || requestUrl === url) throw err;
+          return read(url);
+        })
         .then((payload) => {
           if (signal.aborted) {
             throw new DOMException('Aborted', 'AbortError');
@@ -101,6 +108,16 @@ function stringProperty(
     : null;
 }
 
+function integerProperty(
+  properties: Readonly<Record<string, unknown>>,
+  key: string
+): number | null {
+  const value = properties[key];
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
 export function parseNwsPointMetadata(
   pointUrl: string,
   payload: unknown
@@ -117,7 +134,9 @@ export function parseNwsPointMetadata(
     office:
       stringProperty(properties, 'cwa') ??
       stringProperty(properties, 'forecastOffice'),
-    gridId: stringProperty(properties, 'gridId')
+    gridId: stringProperty(properties, 'gridId'),
+    gridX: integerProperty(properties, 'gridX'),
+    gridY: integerProperty(properties, 'gridY')
   };
 }
 

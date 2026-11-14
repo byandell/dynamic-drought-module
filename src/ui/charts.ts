@@ -20,6 +20,7 @@
  */
 
 import { escapeHtml } from '../util/escape';
+import { ENSO_INDEX_GUIDE_COLORS, CPC_OUTLOOK_TERCILE_COLORS, OBSERVATION_SERIES_COLOR, INDEX_SERIES_COLORS } from '../config/palette';
 
 /**
  * Wrap chart inner markup in an accessible, responsive SVG. `title` is the text
@@ -48,8 +49,8 @@ export interface SparklineOptions {
   readonly title: string;
   /** Unit label appended to the current-value readout, for example "ft3/s". */
   readonly unit?: string;
-  /** Source attribution line. */
-  readonly source?: string;
+  /** Reference values drawn as thin dashed lines (for example the +/-0.5 ENSO thresholds). */
+  readonly guides?: readonly number[];
 }
 
 /**
@@ -57,6 +58,7 @@ export interface SparklineOptions {
  * current-value dot and min and max labels. Legible at a few hundred pixels
  * wide in a narrow popup; tick labels are dropped before the data is. Returns
  * an empty string for fewer than two points (nothing meaningful to draw).
+ * Guides widen the vertical range so each one stays on the plot.
  */
 export function sparklineSvg(values: readonly number[], opts: SparklineOptions): string {
   const clean = values.filter((v) => Number.isFinite(v));
@@ -65,30 +67,35 @@ export function sparklineSvg(values: readonly number[], opts: SparklineOptions):
   const w = 240;
   const h = 56;
   const padX = 6;
-  const padTop = 6;
+  const padTop = 14;
   const padBottom = 16;
+  const guides = (opts.guides ?? []).filter((v) => Number.isFinite(v));
   const min = Math.min(...clean);
   const max = Math.max(...clean);
-  const span = max - min || 1;
+  const lo = Math.min(min, ...guides);
+  const span = Math.max(max, ...guides) - lo || 1;
   const plotW = w - padX * 2;
   const plotH = h - padTop - padBottom;
 
   const x = (i: number): number => padX + (i / (clean.length - 1)) * plotW;
-  const y = (v: number): number => padTop + (1 - (v - min) / span) * plotH;
+  const y = (v: number): number => padTop + (1 - (v - lo) / span) * plotH;
 
+  const guideLines = guides
+    .map((g) => `<line x1="${padX}" y1="${y(g).toFixed(1)}" x2="${w - padX}" y2="${y(g).toFixed(1)}" stroke="var(--line-strong)" stroke-width="0.6" stroke-dasharray="3 3"/>`)
+    .join('');
   const points = clean.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
   const lastIdx = clean.length - 1;
   const lastVal = clean[lastIdx] as number;
   const unit = opts.unit ? ` ${opts.unit}` : '';
 
   const inner =
-    `<polyline points="${points}" fill="none" stroke="var(--accent)" stroke-width="1.5" ` +
+    guideLines +
+    `<polyline points="${points}" fill="none" stroke="${OBSERVATION_SERIES_COLOR}" stroke-width="1.5" ` +
     `stroke-linejoin="round" stroke-linecap="round"/>` +
-    `<circle cx="${x(lastIdx).toFixed(1)}" cy="${y(lastVal).toFixed(1)}" r="2.6" fill="var(--accent)"/>` +
+    `<circle cx="${x(lastIdx).toFixed(1)}" cy="${y(lastVal).toFixed(1)}" r="2.6" fill="${OBSERVATION_SERIES_COLOR}"/>` +
     `<text x="${padX}" y="${h - 4}" fill="var(--fg-3)" font-size="8">min ${min.toLocaleString()}</text>` +
     `<text x="${w - padX}" y="${h - 4}" fill="var(--fg-3)" font-size="8" text-anchor="end">max ${max.toLocaleString()}</text>` +
-    `<text x="${x(lastIdx).toFixed(1)}" y="${(y(lastVal) - 5).toFixed(1)}" fill="var(--fg-0)" font-size="9" text-anchor="end" font-weight="600">${lastVal.toLocaleString()}${escapeHtml(unit)}</text>` +
-    (opts.source ? attribution(padX, h - 4 + 9, opts.source) : '');
+    `<text x="${x(lastIdx).toFixed(1)}" y="${(y(lastVal) - 5).toFixed(1)}" fill="var(--fg-0)" font-size="9" text-anchor="end" font-weight="600">${lastVal.toLocaleString()}${escapeHtml(unit)}</text>`;
 
   return `<figure class="ddm-chart-fig">${svgWrap(w, h, opts.title, inner)}</figure>`;
 }
@@ -153,8 +160,8 @@ export function trendLineSvg(points: readonly TrendPoint[], opts: TrendOptions):
     `<text x="2" y="${(padTop + 4).toFixed(1)}" fill="var(--fg-3)" font-size="8">${opts.yMax}</text>` +
     `<text x="2" y="${baselineY}" fill="var(--fg-3)" font-size="8">0</text>` +
     `<text x="2" y="${(padTop + plotH / 2 + 3).toFixed(1)}" fill="var(--fg-3)" font-size="8">${Math.round(opts.yMax / 2)}</text>` +
-    `<polyline points="${linePts}" fill="none" stroke="var(--accent)" stroke-width="1.6" stroke-linejoin="round"/>` +
-    `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2.8" fill="var(--accent)"/>` +
+    `<polyline points="${linePts}" fill="none" stroke="${OBSERVATION_SERIES_COLOR}" stroke-width="1.6" stroke-linejoin="round"/>` +
+    `<circle cx="${x(last.t).toFixed(1)}" cy="${y(last.v).toFixed(1)}" r="2.8" fill="${OBSERVATION_SERIES_COLOR}"/>` +
     `<text x="${(x(last.t) - 3).toFixed(1)}" y="${(y(last.v) - 5).toFixed(1)}" fill="var(--fg-0)" font-size="9" text-anchor="end" font-weight="600">${escapeHtml(opts.yLabel)} ${Math.round(last.v)}</text>` +
     (opts.source ? attribution(padL, h - 4, opts.source) : '');
 
@@ -162,7 +169,7 @@ export function trendLineSvg(points: readonly TrendPoint[], opts: TrendOptions):
 }
 
 // ---------------------------------------------------------------------------
-// Stacked probability bar (shared by CPC outlook terciles and ENSO)
+// Stacked probability bar (CPC outlook terciles)
 // ---------------------------------------------------------------------------
 
 export interface ProbSegment {
@@ -178,8 +185,7 @@ export interface ProbSegment {
 /**
  * Render a horizontal stacked-probability bar with each segment directly
  * labeled by name and percent, so meaning never rests on hue alone. Used for a
- * Climate Prediction Center below/near/above tercile split and for an El Nino /
- * Southern Oscillation (ENSO) probability split. Probabilities are rendered as
+ * Climate Prediction Center below/near/above tercile split. Probabilities are rendered as
  * probabilities, never collapsed to a single value.
  */
 export function stackedProbabilityBarsSvg(segments: readonly ProbSegment[], title: string, source?: string): string {
@@ -239,6 +245,8 @@ export interface OniLineOptions {
   readonly source: string;
   /** Label for the primary series; defaults to "ONI". */
   readonly primaryLabel?: string;
+  /** Issuer product for the two reference guides, independent of display wording. */
+  readonly guideSource?: keyof typeof ENSO_INDEX_GUIDE_COLORS;
   /** Optional second series (RONI) plotted dashed, with a legend. */
   readonly compare?: OniCompareSeries;
 }
@@ -263,6 +271,7 @@ export function oniLineSvg(values: readonly OniPoint[], opts: OniLineOptions): s
   if (pts.length < 2) return '';
   const cmp = opts.compare ? opts.compare.values.filter((p) => Number.isFinite(p.anom)) : [];
   const primaryLabel = opts.primaryLabel ?? 'ONI';
+  const guideColors = ENSO_INDEX_GUIDE_COLORS[opts.guideSource ?? 'ONI'];
 
   const w = 280;
   const h = 120;
@@ -292,24 +301,26 @@ export function oniLineSvg(values: readonly OniPoint[], opts: OniLineOptions): s
 
   const guides =
     `<line x1="${padL}" y1="${zeroY}" x2="${w - padR}" y2="${zeroY}" stroke="var(--line-strong)" stroke-width="0.7"/>` +
-    `<line x1="${padL}" y1="${elY}" x2="${w - padR}" y2="${elY}" stroke="var(--warn)" stroke-width="0.6" stroke-dasharray="3 3"/>` +
-    `<line x1="${padL}" y1="${laY}" x2="${w - padR}" y2="${laY}" stroke="var(--accent)" stroke-width="0.6" stroke-dasharray="3 3"/>` +
-    `<text x="${w - padR}" y="${(Number(elY) - 2).toFixed(1)}" fill="var(--warn)" font-size="7.5" text-anchor="end">El Nino +0.5</text>` +
-    `<text x="${w - padR}" y="${(Number(laY) + 8).toFixed(1)}" fill="var(--accent)" font-size="7.5" text-anchor="end">La Nina -0.5</text>`;
+    `<line data-index-guide-casing="warm" x1="${padL}" y1="${elY}" x2="${w - padR}" y2="${elY}" stroke="var(--fg-1)" stroke-width="1.6" stroke-dasharray="3 3"/>` +
+    `<line data-index-guide="warm" x1="${padL}" y1="${elY}" x2="${w - padR}" y2="${elY}" stroke="${guideColors.warm}" stroke-width="0.6" stroke-dasharray="3 3"/>` +
+    `<line data-index-guide-casing="cold" x1="${padL}" y1="${laY}" x2="${w - padR}" y2="${laY}" stroke="var(--fg-1)" stroke-width="1.6" stroke-dasharray="3 3"/>` +
+    `<line data-index-guide="cold" x1="${padL}" y1="${laY}" x2="${w - padR}" y2="${laY}" stroke="${guideColors.cold}" stroke-width="0.6" stroke-dasharray="3 3"/>` +
+    `<text x="${w - padR}" y="${(Number(elY) - 2).toFixed(1)}" fill="var(--fg-1)" font-size="7.5" text-anchor="end">El Nino +0.5</text>` +
+    `<text x="${w - padR}" y="${(Number(laY) + 8).toFixed(1)}" fill="var(--fg-1)" font-size="7.5" text-anchor="end">La Nina -0.5</text>`;
 
   // Legend (top-left): a solid swatch for the primary, a dashed swatch for the
   // comparison, each with its current value.
   let legend =
-    `<line x1="${padL}" y1="6" x2="${padL + 12}" y2="6" stroke="var(--fg-0)" stroke-width="1.6"/>` +
+    `<line data-index-series="primary" x1="${padL}" y1="6" x2="${padL + 12}" y2="6" stroke="${INDEX_SERIES_COLORS.primary}" stroke-width="1.6"/>` +
     `<text x="${padL + 16}" y="9" fill="var(--fg-1)" font-size="8">${escapeHtml(primaryLabel)}${primaryHasPreliminary ? '*' : ''} ${signedAnom(last.anom)}</text>`;
   let comparePoly = '';
   let compareDot = '';
   if (cmpLast) {
     const cmpPts = cmp.map((p, i) => `${xOf(i, cmp.length).toFixed(1)},${y(p.anom).toFixed(1)}`).join(' ');
-    comparePoly = `<polyline points="${cmpPts}" fill="none" stroke="var(--fg-2)" stroke-width="1.2" stroke-dasharray="4 2" stroke-linejoin="round"/>`;
-    compareDot = `<circle cx="${xOf(cmp.length - 1, cmp.length).toFixed(1)}" cy="${y(cmpLast.anom).toFixed(1)}" r="2.4" fill="var(--fg-2)"/>`;
+    comparePoly = `<polyline data-index-series="comparison" points="${cmpPts}" fill="none" stroke="${INDEX_SERIES_COLORS.comparison}" stroke-width="1.2" stroke-dasharray="4 2" stroke-linejoin="round"/>`;
+    compareDot = `<circle data-index-series="comparison" cx="${xOf(cmp.length - 1, cmp.length).toFixed(1)}" cy="${y(cmpLast.anom).toFixed(1)}" r="2.4" fill="${INDEX_SERIES_COLORS.comparison}"/>`;
     legend +=
-      `<line x1="${padL + 110}" y1="6" x2="${padL + 122}" y2="6" stroke="var(--fg-2)" stroke-width="1.4" stroke-dasharray="4 2"/>` +
+      `<line data-index-series="comparison" x1="${padL + 110}" y1="6" x2="${padL + 122}" y2="6" stroke="${INDEX_SERIES_COLORS.comparison}" stroke-width="1.4" stroke-dasharray="4 2"/>` +
       `<text x="${padL + 126}" y="9" fill="var(--fg-1)" font-size="8">${escapeHtml(opts.compare!.label)}${compareHasPreliminary ? '*' : ''} ${signedAnom(cmpLast.anom)}</text>`;
   }
   const preliminaryNote = hasPreliminary
@@ -324,9 +335,9 @@ export function oniLineSvg(values: readonly OniPoint[], opts: OniLineOptions): s
     legend +
     preliminaryNote +
     comparePoly +
-    `<polyline points="${primaryPts}" fill="none" stroke="var(--fg-0)" stroke-width="1.4" stroke-linejoin="round"/>` +
+    `<polyline data-index-series="primary" points="${primaryPts}" fill="none" stroke="${INDEX_SERIES_COLORS.primary}" stroke-width="1.4" stroke-linejoin="round"/>` +
     compareDot +
-    `<circle cx="${xOf(pts.length - 1, pts.length).toFixed(1)}" cy="${y(last.anom).toFixed(1)}" r="2.8" fill="var(--fg-0)"/>` +
+    `<circle data-index-series="primary" cx="${xOf(pts.length - 1, pts.length).toFixed(1)}" cy="${y(last.anom).toFixed(1)}" r="2.8" fill="${INDEX_SERIES_COLORS.primary}"/>` +
     `<text x="${padL}" y="${h - 12}" fill="var(--fg-3)" font-size="7.5">${escapeHtml(firstLabel)}</text>` +
     `<text x="${w - padR}" y="${h - 12}" fill="var(--fg-3)" font-size="7.5" text-anchor="end">${escapeHtml(lastLabel)}</text>` +
     attribution(padL, h - 2, opts.source);
@@ -338,114 +349,13 @@ export function oniLineSvg(values: readonly OniPoint[], opts: OniLineOptions): s
 }
 
 // ---------------------------------------------------------------------------
-// ENSO probability plume (DORMANT since 2026-07-21, T-P0-1: the CPC HTML
-// scrape that fed it was removed per the anti-scrape doctrine, so no current
-// snapshot carries a probabilities block and this chart never renders. The
-// machinery is reserved for a documented machine feed or an explicitly-labeled
-// modeled NMME ensemble (workplan T-V0-3 / U-ENSO-REPAIR).
-// ---------------------------------------------------------------------------
-
-export interface EnsoPlumePoint {
-  /** Overlapping three-month season code, for example "MJJ". */
-  readonly seas: string;
-  /** Integer percent chance of La Nina. */
-  readonly laNina: number;
-  /** Integer percent chance of ENSO-neutral. */
-  readonly neutral: number;
-  /** Integer percent chance of El Nino. */
-  readonly elNino: number;
-}
-
-export interface EnsoPlumeOptions {
-  readonly title: string;
-  readonly source: string;
-}
-
-/**
- * The ENSO probability plume: three probability lines (chance of El Nino,
- * neutral, and La Nina) across the CPC outlook's overlapping three-month
- * seasons. Odds, never outcomes: the y axis is percent probability, every
- * line is labeled with its terminal value, and guides sit at 25/50/75 so
- * "likely" reads against an explicit scale rather than an impression. Warm
- * amber for El Nino, cool cyan for La Nina, grey for neutral, matching the
- * tilt-color language used in the outlook bars.
- */
-export function ensoPlumeSvg(
-  seasons: readonly EnsoPlumePoint[],
-  opts: EnsoPlumeOptions
-): string {
-  const pts = seasons.filter(
-    (p) =>
-      Number.isFinite(p.laNina) && Number.isFinite(p.neutral) && Number.isFinite(p.elNino)
-  );
-  if (pts.length < 2) return '';
-
-  const w = 280;
-  const h = 130;
-  const padL = 26;
-  const padR = 8;
-  const padTop = 22;
-  const padBottom = 24;
-  const plotW = w - padL - padR;
-  const plotH = h - padTop - padBottom;
-
-  const xOf = (i: number): number => padL + (i / (pts.length - 1)) * plotW;
-  const y = (pct: number): number => padTop + (1 - pct / 100) * plotH;
-
-  const line = (read: (p: EnsoPlumePoint) => number): string =>
-    pts.map((p, i) => `${xOf(i).toFixed(1)},${y(read(p)).toFixed(1)}`).join(' ');
-
-  const lastPt = pts[pts.length - 1]!;
-  const series = [
-    { label: 'El Nino', color: 'var(--warn)', points: line((p) => p.elNino), last: lastPt.elNino, dash: '' },
-    { label: 'Neutral', color: 'var(--fg-2)', points: line((p) => p.neutral), last: lastPt.neutral, dash: ' stroke-dasharray="4 2"' },
-    { label: 'La Nina', color: 'var(--accent)', points: line((p) => p.laNina), last: lastPt.laNina, dash: ' stroke-dasharray="2 2"' }
-  ];
-
-  const guides = [25, 50, 75]
-    .map((pct) => {
-      const gy = y(pct).toFixed(1);
-      return (
-        `<line x1="${padL}" y1="${gy}" x2="${w - padR}" y2="${gy}" stroke="var(--line-strong)" stroke-width="0.6" stroke-dasharray="3 3"/>` +
-        `<text x="${padL - 3}" y="${(Number(gy) + 2.5).toFixed(1)}" fill="var(--fg-3)" font-size="7" text-anchor="end">${pct}%</text>`
-      );
-    })
-    .join('');
-
-  const legend = series
-    .map(
-      (s, i) =>
-        `<line x1="${padL + i * 88}" y1="6" x2="${padL + i * 88 + 12}" y2="6" stroke="${s.color}" stroke-width="1.6"${s.dash}/>` +
-        `<text x="${padL + i * 88 + 16}" y="9" fill="var(--fg-1)" font-size="8">${escapeHtml(s.label)} ${s.last}%</text>`
-    )
-    .join('');
-
-  const polylines = series
-    .map(
-      (s) =>
-        `<polyline points="${s.points}" fill="none" stroke="${s.color}" stroke-width="1.4" stroke-linejoin="round"${s.dash}/>`
-    )
-    .join('');
-
-  const inner =
-    guides +
-    legend +
-    polylines +
-    `<text x="${padL}" y="${h - 12}" fill="var(--fg-3)" font-size="7.5">${escapeHtml(pts[0]!.seas)}</text>` +
-    `<text x="${w - padR}" y="${h - 12}" fill="var(--fg-3)" font-size="7.5" text-anchor="end">${escapeHtml(lastPt.seas)}</text>` +
-    attribution(padL, h - 2, opts.source);
-
-  return `<figure class="ddm-chart-fig">${svgWrap(w, h, opts.title, inner)}</figure>`;
-}
-
-// ---------------------------------------------------------------------------
 // CPC outlook diverging bars (below / near / above terciles)
 // ---------------------------------------------------------------------------
 
 export interface CpcOutlookInput {
   /** "temperature" or "precipitation". */
   readonly variable: string;
-  /** "Above", "Below", or "Normal" (the favored category). */
+  /** "Above", "Below", "Normal", or the source's "EC" (no favored category). */
   readonly cat: string;
   /** Probability of the favored category (percent). */
   readonly prob: number;
@@ -455,27 +365,38 @@ export interface CpcOutlookInput {
 
 /**
  * Build a below/near/above tercile bar from a CPC favored category and its
- * probability. The favored tercile gets `prob`; the near-normal tercile is held
- * near climatology (33%); the opposite tercile takes the remainder. The favored
- * segment is toned by its drought meaning, not by an arbitrary hue: amber when
- * the tilt is toward drier or hotter (worsening), green when toward wetter or
- * cooler (easing), grey when near climatology. Every segment is labeled.
+ * probability. CPC's reading guide supplies the inferred other probabilities:
+ * Near stays at 33.33% below the 63.33% breakpoint; above it the opposite
+ * stays at 3.33% and Near takes the remainder. Normal splits the remainder
+ * evenly. EC retains its existing textual claim without a favored chart.
+ * The favored segment uses the exact CPC variable/category/probability color
+ * when the source renderer has that row; other segments stay neutral.
  */
 export function cpcOutlookBarsSvg(input: CpcOutlookInput): string {
-  const p = Number.isFinite(input.prob) ? input.prob : 33.3;
-  const near = 33.3;
-  const favored = Math.max(near, p);
-  const opposite = Math.max(0, 100 - favored - near);
+  // The caller already states EC honestly. It has no favored-category chart.
+  if (input.cat === 'EC') return '';
+  // This guard limits reconstruction, not the issuer's possible probability.
+  // Above 96.67, its 3.33 opposite floor would make Near negative; omit only
+  // the chart and retain the caller's source claim. The parser has no cap.
+  if (!['Above', 'Below', 'Normal'].includes(input.cat) ||
+      !Number.isFinite(input.prob) || input.prob < 33 ||
+      input.prob > (input.cat === 'Normal' ? 100 : 96.67)) return '';
+  // Keep the source probability, including its rounded 33-percent class.
+  // CPC erf_info.php (6-10 and 8-14 day), verified 2026-10-07:
+  // use the published decimal breakpoint/floor; residual goes to Near.
+  const p = input.prob;
+  const favored = p;
+  const opposite = p >= 63.33 ? 3.33 : 100 - p - 33.33;
+  const near = 100 - p - opposite;
 
-  // Worsening = above-normal temperature or below-normal precipitation.
-  const isTemp = input.variable.toLowerCase().startsWith('temp');
-  const worseningCat = isTemp ? 'Above' : 'Below';
-  const favoredTone =
-    input.cat === 'Normal'
-      ? 'var(--fg-3)'
-      : input.cat === worseningCat
-        ? 'var(--warn)'
-        : 'var(--good)';
+  // Service uniqueValue matches cat and prob exactly; no default symbol is supplied.
+  // Do not interpolate, round to 33 or borrow a neighboring source class.
+  const variable = input.variable.toLowerCase();
+  const colors: Readonly<Record<string, string>> | undefined =
+    variable === 'temperature' ? CPC_OUTLOOK_TERCILE_COLORS.temperature :
+    variable === 'precipitation' ? CPC_OUTLOOK_TERCILE_COLORS.precipitation : undefined;
+  const sourceWindow = input.window === '6-10 day' || input.window === '8-14 day';
+  const favoredTone = (sourceWindow ? colors?.[`${input.cat},${p}`] : undefined) ?? 'var(--bg-3)';
 
   let below: number;
   let above: number;

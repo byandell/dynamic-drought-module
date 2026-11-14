@@ -40,6 +40,8 @@ import { getViewMode, onViewModeChange, setViewMode } from '../state/view-mode';
 import type { ViewMode } from '../state/view-mode';
 import { closeImpactPanel, openImpactPanel } from './impact-panel';
 import { buildTribalNationsBriefAction } from './tribal-nations-action';
+import { loadSearchController } from './search-chunk';
+import { createChunkLoader } from '../util/chunk-retry';
 import { prefersReducedMotion } from '../util/motion';
 import {
   backToMap,
@@ -60,11 +62,13 @@ import {
   getCommittedSnapshot,
   onCommittedSnapshotChange
 } from '../state/cluster-service';
+import { bindStudioEscape, trapStudioTabFocus } from './island/studio-inert';
 
 const LAYERS_STUDIO_ENTRY_ID = 'layers-studio-entry';
 const PLACE_STUDIO_ENTRY_ID = 'place-studio-entry';
 const STUDIO_ENTRY_PAIR_ID = 'studio-entry-pair';
 const STUDIO_LINKOUT_PAIR_ID = 'studio-linkout-pair';
+const PLACE_STUDIO_ENTRY_STATUS_ID = 'place-studio-entry-status';
 const PLACE_STUDIO_OPENER_EVENT = 'ddm:place-studio-opener';
 const LAYERS_STUDIO_ENTRY_TITLE =
   'Open the LAYERS studio: layer search, toggles, and sources';
@@ -75,6 +79,56 @@ let placeStudioRoot: HTMLElement | null = null;
 let placeStudioModule: typeof import('./island/place-studio') | null = null;
 let placeStudioPromise: Promise<typeof import('./island/place-studio')> | null = null;
 let placeStudioOpener: HTMLElement | null = null;
+let releasePlaceStudioTabTrap: (() => void) | null = null;
+let releasePlaceStudioEscape: (() => void) | null = null;
+
+/**
+ * Mark the PLACE entry button pending (found-012): an `aria-busy` state
+ * plus a reused `.impact-spinner` glyph, set the SAME task as the press
+ * (called synchronously from `syncPlaceStudioRoute`, itself called
+ * synchronously from `enterStudio`'s `notify('push')`), so a held chunk
+ * shows within one frame instead of the 2.4 to 3.6 s of silence the
+ * register recorded. The one-time status paragraph is the "announced
+ * once" half: its text is set once per press, not on every render.
+ */
+function markPlaceStudioEntryPending(el: HTMLElement | null): void {
+  if (!el) return;
+  el.setAttribute('aria-busy', 'true');
+  el.classList.add('studio-entry-pending');
+  if (!el.querySelector('.studio-entry-pending-spinner')) {
+    const spinner = document.createElement('span');
+    spinner.className = 'impact-spinner studio-entry-pending-spinner';
+    spinner.setAttribute('aria-hidden', 'true');
+    el.appendChild(spinner);
+  }
+  let status = document.getElementById(PLACE_STUDIO_ENTRY_STATUS_ID);
+  if (!status) {
+    status = document.createElement('p');
+    status.id = PLACE_STUDIO_ENTRY_STATUS_ID;
+    status.className = 'sr-only';
+    status.setAttribute('role', 'status');
+    status.setAttribute('aria-live', 'polite');
+    document.body.appendChild(status);
+  }
+  status.textContent = 'Opening the PLACE studio.';
+}
+
+function clearPlaceStudioEntryPending(el: HTMLElement | null): void {
+  if (!el) return;
+  el.removeAttribute('aria-busy');
+  el.classList.remove('studio-entry-pending');
+  el.querySelector('.studio-entry-pending-spinner')?.remove();
+}
+
+// DDM-P1-T10: a second `import()` of the SAME failed chunk URL replays the
+// SAME rejection (Chromium's module map, no new request), so a retry after
+// a failure only works under a NEW url. `createChunkLoader`
+// (src/util/chunk-retry.ts) keeps that URL memory across every call the
+// same way sidebar.ts's `loadIsland` does for the core island.
+const loadPlaceStudioChunk = createChunkLoader(
+  () => import('./island/place-studio'),
+  import.meta.url
+);
 
 function restorePlaceStudioFocus(opener: HTMLElement | null): void {
   if (opener?.isConnected) {
@@ -95,13 +149,20 @@ function capturePlaceStudioOpener(event: Event): void {
 /**
  * Render the shared accessible failure surface inside a studio route root.
  *
- * The retry is a full page reload rather than a re-import: Chromium caches
- * a FAILED dynamic-import in the document's module map, so re-running
- * import() with the same static specifier returns the same rejection for
- * the life of the page (observed at this fix's integration gate; the
- * lane's promise-reset alone could not recover). The studio route is URL
- * state, so the reload restores the studio honestly and refetches the
- * chunk.
+ * "Try again" reloads the page: Chromium caches a FAILED dynamic import in
+ * the document's module map, so a fresh `import()` of the SAME url within
+ * the SAME page would replay the SAME rejection. The studio route is URL
+ * state, so the reload restores the studio honestly and starts every
+ * import fresh.
+ *
+ * The studio chunk itself also self-heals without a reload: `loadPlaceStudio`
+ * below and `loadStudio` (src/ui/sidebar.ts) route their import through
+ * `createChunkLoader` (src/util/chunk-retry.ts), which remembers the
+ * chunk's URL once a call rejects and retries a LATER call under a
+ * `retry=<n>` query, a cache key the module map has never marked failed.
+ * Leaving the studio (Back to map) and reopening it is such a later call,
+ * so a studio that failed once can recover on its own re-entry, with no
+ * reload at all.
  */
 export function renderStudioLoadFailure(
   root: HTMLElement,
@@ -148,7 +209,7 @@ export function renderStudioLoadFailure(
 }
 
 function loadPlaceStudio(root: HTMLElement): void {
-  const promise = placeStudioPromise ?? import('./island/place-studio');
+  const promise = placeStudioPromise ?? loadPlaceStudioChunk();
   placeStudioPromise = promise;
   void promise
     .then((module) => {
@@ -162,6 +223,7 @@ function loadPlaceStudio(root: HTMLElement): void {
       ) {
         return;
       }
+      clearPlaceStudioEntryPending(placeStudioOpener);
       module.mountPlaceStudio(root);
     })
     .catch((err: unknown) => {
@@ -174,6 +236,7 @@ function loadPlaceStudio(root: HTMLElement): void {
         !isPhysicallyFramed() &&
         placeStudioRoot === root
       ) {
+        clearPlaceStudioEntryPending(placeStudioOpener);
         renderStudioLoadFailure(root, 'place-studio-failure-heading');
       }
     });
@@ -185,11 +248,13 @@ function syncPlaceStudioRoute(
 ): void {
   if (route === 'place' && source === 'push') {
     const active = document.activeElement;
-    placeStudioOpener =
+    // Keep the click-set opener when the click left focus elsewhere (Safari does not focus buttons).
+    if (
       active instanceof HTMLElement &&
       (active.id === PLACE_STUDIO_ENTRY_ID || active.id === 'sheet-place-studio-entry')
-        ? active
-        : null;
+    ) {
+      placeStudioOpener = active;
+    }
   }
 
   const isEmbed = document.getElementById('app')?.classList.contains('embed') ?? false;
@@ -197,6 +262,15 @@ function syncPlaceStudioRoute(
     if (placeStudioRoot) {
       const opener = placeStudioOpener;
       placeStudioOpener = null;
+      clearPlaceStudioEntryPending(opener);
+      if (releasePlaceStudioTabTrap) {
+        releasePlaceStudioTabTrap();
+        releasePlaceStudioTabTrap = null;
+      }
+      if (releasePlaceStudioEscape) {
+        releasePlaceStudioEscape();
+        releasePlaceStudioEscape = null;
+      }
       if (placeStudioModule) placeStudioModule.unmountPlaceStudio(placeStudioRoot);
       placeStudioRoot.remove();
       placeStudioRoot = null;
@@ -209,6 +283,13 @@ function syncPlaceStudioRoute(
     placeStudioRoot = document.createElement('div');
     placeStudioRoot.id = 'place-studio-root';
     document.body.appendChild(placeStudioRoot);
+    releasePlaceStudioTabTrap = trapStudioTabFocus(placeStudioRoot);
+    releasePlaceStudioEscape = bindStudioEscape(
+      placeStudioRoot,
+      '#place-studio-back',
+      backToMap
+    );
+    markPlaceStudioEntryPending(placeStudioOpener);
   }
   const root = placeStudioRoot;
   loadPlaceStudio(root);
@@ -325,15 +406,7 @@ function buildBriefHead(map: maplibregl.Map): void {
   const head = document.getElementById('brief-head');
   if (!head) return;
 
-  head.innerHTML = `
-    <p class="brief-head-lede" id="brief-head-lede"></p>
-    <p class="brief-place-context" id="brief-place-context" aria-live="polite" hidden>
-      <span>Selected place</span>
-      <strong id="brief-place-name"></strong>
-      <small>Search below to change.</small>
-    </p>
-    <div id="brief-search"></div>
-  `;
+  head.innerHTML = '<div id="brief-search"></div>';
   syncBriefingTitle();
   refreshLayersStudioEntry();
 
@@ -364,9 +437,8 @@ function selectedHazardTitle(): string {
 
 /**
  * Keep every hazard-named briefing surface in step with the selected cluster
- * (UI-14f). Before this, the Brief head's accessible name followed the hazard
- * while the visible lede, the full-report door, and the mobile at-hand
- * landmark stayed hardcoded to drought on all four screens.
+ * (UI-14f): the Brief head's accessible name and the mobile at-hand
+ * landmark, which once stayed hardcoded to drought on every screen.
  *
  * The wording deliberately names the BRIEFING, not its contents: the panel
  * synthesizes several hazards behind one door, and the per-hazard depth
@@ -380,45 +452,19 @@ function syncBriefingTitle(): void {
   const label = `${title} briefing`;
   head.setAttribute('aria-label', label);
 
-  const lede = document.getElementById('brief-head-lede');
-  if (lede) {
-    lede.textContent =
-      'Select a Tribal land area, reservation, state, or watershed to read ' +
-      `local conditions in the ${label}.`;
-  }
-
-  const reportLink = document.getElementById('brief-full-report-link');
-  if (reportLink) reportLink.textContent = `Open the full ${label}`;
-
   document
     .getElementById('sheet-at-hand')
     ?.setAttribute('aria-label', `At-hand ${title} answer`);
-
-  // The selected-place read names the briefing too, so it has to follow the
-  // same switch rather than waiting for the next selection change.
-  syncBriefSelection(getPlaceSelection());
 }
 
 /**
- * Fill and wire the generated portion of the post-time display block. Static
- * hosts in index.html preserve the El Nino / Southern Oscillation disclosure
- * across lazy hydration and keep #time-bar outside every regenerated region.
- */
-function buildBriefDisplay(): void {
-  // The shell island renders the live, status-derived DisplaySummary.
-  // Keeping a static sentence here would create a second, stale account
-  // of the map state.
-
-  document.getElementById('brief-full-report-link')?.addEventListener('click', () => {
-    const place = getPlaceSelection();
-    if (place) openImpactPanel(place.context);
-  });
-}
-
-/**
- * Reflect the existing place-selection store into the two Brief regions. This
- * is presentation only: the store, report opener, and URL behavior remain the
- * single authorities. No selected-place response is exposed before an explicit
+ * Reflect the existing place-selection store into the Brief display: the
+ * chosen place's name, announced through a visually hidden live region and
+ * nothing more. The name is drawn on its one briefing door, the region row's
+ * (#region-briefing-btn, src/ui/sidebar.ts), in Brief and Console alike; the
+ * card and the sentence that repeated it left the display (visual uniformity
+ * wave 1, D6 and repair R2). Presentation only: the store, report opener, and URL behavior
+ * remain the single authorities, and nothing shows before an explicit
  * selection exists.
  */
 function syncBriefSelection(selection: PlaceSelection | null): void {
@@ -428,22 +474,10 @@ function syncBriefSelection(selection: PlaceSelection | null): void {
   const context = document.getElementById('brief-place-context');
   const name = document.getElementById('brief-place-name');
   const selectionSummary = document.getElementById('brief-selection-summary');
-  const selectionRead = document.getElementById('brief-selection-read');
 
-  if (!selection) {
-    if (context) context.hidden = true;
-    if (name) name.textContent = '';
-    if (selectionSummary) selectionSummary.hidden = true;
-    if (selectionRead) selectionRead.textContent = '';
-    return;
-  }
-
-  if (name) name.textContent = selection.label;
-  if (context) context.hidden = false;
-  if (selectionRead) {
-    selectionRead.textContent = `The map and ${selectedHazardTitle()} briefing are focused on ${selection.label}.`;
-  }
-  if (selectionSummary) selectionSummary.hidden = false;
+  if (name) name.textContent = selection?.label ?? '';
+  if (context) context.hidden = selection === null;
+  if (selectionSummary) selectionSummary.hidden = selection === null;
 }
 
 /**
@@ -505,7 +539,8 @@ export function refreshLayersStudioEntry(): void {
   placeButton.type = 'button';
   placeButton.id = PLACE_STUDIO_ENTRY_ID;
   placeButton.className = 'brief-console-door place-studio-entry';
-  placeButton.textContent = 'PLACE';
+  // Mixed case, as the phone rail writes it (visual uniformity wave 1, D1).
+  placeButton.textContent = 'Place';
   // Accessible name only (W2-D7): no title that duplicates it verbatim.
   placeButton.setAttribute('aria-label', PLACE_STUDIO_ENTRY_TITLE);
   placeButton.addEventListener('click', () => {
@@ -517,7 +552,7 @@ export function refreshLayersStudioEntry(): void {
   layersButton.type = 'button';
   layersButton.id = LAYERS_STUDIO_ENTRY_ID;
   layersButton.className = 'brief-console-door layers-studio-entry';
-  layersButton.textContent = 'LAYERS';
+  layersButton.textContent = 'Layers';
   layersButton.setAttribute('aria-label', LAYERS_STUDIO_ENTRY_TITLE);
   layersButton.addEventListener('click', enterLayersStudio);
 
@@ -534,16 +569,26 @@ export function refreshLayersStudioEntry(): void {
  * class is gone, so an exited embed gets the head search without a reload
  * (the U3 stage-5 minor 7 fix). Every other boot has the island mounted
  * already, so the extra chunk is free. Mounting is idempotent: the search
- * renders into a dedicated container and a re-render replaces it.
+ * renders into a dedicated container and a re-render replaces it, so there
+ * is no mounted flag to reset on failure. The chunk is imported through the
+ * shared `loadSearchController` (src/ui/search-chunk.ts, DDM-P1-T04) rather
+ * than a bare `import('./search-controller')`, so a failed attempt is
+ * recorded there too: a later `ensureBriefHeadSearch` call (the same
+ * embed-exit path) retries through that shared loader under a new URL
+ * instead of replaying the same cached module-map failure.
  */
 function mountBriefSearch(map: maplibregl.Map): void {
   const isEmbed = document.getElementById('app')?.classList.contains('embed') ?? false;
   if (isEmbed && getViewMode() === 'brief') return;
   const container = document.getElementById('brief-search');
   if (!container) return;
-  void import('./search-controller').then(({ mountSearchInto }) => {
-    mountSearchInto(map, container);
-  });
+  void loadSearchController()
+    .then(({ mountSearchInto }) => {
+      mountSearchInto(map, container);
+    })
+    .catch((err: unknown) => {
+      console.error('[view-shell] Brief-head search mount failed:', err);
+    });
 }
 
 /**
@@ -584,7 +629,6 @@ export function initViewShell(map: maplibregl.Map): void {
   document.addEventListener(PLACE_STUDIO_OPENER_EVENT, capturePlaceStudioOpener);
   onStudioRouteChange(syncPlaceStudioRoute);
   buildModeSwitch();
-  buildBriefDisplay();
   buildBriefHead(map);
   onCommittedSnapshotChange(syncBriefingTitle);
   syncBriefSelection(getPlaceSelection());

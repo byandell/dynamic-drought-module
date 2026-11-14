@@ -8,51 +8,68 @@
  * search (the console catalog, the Brief head, the mobile sheet), so all three
  * share ONE component and ONE routing brain.
  *
- * Three result kinds:
+ * Four result kinds:
+ *   - tribal a Tribal land area (LARNAME) or a Census AIANNH area
+ *            (census:<code>) for a Tribe LAR cannot locate; locates it live,
+ *            frames it, lights it, and opens its briefing (locateBoundary).
+ *            A Nation neither source draws (hq:<Nation name>) opens at its
+ *            headquarters town (openHeadquarters).
  *   - place  a state; opens its drought briefing (openStateBriefing).
+ *   - city   a major city from the shipped Natural Earth points; moves the
+ *            camera and opens the briefing of the State that holds it (no
+ *            layer change).
  *   - layer  a catalog layer; turns it on through the shared toggle command
- *            (which co-activates the wildfire pair, syncs the checkbox, and
- *            respects surface exclusivity, exactly like a catalog toggle).
- *   - tribal a Tribal land area (LARNAME); locates it live, frames it, lights
- *            it, and opens its briefing (locateTribalLandArea).
+ *            (which syncs the checkbox and respects surface exclusivity,
+ *            exactly like a catalog toggle; no layer co-activates a partner
+ *            since DR-168).
  *
  * Stewardship: the roster it searches is NAMES ONLY (public/data/tribal-roster
- * .json). Locations come from a LIVE AIAN-LAR query at selection time, never a
- * bundled polygon (hard rule 1). The briefing carries the representation caveat
- * through buildBoundaryContext, as a map click would.
+ * .json). Locations come from a LIVE AIAN-LAR or Census AIANNH query at
+ * selection time, never a bundled polygon (hard rule 1). The selection is
+ * titled with the row's gated formal name, not the service's area name. The briefing carries
+ * the representation caveat through buildBoundaryContext, as a map click would.
  */
 
 import { h, render } from 'preact';
 import type * as maplibregl from 'maplibre-gl';
-import type { Feature, FeatureCollection, Geometry } from 'geojson';
+import type { FeatureCollection } from 'geojson';
 
 import { LAYER_DEFS } from '../config/layers';
 import { URLS } from '../config/urls';
 import { STATE_LABEL } from '../impact/resources';
 import type { StateCode } from '../impact/resources';
-import { buildBoundaryContext } from '../impact/context';
+import { buildBoundaryContext, stateAreaNote } from '../impact/context';
+import { escapeSql, mergeArealGeometry } from '../util/arcgis-features';
 import { bboxCenter, bboxToContinuousBounds } from '../util/bbox';
 import { geometryBboxAcrossAntimeridian } from '../util/antimeridian';
-import { openStateBriefing } from '../state/deep-link';
+import { briefingCameraPadding, openStateBriefing } from '../state/deep-link';
 import { showLocatedBoundary } from '../state/located-boundary';
-import { getViewMode } from '../state/view-mode';
+import { clearEmphasis } from '../state/place-emphasis';
 import { onPlaceSelectionChange, setPlaceSelection } from '../state/place-selection';
-import { loadTribalRoster, TRUSTED_PROVENANCE } from '../state/tribal-roster';
-import { fetchWithBudget } from '../util/fetch';
-import { isSheetActive } from './mobile-sheet';
+import {
+  loadTribalRoster,
+  loadTribalCensusAreas,
+  loadTribalHeadquarters,
+  gatedDisplayName,
+  gatedCensusName
+} from '../state/tribal-roster';
+import type { TribalHeadquarters } from '../state/tribal-roster';
+import { fetchBufferedWithBudget, fetchJsonWithBudget } from '../util/fetch';
+import { isObject } from '../util/guards';
 import { requestLayerOn } from './layer-toggle-command';
-import { isCurrentBriefingIntent, nextBriefingIntent, openImpactPanel } from './impact-panel';
+import {
+  isCurrentBriefingIntent,
+  nextBriefingIntent,
+  onImpactPanelClose,
+  openImpactPanel
+} from './impact-panel';
 import { showToast } from './overlay';
 import { Search } from './island/search';
 import type { SearchItem } from './island/search';
+// The same normalization the roster build and the search component use.
 import { foldSearchText } from '../util/search-fold';
 
 const LOCATE_TIMEOUT_MS = 12_000;
-
-/** The same normalization the roster build and the search component use. */
-function norm(s: string): string {
-  return foldSearchText(s);
-}
 
 /** Places (states) and layers are available synchronously from the config tables. */
 function buildSyncItems(
@@ -61,7 +78,7 @@ function buildSyncItems(
   const items: SearchItem[] = [];
   if (!permittedKinds || permittedKinds.has('place')) {
     for (const [code, name] of Object.entries(STATE_LABEL) as Array<[StateCode, string]>) {
-      items.push({ kind: 'place', id: code, label: name, haystack: norm(`${name} ${code}`) });
+      items.push({ kind: 'place', id: code, label: name, haystack: foldSearchText(`${name} ${code}`) });
     }
   }
   if (!permittedKinds || permittedKinds.has('layer')) {
@@ -75,7 +92,7 @@ function buildSyncItems(
         id: def.key,
         label: def.name,
         sublabel: def.source,
-        haystack: norm(
+        haystack: foldSearchText(
           `${def.name} ${def.source} ${(def.searchTerms ?? []).join(' ')}`
         )
       });
@@ -86,35 +103,132 @@ function buildSyncItems(
 
 let tribalCache: SearchItem[] | null = null;
 let tribalInFlight: Promise<SearchItem[]> | null = null;
+/** The headquarters-town rows (build rule 14), keyed by item id. */
+const headquartersById = new Map<string, TribalHeadquarters>();
+/** The briefing line of a state-recognized Census area's row (build rule 13), keyed by item id. */
+const stateAreaNotes = new Map<string, string>();
+
+const stateName = (code: string): string => STATE_LABEL[code as StateCode] ?? code;
+
+// shortcut: rank <= 4 keeps names unique (111 cities); a deeper cut needs a state field in us-places.json
+const MAJOR_CITY_MAX_RANK = 4;
+/** Coordinates of the major-city items, keyed by item id (the city name). */
+const cityCoords = new Map<string, [number, number]>();
+
+let cityCache: SearchItem[] | null = null;
+let cityInFlight: Promise<SearchItem[]> | null = null;
+
+/** Major cities from the shipped Natural Earth points (us-places.json). */
+async function loadCityItems(): Promise<SearchItem[]> {
+  const json = await fetchJsonWithBudget(URLS.usPlacesLocal, null, null, LOCATE_TIMEOUT_MS);
+  const places = isObject(json) ? json['places'] : undefined;
+  if (!Array.isArray(places)) throw new Error('City index payload has no places list');
+  const items: SearchItem[] = [];
+  const seen = new Set<string>();
+  for (const p of places) {
+    if (!isObject(p)) continue;
+    const { name, lon, lat, rank } = p;
+    if (typeof name !== 'string' || typeof lon !== 'number' || typeof lat !== 'number') continue;
+    if (!Number.isFinite(lon) || !Number.isFinite(lat) || typeof rank !== 'number') continue;
+    if (rank > MAJOR_CITY_MAX_RANK || seen.has(name)) continue;
+    seen.add(name);
+    cityCoords.set(name, [lon, lat]);
+    items.push({ kind: 'city', id: name, label: name, haystack: foldSearchText(name) });
+  }
+  return items;
+}
+
+/**
+ * Lazy-load the major cities (once, cached on success). REJECTS on a failed
+ * or malformed index so the component shows the city group as unavailable and
+ * a later search retries; a failure is never cached as an empty result.
+ */
+function loadCities(): Promise<SearchItem[]> {
+  if (cityCache) return Promise.resolve(cityCache);
+  if (cityInFlight) return cityInFlight;
+  cityInFlight = loadCityItems()
+    .then((items) => (cityCache = items))
+    .catch((err: unknown) => {
+      console.warn('[search] City list load failed.', err);
+      throw err instanceof Error ? err : new Error(String(err));
+    })
+    .finally(() => {
+      cityInFlight = null;
+    });
+  return cityInFlight;
+}
 
 /**
  * Lazy-load the NAMES-ONLY Tribal land-area index (once, cached) from the
  * shared roster module (src/state/tribal-roster.ts, which owns the
- * D-0.7.0-026 structural provenance gate). REJECTS on failure (invariant 6:
- * a failed load must surface as "unavailable", never masquerade as an empty
- * result); the component renders the honest unavailable line and a later
- * attempt can retry.
+ * D-0.7.0-026 structural provenance gate): the AIAN-LAR land areas, then the
+ * Census areas for Tribes LAR cannot locate. REJECTS on a roster failure
+ * (invariant 6: a failed load must surface as "unavailable", never masquerade
+ * as an empty result); the component renders the honest unavailable line and
+ * a later attempt can retry. Cities load separately (loadCities), so a slow or
+ * failed city index never delays or drops the Tribal results.
  */
 function loadTribal(): Promise<SearchItem[]> {
   if (tribalCache) return Promise.resolve(tribalCache);
   if (tribalInFlight) return tribalInFlight;
   tribalInFlight = (async () => {
     try {
-      const areas = await loadTribalRoster();
+      const [areas, census, headquarters] = await Promise.all([
+        loadTribalRoster(),
+        loadTribalCensusAreas(),
+        loadTribalHeadquarters()
+      ]);
+      const seen = new Map<string, number>();
+      // Areas with a row on their own Census name: there, a Nation's row answers to the Nation's name alone,
+      // so "comanche" does not also list the three Nations that share the Comanche Nation's statistical area.
+      const ownRow = new Set(census.filter((a) => gatedCensusName(a) === a.name).map((a) => a.aiannh));
+      const censusItems: SearchItem[] = census.map((a) => {
+        const label = gatedCensusName(a);
+        const areaName = label !== a.name && ownRow.has(a.aiannh) ? '' : `${a.name} `;
+        // An area several Nations share has one row per Nation: the first keeps the plain id, later ones a suffix.
+        const nth = seen.get(a.aiannh) ?? 0;
+        seen.set(a.aiannh, nth + 1);
+        const id = `census:${a.aiannh}${nth ? `:${nth}` : ''}`;
+        if (a.stateArea) {
+          stateAreaNotes.set(id, stateAreaNote(a.name));
+        }
+        return {
+          kind: 'tribal' as const,
+          id,
+          label,
+          ...(label !== a.name ? { sublabel: `Census area: ${a.name}` } : {}),
+          // An OTSA is an Oklahoma Tribal Statistical Area: "of Oklahoma" finds it, never a same-named area elsewhere.
+          haystack: foldSearchText(`${areaName}${label}${a.name.endsWith(' OTSA') ? ' oklahoma' : ''}`)
+        };
+      });
       const items: SearchItem[] = areas.map((a) => {
-        const trusted = TRUSTED_PROVENANCE.has(a.provenance ?? '');
-        const label = trusted ? a.displayName : a.larName;
+        // DDM-P2-T10 / DR-094: the shared gate helper (src/state/tribal-roster.ts),
+        // not an open-coded check, so this list and the place catalog's
+        // Tribal Nations list gate identically.
+        const label = gatedDisplayName(a);
         return {
           kind: 'tribal' as const,
           id: a.larName,
           label,
-          haystack: norm(`${a.larName} ${label}`),
+          haystack: foldSearchText(`${a.larName} ${label}`),
           // exactOptionalPropertyTypes: omit sublabel rather than set undefined.
           ...(label !== a.larName ? { sublabel: `Land area: ${a.larName}` } : {})
         };
       });
-      tribalCache = items;
-      return items;
+      // A Nation no boundary source draws: found under its own name, opened at its headquarters town.
+      const headquartersItems: SearchItem[] = headquarters.map((row) => {
+        const id = `hq:${row.displayName}`;
+        headquartersById.set(id, row);
+        return {
+          kind: 'tribal' as const,
+          id,
+          label: row.displayName,
+          sublabel: `Headquarters town: ${row.town}, ${stateName(row.state)}`,
+          haystack: foldSearchText(row.displayName)
+        };
+      });
+      tribalCache = [...items, ...censusItems, ...headquartersItems];
+      return tribalCache;
     } catch (err) {
       console.warn('[search] Tribal roster load failed.', err);
       throw err instanceof Error ? err : new Error(String(err));
@@ -125,19 +239,6 @@ function loadTribal(): Promise<SearchItem[]> {
   return tribalInFlight;
 }
 
-/** Merge many features' Polygon / MultiPolygon rings into one MultiPolygon. */
-function combineGeometry(features: readonly Feature[]): Geometry | null {
-  const polys: number[][][][] = [];
-  for (const f of features) {
-    const g = f.geometry;
-    if (!g) continue;
-    if (g.type === 'Polygon') polys.push(g.coordinates as number[][][]);
-    else if (g.type === 'MultiPolygon') polys.push(...(g.coordinates as number[][][][]));
-  }
-  if (polys.length === 0) return null;
-  return { type: 'MultiPolygon', coordinates: polys };
-}
-
 /**
  * The master abort for the LARNAME locate (invariant 5): a newer locate
  * supersedes and CANCELS the prior in-flight request rather than only
@@ -145,61 +246,73 @@ function combineGeometry(features: readonly Feature[]): Geometry | null {
  */
 let locateAbort: AbortController | null = null;
 
-// Every selection change supersedes an in-flight locate (invariant 5): the
-// panel closing (selection to null) or a different briefing opening cancels
-// the LARNAME request itself, not merely its late result. The locate's own
-// completion also lands here, but only after its fetch has resolved, where
-// the abort is a no-op.
-onPlaceSelectionChange(() => {
+// Every selection change and every briefing close supersedes an in-flight
+// locate (invariant 5): a different briefing opening, or the panel closing
+// (its "Back to map" keeps the selection, so the close is heard on its own),
+// cancels the LARNAME request itself, not merely its late result. The
+// locate's own completion also lands here, but only after its fetch has
+// resolved, where the abort is a no-op.
+const cancelLocate = (): void => {
   locateAbort?.abort();
   locateAbort = null;
-});
+};
+onPlaceSelectionChange(cancelLocate);
+onImpactPanelClose(cancelLocate);
+
+/** One live boundary service a search selection can locate against. */
+interface LocateSpec {
+  readonly url: string;
+  readonly kind: 'bia-reservation' | 'aiannh';
+  readonly layerKey: 'bia-reservations' | 'aiannh';
+  readonly failToast: string;
+  readonly emptyToast: string;
+  /** The row's gated label: a trusted formal Nation name is never abbreviated to the service's area name. */
+  readonly title: string;
+  /** The row's sublabel, the service's own area name, set only when the title differs from it. */
+  readonly areaLabel?: string;
+  /** The row's plain briefing line, set only for a state-recognized Census area. */
+  readonly landNote?: string;
+}
+type LocateLabels = Pick<LocateSpec, 'title' | 'areaLabel' | 'landNote'>;
 
 /**
- * Locate a Tribal land area by LARNAME: one live AIAN-LAR query (SQL-escaped),
- * frame the merged extent, light the located geometry, turn on the BIA layer for
- * surrounding context, and open the briefing. Carries the standard briefing
- * intent guard so a newer user action wins any race, plus a master abort so a
- * superseded request is actively cancelled. Failures surface honestly as a
- * toast (invariant 6), never as a silent no-op.
+ * Locate a Tribal land area: one live boundary query (AIAN-LAR by LARNAME, or
+ * Census AIANNH by code), frame the merged extent, light the located geometry,
+ * turn on that service's layer for surrounding context, and open the briefing.
+ * Carries the standard briefing intent guard so a newer user action wins any
+ * race, plus a master abort so a superseded request is actively cancelled.
+ * Failures surface honestly as a toast (invariant 6), never as a silent no-op.
  */
-async function locateTribalLandArea(map: maplibregl.Map, larName: string): Promise<void> {
+async function locateBoundary(map: maplibregl.Map, spec: LocateSpec): Promise<void> {
   const intent = nextBriefingIntent();
   locateAbort?.abort();
   const abort = new AbortController();
   locateAbort = abort;
-  const escaped = larName.replace(/'/g, "''");
-  const params = new URLSearchParams({
-    where: `LARNAME='${escaped}'`,
-    outFields: 'LARID,LARNAME,CLASSIFICATION,GISACRES,REGION',
-    returnGeometry: 'true',
-    outSR: '4326',
-    f: 'geojson'
-  });
-  const url = `${URLS.biaLarFeatureServer}/query?${params.toString()}`;
 
   let fc: FeatureCollection;
   try {
     // cache: 'no-store': this response carries sovereign-boundary geometry,
     // so it must never persist in the browser HTTP cache (hard rule 1;
     // the same transport guard as the three live Tribal-geography layers).
-    const res = await fetchWithBudget(url, { cache: 'no-store' }, abort.signal, LOCATE_TIMEOUT_MS);
+    const res = await fetchBufferedWithBudget(spec.url, { cache: 'no-store' }, abort.signal, LOCATE_TIMEOUT_MS);
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    fc = (await res.json()) as FeatureCollection;
+    const json: unknown = await res.json();
+    // An ArcGIS host can answer HTTP 200 with an error envelope: unavailable, not empty.
+    if (isObject(json) && 'error' in json) throw new Error('ArcGIS error envelope');
+    fc = json as FeatureCollection;
   } catch (err) {
-    console.warn('[search] LARNAME locate failed.', err);
-    // A deliberate supersede is not an error to report; anything else is
-    // surfaced honestly (the BIA service failed, no result will appear).
-    if (!abort.signal.aborted && isCurrentBriefingIntent(intent)) {
-      showToast('Could not reach the BIA land area service. Try again in a moment.');
-    }
+    // A deliberate supersede is not an error to log or report; anything else is
+    // surfaced honestly (the service failed, no result will appear).
+    if (abort.signal.aborted || !isCurrentBriefingIntent(intent)) return;
+    console.warn('[search] Tribal land area locate failed.', err);
+    showToast(spec.failToast);
     return;
   }
 
   const features = fc.features ?? [];
   if (features.length === 0) {
     if (isCurrentBriefingIntent(intent)) {
-      showToast('The BIA land area service returned no boundary for this land area.');
+      showToast(spec.emptyToast);
     }
     return;
   }
@@ -209,7 +322,7 @@ async function locateTribalLandArea(map: maplibregl.Map, larName: string): Promi
   // retains a compact Aleutian extent and lets the context's crossing evidence
   // describe the same subject the camera frames.
   const aggregateGeometry =
-    combineGeometry(features) ?? features[0]?.geometry ?? null;
+    mergeArealGeometry(features) ?? features[0]?.geometry ?? null;
   const bbox = geometryBboxAcrossAntimeridian(aggregateGeometry);
   if (bbox) {
     const continuous = bboxToContinuousBounds(bbox);
@@ -218,33 +331,164 @@ async function locateTribalLandArea(map: maplibregl.Map, larName: string): Promi
         [continuous[0], continuous[1]],
         [continuous[2], continuous[3]]
       ],
-      { padding: 60 }
+      // The pick opens its briefing on every shell, so the fit keeps the band
+      // it covers clear: the drawer's side on a desktop or tablet, the bottom
+      // sheet or its side drawer on a phone (the shared rule every briefing fit uses).
+      { padding: briefingCameraPadding(true) }
     );
   }
 
-  // Surrounding reservations for context; the located highlight guarantees THIS
-  // land area reads regardless of the BIA layer's clipped viewport.
-  requestLayerOn('bia-reservations');
+  // Surrounding areas for context; the located highlight guarantees THIS
+  // land area reads regardless of the layer's clipped viewport.
+  requestLayerOn(spec.layerKey);
 
   const primary = features[0]!;
-  const lngLat = bbox ? bboxCenter(bbox) : { lng: 0, lat: 0 };
-  // ORDER MATTERS: the located-boundary module clears its highlight on
-  // EVERY selection change (the stage-5 major 4 fix), so the selection is
-  // set first and the highlight for THIS subject renders after; any prior
-  // subject's highlight is gone. Summary-first (D-0.7.0-070): the search
-  // selection behaves like a map click, so the briefing opens through the
-  // left panel's one link; on the active mobile Brief sheet it still opens
-  // directly (map-click parity, the at-hand half detent IS the summary).
+  // Dynamic import: point-in-polygon is briefing-cluster code the activation
+  // gate keeps out of the eager bundle. A failed chunk load falls back to the
+  // box centre so the search still selects the land area.
+  const lngLat = bbox
+    ? await import('../util/point-in-polygon').then(
+        (m) => m.representativePoint(aggregateGeometry, bbox),
+        () => bboxCenter(bbox)
+      )
+    : { lng: 0, lat: 0 };
+  // A newer selection during the lazy import wins: commit nothing stale.
+  if (abort.signal.aborted || !isCurrentBriefingIntent(intent)) return;
+  // ORDER MATTERS: the located-boundary highlight records the selection
+  // current when it is shown and clears on a close or a different subject
+  // (the stage-5 major 4 fix), so the selection is set first and the
+  // highlight for THIS subject renders after; any prior subject's is gone. A
+  // search pick asks for the place, so its briefing opens on every shell
+  // (owner 2026-11-13), as Locate and the Place studio do; a map click keeps
+  // summary-first (D-0.7.0-070) in the interaction coordinator.
   const rawContext = buildBoundaryContext(
-    'bia-reservation',
+    spec.kind,
     primary.properties ?? null,
     aggregateGeometry,
-    lngLat
+    lngLat,
+    spec.title
   );
-  const context = bbox ? { ...rawContext, bbox } : rawContext;
+  const context = {
+    ...(bbox ? { ...rawContext, bbox, pointInsidePlace: true, placeGeometry: aggregateGeometry } : rawContext),
+    ...(spec.areaLabel ? { areaLabel: spec.areaLabel } : {}),
+    ...(spec.landNote ? { landNote: spec.landNote } : {})
+  };
   setPlaceSelection({ label: context.title, context });
-  if (isSheetActive() && getViewMode() === 'brief') openImpactPanel(context);
+  openImpactPanel(context);
+  // The located overlay marks this subject; a place an earlier click lit is unlit.
+  clearEmphasis(map);
   showLocatedBoundary(map, aggregateGeometry);
+}
+
+/** Locate an AIAN-LAR land area by LARNAME (SQL-escaped). */
+function locateTribalLandArea(map: maplibregl.Map, larName: string, labels: LocateLabels): Promise<void> {
+  const params = new URLSearchParams({
+    where: `LARNAME='${escapeSql(larName)}'`,
+    outFields: 'LARID,LARNAME,CLASSIFICATION,GISACRES,REGION',
+    returnGeometry: 'true',
+    outSR: '4326',
+    f: 'geojson'
+  });
+  return locateBoundary(map, {
+    url: `${URLS.biaLarFeatureServer}/query?${params.toString()}`,
+    kind: 'bia-reservation',
+    layerKey: 'bia-reservations',
+    failToast: 'Could not reach the BIA Land Area Representation (AIAN-LAR) service. Try again in a moment.',
+    emptyToast: 'The BIA Land Area Representation (AIAN-LAR) service returned no boundary for this land area.',
+    ...labels
+  });
+}
+
+/** Locate a Census AIANNH area by its four-digit code (layer 47, the live aiannh layer's). */
+function locateCensusArea(map: maplibregl.Map, code: string, labels: LocateLabels): Promise<void> {
+  if (!/^\d{4}$/.test(code)) return Promise.resolve();
+  const params = new URLSearchParams({
+    where: `AIANNH='${code}'`,
+    outFields: 'NAME,AIANNHCC,MTFCC,BASENAME,AIANNHNS,AREALAND,AREAWATER',
+    returnGeometry: 'true',
+    outSR: '4326',
+    geometryPrecision: '5',
+    maxAllowableOffset: '0.002',
+    f: 'geojson'
+  });
+  return locateBoundary(map, {
+    url: `${URLS.censusAiannhMapServer}/47/query?${params.toString()}`,
+    kind: 'aiannh',
+    layerKey: 'aiannh',
+    failToast: 'Could not reach the Census Tribal area service. Try again in a moment.',
+    emptyToast: 'The Census service returned no boundary for this area.',
+    ...labels
+  });
+}
+
+/**
+ * A city's briefing is its State's: the State that holds the city's point
+ * (the shared resolver, rendered states layer first, then the bundled Census
+ * outlines) opens with its own header, and the camera stays on the city
+ * (fit: false). A point no State holds opens nothing; a newer choice wins.
+ */
+async function openContainingStateBriefing(
+  map: maplibregl.Map,
+  [lng, lat]: [number, number],
+  intent: number
+): Promise<void> {
+  const abort = new AbortController();
+  locateAbort = abort;
+  try {
+    // Briefing-cluster code, kept out of the eager bundle as the Tribal path keeps point-in-polygon.
+    const { resolveContainingState } = await import('../state/location-identity');
+    if (abort.signal.aborted || !isCurrentBriefingIntent(intent)) return;
+    const state = await resolveContainingState(map, { lng, lat }, abort.signal);
+    // null: no State holds the point (silent, as a click outside every State). A failed read rejects into the catch.
+    if (!state || abort.signal.aborted || !isCurrentBriefingIntent(intent)) return;
+    await openStateBriefing(map, state.code, { fit: false, guard: () => isCurrentBriefingIntent(intent) });
+  } catch (err) {
+    // A newer pick aborted this lookup on purpose: nothing failed. Any other failure is shown, never silent (invariant 6).
+    if (abort.signal.aborted || !isCurrentBriefingIntent(intent)) return;
+    console.warn('[search] City State lookup failed.', err);
+    showToast("Could not open the briefing for this city's State. Try again in a moment.");
+  }
+}
+
+/** Move the camera to a point (a city, a headquarters town), clear of the briefing that opens beside it. */
+function easeToPoint(map: maplibregl.Map, center: [number, number]): void {
+  // The point lands in the part of the map the briefing leaves clear (the centre of the padded view;
+  // `offset` shifts this move only, unlike a persistent `padding`).
+  const pad = briefingCameraPadding(true);
+  map.easeTo({
+    center,
+    zoom: Math.max(map.getZoom(), 8),
+    offset: [((pad.left ?? 0) - (pad.right ?? 0)) / 2, ((pad.top ?? 0) - (pad.bottom ?? 0)) / 2]
+  });
+  // Every search host passes here; the sidebar's region menu listens (it is not imported into this chunk).
+  window.dispatchEvent(new Event('ddm:city-view'));
+}
+
+/**
+ * A Nation neither boundary source draws (build rule 14): its briefing, under
+ * its full Federal Register name, opens at its headquarters town. No outline
+ * is lit and no service asked: the town is where the office is, not the
+ * Nation's land, and the briefing says so in one line.
+ */
+function openHeadquarters(map: maplibregl.Map, row: TribalHeadquarters): void {
+  nextBriefingIntent();
+  locateAbort?.abort();
+  locateAbort = null;
+  const [lng, lat] = row.point;
+  easeToPoint(map, [lng, lat]);
+  requestLayerOn('aiannh');
+  const context = {
+    ...buildBoundaryContext('aiannh', { NAME: row.displayName, STUSPS: row.state }, null, { lng, lat }, row.displayName),
+    kindLabel: 'Headquarters town (US Census place)',
+    // Nobody clicked: point readings say they are read at the town.
+    readAt: `the headquarters town, ${row.town}`,
+    landNote:
+      "Neither of the map's boundary sources (BIA, Census) draws an area for this Nation. " +
+      `The map opens at its headquarters town, ${row.town}, ${stateName(row.state)}.`
+  };
+  setPlaceSelection({ label: context.title, context });
+  openImpactPanel(context);
+  clearEmphasis(map);
 }
 
 /** Route a chosen search result to its action. */
@@ -259,23 +503,51 @@ function selectResult(map: maplibregl.Map, item: SearchItem): void {
     // subscription above would fire too late; supersede the locate NOW.
     locateAbort?.abort();
     locateAbort = null;
-    // Summary-first (D-0.7.0-070): a search selection behaves like a map
-    // click; the briefing opens only through the panel's one link (the
-    // active mobile Brief sheet keeps map-click parity inside the helper).
+    // A search pick opens the State's briefing on every shell (owner 2026-11-13).
     void openStateBriefing(map, item.id, {
       fit: true,
-      guard: () => isCurrentBriefingIntent(intent),
-      summaryFirst: true
+      guard: () => isCurrentBriefingIntent(intent)
     });
     return;
   }
-  void locateTribalLandArea(map, item.id);
+  if (item.kind === 'city') {
+    // A city moves the camera and opens its State's briefing; no layer change, so the mode stays as it is.
+    const intent = nextBriefingIntent();
+    locateAbort?.abort();
+    locateAbort = null;
+    // The earlier place no longer describes the view; a city has no outline of its own, so none is set yet.
+    setPlaceSelection(null);
+    const center = cityCoords.get(item.id);
+    if (center) {
+      easeToPoint(map, center);
+      void openContainingStateBriefing(map, center, intent);
+    }
+    return;
+  }
+  const headquarters = headquartersById.get(item.id);
+  if (headquarters) {
+    openHeadquarters(map, headquarters);
+    return;
+  }
+  // The row's gated label titles the selection (a formal Nation name is never abbreviated).
+  const landNote = stateAreaNotes.get(item.id);
+  const labels = {
+    title: item.label,
+    ...(item.sublabel ? { areaLabel: item.sublabel } : {}),
+    ...(landNote ? { landNote } : {})
+  };
+  if (item.id.startsWith('census:')) {
+    void locateCensusArea(map, item.id.slice('census:'.length, 'census:'.length + 4), labels);
+    return;
+  }
+  void locateTribalLandArea(map, item.id, labels);
 }
 
 /** The props the search component needs, assembled and routed for a map. */
 export interface SearchWiring {
   items: SearchItem[];
   loadTribal?: () => Promise<SearchItem[]>;
+  loadCities?: () => Promise<SearchItem[]>;
   onSelect: (item: SearchItem) => void;
   placeholder: string;
 }
@@ -292,13 +564,15 @@ export function buildSearchWiring(
 ): SearchWiring {
   const permittedKinds = options ? new Set(options.permittedKinds) : null;
   const permitsTribal = permittedKinds?.has('tribal') ?? true;
+  const permitsCity = permittedKinds?.has('city') ?? true;
   return {
     items: buildSyncItems(permittedKinds),
     ...(permitsTribal ? { loadTribal } : {}),
+    ...(permitsCity ? { loadCities } : {}),
     onSelect: (item) => {
       if (!permittedKinds || permittedKinds.has(item.kind)) selectResult(map, item);
     },
-    placeholder: options?.placeholder ?? 'Search places, Tribal land areas, and layers'
+    placeholder: options?.placeholder ?? 'Search Tribes, states, cities, and layers'
   };
 }
 

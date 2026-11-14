@@ -12,20 +12,43 @@
  * Replacing a selection first aborts the superseded controller, detaches its
  * honesty watcher, and removes its source. A late tile from the removed
  * source therefore has nowhere to render.
+ *
+ * SURFACE CONTINUITY ACROSS A DAY CHANGE (DDM-P8-T05). That teardown is
+ * what keeps a superseded frame from painting, and it is deliberately kept:
+ * holding the previous day's raster up while the new day's tiles arrive
+ * would present a stale product under the new day's valid date, which is a
+ * worse claim than an empty one. The cost is that the map carries no
+ * surface for the length of the exportImage round trip, so the transition
+ * must SAY so for exactly that long. Two statements cover it, and both are
+ * released the moment the frame reaches a terminal verdict:
+ *
+ *   - the on-map loading indicator, held from the teardown until the tile
+ *     watcher reports (`beginFrameLoad` / `endFrameLoad` below);
+ *   - the frame event, which now announces `loading` at render time instead
+ *     of `ready`, so the on-map key qualifies the scale it is showing
+ *     rather than claiming a surface that has not painted.
+ *
+ * The watcher's request-completeness deadline bounds the loading state: it
+ * always reports `ready`, `degraded` or `error` within
+ * TILE_SUCCESS_DEADLINE_MS, so neither statement can outlive its fetch.
  */
 
 import type * as maplibregl from 'maplibre-gl';
 
-import { pointHasHeatRiskCoverage } from './heatrisk-coverage';
+import { viewHasHeatRiskCoverage } from './heatrisk-coverage';
+import type { LayerActivation } from '../config/layers';
 import { URLS } from '../config/urls';
 import { registry } from '../state/registry';
 import {
   parseHeatRiskDayParam,
   syncHeatRiskDayParam
 } from '../state/url';
-import { hideLegend, LEGEND_ORDER, showLegend } from '../ui/legend-registry';
-import { fetchJsonWithBudget } from '../util/fetch';
+import { hideLegend } from '../ui/legend-registry';
+import { hideLoading, showLoading } from '../ui/overlay';
+import { clearTimeBar, setTimeBar, type TimeBarStamp } from '../ui/time-bar';
+import { fetchJsonWithBudget, linkAbort } from '../util/fetch';
 import { isObject } from '../util/guards';
+import { heatRiskMoment } from '../util/iso-day';
 import {
   watchRasterTiles,
   type RasterTileWatch
@@ -72,12 +95,44 @@ let activeSourceId: string | null = null;
 let sourceGeneration = 0;
 let frames: readonly HeatRiskFrame[] = [];
 let selectedDay: number | null = null;
+/**
+ * The last day the user selected, held across a deactivate/reactivate pair
+ * within the same page session (the heatday rule). `activate()` re-applies
+ * it only when the URL carries no valid `heatday=` of its own (the URL, when
+ * present and valid, always wins). `deactivate()` deliberately does not
+ * reset this: it is what lets a HeatRisk day survive a round trip out of
+ * Heat (where `heatday=` itself is dropped from the URL, src/state/url.ts)
+ * and back, without a new cross-module store.
+ */
+let rememberedDay: number | null = null;
 let currentHasCoverage: boolean | null = null;
 let listeningForDaySelection = false;
 let coverageMoveMap: maplibregl.Map | null = null;
+/** The on-map loading-indicator token held across a frame render, or null
+ * when no frame is in flight (DDM-P8-T05). */
+let frameLoadToken: number | null = null;
+/** Re-installs the stamp when the selected frame's period begins or ends. */
+let phaseTimer: ReturnType<typeof setTimeout> | undefined;
 
 function reportStatus(state: Status): void {
   registry.setStatus(LAYER_KEY, state);
+}
+
+/**
+ * Say on the map that a selected frame is loading, from the instant the
+ * previous frame's source is torn down. Replaces any statement a
+ * superseded frame was still making, so a rapid run through the day
+ * selector leaves exactly one.
+ */
+function beginFrameLoad(): void {
+  endFrameLoad();
+  frameLoadToken = showLoading('Loading HeatRisk...');
+}
+
+/** Withdraw the loading statement. Idempotent; safe on every exit. */
+function endFrameLoad(): void {
+  hideLoading(frameLoadToken);
+  frameLoadToken = null;
 }
 
 function emitFrames(status: FrameEventStatus): void {
@@ -88,30 +143,162 @@ function emitFrames(status: FrameEventStatus): void {
   );
 }
 
-function replaceMasterController(): AbortSignal {
+function replaceMasterController(): AbortController {
   masterController?.abort();
   masterController = new AbortController();
-  return masterController.signal;
+  return masterController;
 }
 
-function mapCenterHasCoverage(map: maplibregl.Map): boolean {
-  const center = map.getCenter();
-  return pointHasHeatRiskCoverage(center.lng, center.lat);
+// ---------------------------------------------------------------------------
+// The time bar (DDM-P8-T02): the Extreme Heat screen's time control
+// ---------------------------------------------------------------------------
+
+/**
+ * What the map says about the selected frame's raster, appended to the
+ * stamp detail so the time statement never outruns the surface (the
+ * DDM-P8-T05 loading rule, carried into the bar): a period is only
+ * "displayed" once its tiles paint.
+ */
+function surfaceNote(status: Status): string {
+  switch (status) {
+    case 'loading':
+      return ' · loading the selected day';
+    case 'degraded':
+      return ' · the selected day painted with missing tiles';
+    case 'error':
+      return ' · no tile of the selected day loaded';
+    case 'no-data':
+      return ' · no data at the map center; HeatRisk covers the contiguous United States only';
+    default:
+      return '';
+  }
 }
 
-function showCoverageNote(hasCoverage: boolean): void {
-  showLegend(LAYER_KEY, {
-    order: LEGEND_ORDER.surface,
-    render: (body) => {
-      const title = document.createElement('h3');
-      title.className = 'legend-section-title';
-      title.textContent = 'HeatRisk coverage';
-      const note = document.createElement('p');
-      note.className = 'legend-note';
-      note.textContent = hasCoverage
-        ? 'National Weather Service HeatRisk covers the contiguous United States only.'
-        : 'No HeatRisk data at the map center. National Weather Service HeatRisk covers the contiguous United States only.';
-      body.append(title, note);
+/**
+ * The stamp for one advertised frame. The period is the issuer's own: the
+ * catalog's `idp_validtime` opens a 24-hour period (the seven-daily-period
+ * contract, DAILY_FRAME_MS; the issuer's service description says "over a
+ * 24-hour period"), and the headline states both ends in UTC (acceptance
+ * clause 3). The detail names the issuer and the product (clause 2) and the
+ * day's position in the seven the service advertises, in the issuer's own
+ * terms ("experimental", "expected heat").
+ *
+ * The register word. NWS calls HeatRisk a forecast; this module may not
+ * (the surface-vocabulary lint reserves that word for verbatim upstream
+ * product names, and the S13 session was not authorized to widen it), so
+ * "Outlook" in the headline is the interface's own cross-hazard register
+ * word (DR-070's grammar), not a claim about the issuer's name for it.
+ * The ddm-science-verifier recorded that gap on 2026-09-08; DR-071 carries
+ * it for the owner.
+ *
+ * WHICH STEPS ARE OUTLOOKS (the S13 doctrine, DR-071 R-b). A time step
+ * that is an issuer outlook is labelled as one; a step that is not, is
+ * not. The issuer settles most of it: HeatRisk "provides a forecast of the
+ * potential level of risk for heat-related impacts to occur over a 24-hour
+ * period" and is calculated "from the current date through seven days in
+ * the future" (HeatRisk v2.6 Overview,
+ * wpc.ncep.noaa.gov/heatrisk/pdf/HeatRisk-v2.6-Overview.pdf, read
+ * 2026-09-08), so a frame whose 24-hour period has not begun AND the frame
+ * whose period is in progress are both outlooks in force. The one step that is not an
+ * outlook is a period that has ended: the service still advertises it,
+ * and presenting it as an outlook still in force would be the spent
+ * claim the doctrine forbids. The three phases, read against the page
+ * clock at the moment the stamp is installed:
+ *
+ *   not begun    outlook register: "Outlook valid A to B";
+ *   in progress  outlook register: "Outlook valid A to B", the detail
+ *                saying the period is now in progress;
+ *   ended        plain register, never outlook: "Period ended B".
+ *
+ * The horizon is the product's, at every frame: HeatRisk is the
+ * interface's near-term heat product (the briefing files the selected
+ * frame's classification under Near Term, src/impact/matrix.ts
+ * LANE_PLACEMENT; the heat cluster's current recipe shows it only because
+ * no current heat surface exists, DR-017's open question). The stamp
+ * therefore reads Near Term under the Current Conditions chip too, which
+ * is the truth about the surface rather than a claim about the chip.
+ *
+ * The end of each period is DDM's arithmetic (the service publishes a
+ * start field and no end field) grounded in the issuer's own words "over a
+ * 24-hour period" and the catalog's 24-hour spacing; the two moments are
+ * always the issuer's start and that start plus one day. The phase is read
+ * on every install (a day change, a status change) and again at the
+ * selected frame's next boundary (`phaseTimer`), so a page left open never
+ * keeps presenting an ended period as an outlook in force.
+ */
+type FramePhase = 'not-begun' | 'in-progress' | 'ended';
+
+function framePhase(start: number, end: number, now: number): FramePhase {
+  if (now < start) return 'not-begun';
+  if (now < end) return 'in-progress';
+  return 'ended';
+}
+
+function frameStamp(frame: HeatRiskFrame, status: Status): TimeBarStamp {
+  const start = frame.validTime;
+  const end = start + DAILY_FRAME_MS;
+  const product = `NWS HeatRisk (experimental) · Day ${frame.day} of ${REQUIRED_FRAME_COUNT} · `;
+  const note = surfaceNote(status);
+  switch (framePhase(start, end, Date.now())) {
+    case 'not-begun':
+      return {
+        horizon: 'nearTerm',
+        headline: `Outlook valid ${heatRiskMoment(start)} to ${heatRiskMoment(end)}`,
+        detail: `${product}expected heat impact over a 24-hour period that has not begun${note}`,
+        register: 'outlook'
+      };
+    case 'in-progress':
+      return {
+        horizon: 'nearTerm',
+        headline: `Outlook valid ${heatRiskMoment(start)} to ${heatRiskMoment(end)}`,
+        detail: `${product}expected heat impact over the 24-hour period now in progress${note}`,
+        register: 'outlook'
+      };
+    default:
+      return {
+        horizon: 'nearTerm',
+        headline: `Period ended ${heatRiskMoment(end)}`,
+        detail: `${product}this 24-hour period has ended${note}`,
+        register: 'observed'
+      };
+  }
+}
+
+/**
+ * Install (or refresh) the bar for the selected frame: a seven-stop
+ * discrete rail (an authored, stepped product: Step buttons, never Play)
+ * whose steps drive the same `renderFrame` the on-map key's day select and
+ * the dock sequence drive, so the three controls can never disagree about
+ * the displayed day. Re-installed on every status change so the surface
+ * note above tracks the raster; the bar memoizes identical markup.
+ */
+function installTimeBar(status: Status): void {
+  clearTimeout(phaseTimer);
+  const frame = selectedDay === null ? undefined : frames[selectedDay - 1];
+  if (!activeMap || !frame) return;
+  const now = Date.now();
+  const boundary = [frame.validTime, frame.validTime + DAILY_FRAME_MS].find((t) => t > now);
+  // Past 2^31-1 ms setTimeout fires at once and this would re-arm in a loop; no advertised frame is that far ahead.
+  if (boundary !== undefined && boundary - now <= 0x7fffffff) {
+    phaseTimer = setTimeout(() => installTimeBar(status), boundary - now);
+  }
+  setTimeBar(LAYER_KEY, {
+    ariaLabel: 'NWS HeatRisk day',
+    stamp: frameStamp(frame, status),
+    rail: {
+      count: frames.length,
+      index: frame.day - 1,
+      valueText: (index) => {
+        const stop = frames[index];
+        return stop
+          ? `Day ${stop.day} · ${heatRiskMoment(stop.validTime).replace(/\u00a0/g, ' ')}` // spoken text: plain space, as before found-104
+          : `Day ${index + 1}`;
+      },
+      onStep: (index) => {
+        const day = index + 1;
+        if (!activeMap || day < 1 || day > frames.length || day === selectedDay) return;
+        renderFrame(activeMap, day);
+      }
     }
   });
 }
@@ -213,6 +400,10 @@ function buildImageTileTemplate(timeMs: number): string {
     'size=256,256',
     'format=png32',
     'transparent=true',
+    // Class 0 (Little to None) is not drawn: noData=0 makes it transparent so
+    // classes 1-4 stand out; values and identify are unchanged.
+    'noData=0',
+    'interpolation=RSP_NearestNeighbor',
     `time=${timeMs}`,
     'f=image'
   ].join('&');
@@ -239,17 +430,25 @@ function renderFrame(map: maplibregl.Map, day: number): void {
   if (!frame) return;
 
   replaceMasterController();
+  // The statement is opened BEFORE the teardown, so there is no instant
+  // between losing the old surface and the new frame's first tile at which
+  // the map is both blank and silent (DDM-P8-T05).
+  beginFrameLoad();
   removeActiveRaster(map);
 
   selectedDay = day;
+  rememberedDay = day;
   syncHeatRiskDayParam(day);
 
-  const hasCoverage = mapCenterHasCoverage(map);
+  const hasCoverage = viewHasHeatRiskCoverage(map);
   currentHasCoverage = hasCoverage;
-  showCoverageNote(hasCoverage);
   if (!hasCoverage) {
+    // A verified absence, not a pending fetch: withdraw the loading
+    // statement in the same turn so the two never both stand.
+    endFrameLoad();
     reportStatus('no-data');
     emitFrames('no-data');
+    installTimeBar('no-data');
     return;
   }
 
@@ -261,14 +460,23 @@ function renderFrame(map: maplibregl.Map, day: number): void {
     type: 'raster',
     tiles: [buildImageTileTemplate(frame.validTime)],
     tileSize: 256,
+    // The NWS service advertises 2,539.703 m Web Mercator cells (verified
+    // 2026-09-13). z6 serves 2,445.98 m pixels, so finer exports add
+    // nothing. Linear display resampling softens the cell edges (owner
+    // request, 2026-10-19); point-identify reads keep the issuer's classes.
+    maxzoom: 6,
     attribution: 'NOAA NWS HeatRisk (experimental)'
   });
+  // Floor flat-view coverage zoom so the z6 tiles are magnified, not
+  // re-requested at finer zooms.
+  map.getSource<maplibregl.RasterTileSource>(sourceId)!.roundZoom = false;
   map.addLayer({
     id: LAYER_ID,
     type: 'raster',
     source: sourceId,
     paint: {
-      'raster-opacity': 0.55
+      'raster-opacity': 0.55,
+      'raster-resampling': 'linear'
     }
   });
 
@@ -276,38 +484,52 @@ function renderFrame(map: maplibregl.Map, day: number): void {
     map,
     sourceId,
     (state) => {
-      if (!mapCenterHasCoverage(map)) {
+      // Every path through the watcher is a terminal verdict on this
+      // frame, so every path also ends the loading statement.
+      endFrameLoad();
+      if (!viewHasHeatRiskCoverage(map)) {
         currentHasCoverage = false;
         reportStatus('no-data');
         emitFrames('no-data');
+        installTimeBar('no-data');
         return;
       }
       currentHasCoverage = true;
       reportStatus(state);
       emitFrames(state);
+      installTimeBar(state);
     },
     {
       reportInitialSuccess: true,
       requestCompletenessDeadlineMs: TILE_SUCCESS_DEADLINE_MS
     }
   );
-  emitFrames('ready');
+  // The source is on the map but nothing has painted from it yet. The
+  // frame event carried `ready` here until DDM-P8-T05, which made the
+  // on-map key present an unpainted frame as live for the whole fetch;
+  // `loading` is what is true, and the watcher above replaces it with the
+  // real verdict.
+  emitFrames('loading');
+  installTimeBar('loading');
 }
 
 function onCoverageMoveEnd(): void {
   if (!activeMap || selectedDay === null || frames.length === 0) return;
-  const hasCoverage = mapCenterHasCoverage(activeMap);
+  const hasCoverage = viewHasHeatRiskCoverage(activeMap);
+  // A tile verdict that landed while the view was uncovered left 'no-data' over a source that still stands.
+  const hadCoverage = currentHasCoverage;
   currentHasCoverage = hasCoverage;
-  showCoverageNote(hasCoverage);
   if (!hasCoverage) {
     masterController?.abort();
     masterController = null;
+    endFrameLoad();
     removeActiveRaster(activeMap);
     reportStatus('no-data');
     emitFrames('no-data');
+    installTimeBar('no-data');
     return;
   }
-  if (!activeSourceId || !activeMap.getSource(activeSourceId)) {
+  if (hadCoverage === false || !activeSourceId || !activeMap.getSource(activeSourceId)) {
     renderFrame(activeMap, selectedDay);
   }
 }
@@ -353,67 +575,181 @@ function stopListeningForDaySelection(): void {
 }
 
 /**
+ * Read the service metadata and the catalog and return the seven advertised
+ * frames, or null when either answer is unusable (or the read was aborted).
+ * A network failure the retry does not absorb is thrown.
+ */
+async function readAdvertisedFrames(
+  signal: AbortSignal
+): Promise<readonly HeatRiskFrame[] | null> {
+  const metadataUrl = `${URLS.nwsHeatRisk}?f=json`;
+  let metadataJson: unknown;
+  try {
+    metadataJson = await fetchJsonWithBudget(metadataUrl, null, signal, FETCH_TIMEOUT_MS);
+  } catch (err) {
+    // One retry for a read the network lost (a fetch TypeError, or an
+    // abort nobody here asked for: the budget or the browser). A caller's
+    // cancellation and any answer the service gave are final.
+    const transient =
+      err instanceof TypeError || (err instanceof DOMException && err.name === 'AbortError');
+    if (signal.aborted || !transient) throw err;
+    console.warn('[heatrisk] service metadata read failed; retrying once.', err);
+    metadataJson = await fetchJsonWithBudget(metadataUrl, null, signal, FETCH_TIMEOUT_MS);
+  }
+  if (signal.aborted) return null;
+  const extent = extractTimeExtent(metadataJson);
+  if (extent === null) {
+    console.warn('[heatrisk] service metadata carried no usable time extent.');
+    return null;
+  }
+
+  const catalogJson = await fetchJsonWithBudget(
+    buildCatalogUrl(),
+    null,
+    signal,
+    FETCH_TIMEOUT_MS
+  );
+  if (signal.aborted) return null;
+  const advertised = extractFrames(catalogJson, extent);
+  if (advertised === null) {
+    console.warn('[heatrisk] catalog carried no consistent granule times.');
+  }
+  return advertised;
+}
+
+/** How often the catalog is re-read while its Day 1 period has ended and the service still offers it. */
+const CATALOG_RECHECK_MS = 60 * 60 * 1000;
+let catalogTimer: ReturnType<typeof setTimeout> | undefined;
+let catalogRefresh: AbortController | null = null;
+
+function stopCatalogRefresh(): void {
+  clearTimeout(catalogTimer);
+  catalogRefresh?.abort();
+  catalogRefresh = null;
+}
+
+/**
+ * The catalog rolls forward once a day: a page left open must not keep an
+ * ended Day 1 and miss the new seventh day. Re-read it when Day 1's period
+ * ends, then hourly while the advertised Day 1 stays ended.
+ */
+function armCatalogRefresh(): void {
+  clearTimeout(catalogTimer);
+  const first = frames[0];
+  if (!first) return;
+  const untilEnd = first.validTime + DAILY_FRAME_MS - Date.now();
+  const wait = untilEnd > 0 ? untilEnd : CATALOG_RECHECK_MS;
+  // Past 2^31-1 ms setTimeout fires at once; no advertised Day 1 ends that far ahead.
+  if (wait <= 0x7fffffff) catalogTimer = setTimeout(() => void refreshCatalog(), wait);
+}
+
+/**
+ * Re-enumerate on the same map. A failed or unchanged read keeps the
+ * advertised days and tries again later; a rolled catalog keeps the
+ * displayed period when it is still offered, else shows Day 1.
+ */
+async function refreshCatalog(): Promise<void> {
+  const map = activeMap;
+  if (!map || frames.length === 0) return;
+  const controller = new AbortController();
+  catalogRefresh = controller;
+  let advertised: readonly HeatRiskFrame[] | null = null;
+  try {
+    advertised = await readAdvertisedFrames(controller.signal);
+  } catch (err) {
+    if (!controller.signal.aborted) {
+      console.warn('[heatrisk] catalog re-read failed; keeping the advertised days.', err);
+    }
+  }
+  if (controller.signal.aborted || activeMap !== map || frames.length === 0) return;
+  catalogRefresh = null;
+  if (advertised !== null && advertised[0]!.validTime !== frames[0]!.validTime) {
+    const shownTime = selectedDay === null ? undefined : frames[selectedDay - 1]?.validTime;
+    frames = advertised;
+    renderFrame(map, advertised.find((frame) => frame.validTime === shownTime)?.day ?? 1);
+  }
+  armCatalogRefresh();
+}
+
+/**
  * Enumerate exact granule times, then add the first or URL-selected raster
  * frame. Missing or inconsistent metadata reports `error`; there is no
  * fallback that guesses a date.
  */
-export async function activate(map: maplibregl.Map): Promise<void> {
+export async function activate(
+  map: maplibregl.Map,
+  activation?: LayerActivation
+): Promise<void> {
   if (activeMap === map && frames.length > 0) return;
 
-  const signal = replaceMasterController();
+  // The controller-owned attempt signal joins the private controller, so an
+  // off intent aborts the held metadata or catalog read at that moment and
+  // not at the 10 s budget behind the queued teardown (plan rule 5). The
+  // link lasts only while this activation reads; `renderFrame` below
+  // replaces the private controller for the frame's life.
+  const master = replaceMasterController();
+  const signal = master.signal;
+  const unlink = linkAbort(master, activation?.signal ?? null);
+  // A re-activation supersedes any frame statement still standing; the
+  // controller's own indicator covers the enumeration below, and
+  // `renderFrame` opens a fresh one for the frame it draws.
+  endFrameLoad();
   activeMap = map;
   activeSourceId = null;
   frames = [];
   selectedDay = null;
   currentHasCoverage = null;
+  stopCatalogRefresh();
   listenForDaySelection();
   listenForCoverageMoves(map);
   reportStatus('loading');
   emitFrames('loading');
 
   try {
-    const metadataJson = await fetchJsonWithBudget(
-      `${URLS.nwsHeatRisk}?f=json`,
-      null,
-      signal,
-      FETCH_TIMEOUT_MS
-    );
-    const extent = extractTimeExtent(metadataJson);
-    if (extent === null) {
-      console.warn('[heatrisk] service metadata carried no usable time extent.');
-      reportStatus('error');
-      emitFrames('error');
-      return;
-    }
-
-    const catalogJson = await fetchJsonWithBudget(
-      buildCatalogUrl(),
-      null,
-      signal,
-      FETCH_TIMEOUT_MS
-    );
-    const advertised = extractFrames(catalogJson, extent);
-    if (advertised === null) {
-      console.warn('[heatrisk] catalog carried no consistent granule times.');
-      reportStatus('error');
-      emitFrames('error');
-      return;
-    }
-
+    const advertised = await readAdvertisedFrames(signal);
     if (signal.aborted) return;
+    if (advertised === null) {
+      reportStatus('error');
+      emitFrames('error');
+      return;
+    }
+
     frames = advertised;
+    armCatalogRefresh();
+    // The heatday rule: an explicit, valid `heatday=` on the URL always
+    // wins (a shared link is honored exactly); absent that, the day
+    // remembered from this session's last selection is re-applied (the
+    // restore-on-return half of the rule); absent both, day 1 (today).
     const requestedDay = parseHeatRiskDayParam();
-    const initialDay =
-      requestedDay !== null && requestedDay <= frames.length
+    const validRequestedDay =
+      requestedDay !== null && requestedDay >= 1 && requestedDay <= frames.length
         ? requestedDay
-        : 1;
+        : null;
+    const validRememberedDay =
+      rememberedDay !== null && rememberedDay >= 1 && rememberedDay <= frames.length
+        ? rememberedDay
+        : null;
+    const initialDay = validRequestedDay ?? validRememberedDay ?? 1;
     renderFrame(map, initialDay);
   } catch (err) {
     if (signal.aborted) return;
     console.warn('[heatrisk] source qualification fetch failed.', err);
     reportStatus('error');
     emitFrames('error');
+  } finally {
+    unlink();
   }
+}
+
+/**
+ * Synchronous cancellation seam (the layer controller calls it the moment off intent is recorded).
+ * The teardown waits out the fade; a tile verdict, camera move or day pick inside it must not
+ * re-take the shared time bar, or that teardown's clear would remove the next surface's bar.
+ */
+export function cancelActivation(): void {
+  masterController?.abort();
+  stopCatalogRefresh();
+  activeMap = null;
 }
 
 /**
@@ -423,10 +759,14 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 export function deactivate(map: maplibregl.Map): void {
   masterController?.abort();
   masterController = null;
+  endFrameLoad();
+  clearTimeout(phaseTimer);
+  stopCatalogRefresh();
   removeActiveRaster(map);
   stopListeningForDaySelection();
   stopListeningForCoverageMoves();
   hideLegend(LAYER_KEY);
+  clearTimeBar(LAYER_KEY);
   activeMap = null;
   frames = [];
   selectedDay = null;

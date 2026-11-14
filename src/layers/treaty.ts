@@ -13,7 +13,8 @@
  * handler. The repository ships an empty FeatureCollection placeholder
  * because the project never redistributes sovereign-jurisdiction polygons;
  * deployers populate `data/treaty-areas.geojson`
- * under their own authorizations.
+ * under their own authorizations. The repository ships no Treaty polygons,
+ * and an operator's agency polygons are shown as representations.
  *
  * Per-feature color: MapLibre data-driven property expressions cannot call
  * arbitrary JavaScript, so we precompute the per-feature outline color in
@@ -27,11 +28,12 @@ import type * as maplibregl from 'maplibre-gl';
 import type { Feature, FeatureCollection, GeoJsonProperties, Geometry } from 'geojson';
 import { URLS } from '../config/urls';
 import { TREATY_COLOR_DEFAULT, pickTreatyColor } from '../config/palette';
-import { buildTreatyPopupHtml } from '../ui/popups';
-import { buildBoundaryContext } from '../impact/context';
+import { buildTreatyPopupModel } from '../ui/popups';
+import { buildPlaceConditionsHtml } from '../ui/popup-conditions';
+import { buildBoundaryContext, resolveBoundaryTitle } from '../impact/context';
 import { registerClickTarget } from '../map/interaction-coordinator';
 import { registry } from '../state/registry';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchBufferedWithBudget } from '../util/fetch';
 
 const LAYER_KEY = 'treaty';
 const SOURCE_ID = 'treaty-areas';
@@ -50,26 +52,6 @@ type TreatyStatus = 'loading' | 'ready' | 'error' | 'no-data';
 
 function reportStatus(state: TreatyStatus): void {
   registry.setStatus(LAYER_KEY, state);
-}
-
-/**
- * Mirrors the vanilla `pickTreatyName` helper. Reads name-bearing keys in
- * the order observed across upstream Treaty datasets (Native Land Digital,
- * Washington Department of Archaeology and Historic Preservation (DAHP),
- * regional Tribal data sources). Returns null if no candidate is present;
- * callers substitute a generic label in that case.
- */
-function pickTreatyName(props: GeoJsonProperties): string | null {
-  if (!props) return null;
-  const candidate =
-    props.name ??
-    props.TREATY_NAM ??
-    props.TREATY_NAME ??
-    props.TreatyName ??
-    props.NAME ??
-    props.Treaty;
-  if (candidate === null || candidate === undefined || candidate === '') return null;
-  return String(candidate);
 }
 
 /**
@@ -94,7 +76,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 
   let geojson: FeatureCollection;
   try {
-    const response = await fetchWithBudget(URLS.treatyAreasLocal, null, signal, FETCH_TIMEOUT_MS);
+    const response = await fetchBufferedWithBudget(URLS.treatyAreasLocal, null, signal, FETCH_TIMEOUT_MS);
     if (!response.ok) {
       throw new Error(`HTTP ${response.status} fetching ${URLS.treatyAreasLocal}`);
     }
@@ -127,8 +109,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
     type: 'FeatureCollection',
     features: features.map((feature) => {
       const props: GeoJsonProperties = { ...(feature.properties ?? {}) };
-      const name = pickTreatyName(props);
-      props._color = pickTreatyColor(name);
+      props._color = pickTreatyColor(resolveBoundaryTitle('treaty', props));
       return {
         ...feature,
         properties: props
@@ -202,9 +183,9 @@ export function deactivate(map: maplibregl.Map): void {
  * with HTML produced by `buildTreatyPopupHtml`. The mandatory stewardship
  * framing (boundaries as representations) lives inside that factory. The
  * full formal Tribe names (Confederated Tribes and Bands of the Yakama
- * Nation, Nez Perce Tribe, Quinault Indian Nation) come through
- * `pickTreatyEntry` inside the popup factory; full formal names are a
- * project hard rule.
+ * Nation, Nez Perce Tribe) come through `pickTreatyEntry` inside the popup
+ * factory; a Treaty with several signatories shows the deployer's own
+ * value. Full formal names are a project hard rule.
  *
  * Cursor affordance: switch to the pointer cursor on hover so users see
  * that Treaty outlines are interactive even though they are hollow.
@@ -213,12 +194,12 @@ export function bindPopups(map: maplibregl.Map): void {
   registerClickTarget({
     kind: 'treaty-cession',
     layerIds: [OUTLINE_LAYER_ID],
-    label: (feature) => pickTreatyName(feature.properties ?? {}) ?? 'Treaty Area',
-    respond: (feature, click) => {
+    label: (feature) => resolveBoundaryTitle('treaty', feature.properties ?? null),
+    respond: (feature, click, map) => {
       const props: GeoJsonProperties = feature.properties ?? {};
-      const featureName = pickTreatyName(props) ?? 'Treaty Area';
+      const featureName = resolveBoundaryTitle('treaty', props);
       return {
-        content: buildTreatyPopupHtml(props, featureName),
+        model: buildTreatyPopupModel(props, featureName, buildPlaceConditionsHtml(map, click.point, feature)),
         selection: buildBoundaryContext('treaty', props, feature.geometry, click.lngLat, featureName),
         // An id-less feature clears any prior emphasis (the old
         // emphasizePlace contract) rather than lighting an unknown one.

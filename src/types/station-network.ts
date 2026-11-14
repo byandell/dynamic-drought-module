@@ -54,10 +54,9 @@ export interface StationNetworkAdapter<TRawRecord = unknown> {
 export interface StationNetwork<TRawRecord = unknown> {
   readonly key: StationNetworkKey;
   readonly label: string;
-  readonly refreshWindowMs: number;
   /** Honest human update cadence for this network, surfaced in the popup
-   * custody block ("Updates: about every 6 minutes"). Distinct from
-   * refreshWindowMs, which is the staleness window for the freshness pill. */
+   * custody block ("Updates: about every 6 minutes"). Not a staleness
+   * window: freshness is decided in freshnessForNetwork and dailyFreshness. */
   readonly cadence: string;
   readonly adapter: StationNetworkAdapter<TRawRecord>;
 }
@@ -82,6 +81,8 @@ export interface StationViewportDiscoveryRequest {
   readonly bounds: ViewportBounds;
   readonly center: readonly [number, number];
   readonly signal: AbortSignal | null;
+  /** Called with every record settled so far each time one source settles. */
+  readonly onProgress?: (records: readonly StationDiscoveryRecord[]) => void;
 }
 
 export type StationViewportDiscoveryResult =

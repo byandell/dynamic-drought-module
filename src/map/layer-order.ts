@@ -7,10 +7,11 @@ import type * as maplibregl from 'maplibre-gl';
  *
  * The contract, bottom to top:
  *
- *   background -> basemap (OSM fallback)
- *     -> basemap-satellite (recent NOAA) -> hillshade
- *     -> condition surfaces -> event overlays -> reference boundaries
- *     -> reference labels
+ *   background -> base ground (land, water, rivers)
+ *     -> basemap-satellite (recent NOAA) -> wildfire-dryness-ground -> hillshade
+ *     -> base lines (boundaries, highways)
+ *     -> condition surfaces (the 3D edge fade last) -> event overlays -> reference boundaries
+ *     -> reference labels (base names first)
  *
  * Three mechanisms enforce it:
  *   1. `firstLayerIdAbove(map, skip)` computes an insertion anchor by
@@ -26,31 +27,118 @@ import type * as maplibregl from 'maplibre-gl';
  *      them.
  */
 
-/** The permanent bottom-stack ids, in stacking order. */
-export const BOTTOM_STACK_IDS: readonly string[] = [
-  'background',
-  'basemap',
-  'basemap-satellite',
-  'hillshade'
+/** DDM's own base map (src/map/style.ts): the ground fills draw under
+ * satellite imagery, so imagery replaces them where it covers. The named
+ * lakes and streams read live inside Tribal areas (src/layers/tribal-streets.ts,
+ * mirrored literals) sit with the base map's water. */
+export const BASE_GROUND_IDS: readonly string[] = [
+  'base-world-land',
+  'base-land',
+  'base-world-water',
+  'base-water',
+  'tribal-waterbodies',
+  'base-wetland',
+  'base-glacier',
+  'base-river',
+  'tribal-streams'
 ];
 
-/** Reference label layers that always read above every data layer. */
-const TOP_LABEL_IDS: readonly string[] = ['us-places-labels'];
+/** The base map's lines, above imagery and terrain shading and below every
+ * condition surface. The Tribal-area streets (src/layers/tribal-streets.ts,
+ * mirrored literal) read live at street zoom and sit with them. */
+export const BASE_LINE_IDS: readonly string[] = [
+  'base-county',
+  'base-region',
+  'base-world-country',
+  'base-country',
+  'base-road',
+  'tribal-streets-line'
+];
+
+/** The permanent bottom-stack ids, in stacking order. The Wildfire 3D
+ * dryness ground (DDM-P9-T13; src/layers/wildfire-dryness.ts, mirrored
+ * literal) sits under the hillshade and every drape, present only in that scene. */
+export const BOTTOM_STACK_IDS: readonly string[] = [
+  'background',
+  ...BASE_GROUND_IDS,
+  'basemap-satellite',
+  'wildfire-dryness-ground',
+  'hillshade',
+  ...BASE_LINE_IDS
+];
+
+/** Reference label layers that always read above every data layer, bottom to top. MapLibre
+ * places the topmost first, so the Nations' names on the Tribal Lands layer
+ * (src/layers/aiannh.ts, mirrored literal) win a collision with a city name. */
+export const TOP_LABEL_IDS: readonly string[] = [
+  'base-river-label',
+  'base-road-label',
+  'forests-label',
+  'tribal-streets-label',
+  'public-lands-label',
+  'dams-label',
+  'tribal-streams-label',
+  'tribal-waterbodies-label',
+  'base-range-label',
+  'base-peak',
+  'base-region-label',
+  'base-world-water-label',
+  'base-water-label',
+  'tribal-communities-label',
+  'base-world-place',
+  'base-place',
+  'us-places-labels',
+  'aiannh-nation-labels'
+];
 
 /**
  * Condition surfaces, bottom to top. Every known surface is named here so
  * one late network response cannot paint over sovereign and reference
  * outlines. Dynamic SST frames insert immediately below the named Nino line
- * in their owning module and therefore inherit the same ruled position.
+ * in their owning module and therefore inherit the same ruled position;
+ * `reassertThematicOrder` leaves them where they are and re-seats the chain
+ * above them.
  */
 export const CONDITION_SURFACE_IDS: readonly string[] = [
   'whp-2023',
   'gridded-index-raster',
+  // The CPC seasonal, 6-10 and 8-14 day outlooks (src/layers/cpc-seasonal-
+  // outlook.ts): land fields beside the ocean SST, under the ENSO flow paths,
+  // every event, boundary and label. Two on: the later one here paints over.
+  'cpc-seasonal-precip-fill',
+  'cpc-seasonal-precip-line',
+  'cpc-seasonal-temp-fill',
+  'cpc-seasonal-temp-line',
+  'cpc-610-precip-fill',
+  'cpc-610-precip-line',
+  'cpc-610-temp-fill',
+  'cpc-610-temp-line',
+  'cpc-814-precip-fill',
+  'cpc-814-precip-line',
+  'cpc-814-temp-fill',
+  'cpc-814-temp-line',
   'sst-anomaly',
+  'nino34-box-fill',
   'nino34-box-line',
+  // The ENSO "Ocean & atmosphere" overlay's seat (src/layers/enso-flow.ts):
+  // the precipitable water shade, then the wind, wave and current paths'
+  // still form and node arrows, then their moving ribbons
+  // (src/layers/flow/still.ts and index.ts; ENSO-FLOW-PLAN E2-1). One kind
+  // draws at a time. The shade sits above the Nino box line because a dated SST
+  // frame inserts directly under the box's line: a seat any lower would put
+  // the shade under that frame. It stays under every event overlay (the
+  // tropical cyclones), every outline and the labels.
+  'flow-shade',
+  'flow-still-casing',
+  'flow-still',
+  'flow-still-marks',
+  'flow-paths',
+  // The Nino 3.4 label reads above the paths, which (wind and waves in light
+  // ink) invert the ground beneath them (the block's browser look, 2026-10-19).
   'nino34-box-label',
   'heatrisk',
   'usfs-whp',
+  'usfs-whp-classes',
   'drought-outlook-fill',
   'drought-outlook-outline',
   'spc-fire-weather-fill',
@@ -63,12 +151,14 @@ export const CONDITION_SURFACE_IDS: readonly string[] = [
   'bc-drought-outline',
   'usdm-frame-a-fill',
   'usdm-frame-a-outline',
-  'usdm-frame-a-d4-rim',
   'usdm-frame-b-fill',
   'usdm-frame-b-outline',
-  'usdm-frame-b-d4-rim',
   'usdm-change-fill',
-  'usdm-change-outline'
+  'usdm-change-outline',
+  // The 3D scene's edge fade (src/map/fire3d.ts, mirrored literal): last, so it
+  // veils the seam above the drapes whose stretched texels climb the terrain
+  // box's edge face, still below power lines, fires, boundaries and labels.
+  'fire3d-terrain-edge'
 ];
 
 /**
@@ -76,14 +166,12 @@ export const CONDITION_SURFACE_IDS: readonly string[] = [
  * above condition fields so lines and plant points stay readable over a
  * drape, below event overlays so mapped incidents always read on top.
  *
- * The structures pair is present only while the 3D Fire mode is active.
  * The power surfaces became an ordinary catalog layer 2026-08-19 and can
  * now appear in any view from zoom 6, so this band is no longer 3D-only;
  * their seat is unchanged, which is the point of listing them here.
  */
 export const CONTEXT_OVERLAY_IDS: readonly string[] = [
   'structures-3d',
-  'structures-3d-est',
   'power-lines',
   'power-lines-unknown',
   'power-plants-clusters',
@@ -113,7 +201,14 @@ export const EVENT_OVERLAY_IDS: readonly string[] = [
   'nifc-prescribed-outline',
   'nifc-other-outline',
   'nws-alerts-fill',
-  'nws-alerts-outline'
+  'nws-alerts-outline',
+  // ENSO block B3, above the SST frames, the Nino 3.4 box and the flow
+  // paths, below every reference boundary (src/layers/tropical-cyclones.ts).
+  'tropical-cyclones-cone-fill',
+  'tropical-cyclones-cone-line',
+  'tropical-cyclones-track',
+  'tropical-cyclones-ww',
+  'tropical-cyclones-points'
 ];
 
 /**
@@ -122,10 +217,23 @@ export const EVENT_OVERLAY_IDS: readonly string[] = [
  * only and does not change the source or stewardship caveats of any module.
  */
 export const REFERENCE_BOUNDARY_IDS: readonly string[] = [
+  // The Hydrography lake fill (src/layers/hydrography.ts) sits directly under its river lines.
+  'hydrography-water',
   'hydrography',
+  'public-lands-fill',
+  'public-lands-line',
+  'railroads',
+  'dams',
+  'forests-outline',
   'us-states-fill',
   'us-states-casing',
+  // The coast (src/layers/states.ts COASTS): land edge, then the Great Lakes' water edge; casings under lines.
+  'us-coast-casing',
+  'us-coast-lakes-casing',
   'us-states-outline',
+  'us-coast-outline',
+  'us-coast-lakes-outline',
+  'us-states-selected',
   'tribal-lands-fill',
   'tribal-lands-outline',
   'aiannh-fill',
@@ -166,6 +274,9 @@ const BELOW_THEMATIC_IDS: readonly string[] = [
   'ecoregions-l4-outline'
 ];
 
+/** The id prefix of a dated SST frame's layer (src/layers/sst-anomaly.ts `frameSourceId`, mirrored literal). */
+const SST_FRAME_ID_PREFIX = 'sst-frame-';
+
 /**
  * The id of the first style layer whose id is NOT in `skip`, or undefined
  * when every layer is skipped (the new layer then appends at the top,
@@ -201,7 +312,10 @@ export function reassertLabelOrder(map: maplibregl.Map): void {
  * network fetch resolved first.
  */
 export function reassertThematicOrder(map: maplibregl.Map): void {
-  const skip = [...BOTTOM_STACK_IDS, ...BELOW_THEMATIC_IDS, ...THEMATIC_STACK_IDS];
+  // A dated SST frame sits inside the chain without being a member of it. Taken as the anchor it would pull
+  // every member, the outlines included, beneath it; skipped, it stays put and the chain re-seats above it.
+  const frames = (map.getStyle().layers ?? []).map((l) => l.id).filter((id) => id.startsWith(SST_FRAME_ID_PREFIX));
+  const skip = [...BOTTOM_STACK_IDS, ...BELOW_THEMATIC_IDS, ...THEMATIC_STACK_IDS, ...frames];
   const anchor = firstLayerIdAbove(map, skip);
   for (const id of THEMATIC_STACK_IDS) {
     if (!map.getLayer(id)) continue;

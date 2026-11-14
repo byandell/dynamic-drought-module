@@ -3,39 +3,82 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta name="description" content="Pacific Northwest drought, hydrology, and Tribal Treaty regional mapping. ATNI Climate." />
+  <meta name="description" content="(TEST PREVIEW) Live Drought, Wildfire, Extreme heat, and El Niño monitoring and impact briefing for Tribes and communities across North America. It features 3D fire modes, atmospheric currents, near-term and long-range projections, hurricane tracking, NWS warnings, and more, with Place and Layer Studio to fine tune the display. Built by ATNI Climate." />
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="ATNI Climate" />
+  <meta property="og:title" content="(TEST PREVIEW) Dynamic Drought Module | ATNI Climate" />
+  <meta property="og:description" content="(TEST PREVIEW) Live Drought, Wildfire, Extreme heat, and El Niño monitoring and impact briefing for Tribes and communities across North America. It features 3D fire modes, atmospheric currents, near-term and long-range projections, hurricane tracking, NWS warnings, and more, with Place and Layer Studio to fine tune the display. Built by ATNI Climate." />
+  <meta property="og:url" content="https://atniclimate.github.io/dynamic-drought-module/" />
+  <meta property="og:image" content="https://atniclimate.github.io/dynamic-drought-module/social/ddm-test-preview.jpg" />
+  <meta property="og:image:type" content="image/jpeg" />
+  <meta property="og:image:width" content="1919" />
+  <meta property="og:image:height" content="1079" />
+  <meta property="og:image:alt" content="Test preview of the Dynamic Drought Module showing the 3D Fire view and an impact briefing for Warm Springs Reservation and Off-Reservation Trust Land." />
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="(TEST PREVIEW) Dynamic Drought Module | ATNI Climate" />
+  <meta name="twitter:description" content="(TEST PREVIEW) Live Drought, Wildfire, Extreme heat, and El Niño monitoring and impact briefing for Tribes and communities across North America." />
+  <meta name="twitter:image" content="https://atniclimate.github.io/dynamic-drought-module/social/ddm-test-preview.jpg" />
+  <meta name="twitter:image:alt" content="Test preview of the Dynamic Drought Module showing the 3D Fire view and an impact briefing for Warm Springs Reservation and Off-Reservation Trust Land." />
   <meta name="color-scheme" content="dark" />
   <title>Dynamic Drought Module · ATNI Climate</title>
-  <!-- The ATNI seal as the tab icon; also silences the browser's default
-       /favicon.ico request, which 404ed on every first load (found by the
-       U4d browser pass 2026-07-14). -->
   <link rel="icon" type="image/png" href="/brand/atni-seal.png" />
 
-  <!-- Fonts are self-hosted (public/fonts/, SIL OFL 1.1); the @font-face
+  <!-- Fonts are self-hosted (public/fonts/, licences alongside); the @font-face
        declarations live in src/styles/app.css. No third-party font request. -->
 </head>
 <body class="app-body">
   <div id="app" class="app-shell">
+    <script id="ddm-sidebar-boot">
+      /* D1 M7 (DDM-P10-T07, DR-139): apply the URL's chrome before the
+         sidebar below is parsed, so an embed or a desktop sidebar=closed boot
+         never paints an open column while the application module loads. A
+         classic inline script on purpose: a module script is deferred to
+         after parsing, which is the very frame this has to beat. The grammar
+         mirrors src/state/url.ts (parseEmbedParam, parseSidebarParam,
+         SIDEBAR_DESKTOP_QUERY); tests/precedence.spec.ts pins the two
+         together. The runtime (src/ui/sidebar.ts) applies the same state
+         again at boot, so a failure here only costs the early frame. */
+      (function () {
+        try {
+          var app = document.getElementById('app');
+          if (!app) return;
+          var params = new URLSearchParams(window.location.search);
+          var embed = params.get('embed');
+          if (embed === 'true' || embed === '1') {
+            app.classList.add('embed');
+            return;
+          }
+          var sidebar = params.getAll('sidebar');
+          if (
+            sidebar.length === 1 &&
+            sidebar[0] === 'closed' &&
+            window.matchMedia('(min-width: 721px)').matches
+          ) {
+            app.classList.add('sidebar-collapsed');
+          }
+        } catch (err) {
+          /* The runtime applies the same state once it boots. */
+        }
+      })();
+    </script>
 
     <aside id="sidebar" class="sidebar" aria-label="Map controls">
-      <!-- The mobile bottom-sheet grabber (0.7.0 U2, D-0.7.0-017). Display
-           is stylesheet-gated: it exists only below 720px when the sheet is
-           active (never in embed). The grabber is a real button and the ONLY
-           gesture surface that moves the sheet (drag, tap to cycle,
-           Enter/Space cycles, arrow keys step); wired in src/ui/mobile-sheet.ts. -->
+      <!-- The phone window's header (owner, 2026-11-13: every window opens
+           full screen with "Back to map"). Display is stylesheet-gated: it
+           exists only below 720px when the sheet is active (never in embed).
+           The button is static markup wired in src/ui/mobile-sheet.ts, so a
+           failed motion chunk still leaves the way back; the title after it
+           arrives with src/ui/sheet-motion.ts. -->
       <div class="sheet-grabber-row">
-        <button type="button" id="sheet-grabber" class="sheet-grabber" aria-label="Resize the briefing sheet">
-          <span class="sheet-grabber-bar" aria-hidden="true"></span>
-        </button>
+        <button type="button" id="sheet-close" class="sheet-close">Back to map</button>
       </div>
       <header class="sidebar-header">
         <div class="brand">
           <button class="brand-seal" popovertarget="about-atni" aria-label="About ATNI Climate">
-            <img src="/brand/atni-seal.png" alt="Seal of the Affiliated Tribes of Northwest Indians" width="28" height="28" />
+            <span class="atni-wordmark" aria-hidden="true"><span>ATNI</span><span class="atni-wordmark-climate">CLIMATE</span></span>
           </button>
           <div class="brand-text">
             <h1>Dynamic Drought Module</h1>
-            <p>Regional climate &amp; water indicators</p>
           </div>
         </div>
         <button id="sidebar-collapse" class="icon-btn" aria-label="Collapse sidebar">
@@ -45,9 +88,26 @@
 
       <div class="sidebar-scroll">
 
-        <!-- Stable fallback seat for the one conditions strip. Desktop Brief
-             moves the SAME section into the fixed sidebar dock below; every
-             other surface and the island pre-mount fallback retain this seat. -->
+        <!-- Stable fallback seat for the generated Brief head. The eligible
+             desktop Brief shell moves the SAME section below its minimap;
+             console, mobile, embed, collapse, and pre-mount retain this seat. -->
+        <span id="brief-head-home" hidden></span>
+        <!-- Brief head: the selected-place context and the one place
+             entry surface. Filled by src/ui/view-shell.ts and visible only in
+             Brief mode. Regenerated markup never owns any shell host. -->
+        <section class="panel brief-head" id="brief-head" aria-label="Drought briefing" hidden></section>
+
+        <!-- Stable host for the lazy Preact shell; CSS limits it to desktop,
+             while the mobile sheet and hazard rail serve smaller screens. -->
+        <section class="panel shell-panel" id="shell-panel" aria-label="Hazard view, conditions, region, framing, time, and share">
+          <div id="shell-island"></div>
+        </section>
+
+        <!-- Stable fallback seat for the one conditions strip, below the hazard
+             buttons so its changing height never moves them. Desktop Brief
+             parks the SAME section unseen in the map's dock, and the Key chip
+             carries its lead reading; every other surface and the island
+             pre-mount fallback retain this seat. -->
         <span id="conditions-strip-home" hidden></span>
         <section class="panel conditions-strip" id="conditions-strip" aria-label="Conditions in view" hidden>
           <div class="conditions-head">
@@ -57,32 +117,8 @@
           <div class="conditions-metrics" id="conditions-metrics" aria-live="polite" aria-atomic="true"></div>
         </section>
 
-        <!-- Stable fallback seat for the generated Brief head. The eligible
-             desktop Brief shell moves the SAME section below its minimap;
-             console, mobile, embed, collapse, and pre-mount retain this seat. -->
-        <span id="brief-head-home" hidden></span>
-        <!-- Brief head (U1, the two doors): the concise lede and the one place
-             entry surface. Filled by src/ui/view-shell.ts and visible only in
-             Brief mode. Regenerated markup never owns any shell host. -->
-        <section class="panel brief-head" id="brief-head" aria-label="Drought briefing" hidden></section>
-
-        <!-- The S4 main-screen shell (the 2026-07-18 design record): the four
-             hazard cluster buttons, honest conditions summary, same-node
-             region controls, continental minimap, compact temporal row,
-             share door, and same-node Brief place search,
-             rendered by the lazy Preact shell island into this static host.
-             Stylesheet-gated: desktop only (below 720px the mobile sheet
-             and hazard rail carry the same decisions), never in embed. -->
-        <section class="panel shell-panel" id="shell-panel" aria-label="Hazard view, conditions, region, framing, time, and share">
-          <div id="shell-island"></div>
-        </section>
-
-        <!-- The contextual time rail (D-0.7.0-067, Option 1): a stable direct
-             child after place and before the generated display description.
-             src/ui/time-bar.ts renders the current temporal owner's one spec
-             here and moves this SAME node into #sheet-time-host for the mobile
-             Brief surface. Embeds suppress the full rail and keep only the
-             mirrored #embed-date-stamp chip on the map. -->
+        <!-- time-bar.ts moves this same node to #sheet-time-host on mobile;
+             embeds show only the mirrored #embed-date-stamp. -->
         <div id="time-bar" class="time-bar" role="group" hidden></div>
 
         <!-- What is shown and how to refine it. Stable hosts let view-shell
@@ -90,16 +126,24 @@
              without ever rebuilding or nesting #time-bar. The ENSO capability
              is demoted into this description with its detail behind disclosure. -->
         <section class="panel brief-display" id="brief-display" aria-label="Refine the view" hidden>
-          <!-- The static "Shown now" heading and summary sentence moved into
-               the shell island (S4): the S3 DisplaySummary renders the live,
-               status-derived truth there, so a hand-authored placeholder
-               sentence here would be a second, staler description. -->
+          <!-- DisplaySummary owns the live summary in the shell; do not duplicate it here. -->
           <div id="layers-studio-entry-host"></div>
           <div id="brief-secondary-actions"></div>
+          <!-- The chosen place's name, announced and not drawn: the one
+               briefing door (#region-briefing-btn, the region row's, in
+               Brief and Console alike) shows it. -->
           <div class="brief-selection-summary" id="brief-selection-summary" hidden>
-            <p id="brief-selection-read"></p>
-            <button type="button" class="brief-full-report-link" id="brief-full-report-link">Open the full briefing</button>
+            <p class="brief-place-context sr-only" id="brief-place-context" aria-live="polite" hidden>
+              <span>Selected place</span>
+              <strong id="brief-place-name"></strong>
+            </p>
           </div>
+        </section>
+        <div id="enso-flow-controls"></div>
+        <!-- Variable view details follow the persistent navigation controls
+             and the ENSO buttons, so their mode-sized height moves neither. -->
+        <section id="shell-details-panel" class="shell-details-panel" aria-label="View details">
+          <div id="shell-details-island"></div>
         </section>
 
         <!-- The sheet's at-hand block (U2/U3): the half detent's Brief content
@@ -140,16 +184,10 @@
           <select id="region-select" class="region-select" aria-label="Jump to region"></select>
         </section>
 
-        <!-- The Quick views preset panel (UX-2). On the desktop BRIEF
-             launch pad the shell panel's four cluster buttons carry the
-             view question (S4; the 2026-07-18 design record) and this
-             panel stays hidden as it has since E1; it remains the shipped
-             surface of desktop console and the mobile sheet's half and
-             console detents (mobile surfaces defer to S6). -->
-        <section class="panel" id="panel-quick-views">
-          <h2 class="panel-title">Quick views</h2>
-          <div id="preset-chips" class="preset-chips" role="group" aria-label="Quick view presets"></div>
-        </section>
+        <!-- Mobile seat for the same ENSO flow controls used by the desktop
+             Brief display. The controller rehosts its single node here only
+             at the phone breakpoint; no duplicate state or controls. -->
+        <section class="panel sheet-enso-flow" id="sheet-enso-flow-host" aria-label="ENSO flow overlays"></section>
 
         <!-- The sheet's "All layers" door (U2): the half detent's console
              content ends with the one entry that expands to the full catalog.
@@ -180,12 +218,11 @@
             <button type="button" class="panel-reveal" id="telemetry-reveal" aria-expanded="false" aria-controls="telemetry-body">Water &amp; Snow</button>
           </h2>
           <div id="telemetry-body" class="panel-reveal-body" hidden>
-            <p class="telemetry-discovery-hint">Stations are discovered in the current map view once you zoom in far enough; at wide zooms the featured stations below are shown and the layer reads "zoom in to load". Where discovery finds more than 50 stations, the nearest 50 are shown.</p>
+            <p class="telemetry-discovery-hint">Zoom in to find more stations in this area (up to the nearest 50).</p>
             <div id="telemetry-list" class="telemetry-list"></div>
           </div>
         </section>
 
-        <span id="legend-panel-home" hidden></span>
         <section class="panel legend-panel" id="legend-panel" hidden>
           <h2 class="panel-title">Legend</h2>
           <div id="legend-sections"></div>
@@ -207,6 +244,19 @@
              overlay. Display is stylesheet-gated. -->
         <div class="sheet-report" id="sheet-report"></div>
 
+        <!-- The credit and the date line end the scroll column; neither is pinned under it. -->
+        <footer class="sidebar-footer">
+          <p>A project of ATNI Climate (Affiliated Tribes of Northwest Indians)</p>
+          <p id="footer-credits"></p>
+          <p class="muted">
+            <a href="https://github.com/atniclimate/dynamic-drought-module" target="_blank" rel="noopener">atniclimate/dynamic-drought-module</a>
+            · <span id="footer-version"></span>
+          </p>
+        </footer>
+
+        <!-- The date line is the column's last element, drawn in Console only
+             (stylesheet-gated) and filled by the shell island. -->
+        <div id="shell-time-island" class="shell-time-foot"></div>
       </div>
 
       <!-- The S4c panel-foot response: place-bearing map clicks rehost their
@@ -217,28 +267,6 @@
            OUTSIDE .sidebar-scroll so the no-scroll contract and the foot's
            own scroll region cannot fight. -->
       <div id="panel-response" class="panel-response"></div>
-
-      <!-- Desktop Brief keeps the current rendered-condition readout pinned
-           below the scrolling controls. The shell rehosts the existing
-           #conditions-strip here, preserving its listeners and status. Its
-           full categorical legend remains available through the compact Key
-           disclosure; Console and mobile return both nodes to their homes. -->
-      <div id="sidebar-bottom-dock" class="sidebar-bottom-dock">
-        <div id="conditions-strip-dock" class="conditions-strip-dock"></div>
-        <details class="sidebar-key-disclosure">
-          <summary>Key</summary>
-          <div id="sidebar-key-host" class="sidebar-key-host"></div>
-        </details>
-      </div>
-
-      <footer class="sidebar-footer">
-        <p>A project of ATNI Climate (Affiliated Tribes of Northwest Indians)</p>
-        <p>Data: OpenStreetMap · NOAA · USGS · BIA · EPA</p>
-        <p class="muted">
-          <a href="https://github.com/atniclimate/dynamic-drought-module" target="_blank" rel="noopener">atniclimate/dynamic-drought-module</a>
-          · v0.6.26
-        </p>
-      </footer>
     </aside>
 
     <button id="sidebar-expand" class="icon-btn sidebar-expand-btn" aria-label="Expand sidebar" hidden>
@@ -247,6 +275,16 @@
 
     <main id="map-container" class="map-container">
       <div id="map" role="application" aria-label="Interactive regional map"></div>
+
+      <div id="map-condition-indicator" class="map-condition-indicator">
+        <div id="map-key-overlay-host" class="map-overlay-seat"></div>
+        <!-- Desktop Brief parks Conditions in view here, unseen, so it keeps
+             computing; the Key chip above carries its lead reading as its
+             title (owner 2026-11-13, one box). The status region speaks a
+             changed reading while the strip's own live region is parked. -->
+        <div id="conditions-strip-dock" class="conditions-strip-dock"></div>
+        <span id="map-key-reading-status" class="sr-only" role="status" aria-atomic="true"></span>
+      </div>
 
       <div id="hover-inspector" class="hover-inspector" aria-hidden="true" hidden></div>
 
@@ -273,35 +311,37 @@
              build is still a preview, and hard rule 8 keeps the embed a
              first-class surface rather than one that hides its own status. -->
         <span class="test-preview-badge">Test preview</span>
-        <!-- Stable fallback seat for the one wired Share view button. The
-             desktop Brief shell rehosts this exact node; every other surface
-             returns it here beside Reset. -->
-        <span id="share-btn-home" hidden></span>
-        <button id="share-btn" class="overlay-btn" aria-label="Share view" title="Copy embed-ready link to clipboard">
+        <!-- The desktop column's four fixed slots (S30D D1 M9; rulings R1 a
+             and R2 a; the seat table is src/config/map-chrome.ts): 1 Reset,
+             2 SAT, 3 Help with its drawer, 4 Share. On the
+             desktop shell the stylesheet places each by `data-map-slot` in a
+             four-row grid, so Share fills slot 4 in Brief and Console alike.
+             Share and Reset stay direct children in this
+             source order, which the phone rail (its `order` rules) and the
+             embed stack read unchanged. -->
+        <button id="share-btn" class="overlay-btn map-cell" data-map-slot="4" aria-label="Share: the link restores region or framing, layers, mode and horizon, not the map position or an open briefing" title="The link restores region or framing, layers, mode and horizon, not the map position or an open briefing">
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
-          <span class="map-control-label">Share view</span>
+          <span class="map-control-label">Share</span>
         </button>
-        <button id="reset-btn" class="overlay-btn" aria-label="Reset map view" title="Reset to selected region bounds">
-          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+        <!-- The Reset glyph is Feather rotate-ccw, whose ink spans x 1 to 21
+             of its 24 box. The viewBox starts at x -1 so the ink box is
+             centred on the icon column (it sat 0.83 px left at 20 px). -->
+        <button id="reset-btn" class="overlay-btn map-cell" data-map-slot="1" aria-label="Reset map view" title="Return to the default view">
+          <svg viewBox="-1 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
           <span class="map-control-label">Reset</span>
         </button>
 
         <!-- Desktop seat for the satellite control (owner direction,
-             2026-08-19). The control is MapLibre's, added bottom-right in
-             src/map/init.ts and moved here by the desktop shell so the
-             three map buttons finally read as the one family the E2 ruling
-             describes. Phones and embeds keep the bottom-right seat their
+             2026-08-19): slot 2. The control is MapLibre's, added
+             bottom-right in src/map/init.ts and moved here by the desktop
+             shell. Phones and embeds keep the bottom-right seat their
              layouts were designed around. -->
-        <div id="basemap-switcher-overlay-host" class="map-overlay-seat"></div>
-
-        <!-- Desktop seat for the on-map key (owner direction, 2026-08-19).
-             The key's static home stays in the bottom dock below; the
-             desktop shell moves the SAME node here so phones and embeds
-             keep the dock layout they were designed around. The satellite
-             control is inserted just above this host at runtime
-             (src/map/init.ts), so the desktop column reads Share, Reset,
-             Satellite, then the key for the committed hazard view. -->
-        <div id="map-key-overlay-host" class="map-overlay-seat"></div>
+        <div id="basemap-switcher-overlay-host" class="map-overlay-seat map-spine-slot" data-map-slot="2"></div>
+        <!-- Desktop seat for help and its Map information drawer: slot 3.
+             src/ui/map-information.ts moves the button and the drawer in
+             together on the desktop shell; phones and embeds keep their
+             homes beside #map-info-home below. -->
+        <div id="map-info-seat" class="map-overlay-seat map-spine-slot" data-map-slot="3"></div>
       </div>
 
       <!-- The mobile hazard rail (0.7.0 mobile shell): the quick hazard
@@ -311,36 +351,23 @@
            never on desktop, and never where an open sheet owns the zone). Each button
            applies a MOBILE_HAZARD_PRESETS entry through the one layer
            controller and returns an open sheet to the map (you asked for a
-           hazard map; the map should show); wired in src/ui/sidebar.ts. -->
-      <div id="hazard-rail" class="hazard-rail" role="group" aria-label="Quick hazard views">
-        <button type="button" class="hazard-rail-btn" data-preset="hazard-enso">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M3 8c2.25-3 4.75-3 7 0s4.75 3 7 0 3.5-2.5 4-2.5"/><path d="M3 14c2.25-3 4.75-3 7 0s4.75 3 7 0 3.5-2.5 4-2.5"/><path d="M5 19c1.5-1.5 3-1.5 4.5 0s3 1.5 4.5 0"/></svg>
-          <span class="map-control-label">ENSO</span>
-        </button>
-        <button type="button" class="hazard-rail-btn" data-preset="hazard-fire">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.072-2.143-.224-4.054 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.153.433-2.294 1-3a2.5 2.5 0 0 0 2.5 2.5z"/></svg>
-          <span class="map-control-label">Fire</span>
-        </button>
-        <button type="button" class="hazard-rail-btn" data-preset="hazard-drought">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 2.69l5.66 5.66a8 8 0 1 1-11.31 0z"/></svg>
-          <span class="map-control-label">Drought</span>
-        </button>
-        <button type="button" class="hazard-rail-btn" data-preset="hazard-heat">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 14.76V3.5a2.5 2.5 0 0 0-5 0v11.26a4.5 4.5 0 1 0 5 0z"/></svg>
-          <span class="map-control-label">Heat</span>
-        </button>
-      </div>
+           hazard map; the map should show); wired in src/ui/sidebar.ts. The
+           buttons are generated, one per mode, by src/ui/hazard-rail.ts. -->
+      <div id="hazard-rail" class="hazard-rail" role="group" aria-label="Quick hazard views"></div>
 
       <!-- The map-information disclosure. The glyph is a QUESTION MARK
            (owner direction, 2026-08-19): the round button asks "what am I
            looking at?", which is exactly what the panel answers (active
            view, every active source with its status, basemap and its
-           observation window). Since 2026-08-31 (owner direction) it also
-           carries the license credits: MapLibre's compact attribution
-           circle is gone, and the live per-source attribution strings
-           render in this panel's credits line instead. -->
-      <button id="map-info-btn" class="map-info-btn" type="button" aria-label="Map information" title="Map information: active view, sources, credits, and basemap" aria-controls="map-info-panel" aria-expanded="false">
+           observation window). Its credits line points to the
+           Acknowledgements (M22). On the desktop
+           shell (S30D D1 M9) the button and this panel move together into
+           the column's slot 3, where the button shows the word Help; the
+           span below is their phone and embed home. -->
+      <span id="map-info-home" hidden></span>
+      <button id="map-info-btn" class="map-info-btn map-cell" type="button" aria-label="Map information" title="Map information: active view, sources, credits, and basemap" aria-controls="map-info-panel" aria-expanded="false">
         <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M9.4 9.4a2.7 2.7 0 1 1 3.4 2.6c-.55.18-.9.7-.9 1.28v.62"/><path d="M12 17.2h.01"/></svg>
+        <span class="map-cell-label">Help</span>
       </button>
 
       <section id="map-info-panel" class="map-info-panel" role="region" aria-labelledby="map-info-title" tabindex="-1" hidden>
@@ -359,6 +386,7 @@
         </div>
       </section>
 
+      <div id="copy-toast-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
       <div id="copy-toast" class="copy-toast" hidden>Link copied to clipboard</div>
 
       <!-- Shared bottom overlay dock (H2, 0.6.2): notices and the corner
@@ -382,8 +410,7 @@
           <div id="map-key" class="map-key" role="img" aria-label="Drought category key, D0 abnormally dry through D4 exceptional drought" hidden></div>
 
           <a class="embed-brand" href="https://atniclimate.github.io/dynamic-drought-module/" target="_blank" rel="noopener" aria-label="Open the full Dynamic Drought Module by ATNI Climate">
-            <img src="/brand/atni-seal.png" alt="" width="18" height="18" />
-            <span>ATNI Climate</span>
+            <span class="atni-wordmark" aria-hidden="true"><span>ATNI</span><span class="atni-wordmark-climate">CLIMATE</span></span>
           </a>
         </div>
       </div>
@@ -419,7 +446,7 @@
   </div>
 
   <div id="about-atni" popover class="about-card">
-    <img class="about-lockup" src="/brand/atni-climate-lockup.png" alt="Affiliated Tribes of Northwest Indians, ATNI Climate" />
+    <img class="about-seal" src="/brand/atni-seal-on-dark-64.png" srcset="/brand/atni-seal-on-dark-128.png 2x" alt="Seal of the Affiliated Tribes of Northwest Indians" width="64" height="64" />
     <p>The Dynamic Drought Module is a project of ATNI Climate, the climate resilience program of the Affiliated Tribes of Northwest Indians (ATNI).</p>
     <p class="about-links">
       <a href="https://atnitribes.org" target="_blank" rel="noopener">atnitribes.org</a>

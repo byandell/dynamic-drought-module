@@ -64,8 +64,10 @@
  *
  * Render. Raster source at 0.55 opacity so the basemap and
  * the USDM/Treaty/Tribal overlays remain legible underneath. The palette
- * is encoded server-side in the `WHP_CLS_2023_8bit` raster function, so
- * we do not recolor on the client; we only choose the layer opacity.
+ * is encoded server-side in the `WHP_CLS_2023_8bit` raster function.
+ * Fuel risk draws the issuer classes as white of increasing opacity
+ * (src/config/whp-shade.ts) on every map; the issuer colours are the
+ * separate usfs-whp-classes catalog row (owner, 2026-10-19).
  *
  * The legend lives in `USFS_WHP_PRESENTATION`
  * (src/config/wildfire-presentation.ts), and it was CORRECTED on
@@ -86,24 +88,50 @@
 import type * as maplibregl from 'maplibre-gl';
 
 import { URLS } from '../config/urls';
+import { WHP_SURFACE_OPACITY } from '../config/whp-shade';
 import { registry } from '../state/registry';
-import { watchRasterTiles, type RasterTileWatch } from '../util/raster-status';
+import type { LayerStatus } from '../types/layer';
+import { clearTimeBar, setTimeBar } from '../ui/time-bar';
+import { watchRasterTiles, type RasterTileOutcome, type RasterTileWatch } from '../util/raster-status';
+import { viewHasHeatRiskCoverage } from './heatrisk-coverage';
+import { registerWhpImageShadeProtocol } from './whp-image-shade-protocol';
 
-const LAYER_KEY = 'usfs-whp';
-const SOURCE_ID = 'usfs-whp';
-const LAYER_ID = 'usfs-whp';
 const TILE_SUCCESS_DEADLINE_MS = 10_000;
 
-/** Fade targets for the sidebar's toggle transitions (LayerModule contract). */
-export const fadeLayerIds = [LAYER_ID] as const;
+type WhpStatus = 'loading' | 'ready' | 'degraded' | 'error' | 'no-data';
 
-/** The tile-load honesty watcher (util/raster-status.ts); null when inactive. */
-let tileWatch: RasterTileWatch | null = null;
+/** The issuer-coloured row: the same service, and the one drawn copy while it stands the 3D drape down. */
+const COLOURS_KEY = 'usfs-whp-classes';
 
-type WhpStatus = 'loading' | 'ready' | 'degraded' | 'error';
+/**
+ * Whether the Wildfire 3D drape draws this edition: mounted (src/layers/whp-3d.ts,
+ * its layer id mirrored, as src/map/fire3d.ts does, so this chunk stays free of
+ * the scene) and not stood down, which it is exactly while the colours row is on.
+ */
+function drapeDrawn(map: maplibregl.Map): boolean {
+  return Boolean(map.getLayer('whp-2023')) && !registry.getActiveKeys().has(COLOURS_KEY);
+}
 
-function reportStatus(state: WhpStatus): void {
-  registry.setStatus(LAYER_KEY, state);
+/**
+ * The time statement (DDM-P8-T02 clause 4), the Wildfire screen's stamp at
+ * the long-range horizon. WHP is a static edition, not a dated condition:
+ * the 2023 classified raster the issuer serves carries no valid period, so
+ * the stamp names the edition and says plainly that it is potential
+ * context, neither a current condition nor an outlook. Plain (observed)
+ * typography, because the outlook instrument would claim a forward-looking
+ * register this product does not have; the text carries the same point.
+ */
+function installTimeBar(key: string): void {
+  setTimeBar(key, {
+    ariaLabel: 'Wildfire Hazard Potential edition',
+    stamp: {
+      horizon: 'longRange',
+      headline: 'Static 2023 edition · not a dated condition',
+      detail:
+        'USDA Forest Service Wildfire Hazard Potential · a static classified index at 270 m for the conterminous United States; potential context, not current fire conditions and not an outlook',
+      register: 'observed'
+    }
+  });
 }
 
 /**
@@ -132,7 +160,8 @@ function buildImageTileTemplate(): string {
     'size=256,256',
     'format=png',
     'transparent=true',
-    'f=image'
+    'f=image',
+    'interpolation=RSP_NearestNeighbor'
   ].join('&');
   const upstream = `${URLS.usfsWhp}/exportImage?${params}`;
   const encoded = encodeURIComponent(upstream).replace(
@@ -143,92 +172,204 @@ function buildImageTileTemplate(): string {
 }
 
 /**
- * Add the WHP raster source and layer to the map. Idempotent: a second
- * call with an existing source/layer is a no-op so URL-as-state restore
- * cannot stack duplicates.
- *
- * Network failures during the synchronous source addition are extremely
- * uncommon (MapLibre defers actual tile requests) but we still wrap the
- * setup in try/catch so a misconfiguration surfaces as `'error'`
- * instead of throwing into the caller's activation flow.
+ * One WHP raster catalog row: `usfs-whp` is Fuel risk (shaded white), and
+ * `usfs-whp-classes` is the same service in the issuer's class colours.
+ * Each key owns its own source, layer, watchers and time statement.
  */
-export async function activate(map: maplibregl.Map): Promise<void> {
-  reportStatus('loading');
+export function createWhpLayer(key: 'usfs-whp' | 'usfs-whp-classes', shaded: boolean) {
+  const SOURCE_ID = key;
+  const LAYER_ID = key;
 
-  // WHP tiles ride the Worker proxy (see the module header). A deployment
-  // without a configured Worker cannot serve this layer; report it
-  // unavailable honestly instead of issuing direct fetches that fail
-  // intermittently in real browsers.
-  if (!URLS.workerProxy) {
-    console.warn(
-      '[usfs-whp] no Worker proxy configured (URLS.workerProxy is empty); ' +
-        'the WHP raster requires the proxy route.'
-    );
-    reportStatus('error');
-    return;
+  /** The tile-load honesty watcher (util/raster-status.ts); null when inactive. */
+  let tileWatch: RasterTileWatch | null = null;
+  let releaseCoverageWatch: (() => void) | null = null;
+
+  function reportStatus(state: LayerStatus): void {
+    registry.setStatus(key, state);
   }
 
-  try {
-    if (!map.getSource(SOURCE_ID)) {
-      map.addSource(SOURCE_ID, {
-        type: 'raster',
-        tiles: [buildImageTileTemplate()],
-        tileSize: 256,
-        attribution: 'USDA Forest Service - Wildfire Hazard Potential'
-      });
-    }
-
-    if (!map.getLayer(LAYER_ID)) {
-      map.addLayer({
-        id: LAYER_ID,
-        type: 'raster',
-        source: SOURCE_ID,
-        paint: {
-          // 0.55 opacity preserves basemap topography and lets the USDM /
-          // NIFC overlays read clearly when stacked above WHP.
-          'raster-opacity': 0.55
+  /**
+   * Outside the conterminous United States the service answers 200 with
+   * transparent tiles, which the watcher reads as ready, so the view's five
+   * sample points decide (the coverage ring HeatRisk uses). Returns the watcher's reporter.
+   */
+  function watchCoverage(map: maplibregl.Map): (tile: RasterTileOutcome) => void {
+    releaseCoverageWatch?.();
+    let tile: WhpStatus = 'loading';
+    // Hidden before a verdict under a stood-down drape, nothing draws this
+    // row: it reads the colours row until the drape stands up and draws it.
+    let borrowing = false;
+    const sync = (): void => {
+      if (borrowing && drapeDrawn(map)) {
+        borrowing = false;
+        tile = 'ready';
+      }
+      const own = borrowing ? (registry.getStatus(COLOURS_KEY) ?? 'loading') : tile;
+      const next = viewHasHeatRiskCoverage(map) ? own : 'no-data';
+      if (registry.getStatus(key) !== next) reportStatus(next);
+    };
+    // A hidden source's closed cycle reports nothing more, so the registry drives the borrowed read.
+    const follow = (): void => {
+      if (borrowing) sync();
+    };
+    const releaseFollow = [registry.on('change', follow), registry.on('status-change', follow)];
+    // The watcher's last verdict while the drape hid this layer; null once given back.
+    let held: RasterTileOutcome | null = null;
+    // Given back (MapLibre marks the source used again, before any tile request):
+    // the watcher's own last verdict replaces the drape's, so held tiles need no
+    // new read. A hidden 'error' is no evidence and stays in the watcher's
+    // memory, so the view is read afresh under a new deadline.
+    const givenBack = (e: { sourceId?: string; sourceDataType?: string }): void => {
+      if (held === null || e.sourceId !== SOURCE_ID || e.sourceDataType !== 'visibility') return;
+      if (map.getLayoutProperty(LAYER_ID, 'visibility') === 'none') return;
+      borrowing = false;
+      if (held === 'error') {
+        tile = 'loading';
+        tileWatch?.reset();
+      } else {
+        tile = held;
+      }
+      held = null;
+      sync();
+    };
+    map.on('moveend', sync);
+    map.on('sourcedata', givenBack);
+    releaseCoverageWatch = () => {
+      map.off('moveend', sync);
+      map.off('sourcedata', givenBack);
+      for (const release of releaseFollow) release();
+    };
+    return (state) => {
+      // A hidden layer (the Wildfire 3D drape stands in for it) requests no
+      // tiles, so a deadline verdict then is no evidence; keep the last one.
+      // A row hidden before its first verdict is settled ready (off coverage,
+      // no data) while the drape draws it, and borrows the colours row's verdict while it is stood down.
+      // Hidden only under the mounted 3D drape, which draws this edition from the probed archive unless stood down.
+      if (map.getLayoutProperty(LAYER_ID, 'visibility') === 'none') {
+        held = state;
+        if (tile === 'loading') {
+          borrowing = !drapeDrawn(map);
+          if (!borrowing) tile = 'ready';
+          sync();
         }
-      });
+        return;
+      }
+      held = null;
+      borrowing = false;
+      tile = state;
+      sync();
+    };
+  }
+
+  /**
+   * Add the WHP raster source and layer to the map. Idempotent: a second
+   * call with an existing source/layer is a no-op so URL-as-state restore
+   * cannot stack duplicates.
+   *
+   * Network failures during the synchronous source addition are extremely
+   * uncommon (MapLibre defers actual tile requests) but we still wrap the
+   * setup in try/catch so a misconfiguration surfaces as `'error'`
+   * instead of throwing into the caller's activation flow.
+   */
+  async function activate(map: maplibregl.Map): Promise<void> {
+    reportStatus('loading');
+
+    // WHP tiles ride the Worker proxy (see the module header). A deployment
+    // without a configured Worker cannot serve this layer; report it
+    // unavailable honestly instead of issuing direct fetches that fail
+    // intermittently in real browsers.
+    if (!URLS.workerProxy) {
+      console.warn(
+        `[${key}] no Worker proxy configured (URLS.workerProxy is empty); ` +
+          'the WHP raster requires the proxy route.'
+      );
+      reportStatus('error');
+      return;
     }
 
+    try {
+      registerWhpImageShadeProtocol();
+      if (!map.getSource(SOURCE_ID)) {
+        map.addSource(SOURCE_ID, {
+          type: 'raster',
+          // The classes row decodes too: the issuer paints its NoData opaque black (whp-image-shade-protocol.ts).
+          tiles: [`${shaded ? 'whp-image-shade://' : 'whp-image-classes://'}${buildImageTileTemplate()}`],
+          tileSize: 256,
+          attribution: 'USDA Forest Service - Wildfire Hazard Potential'
+        });
+        // Floor flat-view coverage zoom so categorical tiles are magnified rather
+        // than rounded up into linear minification. Pitch needs separate coverage.
+        map.getSource<maplibregl.RasterTileSource>(SOURCE_ID)!.roundZoom = false;
+      }
+
+      if (!map.getLayer(LAYER_ID)) {
+        map.addLayer({
+          id: LAYER_ID,
+          type: 'raster',
+          source: SOURCE_ID,
+          paint: {
+            // 0.55 opacity preserves basemap topography and lets the USDM /
+            // NIFC overlays read clearly when stacked above WHP.
+            'raster-opacity': WHP_SURFACE_OPACITY,
+            'raster-resampling': 'nearest'
+          }
+        });
+      }
+
+      tileWatch?.detach();
+      tileWatch = watchRasterTiles(map, SOURCE_ID, watchCoverage(map), {
+        reportInitialSuccess: true,
+        requestCompletenessDeadlineMs: TILE_SUCCESS_DEADLINE_MS
+      });
+      // The raster is the displayed surface from here on; its time statement
+      // stands while it is, and the controller's terminal-error cleanup
+      // (deactivate below) withdraws it if no tile ever paints.
+      installTimeBar(key);
+    } catch (err) {
+      console.warn(`[${key}] activation failed.`, err);
+      reportStatus('error');
+    }
+  }
+
+  /**
+   * Remove the WHP raster layer and source from the map. Symmetric with
+   * `activate`; safe to call when the layer was never activated.
+   */
+  function deactivate(map: maplibregl.Map): void {
+    releaseCoverageWatch?.();
+    releaseCoverageWatch = null;
     tileWatch?.detach();
-    tileWatch = watchRasterTiles(map, SOURCE_ID, reportStatus, {
-      reportInitialSuccess: true,
-      requestCompletenessDeadlineMs: TILE_SUCCESS_DEADLINE_MS
-    });
-  } catch (err) {
-    console.warn('[usfs-whp] activation failed.', err);
-    reportStatus('error');
+    tileWatch = null;
+    if (map.getLayer(LAYER_ID)) {
+      map.removeLayer(LAYER_ID);
+    }
+    if (map.getSource(SOURCE_ID)) {
+      map.removeSource(SOURCE_ID);
+    }
+    clearTimeBar(key);
   }
+
+  /**
+   * No-op popup binder. WHP is a server-rendered raster: we do not have
+   * per-pixel attributes on the client, so there is nothing to attach a
+   * click handler to. The interactive `identify` operation against
+   * ImageServer is left to a future milestone (it would require a separate
+   * `identify` call per click, which is out of scope for M9).
+   *
+   * The function is exported with the same shape as the GeoJSON layer
+   * modules so the LayerRegistry (M7) can call it uniformly without
+   * branching on layer kind.
+   */
+  function bindPopups(_map: maplibregl.Map): void {
+    // Intentionally empty; WHP is a raster layer with no client-side
+    // attributes. See JSDoc above.
+  }
+
+  /** Fade targets for the sidebar's toggle transitions (LayerModule contract). */
+  const fadeLayerIds = [LAYER_ID] as const;
+
+  return { activate, deactivate, bindPopups, fadeLayerIds };
 }
 
-/**
- * Remove the WHP raster layer and source from the map. Symmetric with
- * `activate`; safe to call when the layer was never activated.
- */
-export function deactivate(map: maplibregl.Map): void {
-  tileWatch?.detach();
-  tileWatch = null;
-  if (map.getLayer(LAYER_ID)) {
-    map.removeLayer(LAYER_ID);
-  }
-  if (map.getSource(SOURCE_ID)) {
-    map.removeSource(SOURCE_ID);
-  }
-}
-
-/**
- * No-op popup binder. WHP is a server-rendered raster: we do not have
- * per-pixel attributes on the client, so there is nothing to attach a
- * click handler to. The interactive `identify` operation against
- * ImageServer is left to a future milestone (it would require a separate
- * `identify` call per click, which is out of scope for M9).
- *
- * The function is exported with the same shape as the GeoJSON layer
- * modules so the LayerRegistry (M7) can call it uniformly without
- * branching on layer kind.
- */
-export function bindPopups(_map: maplibregl.Map): void {
-  // Intentionally empty; WHP is a raster layer with no client-side
-  // attributes. See JSDoc above.
-}
+/** Fuel risk: the WHP classes as white of increasing opacity on every map. */
+export const { activate, deactivate, bindPopups, fadeLayerIds } = createWhpLayer('usfs-whp', true);

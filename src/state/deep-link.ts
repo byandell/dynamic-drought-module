@@ -25,24 +25,25 @@
 
 import type * as maplibregl from 'maplibre-gl';
 import type { Feature, FeatureCollection } from 'geojson';
-import type { BoundarySelectionContext } from '../impact/types';
+import type { BoundarySelectionContext, ContainingPlaces } from '../impact/types';
+import { postalCodeFromProperties } from '../config/geography';
+import { isStateCode } from '../config/state-codes';
 
 // The boot slice of the URL catalog, not the catalog (DR-008a): this
 // resolver runs at boot and needs one bundled file.
 import { BOOT_URLS } from '../config/urls-boot';
 import { bboxCenter, bboxToContinuousBounds } from '../util/bbox';
 import { geometryBboxAcrossAntimeridian } from '../util/antimeridian';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchSharedJsonWithBudget, US_STATES_SHARED_KEY } from '../util/fetch';
 import {
   isCurrentBriefingIntent,
   nextBriefingIntent,
   openImpactPanel,
   openImpactPanelUnavailable
 } from '../ui/impact-panel';
-import { getSheetDetent, isSheetActive } from '../ui/mobile-sheet';
-import { setPlaceSelection } from './place-selection';
+import { isSheetActive, sheetCameraInset, sheetCameraSideInset } from '../ui/mobile-sheet';
+import { edgeColumnInset } from '../ui/edge-column';
 import { getCurrentRegion } from './region-store';
-import { getViewMode } from './view-mode';
 import { showToast } from '../ui/overlay';
 import type { SelectParam } from './url';
 
@@ -56,34 +57,38 @@ const FETCH_TIMEOUT_MS = 10_000;
  *
  * THE PAD FOLLOWS THE PANEL THAT WILL ACTUALLY RENDER (U-UX-FIX-1
  * DEF-5): `panelWillOpen` says whether THIS open will put the impact
- * panel over the map. The summary-first desktop path (a search
- * selection, D-0.7.0-070) renders in the LEFT sidebar column and never
- * opens the right-side panel, so reserving the desktop right pad there
+ * panel over the map. A path that opens no right-side panel (Locate while
+ * its sheet is closed) must not reserve the desktop right pad: that
  * shrank the effective viewport by up to 480px and computed a fit zoom
  * for a panel that never appeared (Washington at 5.71 instead of ~6.52,
  * Alberta in frame). Paths where the panel does open keep their exact
  * pre-fix padding values.
  *
  * Three cases:
- * - Desktop: the panel overlays the right 440px; a transient right pad,
- *   clamped to half the viewport so a small window can never be asked
- *   for more padding than it has pixels (MapLibre rejects that). With
- *   no panel coming, symmetric aesthetic margins only.
- * - Mobile with the U2 sheet active: the sheet's LIVE height is already
- *   the map's persistent transform padding (the one shared authority,
- *   written by the sheet on every detent settle; MapLibre's
- *   `cameraForBounds` composes transform padding with this option
- *   padding), so the fit passes only its aesthetic margins. Reading the
- *   sheet height here as well would double-count it.
+ * - Desktop and tablet: the briefing covers the whole map, as a studio
+ *   does (owner, 2026-11-13), so there is no band to keep clear. The
+ *   pad is the symmetric margin either way, and "Back to map" reveals
+ *   the place centred.
+ * - Mobile with the phone sheet active: the briefing answers in a window
+ *   that covers the whole screen (owner, 2026-11-13), so `sheetCameraInset`
+ *   and `sheetCameraSideInset` are 0 and the fit centres the place for the
+ *   moment the reader goes back to the map, clear of the right-edge column
+ *   it returns to (`edgeColumnInset`).
  * - Mobile without the sheet (embed keeps today's hidden-chrome
  *   semantics; the no-JavaScript fallback stacks): the briefing overlay
  *   still covers the lower viewport, so the pre-U2 transient bottom pad
  *   stays; with no overlay coming, aesthetic margins only.
  */
-function briefingCameraPadding(panelWillOpen: boolean): maplibregl.PaddingOptions {
+export function briefingCameraPadding(panelWillOpen: boolean): maplibregl.PaddingOptions {
   const mobile = window.matchMedia('(max-width: 720px)').matches;
   if (mobile && isSheetActive()) {
-    return { top: 24, left: 24, right: 24, bottom: 24 };
+    return {
+      top: 24,
+      left: 24 + sheetCameraSideInset(),
+      // The right-edge column stays on screen with a sheet open.
+      right: 24 + edgeColumnInset(),
+      bottom: 24 + (panelWillOpen ? sheetCameraInset() : 0)
+    };
   }
   if (mobile) {
     return {
@@ -95,12 +100,8 @@ function briefingCameraPadding(panelWillOpen: boolean): maplibregl.PaddingOption
         : 24
     };
   }
-  return {
-    top: 40,
-    left: 40,
-    bottom: 40,
-    right: panelWillOpen ? Math.min(480, Math.round(window.innerWidth * 0.5)) : 40
-  };
+  // The full-cover briefing leaves no part of the map beside it, so the pad is uniform.
+  return { top: 40, left: 40, bottom: 40, right: 40 };
 }
 
 /**
@@ -159,29 +160,31 @@ export async function openStateBriefing(
      */
     guard?: () => boolean;
     /**
-     * Summary-first (D-0.7.0-070): set the place selection and let the
-     * left panel offer the one full-report link instead of opening the
-     * briefing directly; on the active mobile Brief sheet the briefing
-     * still opens (map-click parity: the at-hand half detent IS the
-     * mobile summary). The select= deep link and the keyboard
-     * region-briefing trigger stay direct: both are explicit
-     * open-the-briefing requests.
+     * Widen the fit for chrome only the caller knows is over the map
+     * (Locate's card rides above the sheet). It is handed the panel-aware
+     * padding and returns the padding to use; it never replaces the rule.
      */
-    summaryFirst?: boolean;
+    padding?: (base: maplibregl.PaddingOptions) => maplibregl.PaddingOptions;
   } = {}
 ): Promise<void> {
   let feature: Feature | undefined;
   try {
-    const response = await fetchWithBudget(
+    // Shared, page-lifetime transport (DDM-P14-T06): this opener never had a
+    // cancellation seam of its own (the prior call passed a `null` master
+    // signal, timeout-only), so a fresh controller stands in for it; nothing
+    // else ever aborts it, which reproduces that same "no external cancel"
+    // behavior while still letting this consumer's own wait be counted and
+    // released like every other. Joins whatever fetch the states layer, the
+    // Place studio, or another reader already made for the same bundled
+    // file. `fc.features.find` below is read-only, so sharing the reference
+    // is safe.
+    const fc = (await fetchSharedJsonWithBudget(
+      US_STATES_SHARED_KEY,
       BOOT_URLS.usStatesLocal,
       null,
-      null,
+      new AbortController().signal,
       FETCH_TIMEOUT_MS
-    );
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status} ${response.statusText}`);
-    }
-    const fc = (await response.json()) as FeatureCollection;
+    )) as FeatureCollection;
     const wanted = stusps.toUpperCase();
     feature = fc.features.find((f) => {
       const code = f.properties?.STUSPS;
@@ -202,13 +205,31 @@ export async function openStateBriefing(
   if (opts.guard && !opts.guard()) return;
 
   const bbox = geometryBboxAcrossAntimeridian(feature.geometry);
-  const lngLat = bbox ? bboxCenter(bbox) : { lng: 0, lat: 0 };
+  // Dynamic import: point-in-polygon is briefing-cluster code the activation
+  // gate keeps out of the eager bundle. A failed chunk load falls back to the
+  // box centre so the briefing (and its toast fallback) still opens.
+  const lngLat = bbox
+    ? await import('../util/point-in-polygon').then(
+        (m) => m.representativePoint(feature.geometry, bbox),
+        () => bboxCenter(bbox)
+      )
+    : { lng: 0, lat: 0 };
   let buildBoundaryContext: typeof import('../impact/context').buildBoundaryContext;
   try {
     ({ buildBoundaryContext } = await import('../impact/context'));
   } catch {
     if (!opts.guard || opts.guard()) {
       const name = feature.properties?.NAME;
+      // This fallback fires only when the `../impact/context` module itself
+      // fails to load, not from a missing STUSPS: `feature` was just found
+      // BY matching its own STUSPS against `stusps` above, so its own
+      // property is exactly what this context already knows, honestly
+      // reported as 'feature-property' rather than left null.
+      const rawCode = postalCodeFromProperties(feature.properties ?? null);
+      const containing: ContainingPlaces =
+        rawCode !== null && isStateCode(rawCode)
+          ? { state: rawCode, basis: 'feature-property' }
+          : { state: null, basis: 'none' };
       const context: BoundarySelectionContext = {
         kind: 'state',
         title:
@@ -218,7 +239,8 @@ export async function openStateBriefing(
         properties: feature.properties ?? null,
         lngLat,
         ...(bbox ? { bbox, serviceBbox: bbox } : {}),
-        regionKey: getCurrentRegion()
+        regionKey: getCurrentRegion(),
+        containing
       };
       openImpactPanelUnavailable(context);
     }
@@ -226,24 +248,15 @@ export async function openStateBriefing(
   }
   if (opts.guard && !opts.guard()) return;
 
-  // ONE shared decision (U-UX-FIX-1 DEF-5; DG-080-REVIEW finding 3):
-  // whether THIS open will put the impact panel over the map. On the
-  // summary-first path the panel opens ONLY on the active mobile Brief
-  // sheet (map-click parity); every direct open (deep link, the
-  // region-briefing trigger) opens it unconditionally. Computed once and
-  // used by BOTH the camera padding and the open branch below, so the
-  // two can never drift apart. Everything between the two uses is
-  // synchronous, so the single read equals the former pair of reads.
-  const panelWillOpen =
-    !opts.summaryFirst || (isSheetActive() && getViewMode() === 'brief');
-
-  // At the sheet's full detent the map has receded entirely; no camera
-  // call fires against a covered canvas (cartography lens). The report
-  // close restores the prior detent, whose settle re-pads the camera.
-  const mapCovered = getSheetDetent() === 'full';
-  if (opts.fit && bbox && !mapCovered) {
+  // Every open here puts the impact panel over the map (a search pick, the
+  // deep link and the region-briefing trigger all open it), so the camera pad
+  // always reserves the panel's side. Mobile full panels leave the map
+  // visible, so every requested fit still frames the selected geometry behind
+  // the glass surface.
+  if (opts.fit && bbox) {
+    const padding = briefingCameraPadding(true);
     map.fitBounds(bboxToContinuousBounds(bbox), {
-      padding: briefingCameraPadding(panelWillOpen)
+      padding: opts.padding ? opts.padding(padding) : padding
     });
   }
 
@@ -253,13 +266,8 @@ export async function openStateBriefing(
     feature.geometry,
     lngLat
   );
-  const context = bbox ? { ...rawContext, bbox } : rawContext;
-  if (opts.summaryFirst) {
-    setPlaceSelection({ label: context.title, context });
-    // The shared decision: on this branch `panelWillOpen` is exactly
-    // "the mobile Brief sheet is active" (see its computation above).
-    if (panelWillOpen) openImpactPanel(context);
-    return;
-  }
+  const context = bbox
+    ? { ...rawContext, bbox, pointInsidePlace: true, placeGeometry: feature.geometry }
+    : rawContext;
   openImpactPanel(context);
 }

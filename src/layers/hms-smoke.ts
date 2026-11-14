@@ -26,14 +26,16 @@ import type { FeatureCollection, GeoJsonProperties } from 'geojson';
 import { URLS } from '../config/urls';
 import {
   HMS_DENSITY_PRESENTATION,
-  HMS_OVERVIEW_QUALIFICATION,
   buildHmsSmokeFillPaint,
+  hmsLegendSwatch,
   parseArcGisPolygonFeatureCollection,
+  resolveHmsDensityClass,
   resolveHmsDensityPresentation
 } from '../config/wildfire-presentation';
 import { registerClickTarget } from '../map/interaction-coordinator';
-import { escapeHtml } from '../util/escape';
-import { fetchJsonWithBudget } from '../util/fetch';
+import type { ClockAbsent, ClockValue, IssuedModel, PopupClock } from '../ui/popup-frame';
+import type { LayerActivation } from '../config/layers';
+import { fetchJsonWithBudget, linkAbort } from '../util/fetch';
 import { registry } from '../state/registry';
 import { showLegend, hideLegend, LEGEND_ORDER, renderSwatchLegend } from '../ui/legend-registry';
 
@@ -58,6 +60,21 @@ const FETCH_TIMEOUT_MS = 15_000;
  */
 let masterController: AbortController | null = null;
 
+/**
+ * The controller-owned activation signal (DDM-P1-T02): handed in by
+ * `activate` and linked to `masterController`, so the layer controller's
+ * abort on deactivate or supersession reaches a held query at once. Null
+ * when activated without the seam, where `cancelActivation` alone applies.
+ */
+let activationSignal: AbortSignal | null = null;
+
+/**
+ * Request-identity token, the same belt-and-braces the boundary layers wear:
+ * each query takes `++requestSeq` at fetch start and a response whose token
+ * is no longer current renders nothing, even one that raced past the abort.
+ */
+let requestSeq = 0;
+
 type HmsStatus = 'loading' | 'ready' | 'degraded' | 'error' | 'no-data';
 
 function reportStatus(state: HmsStatus): void {
@@ -75,15 +92,30 @@ function julianDayUtc(date: Date): string {
   return `${date.getUTCFullYear()}${String(dayOfYear).padStart(3, '0')}`;
 }
 
-/** Parse an HMS "YYYYDDD HHMM" string into a short human label ("Jul 6, 12:00 UTC"). */
-function formatHmsTime(value: unknown): string {
-  if (typeof value !== 'string') return '';
-  const m = /^(\d{4})(\d{3})\s+(\d{2})(\d{2})$/.exec(value.trim());
-  if (!m) return value;
-  const [, year, doy, hh, mm] = m;
-  const date = new Date(Date.UTC(Number(year), 0, Number(doy), Number(hh), Number(mm)));
-  if (Number.isNaN(date.getTime())) return value;
-  return `${date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' })}, ${hh}:${mm} UTC`;
+/** The frame's explanation for issuer time text DDM does not parse (PF1). */
+const SUPPLIED_TIME_EXPLANATION = 'As the issuer states it; DDM does not read it as a full date.';
+
+/**
+ * Read an HMS "YYYYDDD HHMM" string as a UTC instant (PF1), the year at
+ * least 1000 (Date.UTC reads years 0 to 99 as 1900 to 1999), the day of
+ * year checked against that year (1 to 365, or 366 in a leap year) and the
+ * time against 0000 to 2359. A missing, null or blank value, or one that is
+ * neither text nor a finite number, is absent; any other value is shown as
+ * the issuer supplied it, never silently dropped.
+ */
+function readHmsTime(value: unknown): ClockValue | ClockAbsent {
+  const raw = typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : null;
+  if (raw === null || raw.trim() === '') {
+    return { precision: 'absent', reason: 'unavailable' };
+  }
+  const m = /^(\d{4})(\d{3})\s+(\d{2})(\d{2})$/.exec(raw.trim());
+  const supplied: ClockValue = { precision: 'supplied', text: raw, explanation: SUPPLIED_TIME_EXPLANATION };
+  if (!m) return supplied;
+  const [year, doy, hh, mm] = [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])];
+  if (year < 1000) return supplied;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  if (doy < 1 || doy > (leap ? 366 : 365) || hh > 23 || mm > 59) return supplied;
+  return { precision: 'instant', at: Date.UTC(year, 0, doy, hh, mm), zone: 'UTC' };
 }
 
 /**
@@ -104,21 +136,59 @@ function buildQueryUrl(): string {
   return `${URLS.noaaHmsSmokeFeatureServer}/query?${params.toString()}`;
 }
 
+/** nws-alerts' cadence: the two-day window is computed at fetch time, so a tab left open must re-ask. */
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+let refreshTimer: number | null = null;
+let activeMap: maplibregl.Map | null = null;
+let lastStartedAt = 0;
+
+function scheduleRefresh(map: maplibregl.Map): void {
+  if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+  refreshTimer = null;
+  if (document.hidden) return;
+  refreshTimer = window.setTimeout(() => {
+    refreshTimer = null;
+    void load(map, false);
+  }, Math.max(REFRESH_INTERVAL_MS - (Date.now() - lastStartedAt), 0));
+}
+
+function onVisibilityChange(): void {
+  if (activeMap) scheduleRefresh(activeMap);
+}
+
 /**
  * Add the HMS smoke source plus its borderless fill. Idempotent; an empty
  * result is `'no-data'` (no smoke drawn in the two-day query window is a
  * real, good answer).
  */
-export async function activate(map: maplibregl.Map): Promise<void> {
+export async function activate(
+  map: maplibregl.Map,
+  activation?: LayerActivation
+): Promise<void> {
+  activationSignal = activation?.signal ?? null;
+  activeMap = map;
+  document.removeEventListener('visibilitychange', onVisibilityChange);
+  document.addEventListener('visibilitychange', onVisibilityChange);
   if (map.getSource(SOURCE_ID)) {
+    scheduleRefresh(map);
     return;
   }
+  await load(map, true);
+}
 
+/**
+ * One query and render. A refresh updates the existing source in place
+ * (setData), never removes it: Wildfire 3D reads this source.
+ */
+async function load(map: maplibregl.Map, initial: boolean): Promise<void> {
   if (masterController) masterController.abort();
   masterController = new AbortController();
   const signal = masterController.signal;
+  const unlink = linkAbort(masterController, initial ? activationSignal : null);
+  const token = ++requestSeq;
+  lastStartedAt = Date.now();
 
-  reportStatus('loading');
+  if (initial) reportStatus('loading');
 
   let geojson: FeatureCollection;
   let truncated = false;
@@ -128,45 +198,72 @@ export async function activate(map: maplibregl.Map): Promise<void> {
         buildQueryUrl(),
         null,
         signal,
-        FETCH_TIMEOUT_MS
+        FETCH_TIMEOUT_MS,
+        // shortcut: two days of whole-continent smoke polygons, size never measured on a heavy day; set from a measurement.
+        64 * 1024 * 1024
       ),
       'NOAA HMS smoke'
     );
     geojson = parsed.collection;
     truncated = parsed.truncated;
   } catch (err) {
-    if (signal.aborted) return;
+    unlink();
+    if (signal.aborted || token !== requestSeq) {
+      console.debug(`[hms-smoke] request ${token} dropped: aborted or superseded before it settled`);
+      return;
+    }
     console.warn('[hms-smoke] HMS smoke fetch failed.', err);
+    // Plumes from the last good read must not stay up as current beside an error.
+    (map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined)?.setData({
+      type: 'FeatureCollection',
+      features: []
+    });
+    hideLegend(LAYER_KEY);
     reportStatus('error');
+    scheduleRefresh(map);
     return;
   }
 
-  if (signal.aborted) return;
+  unlink();
+  // A late response to a superseded or torn-down request must not render.
+  if (signal.aborted || token !== requestSeq) {
+    console.debug(`[hms-smoke] request ${token} dropped: a late response after intent changed`);
+    return;
+  }
 
   const features = geojson?.features ?? [];
 
-  map.addSource(SOURCE_ID, {
-    type: 'geojson',
-    data: geojson,
-    attribution: 'NOAA OSPO Hazard Mapping System'
-  });
+  const source = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+  if (source) {
+    source.setData(geojson);
+  } else {
+    map.addSource(SOURCE_ID, {
+      type: 'geojson',
+      data: geojson,
+      attribution: 'NOAA OSPO Hazard Mapping System'
+    });
+  }
+  scheduleRefresh(map);
 
   if (features.length === 0) {
+    hideLegend(LAYER_KEY);
     reportStatus(truncated ? 'degraded' : 'no-data');
     return;
   }
 
-  const beforeId = resolveBeforeId(map);
-
-  map.addLayer(
-    {
-      id: FILL_LAYER_ID,
-      type: 'fill',
-      source: SOURCE_ID,
-      paint: buildHmsSmokeFillPaint()
-    },
-    beforeId
-  );
+  if (!map.getLayer(FILL_LAYER_ID)) {
+    map.addLayer(
+      {
+        id: FILL_LAYER_ID,
+        type: 'fill',
+        source: SOURCE_ID,
+        paint: buildHmsSmokeFillPaint()
+      },
+      resolveBeforeId(map)
+    );
+    // The 3D volume hides the flat fill; a fill added under a live volume joins it hidden.
+    if (map.getLayer('hms-smoke-volume')) map.setLayoutProperty(FILL_LAYER_ID, 'visibility', 'none');
+  }
 
   showLegend(LAYER_KEY, {
     order: LEGEND_ORDER.event + 2,
@@ -176,23 +273,22 @@ export async function activate(map: maplibregl.Map): Promise<void> {
         'Satellite smoke plumes',
         [
           {
-            color: HMS_DENSITY_PRESENTATION.Light.color,
+            color: hmsLegendSwatch('Light'),
             label: HMS_DENSITY_PRESENTATION.Light.legendLabel
           },
           {
-            color: HMS_DENSITY_PRESENTATION.Medium.color,
+            color: hmsLegendSwatch('Medium'),
             label: HMS_DENSITY_PRESENTATION.Medium.legendLabel
           },
           {
-            color: HMS_DENSITY_PRESENTATION.Heavy.color,
+            color: hmsLegendSwatch('Heavy'),
             label: HMS_DENSITY_PRESENTATION.Heavy.legendLabel
           },
           {
-            color: HMS_DENSITY_PRESENTATION.Unknown.color,
+            color: hmsLegendSwatch('Unknown'),
             label: HMS_DENSITY_PRESENTATION.Unknown.legendLabel
           }
-        ],
-        HMS_OVERVIEW_QUALIFICATION
+        ]
       )
   });
   if (truncated) {
@@ -209,11 +305,18 @@ export async function activate(map: maplibregl.Map): Promise<void> {
  */
 export function cancelActivation(): void {
   masterController?.abort();
+  // Invalidate any response that already raced past its abort check.
+  requestSeq++;
+  if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+  refreshTimer = null;
+  activeMap = null;
+  document.removeEventListener('visibilitychange', onVisibilityChange);
 }
 
 export function deactivate(map: maplibregl.Map): void {
   cancelActivation();
   masterController = null;
+  activationSignal = null;
   // Remove the retired outline defensively during a hot module replacement.
   if (map.getLayer(LEGACY_OUTLINE_LAYER_ID)) map.removeLayer(LEGACY_OUTLINE_LAYER_ID);
   if (map.getLayer(FILL_LAYER_ID)) map.removeLayer(FILL_LAYER_ID);
@@ -221,23 +324,40 @@ export function deactivate(map: maplibregl.Map): void {
   hideLegend(LAYER_KEY);
 }
 
-function buildHmsPopupHtml(props: GeoJsonProperties): string {
-  const density = resolveHmsDensityPresentation(props?.['Density']);
+/**
+ * The smoke plume's popup model (D1 M25; the frame's surface head): the
+ * density class on its single hue (unknown stays unclassified), the
+ * observed window at UTC instants, the detecting satellite as a row.
+ */
+export function buildHmsPopupModel(props: GeoJsonProperties): IssuedModel {
+  const densityClass = resolveHmsDensityClass(props?.['Density']);
+  const density = HMS_DENSITY_PRESENTATION[densityClass];
   const satellite = typeof props?.['Satellite'] === 'string' ? props['Satellite'] : '';
-  const start = formatHmsTime(props?.['Start']);
-  const end = formatHmsTime(props?.['End_']);
+  const start = readHmsTime(props?.['Start']);
+  const end = readHmsTime(props?.['End_']);
+  const observed: PopupClock =
+    start.precision === 'absent' && end.precision === 'absent'
+      ? { kind: 'not-stated', label: 'Observed', reason: 'unavailable' }
+      : { kind: 'window', meaning: 'observed', from: { label: 'Observed', at: start }, until: { label: 'to', at: end } };
 
-  return `
-    <div class="popup-title">${escapeHtml(density.popupLabel)}</div>
-    <div class="popup-agency">NOAA Hazard Mapping System</div>
-    ${satellite ? `<div class="popup-treaty-meta">Detected by: ${escapeHtml(satellite)}</div>` : ''}
-    ${start ? `<div class="popup-treaty-meta">Observed: ${escapeHtml(start)}${end ? ` to ${escapeHtml(end)}` : ''}</div>` : ''}
-    <div class="popup-description">Analyst-drawn smoke plume from GOES satellite imagery. Density classes describe apparent smoke thickness (Light, Medium, Heavy), not ground-level air quality; check local air quality observations for exposure decisions.</div>
-    <div class="popup-description">Strategic context only, not tactical fire operations or evacuation guidance.</div>
-    <div class="popup-links">
-      <a href="https://www.ospo.noaa.gov/products/land/hms.html" target="_blank" rel="noopener">NOAA OSPO Hazard Mapping System</a>
-    </div>
-  `;
+  return {
+    kind: 'surface',
+    title: 'HMS smoke analysis',
+    issuer: { role: 'issued-by', name: 'NOAA NESDIS Office of Satellite and Product Operations', productKey: 'hms-smoke' },
+    value: [
+      {
+        text: density.popupLabel,
+        swatch: { table: 'HMS_DENSITY_PRESENTATION', classKey: densityClass, color: density.color }
+      }
+    ],
+    clocks: [observed],
+    details: satellite.trim() === '' ? [] : [{ kind: 'row', label: 'Detected by', text: satellite }],
+    source: { link: { label: 'NOAA OSPO Hazard Mapping System', href: 'https://www.ospo.noaa.gov/products/land/hms.html' } },
+    qualifications: [
+      'Analyst-drawn smoke plume from GOES satellite imagery. Density classes describe apparent smoke thickness (Light, Medium, Heavy), not ground-level air quality; check local air quality observations for exposure decisions.',
+      'Strategic context only, not tactical fire operations or evacuation guidance.'
+    ]
+  };
 }
 
 /**
@@ -262,7 +382,7 @@ export function bindPopups(map: maplibregl.Map): void {
       ).popupLabel;
     },
     respond: (feature) => ({
-      content: buildHmsPopupHtml(feature.properties ?? {})
+      model: buildHmsPopupModel(feature.properties ?? {})
     })
   });
 

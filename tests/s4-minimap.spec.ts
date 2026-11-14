@@ -1,13 +1,16 @@
-import { test, expect } from '@playwright/test';
-import type { Page } from '@playwright/test';
-import { gotoApp, search } from './helpers';
+import { test, expect, type Page } from './offline-test';
+import { gotoApp, layerCheckbox, layerPill, PILL, search, urlLayers } from './helpers';
 import {
   FRAMINGS,
   FRAMING_KEYS,
   framingFitBounds,
 } from '../src/config/framings';
-import type { FramingKey } from '../src/config/framings';
-import { buildMinimapWildfireQueryBody } from '../src/state/minimap-wildfire';
+import { MINIMAP_WHP } from '../src/config/minimap-whp';
+import {
+  stubWildfireMinimap,
+  stubWildfireMinimapUnavailable,
+} from './minimap-fixtures';
+import { stubCpcDroughtOutlook } from './cpc-outlook-fixtures';
 
 test('the Alaska framing camera includes the wrapped western Aleutians', () => {
   const [[west], [east]] = framingFitBounds(FRAMINGS['alaska-northwest']);
@@ -37,53 +40,42 @@ const NADM_FIXTURE = {
   ],
 };
 
-const WILDFIRE_GEOMETRY_KEYS = new Map(
-  FRAMING_KEYS.map((key) => [
-    buildMinimapWildfireQueryBody(key).get('geometry'),
-    key,
-  ]),
-);
-
-async function stubWildfireMinimap(
+/**
+ * A screen point inside an ocean zone where the zone itself is topmost
+ * (elementFromPoint, with a 3px margin each way) and that lies off the
+ * physical land path: exposed water a person can click. Nearest the zone's
+ * box centre among the candidates.
+ */
+async function exposedWaterPoint(
   page: Page,
-  counts: Readonly<Partial<Record<FramingKey, number>>> = {},
-  onPost?: () => void,
-): Promise<void> {
-  await page.route(
-    '**/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query**',
-    (route) => {
-      if (route.request().method() !== 'POST') {
-        return route.fulfill({
-          status: 200,
-          contentType: 'application/geo+json',
-          body: JSON.stringify({ type: 'FeatureCollection', features: [] }),
-        });
+  key: string,
+): Promise<{ x: number; y: number }> {
+  const zone = page.locator(`#shell-minimap-ocean-${key}`);
+  await zone.scrollIntoViewIfNeeded();
+  const point = await zone.evaluate((path) => {
+    const land = document.querySelector<SVGPathElement>(
+      `#${path.id.replace(/-ocean-[a-z]+$/, '')}-physical-land path`,
+    );
+    const toLand = land?.ownerSVGElement?.getScreenCTM()?.inverse();
+    if (!land || !toLand) return null;
+    const box = path.getBoundingClientRect();
+    const cx = box.left + box.width / 2;
+    const cy = box.top + box.height / 2;
+    let best: { x: number; y: number; d: number } | null = null;
+    for (let y = Math.ceil(box.top) + 3; y <= box.bottom - 3; y += 3) {
+      for (let x = Math.ceil(box.left) + 3; x <= box.right - 3; x += 3) {
+        const topmost = [[0, 0], [3, 0], [-3, 0], [0, 3], [0, -3]].every(
+          ([dx, dy]) => document.elementFromPoint(x + dx!, y + dy!) === path,
+        );
+        if (!topmost || land.isPointInFill(new DOMPoint(x, y).matrixTransform(toLand))) continue;
+        const d = (x - cx) ** 2 + (y - cy) ** 2;
+        if (best === null || d < best.d) best = { x, y, d };
       }
-      onPost?.();
-      const body = new URLSearchParams(route.request().postData() ?? '');
-      const key = WILDFIRE_GEOMETRY_KEYS.get(body.get('geometry'));
-      if (key === undefined) {
-        return route.fulfill({
-          status: 400,
-          contentType: 'application/json',
-          body: JSON.stringify({ error: { message: 'Unknown test geometry' } }),
-        });
-      }
-      return route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({ count: counts[key] ?? 0 }),
-      });
-    },
-  );
-  await page.route('**/NOAA_Satellite_Smoke_Detection_*/FeatureServer/0/query**',
-    (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: 'application/geo+json',
-        body: JSON.stringify({ type: 'FeatureCollection', features: [] }),
-      }),
-  );
+    }
+    return best && { x: best.x, y: best.y };
+  });
+  expect(point, `no exposed water point in the ${key} zone`).not.toBeNull();
+  return point!;
 }
 
 /**
@@ -112,10 +104,23 @@ test.describe('S4b minimap', () => {
     // that the rest of the suite stopped fetching them live.
   });
 
-  test('renders the nine framings plus ALL, with the ALL radio checked at boot', async ({
+  test('monthly NADM D1 uses its own issuer color in the actual minimap', async ({ page }) => {
+    const body = structuredClone(NADM_FIXTURE);
+    body.features[0]!.properties.DROUGHTCAT = 'd1';
+    await page.route('**/NADM-current.geojson', route => route.fulfill({
+      status: 200, contentType: 'application/geo+json', body: JSON.stringify(body)
+    }));
+    await gotoApp(page, '?region=washington_state&view=brief');
+    await expect(page.locator('.shell-minimap-map .shell-minimap-scale')).toHaveText('NADM · Jul 2026');
+    const pacificPath = page.locator('.shell-minimap-map [data-framing="pacific-coast"]');
+    await expect(pacificPath).toHaveAttribute('data-drought-class', 'D1');
+    await expect(pacificPath).toHaveCSS('fill', 'rgb(252, 210, 126)');
+  });
+
+  test('renders the nine framings with none checked at boot, and no caption, tile or box', async ({
     page,
   }) => {
-    await gotoApp(page);
+    await gotoApp(page, '?region=washington_state&view=brief');
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-region'),
     ).toHaveCount(9);
@@ -134,9 +139,20 @@ test.describe('S4b minimap', () => {
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-title'),
     ).toHaveText('Jump to region');
+    // The spec's own beforeEach route (page-level, registered before
+    // gotoApp's context-level NADM backstop) always wins over that backstop
+    // regardless of registration order, so this boot reads NADM_FIXTURE's
+    // own YEAR_MONTH ('202607', July) rather than the backstop's fixture
+    // month. Before the backstop moved to context level (DDM-P1-T09 step 2
+    // part d), gotoApp's own page-level default installed AFTER this route
+    // for a query naming neither layers= nor cluster= (exactly this bare
+    // `gotoApp(page)` boot) and, as the LAST-registered page route, won
+    // instead: this assertion used to read the shadowing default's month
+    // ('202606', June), never this file's own fixture. Legitimately changed
+    // to the fixture this file actually authors, now that it is honored.
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-scale'),
-    ).toHaveText('NADM · Jun 2026');
+    ).toHaveText('NADM · Jul 2026');
     await expect(
       page.locator('.shell-minimap-map [role="radiogroup"]'),
     ).toHaveAttribute(
@@ -145,13 +161,22 @@ test.describe('S4b minimap', () => {
     );
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-drawing'),
-    ).toHaveAttribute('viewBox', '0 0 660 348');
+    ).toHaveAttribute('viewBox', '0 49 660 299');
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-drawing'),
-    ).toHaveAttribute('data-geographic-extent', '-188,14,-52,84');
+    ).toHaveAttribute('data-geographic-extent', '-188,14,-52,74');
+    // No viewport rectangle (owner, 2026-10-19).
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-hawaii-label'),
-    ).toHaveText('Hawaii (enlarged)');
+      page.locator('.shell-minimap-map .shell-minimap-viewport'),
+    ).toHaveCount(0);
+    // The caption and the dashed frame are gone (owner direction 2026-11-09, sprint); the islands fill the target and what the caption said rides the accessible name.
+    const hawaiiInset = page.locator('.shell-minimap-map [data-framing="hawaii"]');
+    await expect(page.locator('.shell-minimap-map .shell-minimap-hawaii-label')).toHaveCount(0);
+    await expect(hawaiiInset).toHaveText('');
+    await expect(hawaiiInset).toHaveAttribute('aria-label', /Drawn enlarged and apart from the mainland\./);
+    await expect(hawaiiInset).toHaveCSS('border-top-style', 'solid');
+    await expect(hawaiiInset).toHaveCSS('border-top-color', 'rgba(0, 0, 0, 0)');
+    await expect(hawaiiInset).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
     const pacificPath = page.locator(
       '.shell-minimap-map [data-framing="pacific-coast"]',
     );
@@ -181,18 +206,32 @@ test.describe('S4b minimap', () => {
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-drought-legend'),
     ).toHaveCount(0);
+    // All of North America is the region select's first option, not a tile in
+    // the drawing: a radiogroup may have none checked, and the group keeps
+    // one Tab stop, on the first framing.
+    await expect(page.locator('.shell-minimap-map .shell-minimap-all')).toHaveCount(0);
+    await expect(page.locator('#region-select option[value="framing:all"]')).toHaveText('All of North America');
+    const radios = page.locator('.shell-minimap-map [role="radiogroup"] [role="radio"]');
+    await expect(radios).toHaveCount(FRAMING_KEYS.length);
+    await expect(radios.and(page.locator('[aria-checked="true"]'))).toHaveCount(0);
+    await expect(radios.and(page.locator('[tabindex="0"]'))).toHaveCount(1);
+    await expect(radios.first()).toHaveAttribute('data-framing', FRAMING_KEYS[0]!);
+    await expect(radios.first()).toHaveAttribute('tabindex', '0');
+    // No caption, second caption line, rule under the drawing or frame
+    // around it (owner direction): the scale words ride the accessible name only.
+    await expect(page.locator('.shell-minimap-map .shell-minimap-divider')).toHaveCount(0);
+    await expect(page.locator('.shell-minimap-map .shell-minimap-unshaded-line')).toHaveCount(0);
+    await expect(page.locator('.shell-minimap-map .shell-minimap-scale')).toHaveClass(/\bsr-only\b/);
+    await expect(page.locator('.shell-minimap-map .shell-minimap-scale')).toHaveAttribute(
+      'aria-label',
+      /North American Drought Monitor monthly consensus/,
+    );
+    await expect(page.locator('.shell-minimap-map .shell-minimap-canvas')).toHaveCSS('border-top-width', '0px');
+    await expect(page.locator('.shell-minimap-map .shell-minimap-ocean').first()).toHaveCSS('fill', 'rgba(0, 0, 0, 0)');
+    await expect(page.locator('#shell-framing-note')).toHaveClass(/\bsr-only\b/);
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-all'),
-    ).toHaveAttribute('aria-checked', 'true');
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-all'),
-    ).toHaveAttribute('aria-label', 'All: fit North America');
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-divider'),
-    ).toBeVisible();
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-note'),
-    ).toHaveCount(0);
+      page.locator('#shell-framing-note'),
+    ).toHaveText('');
     // The compact minimap door, combined dropdown, then place refinement
     // follow the inline minimap and retain the detailed legacy cameras.
     await expect(page.locator('#shell-region-host > #panel-region')).toBeVisible();
@@ -201,7 +240,8 @@ test.describe('S4b minimap', () => {
     ).toHaveCount(1);
     await expect(page.locator('#shell-region-host + #shell-refine-host')).toHaveCount(1);
     await expect(page.locator('#region-select')).toHaveValue('region:washington_state');
-    await expect(page.locator('#region-select optgroup')).toHaveCount(2);
+    // Overview, Ocean views (moved off the card 2026-10-13), Detailed regions.
+    await expect(page.locator('#region-select optgroup')).toHaveCount(3);
     await expect(page.locator('.shell-minimap-map [role="radiogroup"]')).toHaveCount(1);
     await expect(
       page.locator('.shell-minimap-map [data-framing="boreal-arctic"]'),
@@ -232,23 +272,7 @@ test.describe('S4b minimap', () => {
     await expect(minimap.locator('.shell-minimap-scale')).toHaveText(
       'NIFC / WHP 2023',
     );
-    await expect(minimap.locator('.shell-minimap-metric-note')).toContainText(
-      'Red marks a current mapped wildfire perimeter',
-    );
-    await expect(minimap.locator('.shell-minimap-metric-note')).toContainText(
-      'a zero count does not establish no active wildfire',
-    );
-    await expect(minimap.locator('.shell-minimap-metric-note')).toContainText(
-      'light below both thresholds, and dark for no data',
-    );
-    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveAttribute(
-      'role',
-      'status',
-    );
-    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveAttribute(
-      'aria-atomic',
-      'true',
-    );
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
     await expect(minimap.locator('.shell-minimap-canvas')).toHaveAttribute(
       'data-metric-context',
       'wildfire',
@@ -262,7 +286,22 @@ test.describe('S4b minimap', () => {
     ).toHaveAttribute('data-wildfire-condition', 'mapped-wildfire');
     await expect(
       minimap.locator('[data-framing="alaska-northwest"]'),
-    ).toHaveCSS('fill', 'rgb(215, 48, 39)');
+    ).toHaveCSS('fill', 'rgb(255, 76, 0)');
+    // Round 4 audit, R4-19: the browser check reads in the house date token
+    // (dateTok), as the Wildfire time statement writes the same check.
+    // Red on 22268b3: the year-less 12-hour form ("browser checked Nov 6, 1:14 PM PST").
+    await expect(
+      minimap.locator('[data-framing="alaska-northwest"]'),
+    ).toHaveAttribute(
+      'aria-label',
+      /browser checked [A-Z][a-z]{2} \d{1,2}, \d{4}, \d{2}:\d{2} \S+\./,
+    );
+    // A live mapped-fire framing has no discrete date to claim.
+    expect(
+      await minimap
+        .locator('[data-framing="alaska-northwest"]')
+        .getAttribute('data-metric-time'),
+    ).toBeNull();
     const pacific = minimap.locator('[data-framing="pacific-coast"]');
     await expect(pacific).toHaveAttribute(
       'data-wildfire-condition',
@@ -276,9 +315,31 @@ test.describe('S4b minimap', () => {
       'aria-label',
       /static strategic landscape potential, not current fire conditions or a forecast/i,
     );
+    // DR-138 R5: a WHP fallback (this framing's zero current-fire count with
+    // WHP data) keeps its issuer class color and stipple, distinct from the older
+    // plain partial-coverage crosshatch; its source's valid time is the
+    // edition year, never a retrieval timestamp.
     await expect(
-      minimap.locator('#shell-minimap-partial-pacific-coast rect'),
-    ).toHaveAttribute('fill', '#FFE066');
+      minimap.locator('#shell-minimap-whp-pacific-coast rect'),
+    ).toHaveAttribute('fill', '#ffff63');
+    await expect(
+      minimap.locator('#shell-minimap-whp-pacific-coast circle'),
+    ).toHaveCount(1);
+    // The edition YEAR, never the trailing "updated" date in the same
+    // field (that later date is a Nodata-classification patch to the
+    // already-published 2023 raster, not a refresh of the assessment;
+    // ddm-science-verifier, USFS RDS-2015-0047-4, 2026-09-09).
+    await expect(pacific).toHaveAttribute(
+      'data-metric-time',
+      MINIMAP_WHP.source.edition.match(/^\d{4}/)?.[0] ?? '',
+    );
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
+    // The card's own label teaches the count-depth rule (hover), from the
+    // same sentence the briefing's Technical information reads.
+    await expect(minimap.locator('.shell-minimap-scale')).toHaveAttribute(
+      'title',
+      /Orange-red marks current mapped wildfire perimeters, deeper for more: 1, 2 to 9, 10 to 49, 50 or more per framing/,
+    );
     await expect(
       minimap.locator('[data-framing="plains-prairies"]'),
     ).toHaveAttribute('data-wildfire-condition', 'below-threshold');
@@ -293,19 +354,95 @@ test.describe('S4b minimap', () => {
       'NADM · Jul 2026',
     );
     expect(nadmRequests).toBe(1);
+    // The source's valid month (NADM YEAR_MONTH), never a retrieval time.
+    await expect(minimap.locator('.shell-minimap-canvas')).toHaveAttribute(
+      'data-metric-time',
+      '2026-07',
+    );
 
-    // EF-3: the metric note renders for EVERY metric context, not wildfire
-    // only. On Heat and ENSO it states the honest absence of a framing
-    // metric (DDM-UI-004) instead of leaving the flat fills unexplained,
-    // so the former `toHaveCount(0)` is now the neutral sentence.
+    // Methodology is now at the briefing end. Neutral navigation labels
+    // remain on the controls, without a paragraph below the minimap.
     await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
-    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveText(
-      'No verified Extreme Heat framing metric applied.',
-    );
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
+    // DR-040 c clause 1: every framing target's accessible name says the
+    // framings are unshaded and why, citing the mode's own source and never
+    // the Drought Monitor, and the canvas carries no status word at all
+    // (absent, not the retired 'neutral' sentinel) since none of the six
+    // states apply to a metric-free context.
+    // `pacific` is the pacific-coast framing locator declared above.
+    await expect(pacific).toHaveAttribute('aria-label', /Framings are unshaded/);
+    await expect(pacific).toHaveAttribute('aria-label', /HeatRisk/);
+    await expect(pacific).not.toHaveAttribute('aria-label', /Drought Monitor/);
+    await expect(minimap.locator('.shell-minimap-scale')).toHaveText('Unshaded · see main map');
+    expect(
+      await minimap.locator('.shell-minimap-canvas').getAttribute('data-minimap-status'),
+    ).toBeNull();
     await page.locator('.shell-cluster-btn[data-cluster="enso"]').click();
-    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveText(
-      'No verified ENSO framing metric applied.',
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
+    // The visible second line is gone (owner direction); the scale's own
+    // accessible name carries why the framings are unshaded.
+    await expect(minimap.locator('.shell-minimap-unshaded-line')).toHaveCount(0);
+    await expect(minimap.locator('.shell-minimap-scale')).toHaveAttribute(
+      'aria-label',
+      /^Framings are unshaded in this display\./,
     );
+    await expect(pacific).toHaveAttribute('aria-label', /Framings are unshaded/);
+    await expect(pacific).toHaveAttribute('aria-label', /Relative Oceanic Nino Index/);
+    await expect(pacific).not.toHaveAttribute('aria-label', /Drought Monitor/);
+    expect(
+      await minimap.locator('.shell-minimap-canvas').getAttribute('data-minimap-status'),
+    ).toBeNull();
+  });
+
+  test('an outlook horizon reads only a product it loads, and is otherwise navigation-only and names no product it does not show', async ({
+    page,
+  }) => {
+    await stubCpcDroughtOutlook(page);
+    await stubWildfireMinimap(page, { 'alaska-northwest': 1 });
+    await gotoApp(page, '?view=brief&horizon=weeks-ahead');
+    const minimap = page.locator('.shell-minimap-map');
+    const scale = minimap.locator('.shell-minimap-scale');
+    const canvas = minimap.locator('.shell-minimap-canvas');
+    const pacific = minimap.locator('[data-framing="pacific-coast"]');
+    // Drought at Weeks ahead draws the CPC Drought Outlook, whose minimap row
+    // is the owner's to turn on (src/config/minimap-readings.ts). Until then
+    // no framing is shaded and no product is named, least of all the
+    // Drought Monitor the main map is not showing.
+    await expect(canvas).toHaveAttribute('data-metric-context', 'drought');
+    await expect(scale).toHaveText('Unshaded · see main map');
+    await expect(pacific).toHaveAttribute('data-drought-class', 'neutral');
+    await expect(pacific).toHaveAttribute('aria-label', /Framings are unshaded in this display\./);
+    await expect(pacific).not.toHaveAttribute('aria-label', /Drought Monitor|Drought Outlook|informs/);
+    expect(await canvas.getAttribute('data-minimap-status')).toBeNull();
+    await pacific.click();
+    await expect(page.locator('#map-key')).not.toContainText(/informs (this|the) minimap/);
+    // Wildfire opens on Current (DR-190 as amended 2026-11-13). Weeks ahead draws the
+    // perimeters too, so the shipped perimeter count reads there as at Current.
+    await page.locator('.shell-cluster-btn[data-cluster="wildfire"]').click();
+    await expect(canvas).toHaveAttribute('data-metric-context', 'wildfire');
+    await expect(
+      page.locator('.shell-horizon-btn[data-horizon="current"]'),
+    ).toHaveAttribute('aria-pressed', 'true');
+    await page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]').click();
+    await expect(
+      page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]'),
+    ).toHaveAttribute('aria-pressed', 'true');
+    await expect(scale).toHaveText('NIFC / WHP 2023');
+    await expect(
+      minimap.locator('[data-framing="alaska-northwest"]'),
+    ).toHaveAttribute('data-wildfire-condition', 'mapped-wildfire');
+    // Season ahead draws the perimeters beside the WHP raster (DR-022), but its minimap
+    // row reads nothing yet (src/config/minimap-readings.ts): no count and no WHP fallback named.
+    await page.locator('.shell-horizon-btn[data-horizon="season-ahead"]').click();
+    await expect(scale).toHaveText('Unshaded · see main map');
+    await expect(pacific).toHaveAttribute('data-wildfire-condition', 'neutral');
+    await expect(pacific).not.toHaveAttribute('aria-label', /NIFC|Wildfire Hazard Potential/);
+    // Back at Current, the shipped reading returns as it was.
+    await page.locator('.shell-horizon-btn[data-horizon="current"]').click();
+    await expect(scale).toHaveText('NIFC / WHP 2023');
+    await expect(
+      minimap.locator('[data-framing="alaska-northwest"]'),
+    ).toHaveAttribute('data-wildfire-condition', 'mapped-wildfire');
   });
 
   test('the annotated granular drought URL keeps the selected drought metric and regional fills', async ({
@@ -323,12 +460,28 @@ test.describe('S4b minimap', () => {
     const pacific = minimap.locator('[data-framing="pacific-coast"]');
     await expect(pacific).toHaveAttribute('data-drought-class', 'D2');
     await expect(pacific).toHaveCSS('fill', 'rgb(255, 170, 0)');
-    // EF-3: Drought's live NADM encoding used to be explained only in the
-    // scale slot's accessible name; the visible note now carries it in every
-    // status (loading, unavailable, live all name the source).
-    await expect(minimap.locator('.shell-minimap-metric-note')).toContainText(
-      'North American Drought Monitor',
-    );
+    // The source remains identified in the scale slot. Detailed encoding
+    // now belongs to the briefing's Technical information disclosure.
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
+  });
+
+  test('moves the drought navigation methodology to the end of the Impact Briefing', async ({ page }) => {
+    await gotoApp(page, '?region=washington_state&view=brief&cluster=drought');
+    await expect(page.locator('.shell-minimap-map .shell-minimap-scale')).toHaveText('NADM · Jul 2026');
+    await expect(page.locator('.shell-minimap-metric-note')).toHaveCount(0);
+    await page.locator('#region-briefing-btn').click();
+    const technical = page.locator('.impact-technical-information');
+    await expect(technical).toBeVisible();
+    await technical.locator('summary').click();
+    await expect(technical.locator('#impact-technical-drought')).toContainText('approximate area-weighted mean category index');
+    await expect(technical.locator('#impact-technical-drought')).toContainText('not an NADM-issued regional category');
+    // The Acknowledgements section (S30D D1 M22, DDM-P7-T11) is the body's
+    // last element, so the methodology is the last section before it. A
+    // retrying locator assertion: a hydration refresh can replace the
+    // sections above the Acknowledgements while this reads.
+    await expect(
+      page.locator('.impact-technical-information + #impact-acknowledgements:last-child')
+    ).toHaveCount(1);
   });
 
   test('uses the legible Hawaii inset proportions from the desktop rail', async ({
@@ -355,13 +508,14 @@ test.describe('S4b minimap', () => {
         };
       });
 
-    expect(proportions.left).toBeCloseTo(0.027, 2);
-    expect(proportions.top).toBeCloseTo(0.567, 2);
+    expect(proportions.left).toBeCloseTo(0.16, 2);
+    expect(proportions.top).toBeCloseTo(0.38, 2);
     expect(proportions.width).toBeCloseTo(0.257, 2);
     expect(proportions.height).toBeCloseTo(0.39, 2);
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-island').first(),
-    ).toHaveCSS('stroke', 'rgb(241, 245, 249)');
+    // --fg-0 is var(--ink), #E8ECF0, since the 2026-10-07 interface tokens.
+    ).toHaveCSS('stroke', 'rgb(232, 236, 240)');
   });
 
   test('removes minimap transitions when reduced motion is requested', async ({
@@ -387,7 +541,9 @@ test.describe('S4b minimap', () => {
     await expect(
       page.locator('.shell-minimap-map .shell-minimap-tooltip'),
     ).toHaveCount(0);
-    await expect(pacific).toHaveCSS('stroke', 'rgb(6, 182, 212)');
+    // --accent is white since the 2026-10-07 interface tokens (the old cyan
+    // is the map's La Niña colour).
+    await expect(pacific).toHaveCSS('stroke', 'rgb(255, 255, 255)');
     // `.shell-minimap-mainland` transitions `filter 0.12s ease`
     // (src/styles/app.css:6147); a one-shot getComputedStyle read right
     // after hover() can still catch the pre-transition `none` on the first
@@ -415,10 +571,15 @@ test.describe('S4b minimap', () => {
     );
     // Camera exclusivity (S2): one camera vocabulary at a time.
     expect(await search(page)).not.toContain('region=');
-    // Coverage honesty: the caption carries the user-facing clause.
+    // Coverage honesty relocated off the popped-up caption (2026-09-10,
+    // owner ask) and onto the on-map key, its one home now: the caption
+    // still names the framing but never repeats the coverage sentence,
+    // and the key (whatever hazard is active; the default boot's US
+    // Drought Monitor here) carries it instead.
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-note'),
-    ).toContainText(
+      page.locator('#shell-framing-note'),
+    ).not.toContainText('North American Drought Monitor');
+    await expect(page.locator('#map-key')).toContainText(
       'North American Drought Monitor informs the minimap across the border',
     );
     await expect(
@@ -445,11 +606,13 @@ test.describe('S4b minimap', () => {
     ).toHaveCount(0);
     await region.click();
     await expect(page.locator('#region-select')).toHaveValue('framing:pacific-coast');
-    // Coverage copy stays a separate sentence; it does not substitute
-    // for the geometry provenance.
+    // Coverage copy stays out of the caption (relocated to the on-map
+    // key, 2026-09-10) and never substitutes for the geometry provenance,
+    // which the accessible name above still carries on its own.
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-note'),
-    ).toContainText(
+      page.locator('#shell-framing-note'),
+    ).not.toContainText('North American Drought Monitor');
+    await expect(page.locator('#map-key')).toContainText(
       'North American Drought Monitor informs the minimap across the border',
     );
   });
@@ -485,23 +648,31 @@ test.describe('S4b minimap', () => {
     expect(await search(page)).toContain('framing=arid-west');
   });
 
-  test('ocean controls enter ENSO, fit one schematic ocean, and preserve the authored framing', async ({
+  test('ocean views in the framing dropdown enter ENSO, fit one schematic ocean, and preserve the authored framing', async ({
     page,
   }) => {
     await gotoApp(page, '?view=brief&framing=pacific-coast');
     const minimap = page.locator('.shell-minimap-map');
-    await expect(minimap.locator('[data-ocean]')).toHaveCount(3);
+    const select = page.locator('#region-select');
+    // The card draws clickable Pacific and Atlantic zones (owner,
+    // 2026-10-19); the Arctic is a dropdown and deep-link view only.
+    const oceanShape = (key: string) =>
+      minimap.locator(`[data-ocean="${key}"]`);
+    await expect(minimap.locator('[data-ocean]')).toHaveCount(2);
+    await expect(oceanShape('arctic')).toHaveCount(0);
+    await expect(
+      select.locator('optgroup[label="Ocean views"] option'),
+    ).toHaveText(['Pacific Ocean', 'Arctic Ocean', 'Atlantic Ocean']);
+    // Dispatched in the page because the select can sit in a collapsed column.
+    const chooseOceanView = (key: string) =>
+      page.evaluate((value: string) => {
+        const el = document.getElementById('region-select');
+        if (!(el instanceof HTMLSelectElement)) throw new Error('no #region-select');
+        el.value = value;
+        el.dispatchEvent(new Event('change'));
+      }, `ocean:${key}`);
 
-    const atlantic = minimap.locator('[data-ocean="atlantic"]');
-    await expect(atlantic).toHaveAttribute(
-      'aria-label',
-      /Switch to the El Nino \/ Southern Oscillation sea-surface-temperature anomaly display/,
-    );
-    await expect(atlantic).toHaveAttribute(
-      'aria-label',
-      /Schematic click affordance for camera navigation; not a boundary/,
-    );
-    await atlantic.click();
+    await chooseOceanView('atlantic');
     await expect
       .poll(async () => {
         const params = new URLSearchParams(await search(page));
@@ -516,37 +687,138 @@ test.describe('S4b minimap', () => {
         ocean: 'atlantic',
         framing: 'pacific-coast',
       });
-    await expect(atlantic).toHaveAttribute('aria-pressed', 'true');
+    await expect(select).toHaveValue('ocean:atlantic');
+    await expect(oceanShape('atlantic')).toHaveClass(/\bactive\b/);
+    await expect(minimap.locator('.shell-minimap-ocean.active')).toHaveCount(1);
     await expect(page.locator('input[data-layer-key="sst-anomaly"]')).toBeChecked();
-    await expect(minimap.locator('.shell-minimap-note')).toContainText(
+    await expect(page.locator('#shell-framing-note')).toContainText(
       'Ocean view: Atlantic Ocean',
     );
-    await expect(minimap.locator('.shell-minimap-note')).toContainText(
+    await expect(page.locator('#shell-framing-note')).toContainText(
       'Preserved land framing: Pacific Coast',
     );
     await expect(
       minimap.locator('[data-framing="pacific-coast"]'),
     ).toHaveAttribute('aria-checked', 'false');
 
-    const arctic = minimap.locator('[data-ocean="arctic"]');
-    await arctic.focus();
-    await page.keyboard.press('Space');
+    await chooseOceanView('arctic');
     await expect
       .poll(async () => new URLSearchParams(await search(page)).get('ocean'))
       .toBe('arctic');
-    await expect(arctic).toHaveAttribute('aria-pressed', 'true');
+    await expect(select).toHaveValue('ocean:arctic');
+    await expect(minimap.locator('.shell-minimap-ocean.active')).toHaveCount(0);
 
     await page.reload({ waitUntil: 'domcontentloaded' });
-    await expect(
-      page.locator('.shell-minimap-map [data-ocean="arctic"]'),
-    ).toHaveAttribute('aria-pressed', 'true');
+    await expect(select).toHaveValue('ocean:arctic');
+    await expect(minimap.locator('.shell-minimap-ocean.active')).toHaveCount(0);
     const restored = new URLSearchParams(await search(page));
     expect(restored.get('cluster')).toBe('enso');
     expect(restored.get('ocean')).toBe('arctic');
     expect(restored.get('framing')).toBe('pacific-coast');
   });
 
-  test('ALL writes a restorable North America camera and survives reload', async ({
+  test('the minimap Pacific and Atlantic zones enter ENSO and fit their ocean by keyboard and pointer', async ({
+    page,
+  }) => {
+    await gotoApp(page, '?view=brief&framing=pacific-coast');
+    const pacific = page.locator('#shell-minimap-ocean-pacific');
+    const atlantic = page.locator('#shell-minimap-ocean-atlantic');
+    await expect(pacific).toHaveAttribute('role', 'button');
+    await expect(pacific).toHaveAttribute('aria-pressed', 'false');
+
+    await pacific.focus();
+    await page.keyboard.press('Enter');
+    await expect
+      .poll(async () => {
+        const params = new URLSearchParams(await search(page));
+        return {
+          cluster: params.get('cluster'),
+          ocean: params.get('ocean'),
+          framing: params.get('framing'),
+        };
+      })
+      .toEqual({
+        cluster: 'enso',
+        ocean: 'pacific',
+        framing: 'pacific-coast',
+      });
+    await expect(pacific).toHaveAttribute('aria-pressed', 'true');
+
+    // A real pointer click at exposed water: the zone's bbox centre falls on
+    // land or the Hawaii box, so the point is found by hit-testing instead.
+    const atlanticWater = await exposedWaterPoint(page, 'atlantic');
+    await page.mouse.click(atlanticWater.x, atlanticWater.y);
+    await expect
+      .poll(async () => new URLSearchParams(await search(page)).get('ocean'))
+      .toBe('atlantic');
+    await expect(atlantic).toHaveAttribute('aria-pressed', 'true');
+    await expect(pacific).toHaveAttribute('aria-pressed', 'false');
+
+    const pacificWater = await exposedWaterPoint(page, 'pacific');
+    await page.mouse.click(pacificWater.x, pacificWater.y);
+    await expect
+      .poll(async () => new URLSearchParams(await search(page)).get('ocean'))
+      .toBe('pacific');
+    await expect(pacific).toHaveAttribute('aria-pressed', 'true');
+    await expect(atlantic).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  test('the former Arctic zone is no longer a pointer target (owner, 2026-10-19)', async ({
+    page,
+  }) => {
+    await gotoApp(page, '?view=brief&framing=pacific-coast');
+    const pacific = page.locator('#shell-minimap-ocean-pacific');
+    await pacific.scrollIntoViewIfNeeded();
+    // Sample the retired Arctic zone (its path as shipped before 2026-10-19)
+    // where it does not overlap the surviving zones, inside the cropped view.
+    const samples = await pacific.evaluate((path, arcticPath) => {
+      const oceans = (path as SVGPathElement).ownerSVGElement;
+      const ctm = oceans?.getScreenCTM();
+      if (!oceans || !ctm) return [];
+      const view = oceans.viewBox.baseVal;
+      const toLocal = ctm.inverse();
+      const live = [...oceans.querySelectorAll<SVGPathElement>('[data-ocean]')];
+      // A live zone's own edge (its painted stroke, rounding under the
+      // stretched viewBox) answers its own clicks, so keep 3px clear of it.
+      const nearLive = (screen: DOMPoint): boolean =>
+        [[0, 0], [3, 0], [-3, 0], [0, 3], [0, -3]].some(([dx, dy]) => {
+          const point = new DOMPoint(screen.x + dx!, screen.y + dy!).matrixTransform(toLocal);
+          return live.some((zone) => zone.isPointInFill(point));
+        });
+      const scratch = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      scratch.setAttribute('style', 'position:absolute;left:0;top:0;width:1px;height:1px;visibility:hidden;pointer-events:none');
+      const arctic = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      arctic.setAttribute('d', arcticPath);
+      scratch.appendChild(arctic);
+      document.body.appendChild(scratch);
+      const points: { x: number; y: number; ocean: string | null }[] = [];
+      for (let y = view.y + 2; y <= 78; y += 4) {
+        for (let x = 10; x <= 650; x += 20) {
+          const local = new DOMPoint(x, y);
+          if (!arctic.isPointInFill(local)) continue;
+          const screen = local.matrixTransform(ctm);
+          if (nearLive(screen)) continue;
+          const hit = document.elementFromPoint(screen.x, screen.y);
+          points.push({ x: screen.x, y: screen.y, ocean: hit?.closest('[data-ocean]')?.getAttribute('data-ocean') ?? null });
+        }
+      }
+      scratch.remove();
+      return points;
+      // spec-impact: intended, the retired Arctic zone's path is sampled to prove it no longer answers.
+    }, 'M0,0H660V78C572,66 502,78 430,70C344,61 266,70 194,66C126,62 62,70 0,58Z');
+    expect(samples.length, 'no sample fell in the retired Arctic zone').toBeGreaterThan(0);
+    expect(samples.filter((point) => point.ocean !== null)).toEqual([]);
+
+    const middle = samples[Math.floor(samples.length / 2)]!;
+    await page.mouse.click(middle.x, middle.y);
+    await page.waitForTimeout(500);
+    const params = new URLSearchParams(await search(page));
+    expect(params.get('ocean')).toBeNull();
+    expect(params.get('cluster')).not.toBe('enso');
+    await expect(page.locator('.shell-minimap-map .shell-minimap-ocean.active')).toHaveCount(0);
+  });
+
+  test('All of North America, from the region select, writes a restorable camera and survives reload', async ({
     page,
   }) => {
     await gotoApp(page);
@@ -555,35 +827,306 @@ test.describe('S4b minimap', () => {
       window.location.search.includes('framing=mexico'),
     );
     // The Mexico coverage sentence distinguishes the monthly minimap from
-    // place and briefing capability.
+    // place and briefing capability; it renders on the on-map key now
+    // (2026-09-10), never in the caption, which names only the framing.
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-note'),
-    ).toContainText(
+      page.locator('#shell-framing-note'),
+    ).not.toContainText('North American Drought Monitor');
+    await expect(page.locator('#map-key')).toContainText(
       'North American Drought Monitor informs this minimap in Mexico',
     );
-    await page.locator('.shell-minimap-map .shell-minimap-all').click();
+    // All of North America is the region select's first option (the minimap
+    // has no All tile); choosing it writes the same camera.
+    const checkedRadios = page.locator(
+      '.shell-minimap-map [role="radiogroup"] [role="radio"][aria-checked="true"]',
+    );
+    await expect(checkedRadios).toHaveCount(1);
+    await page.locator('#region-select').selectOption('framing:all');
     await page.waitForFunction(
       () => new URLSearchParams(window.location.search).get('framing') === 'all',
     );
     expect(new URLSearchParams(await search(page)).get('region')).toBeNull();
+    await expect(page.locator('#region-select')).toHaveValue('framing:all');
+    await expect(checkedRadios).toHaveCount(0);
     await expect(
-      page.locator('.shell-minimap-map .shell-minimap-all'),
-    ).toHaveAttribute('aria-checked', 'true');
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-all'),
-    ).toHaveAttribute('aria-label', 'All: fit North America');
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-note'),
-    ).toHaveCount(0);
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-divider'),
-    ).toBeVisible();
+      page.locator('#shell-framing-note'),
+    ).toHaveText('');
 
     await page.reload();
-    await expect(
-      page.locator('.shell-minimap-map .shell-minimap-all'),
-    ).toHaveAttribute('aria-checked', 'true');
+    await expect(page.locator('#region-select')).toHaveValue('framing:all');
+    await expect(checkedRadios).toHaveCount(0);
     expect(new URLSearchParams(await search(page)).get('framing')).toBe('all');
     expect(new URLSearchParams(await search(page)).get('region')).toBeNull();
+  });
+
+  test('no viewport rectangle is drawn; the canvas still carries the main map camera bounds', async ({
+    page,
+  }) => {
+    // Reduced motion: the camera jumps to the new bounds with fitBounds's
+    // own animation skipped, rather than this test racing an easing curve.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    await gotoApp(page);
+    const minimap = page.locator('.shell-minimap-map');
+    // The owner removed the rectangle (2026-10-19); the bounds stay as a
+    // camera seam on the canvas.
+    await expect(minimap.locator('.shell-minimap-viewport')).toHaveCount(0);
+    const canvas = minimap.locator('.shell-minimap-canvas');
+    await expect(canvas).toHaveAttribute('data-bounds', /^-?\d/);
+
+    const readBounds = () => canvas.getAttribute('data-bounds');
+    const before = await readBounds();
+
+    // The SAME `map` instance the minimap's own fit* helpers fly: clicking
+    // a framing region is the established way this suite already moves the
+    // main map's real camera (see the pointer-selection test above), so it
+    // doubles as this test's camera-mover with no second map handle
+    // needed.
+    await minimap.locator('[data-framing="arid-west"]').click();
+    await page.waitForFunction(() =>
+      window.location.search.includes('framing=arid-west'),
+    );
+
+    await expect.poll(readBounds).not.toEqual(before);
+    await expect(minimap.locator('.shell-minimap-viewport')).toHaveCount(0);
+    // Read only: the click already committed framing=arid-west above;
+    // the bounds reflecting the SAME camera do not write a second claim.
+    expect(new URLSearchParams(await search(page)).get('framing')).toBe(
+      'arid-west',
+    );
+  });
+
+  test('an unavailable current-fire read renders unavailable and never falls through to a WHP fill (DR-041 b)', async ({
+    page,
+  }) => {
+    await stubWildfireMinimap(page, {});
+    await stubWildfireMinimapUnavailable(page, FRAMING_KEYS);
+    await gotoApp(page, '?view=brief&cluster=wildfire');
+    const minimap = page.locator('.shell-minimap-map');
+    await expect(minimap.locator('.shell-minimap-canvas')).toHaveAttribute(
+      'data-wildfire-status',
+      'unavailable',
+    );
+    const pacific = minimap.locator('[data-framing="pacific-coast"]');
+    await expect(pacific).toHaveAttribute('data-wildfire-condition', 'unavailable');
+    // No fallthrough to either WHP treatment (new stipple or old crosshatch).
+    await expect(minimap.locator('#shell-minimap-whp-pacific-coast')).toHaveCount(0);
+    await expect(
+      minimap.locator('#shell-minimap-partial-pacific-coast'),
+    ).toHaveCount(0);
+    expect(await pacific.getAttribute('data-metric-time')).toBeNull();
+    await expect(minimap.locator('.shell-minimap-metric-note')).toHaveCount(0);
+    const hawaii = minimap.locator('[data-framing="hawaii"]');
+    await expect(hawaii).toHaveAttribute('data-wildfire-condition', 'unavailable');
+    await expect(hawaii.locator('.shell-minimap-island')).toHaveCount(4);
+    for (const island of await hawaii.locator('.shell-minimap-island').all()) {
+      await expect(island).toHaveCSS('fill', 'rgb(30, 41, 59)');
+    }
+    await expect(hawaii.locator('pattern')).toHaveCount(0);
+    expect(await hawaii.getAttribute('data-metric-time')).toBeNull();
+  });
+
+  test('D3 M3 mainland and Hawaii fallback preserve neutral color, stipple and no-data separation', async ({ page }) => {
+    await stubWildfireMinimap(page);
+    await gotoApp(page, '?view=brief&cluster=wildfire');
+    const minimap = page.locator('.shell-minimap-map');
+    // Actual artifact: these two framings are below threshold. This does
+    // not substitute their neutral mark for an unexercised High class.
+    for (const key of ['plains-prairies', 'hawaii']) {
+      const framing = minimap.locator(`[data-framing="${key}"]`);
+      await expect(framing).toHaveAttribute('data-wildfire-condition', 'below-threshold');
+      await expect(framing).toHaveAttribute('data-metric-time', '2023');
+      await expect(framing).toHaveAttribute('aria-label', /static strategic landscape potential, not current fire conditions or a forecast/i);
+      const patternId = `shell-minimap-whp-${key}`;
+      const pattern = minimap.locator(`#${patternId}`);
+      await expect(pattern.locator('rect')).toHaveAttribute('fill', '#E2E8F0');
+      await expect(pattern.locator('circle')).toHaveAttribute('fill', '#0F172A');
+      await expect(pattern.locator('circle')).toHaveAttribute('fill-opacity', '0.4');
+      await expect(pattern.locator('path')).toHaveCount(0);
+      const shapes = key === 'hawaii' ? framing.locator('.shell-minimap-island') : framing;
+      await expect(shapes).toHaveCount(key === 'hawaii' ? 4 : 1);
+      for (const shape of await shapes.all()) {
+        const fill = await shape.evaluate(element => (element as SVGElement).style.fill);
+        expect(fill.replaceAll('"', '').replaceAll("'", '')).toBe(`url(#${patternId})`);
+      }
+    }
+    const partial = minimap.locator('[data-framing="pacific-coast"]');
+    await expect(partial).toHaveAttribute('data-wildfire-region-status', 'live-partial');
+    await expect(minimap.locator('#shell-minimap-whp-pacific-coast rect')).toHaveAttribute('fill', '#ffff63');
+    for (const key of ['mexico', 'boreal-arctic']) {
+      const framing = minimap.locator(`[data-framing="${key}"]`);
+      await expect(framing).toHaveAttribute('data-wildfire-condition', 'no-data');
+      await expect(framing).toHaveCSS('fill', 'rgb(51, 65, 85)');
+      await expect(minimap.locator(`#shell-minimap-whp-${key}`)).toHaveCount(0);
+      expect(await framing.getAttribute('data-metric-time')).toBeNull();
+    }
+  });
+
+  test('D3 M3 current-fire precedence removes fallback on mainland and Hawaii', async ({ page }) => {
+    await stubWildfireMinimap(page, { 'pacific-coast': 1, hawaii: 1 });
+    await gotoApp(page, '?view=brief&cluster=wildfire');
+    const minimap = page.locator('.shell-minimap-map');
+    for (const key of ['pacific-coast', 'hawaii']) {
+      const framing = minimap.locator(`[data-framing="${key}"]`);
+      await expect(framing).toHaveAttribute('data-wildfire-condition', 'mapped-wildfire');
+      await expect(framing).toHaveAttribute('data-wildfire-region-status', 'live');
+      await expect(minimap.locator(`#shell-minimap-whp-${key}`)).toHaveCount(0);
+      expect(await framing.getAttribute('data-metric-time')).toBeNull();
+      const shapes = key === 'hawaii' ? framing.locator('.shell-minimap-island') : framing;
+      await expect(shapes).toHaveCount(key === 'hawaii' ? 4 : 1);
+      for (const shape of await shapes.all()) {
+        await expect(shape).toHaveCSS('fill', 'rgb(255, 76, 0)');
+        // One perimeter reads in the lowest count tier, not the full mark.
+        await expect(shape).toHaveCSS('fill-opacity', '0.4');
+      }
+    }
+  });
+});
+
+test.describe('S4b minimap: compact height band geometry gating (DDM-P11-T01 clause 3)', () => {
+  // The short/landscape touch band from tests/interface-responsive.spec.ts's
+  // "short landscape coarse-pointer shell" describe (width >= 721,
+  // height <= 699): `.shell-minimap-map` yields to the popover door there,
+  // which is the desktop inline card's own "hidden" case, not a phone-width
+  // one (below 721px hides `#shell-panel` entirely, unrelated to this gate).
+  test.use({ viewport: { width: 844, height: 390 }, hasTouch: true });
+
+  test('neither instance builds geometry until the popover opens', async ({
+    page,
+  }) => {
+    await page.route('**/NADM-current.geojson', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify(NADM_FIXTURE),
+      }),
+    );
+    await gotoApp(page);
+
+    const inline = page.locator('.shell-minimap-map');
+    await expect(inline).toBeHidden();
+    await expect(inline.locator('path')).toHaveCount(0);
+    await expect(inline.locator('svg')).toHaveCount(0);
+
+    const popover = page.locator('#shell-minimap-popover');
+    await expect(popover.locator('path')).toHaveCount(0);
+    await expect(popover.locator('svg')).toHaveCount(0);
+
+    const door = page.locator('#shell-minimap-door');
+    await door.scrollIntoViewIfNeeded();
+    await door.click();
+    await expect(popover).toBeVisible();
+    // Focus lands on the current framing (the first one when none is chosen), never on an ocean zone (Enter there switches to ENSO).
+    await expect(
+      popover.locator('[role="radiogroup"] [role="radio"][tabindex="0"]'),
+    ).toBeFocused();
+    await expect(popover.locator('svg.shell-minimap-drawing')).toHaveCount(1);
+    await expect(
+      popover.locator('svg.shell-minimap-drawing path.shell-minimap-mainland'),
+    ).toHaveCount(8);
+  });
+});
+
+/**
+ * Each framing coverage clause renders only where it is true (Codex
+ * adversarial review 2026-09-10, finding 5; `FramingCoverage` in
+ * src/config/framings.ts and `frameCoverageNote` in src/ui/map-key.ts).
+ *
+ * The three cases below are the three the review found, and they are three
+ * different subjects wrongly bound to one gate: a claim about the DISPLAY was
+ * published while a tri-national surface covered the ground it denied, a
+ * claim about the MINIMAP survived into a view that hides the minimap, and
+ * both survived a camera that had left the land framing entirely for an ocean.
+ */
+test.describe('framing coverage clauses render only where each is true', () => {
+  const MEXICO_DISPLAY = 'The current display layers do not cover Mexico';
+  const MEXICO_MINIMAP = 'North American Drought Monitor informs this minimap in Mexico';
+  const MEXICO_BRIEFING = 'Place selection and local briefings are unavailable';
+
+  async function stubUsdmSurface(page: Page): Promise<void> {
+    // A successful US-scoped surface keeps the coverage clauses under test
+    // independent of failed custom-layer rollback at the offline boundary.
+    await page.route('**/USDM_current/**', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify({
+        type: 'FeatureCollection',
+        features: [{
+          type: 'Feature',
+          properties: { DM: 3, MapDate: Date.now() },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [[[-125, 42], [-116, 42], [-116, 49], [-125, 49], [-125, 42]]]
+          }
+        }]
+      })
+    }));
+  }
+
+  async function expectUsdmSurfaceActive(page: Page): Promise<void> {
+    await expect(layerPill(page, 'usdm')).toHaveText(PILL.live);
+    await expect(layerCheckbox(page, 'usdm')).toBeChecked();
+    await expect.poll(async () => (await urlLayers(page)).has('usdm')).toBe(true);
+  }
+
+  test('the tri-national NADM surface is not told it fails to cover Mexico, while the clauses that stay true still render', async ({
+    page,
+  }) => {
+    // Finding 5's first case, which is the DEFAULT drought boot: the drought
+    // cluster's `current` recipe is ['nadm-drought'] (src/config/clusters.ts),
+    // the app's own tri-national monthly surface. So "the current display
+    // layers do not cover Mexico" was a statement about the display that the
+    // display itself refuted, on the most ordinary path into this framing.
+    await gotoApp(page, '?view=brief&cluster=drought&framing=mexico');
+    const key = page.locator('#map-key');
+    await expect(key).toContainText(MEXICO_MINIMAP);
+    await expect(key).not.toContainText(MEXICO_DISPLAY);
+    // The place catalog still ends at the border whatever is displayed, so
+    // that clause is unaffected: this is a narrowing of one claim, not a
+    // silencing of the framing's honesty.
+    await expect(key).toContainText(MEXICO_BRIEFING);
+  });
+
+  test('a US-scoped surface over the same framing still earns the display clause', async ({
+    page,
+  }) => {
+    // The control for the case above. Without it, a fix that simply deleted
+    // the sentence would pass just as well as one that gated it.
+    await stubUsdmSurface(page);
+    await gotoApp(page, '?view=brief&layers=usdm&framing=mexico');
+    await expectUsdmSurfaceActive(page);
+    const key = page.locator('#map-key');
+    await expect(key).toContainText(MEXICO_DISPLAY);
+    await expect(key).toContainText(MEXICO_MINIMAP);
+  });
+
+  test('Console, which hides the minimap and stops its reads, carries no sentence about that minimap', async ({
+    page,
+  }) => {
+    // Finding 5's second case. The widget is hidden in Console and its
+    // retained drought and wildfire reads stop; a sentence about what
+    // "informs this minimap" has no referent there.
+    await stubUsdmSurface(page);
+    await gotoApp(page, '?view=console&layers=usdm&framing=mexico');
+    await expectUsdmSurfaceActive(page);
+    await expect(page.locator('.shell-minimap-map')).toBeHidden();
+    const key = page.locator('#map-key');
+    await expect(key).not.toContainText(MEXICO_MINIMAP);
+    // The other two clauses do not depend on the minimap and stay.
+    await expect(key).toContainText(MEXICO_DISPLAY);
+    await expect(key).toContainText(MEXICO_BRIEFING);
+  });
+
+  test('an ocean camera takes precedence, so the land framing left underneath it says nothing', async ({
+    page,
+  }) => {
+    // Finding 5's third case. Choosing an ocean deliberately preserves
+    // `framing=` (D-0.7.0-042/053: an ocean click is an ENSO entry, display
+    // plus camera) while taking the camera, so reading the land framing alone
+    // put Mexico copy on a Pacific scene.
+    await gotoApp(page, '?view=brief&cluster=enso&ocean=pacific&framing=mexico');
+    const key = page.locator('#map-key');
+    await expect(key).not.toContainText(MEXICO_DISPLAY);
+    await expect(key).not.toContainText(MEXICO_MINIMAP);
+    await expect(key).not.toContainText(MEXICO_BRIEFING);
   });
 });

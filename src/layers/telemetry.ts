@@ -3,25 +3,25 @@
  * with the v0.1.1 popup race-fix preserved).
  *
  * Each station in `TELEMETRY_STATIONS` becomes a `maplibregl.Marker` with a
- * small color-coded dot. Clicking a marker opens a `maplibregl.Popup` whose
- * static skeleton (title, agency, description, links) is rendered immediately
- * and whose live data slot (United States Geological Survey (USGS)
- * Instantaneous Values (IV) for `usgsSite` stations, an honest "not available
- * in-browser" message for Natural Resources Conservation Service (NRCS)
- * Air-Water Database (AWDB) Snow Telemetry (SNOTEL) stations) is hydrated
- * asynchronously.
+ * small color-coded dot. Clicking a marker opens its `maplibregl.Popup`,
+ * which the InteractionCoordinator adopts as the one response and paints
+ * through the popup frame (S30D D1 M26c): first the station's model as it
+ * stands before its live read (the loading state, or the custody cadence of
+ * a station DDM does not read in the browser), then, once the live read
+ * lands, the hydrated model, whole (src/ui/popups.ts
+ * `buildTelemetryPopupModel`, `hydrateTelemetryPopup`).
  *
  * Critical port behavior preserved from v0.1.1:
  *   - Per-marker AbortController stored externally via `WeakMap` (MapLibre's
  *     `Marker` does not support arbitrary custom properties as cleanly as
  *     Leaflet's marker did).
- *   - The popup `close` event aborts the in-flight USGS fetch so a re-open
- *     within ~8 seconds does not race two fetches into a re-created slot.
- *   - `hydrateTelemetryPopupData(...)` and the internal USGS fetch thread the
- *     signal end-to-end; both check `signal.aborted` before writing into the
- *     slot.
- *   - Every interpolated value in the popup is escaped via `escapeHtml`; only
- *     `https://` URLs are rendered as anchors.
+ *   - The popup `close` event aborts the in-flight read so a re-open within
+ *     ~8 seconds does not race two reads into the reopened popup: an aborted
+ *     read returns no model, and the coordinator refuses a paint for an
+ *     adoption that is no longer current.
+ *   - The read threads the signal end-to-end.
+ *   - Every model string is escaped once by the frame; only https links
+ *     without userinfo reach it.
  *
  * Coordinates note: the `TelemetryStation.coords` tuple is `[latitude,
  * longitude]` to match the bounding-box convention used elsewhere in the
@@ -34,24 +34,26 @@
 
 import * as maplibregl from 'maplibre-gl';
 
-import { adoptExternalResponse } from '../map/interaction-coordinator';
+import { adoptExternalResponse, warmPopupFrame } from '../map/interaction-coordinator';
+import { DDM_NOTICE_LABEL, RAWS_PUBLIC_VIEW_NOTICE } from '../config/ddm-notice';
 import type { TelemetryFreshness, TelemetryStation } from '../types/station';
 import {
   STATIC_TELEMETRY_STATION_REGISTRY,
   STATION_MARKER_LEGEND,
   discoverStationsForViewport,
+  distanceMeters,
   mergeTelemetryStations,
-  stationNetworkByKey
+  parseLeadingNumber,
+  stationNetworkByKey,
+  type RawsWindStationFields
 } from '../config/station-registry';
 import type {
   PrimaryParameterCategory,
+  StationDiscoveryRecord,
   StationRegistryEntry,
   ViewportBounds
 } from '../types/station-network';
-import {
-  buildTelemetryPopupSkeleton,
-  hydrateTelemetryPopupData
-} from '../ui/popups';
+import { buildTelemetryPopupModel, hydrateTelemetryPopup } from '../ui/popups';
 import { registry } from '../state/registry';
 import {
   LEGEND_ORDER,
@@ -60,6 +62,7 @@ import {
   showLegend
 } from '../ui/legend-registry';
 import { prefersReducedMotion } from '../util/motion';
+import { dateTok } from '../util/text-tokens';
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -74,6 +77,7 @@ import { prefersReducedMotion } from '../util/motion';
 const activeMarkers: maplibregl.Marker[] = [];
 const markersByStationId = new Map<string, maplibregl.Marker>();
 const stationByMarker = new WeakMap<maplibregl.Marker, TelemetryStation>();
+const markerViews = new WeakMap<maplibregl.Marker, TelemetryMarkerView>();
 
 /**
  * Per-marker AbortController. Stored externally (rather than as a custom
@@ -82,11 +86,12 @@ const stationByMarker = new WeakMap<maplibregl.Marker, TelemetryStation>();
  * garbage collection of stale entries follows the marker's lifetime.
  */
 const abortControllers = new WeakMap<maplibregl.Marker, AbortController>();
+/** The list button belongs only to the synchronous popup open it requested. */
+const popupOrigins = new WeakMap<maplibregl.Marker, HTMLElement>();
 
 const LAYER_KEY = 'telemetry';
 const MOVEEND_DEBOUNCE_MS = 350;
 const DISCOVERED_STATION_RENDER_CAP = 50;
-const EARTH_RADIUS_METERS = 6_371_000;
 const CAP_NOTE_ID = 'telemetry-discovery-note';
 // H2 (0.6.2, D-0.7.0-004): a compact count chip in the shared bottom dock;
 // the full explanation lives in the sidebar Water & Snow panel. The old
@@ -105,6 +110,8 @@ interface TelemetryMarkerView {
 let currentDiscoveryController: AbortController | null = null;
 let moveendDebounce: ReturnType<typeof setTimeout> | null = null;
 let moveendHandler: (() => void) | null = null;
+// The last final discovery answer: a progress paint merges it in, so only a final answer removes markers.
+let lastFinalRecords: readonly StationDiscoveryRecord[] = [];
 
 function reportStatus(state: TelemetryStatus): void {
   registry.setStatus(LAYER_KEY, state);
@@ -135,6 +142,9 @@ export async function activate(map: maplibregl.Map): Promise<void> {
   }
 
   reportStatus('loading');
+  // The station popups paint through the popup frame and register no click
+  // target, so the layer warms the frame itself (D1 M26c).
+  warmPopupFrame();
 
   ensureMoveendHandler(map);
   await runDiscoveryForCurrentViewport(map);
@@ -155,25 +165,88 @@ function showStationLegend(): void {
         body,
         'Monitoring stations',
         STATION_MARKER_LEGEND,
-        'Featured stations keep their own marker colors; open a marker for its source.'
+        // DDM-P9-T06 fix F6 (opus-read.md), NEW bounded grant for this one
+        // sentence only: the wind symbol had no legend entry anywhere. Not
+        // added to `STATION_MARKER_LEGEND` itself (that table is a color
+        // swatch list; a wind-direction convention does not fit its shape,
+        // per the fix brief). "NIFC RAWS" and "the direction from which the
+        // air is moving" are the issuer's own words (science verdict item 3,
+        // NWCG PMS 426-3 / the FeatureServer's own field description); the
+        // rest states a DDM display convention, not an issuer definition.
+        'Featured stations keep their own marker colors; open a marker for its source. An arrow on a NIFC RAWS marker is that station\'s served wind: it points into the wind (the direction from which the air is moving), its length scales with the served speed, and the marker\'s popup carries the values and observation time.'
       );
+      // DR-159 (S30D D1 M22): the public-view RAWS notice, verbatim, as
+      // DDM's own notice under DDM's label, never as NIFC's words; the
+      // Impact Briefing's acknowledgements carry the same notice.
+      // ledger: nifc-raws-public-view (cite sheet c01)
+      const notice = document.createElement('p');
+      notice.className = 'legend-note legend-ddm-notice';
+      const label = document.createElement('span');
+      label.className = 'ack-notice-label';
+      label.textContent = `${DDM_NOTICE_LABEL}:`;
+      notice.append(label, ` ${RAWS_PUBLIC_VIEW_NOTICE.text}`);
+      body.append(notice);
     }
   });
 }
 
 function renderStations(map: maplibregl.Map, views: readonly TelemetryMarkerView[]): void {
-  clearMarkers();
+  const nextViews = new Map(views.map((view) => [view.station.id, view]));
+  // A viewport refresh must not dismiss an unchanged station's open popup or
+  // restart its live read. Changed identities/handles and marker labels still
+  // take the full removal path, so no popup remains bound to obsolete data.
+  for (let index = activeMarkers.length - 1; index >= 0; index--) {
+    const marker = activeMarkers[index]!;
+    const previous = markerViews.get(marker)!;
+    const next = nextViews.get(previous.station.id);
+    // By content: each refresh rebuilds every discovered station as a new object.
+    if (next && JSON.stringify(next.station) === JSON.stringify(previous.station) &&
+        next.freshness === previous.freshness &&
+        next.primaryParameterCategory === previous.primaryParameterCategory &&
+        next.networkLabel === previous.networkLabel) continue;
+    removeMarker(marker);
+    markersByStationId.delete(previous.station.id);
+    activeMarkers.splice(index, 1);
+  }
+  const created: maplibregl.Marker[] = [];
 
   for (const view of views) {
     const { station } = view;
+    if (markersByStationId.has(station.id)) continue;
     const el = document.createElement('div');
     el.className = 'telemetry-marker';
     el.dataset.telemetryStationId = station.id;
     el.dataset.telemetryFreshness = view.freshness;
     el.dataset.telemetryCategory = view.primaryParameterCategory;
     const accessibleLabel = markerAccessibleLabel(view);
-    el.title = accessibleLabel;
+
+    // DDM-P9-T06: a RAWS station's served wind rides on `station` itself
+    // (src/config/station-registry.ts's `RawsWindStationFields`, cast on
+    // both ends since `TelemetryStation` in types/station.ts is not owned
+    // by this task). Every other network's station simply never carries
+    // these properties, so this is a no-op for them: no glyph, no
+    // interpolation, nothing drawn off a station's own point.
+    //
+    // `glyphEligibleWind` (below) is the ONE eligibility gate: a null,
+    // missing, or unparseable field of ANY of the three (speed string,
+    // direction string, numeric direction) means no glyph, per the
+    // acceptance's "Station reported none" clause and fix F3 (opus-read.md:
+    // an unparseable served direction, for example "VRB" or "calm", must
+    // never fall back to an invented due-north rotation).
+    const glyphWind = glyphEligibleWind(readRawsWindFields(station));
+
+    // Fix F4 (opus-read.md): `buildRawsWindGlyph`'s own SVG carries
+    // `pointer-events: none` (a hover target would intercept clicks meant
+    // for the marker), so its `<title>` can never actually receive a hover
+    // and show a tooltip; the browser resolves the hover to THIS element,
+    // `.telemetry-marker`, whose `title` attribute is the one the acceptance's
+    // "carrying the observation time in its title" clause needs. Appended,
+    // not replaced, so the marker's base identity sentence is never lost.
+    el.title = glyphWind
+      ? `${accessibleLabel} ${buildRawsWindAccessibleName(glyphWind)}`
+      : accessibleLabel;
     el.setAttribute('aria-label', accessibleLabel);
+    el.setAttribute('role', 'button');
 
     const inner = document.createElement('div');
     inner.className = 'telemetry-marker-inner';
@@ -190,6 +263,14 @@ function renderStations(map: maplibregl.Map, views: readonly TelemetryMarkerView
     el.style.width = '16px';
     el.style.height = '16px';
 
+    if (glyphWind) {
+      // overflow stays visible on `.telemetry-marker` (no CSS rule says
+      // otherwise), so an absolutely-positioned child sized past the
+      // marker's own 16px box still renders in full; no src/styles/app.css
+      // edit needed (that grant does not exist for this task).
+      el.appendChild(buildRawsWindGlyph(glyphWind, station.color, view.freshness === 'fresh'));
+    }
+
     // TelemetryStation.coords is [lat, lng]; MapLibre wants [lng, lat].
     const [lat, lng] = station.coords;
 
@@ -204,18 +285,277 @@ function renderStations(map: maplibregl.Map, views: readonly TelemetryMarkerView
       closeOnClick: true
     });
 
-    const marker = new maplibregl.Marker({ element: el })
+    const marker = new maplibregl.Marker(telemetryMarkerOptions(el, glyphWind))
       .setLngLat([lng, lat])
-      .setPopup(popup)
-      .addTo(map);
+      // addTo removes an earlier keypress listener in MapLibre; bind
+      // the popup afterward so its native Enter/Space handler remains.
+      .addTo(map)
+      .setPopup(popup);
 
     stationByMarker.set(marker, station);
+    markerViews.set(marker, view);
     markersByStationId.set(station.id, marker);
     activeMarkers.push(marker);
+    created.push(marker);
   }
 
-  bindPopups(map);
+  bindPopups(map, created);
   showStationLegend();
+}
+
+/**
+ * DDM-P9-T06: read the served wind fields off a discovered RAWS station's
+ * own identity object. `undefined` on `windSpeedServed` means the property
+ * was never set at all (every non-RAWS station, and RAWS stations rendered
+ * from the curated seed table rather than live discovery); `null` means a
+ * RAWS station whose discovery response affirmatively reported no wind
+ * speed. Only the latter is a RAWS station with nothing to draw; the
+ * caller treats both the same way (no glyph), but the distinction matters
+ * for anyone extending this later: never draw a glyph for a station this
+ * function returns `null` for, and never invent a value for one it returns
+ * a `RawsWindStationFields` for with a `null` field.
+ */
+function readRawsWindFields(station: TelemetryStation): RawsWindStationFields | null {
+  const widened = station as TelemetryStation & Partial<RawsWindStationFields>;
+  if (widened.windSpeedServed === undefined) return null;
+  return {
+    windSpeedServed: widened.windSpeedServed,
+    windDirectionServed: widened.windDirectionServed ?? null,
+    windDirectionDeg: widened.windDirectionDeg ?? null,
+    windObservedAtIso: widened.windObservedAtIso ?? null
+  };
+}
+
+/**
+ * The narrowed, definitely-non-null shape a glyph (and its shared accessible
+ * name) may be built from. `glyphEligibleWind` below is the ONLY place that
+ * decides eligibility; `buildRawsWindGlyph` and `buildRawsWindAccessibleName`
+ * both take this type as their parameter so neither one can re-check (or
+ * mis-check) what the caller already guaranteed (opus-read.md F12: the
+ * former inner `if` in `buildRawsWindGlyph` was dead code because its only
+ * caller already enforced the same condition; removed, not duplicated).
+ */
+interface RawsWindGlyphFields {
+  readonly windSpeedServed: string;
+  readonly windDirectionServed: string;
+  readonly windDirectionDeg: number;
+  readonly windObservedAtIso: string | null;
+}
+
+/**
+ * DDM-P9-T06 fix F3 (opus-read.md): the single eligibility gate for the wind
+ * symbol. A glyph exists ONLY when the discovery response served a speed
+ * string, a direction string, AND a numeric direction: `windDirectionDeg` is
+ * `null` whenever `windDirectionServed` has no leading numeric token (for
+ * example the issuer's own "calm" or "VRB"), and drawing a rotated arrow in
+ * that case would silently invent a due-north reading the issuer never
+ * served. The popup's own wind row (src/ui/popups.ts `rawsWindText`) still
+ * renders the served strings verbatim regardless of what this function
+ * returns; only the marker's visual glyph and its title/accessible-name
+ * sentence are gated here.
+ */
+function glyphEligibleWind(wind: RawsWindStationFields | null): RawsWindGlyphFields | null {
+  if (
+    wind === null ||
+    wind.windSpeedServed === null ||
+    wind.windDirectionServed === null ||
+    wind.windDirectionDeg === null
+  ) {
+    return null;
+  }
+  return {
+    windSpeedServed: wind.windSpeedServed,
+    windDirectionServed: wind.windDirectionServed,
+    windDirectionDeg: wind.windDirectionDeg,
+    windObservedAtIso: wind.windObservedAtIso
+  };
+}
+
+/**
+ * The observation time as the house `dateTok` token, zone named, the way the
+ * popup frame prints instants. `null` reads "an unknown time" rather than
+ * omitting the clause the acceptance requires.
+ */
+function formatRawsObservedTime(observedAtIso: string | null): string {
+  if (!observedAtIso) return 'an unknown time';
+  const observed = new Date(observedAtIso);
+  return Number.isNaN(observed.getTime()) ? observedAtIso : dateTok(observed);
+}
+
+/**
+ * The one accessible-name sentence for a station's sustained wind, shared by
+ * the marker's own `title` tooltip (fix F4: the SVG glyph's
+ * `pointer-events: none` means ITS `<title>` never receives a hover, so
+ * `renderStations` appends this same sentence to the parent
+ * `.telemetry-marker` element's `title` instead) and the glyph's own
+ * `aria-label` / `<title>` below, so a mouse hover and a screen reader read
+ * the identical served sentence rather than two independently-worded claims
+ * about the same reading.
+ */
+function buildRawsWindAccessibleName(wind: RawsWindGlyphFields): string {
+  const observed = formatRawsObservedTime(wind.windObservedAtIso);
+  return `Wind ${wind.windSpeedServed} from ${wind.windDirectionServed} (NIFC RAWS), observed ${observed}`;
+}
+
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+// DDM-P9-T06 fix F5 and F10 (opus-read.md): the glyph's drawn size and shape
+// are a stated DDM display convention, never an issuer-defined unit or
+// threshold. `WIND_GLYPH_DOT_RADIUS_PX` matches the 16px network-color dot's
+// own radius (`el.style.width/height = '16px'` above) so the shaft always
+// starts just outside the dot regardless of the served speed, keeping the
+// dot fully visible under the glyph (fix F10). The shaft then grows linearly
+// from `WIND_GLYPH_SHAFT_MIN_PX` at `WIND_GLYPH_SHAFT_MIN_MPH` (5 mph) or
+// slower up to `WIND_GLYPH_SHAFT_MAX_PX` at `WIND_GLYPH_SHAFT_MAX_MPH`
+// (35 mph) or faster, clamped at both ends; the arrowhead is a fixed size at
+// the shaft's outer end. None of these numbers are read from, or shown as, a
+// served value: the served strings themselves are what the accessible name,
+// the title, and the popup always display.
+const WIND_GLYPH_DOT_RADIUS_PX = 8;
+const WIND_GLYPH_SHAFT_MIN_PX = 6;
+const WIND_GLYPH_SHAFT_MAX_PX = 22;
+const WIND_GLYPH_SHAFT_MIN_MPH = 5;
+const WIND_GLYPH_SHAFT_MAX_MPH = 35;
+const WIND_GLYPH_ARROWHEAD_LENGTH_PX = 8;
+const WIND_GLYPH_ARROWHEAD_HALF_WIDTH_PX = 5;
+const WIND_GLYPH_STROKE_WIDTH_PX = 1.5;
+// Padding so the arrowhead's white contrast stroke never clips against the
+// SVG's own edge.
+const WIND_GLYPH_PAD_PX = 2;
+
+function clampWindSpeedForShaft(speedMph: number): number {
+  return Math.min(Math.max(speedMph, WIND_GLYPH_SHAFT_MIN_MPH), WIND_GLYPH_SHAFT_MAX_MPH);
+}
+
+function windGlyphShaftLengthPx(speedMph: number): number {
+  const clamped = clampWindSpeedForShaft(speedMph);
+  const t =
+    (clamped - WIND_GLYPH_SHAFT_MIN_MPH) / (WIND_GLYPH_SHAFT_MAX_MPH - WIND_GLYPH_SHAFT_MIN_MPH);
+  return WIND_GLYPH_SHAFT_MIN_PX + t * (WIND_GLYPH_SHAFT_MAX_PX - WIND_GLYPH_SHAFT_MIN_PX);
+}
+
+/**
+ * A wind marker turns with the map (MapLibre applies `rotation - bearing`)
+ * but stays facing the viewer: `pitchAlignment` would otherwise follow
+ * `rotationAlignment` and lay the arrow flat in Fire 3D.
+ */
+function telemetryMarkerOptions(element: HTMLElement, wind: RawsWindGlyphFields | null): maplibregl.MarkerOptions {
+  return wind
+    ? { element, rotationAlignment: 'map', pitchAlignment: 'viewport', rotation: wind.windDirectionDeg }
+    : { element };
+}
+
+/**
+ * The sustained-wind symbol: an inline-styled SVG child of the marker
+ * element (no CSS class whose appearance depends on src/styles/app.css;
+ * that grant does not exist for this task). The caller (`renderStations`,
+ * via `glyphEligibleWind`) is the only gate on when this is built at all; a
+ * missing or unparseable field never reaches here (fix F12: no inner
+ * re-check, no dead branch).
+ *
+ * Rotation convention, stated here and in the glyph's own accessible name:
+ * `WindDirDegrees` is the direction the wind is blowing FROM, in degrees
+ * clockwise from true north (NWCG PMS 426-3, verified against the NIFC
+ * PublicView_RAWS FeatureServer's own field description). The glyph is a
+ * wind-vane arrowhead that points INTO the wind. The SVG draws it pointing
+ * up (north) and never rotates it; the marker's `rotation` carries it,
+ * clockwise by exactly the served number of degrees, with no sign inversion
+ * and no re-derivation of the served value.
+ *
+ * `color` is `station.color`, the SAME network color the unified legend
+ * already keys on (fix F10: the glyph no longer carries its own hardcoded
+ * dark fill). Measured for the RAWS network color specifically (DDM-P9-T06
+ * report, WCAG 2.1 non-text contrast, 3:1 minimum): `#ef4444` (raws) against
+ * a white basemap area is 3.76:1 (relative luminance 0.2291 vs 1.0), so the
+ * network color passes and is used directly, with a white 1px contrast
+ * stroke; a live satellite or terrain basemap varies pixel to pixel, so this
+ * is a representative check against the lightest plausible background, not
+ * an exhaustive one.
+ *
+ * `fresh` is the marker's own freshness verdict (freshnessForNetwork): a
+ * reading past its window draws the way its dot does in app.css, at 0.7
+ * opacity with a dashed line, so an old arrow never reads as a current one.
+ */
+function buildRawsWindGlyph(wind: RawsWindGlyphFields, color: string, fresh: boolean): SVGSVGElement {
+  const accessibleName = buildRawsWindAccessibleName(wind);
+  const parsedSpeedMph = parseLeadingNumber(wind.windSpeedServed);
+  // Fix F5 (opus-read.md, including its "0 mph with a direction" caveat): a
+  // parsed speed of 0, or a speed string with no numeric token at all, draws
+  // no directional shape. A calm or unparseable reading has nothing honest
+  // to point; the accessible name, the marker's title, and the popup's own
+  // wind row still carry the served strings verbatim regardless.
+  const drawArrow = parsedSpeedMph !== null && parsedSpeedMph > 0;
+  const shaftLength = drawArrow ? windGlyphShaftLengthPx(parsedSpeedMph) : 0;
+  const halfSize =
+    WIND_GLYPH_DOT_RADIUS_PX +
+    shaftLength +
+    (drawArrow ? WIND_GLYPH_ARROWHEAD_LENGTH_PX : 0) +
+    WIND_GLYPH_PAD_PX;
+  const size = halfSize * 2;
+
+  const svg = document.createElementNS(SVG_NS, 'svg') as unknown as SVGSVGElement;
+  // A viewBox centered on (0, 0) so the drawn shape's own coordinates are
+  // measured from the marker's center, matching the `translate(-50%, -50%)`
+  // positioning below with no separate offset math.
+  svg.setAttribute('viewBox', `${-halfSize} ${-halfSize} ${size} ${size}`);
+  svg.setAttribute('width', String(size));
+  svg.setAttribute('height', String(size));
+  svg.setAttribute('data-telemetry-wind-glyph', 'true');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', accessibleName);
+  svg.setAttribute('focusable', 'false');
+  svg.style.position = 'absolute';
+  svg.style.left = '50%';
+  svg.style.top = '50%';
+  svg.style.pointerEvents = 'none';
+  // The direction is the marker's own `rotation` (telemetryMarkerOptions),
+  // so MapLibre subtracts the map bearing on every turn.
+  svg.style.transform = 'translate(-50%, -50%)';
+  if (!fresh) svg.style.opacity = '0.7';
+
+  // An SVG `<title>` is the element's native tooltip-on-hover text, but
+  // `pointer-events: none` above means this element is never itself the
+  // hover target (the browser resolves the hover to the parent
+  // `.telemetry-marker`, whose own `title` attribute carries this same
+  // sentence; see `renderStations`). The SVG `<title>` still records the
+  // accessible sentence directly in the DOM for anything that reads it there.
+  const title = document.createElementNS(SVG_NS, 'title');
+  title.textContent = accessibleName;
+  svg.appendChild(title);
+
+  if (drawArrow) {
+    // Fix F10: the shaft starts exactly `WIND_GLYPH_DOT_RADIUS_PX` from
+    // center, the SAME radius as the network-color dot underneath, so the
+    // glyph's stroke never overlaps the dot at any served speed; the
+    // arrowhead sits further out still, at the shaft's far end.
+    const shaftStart = WIND_GLYPH_DOT_RADIUS_PX;
+    const shaftEnd = shaftStart + shaftLength;
+    const tipY = shaftEnd + WIND_GLYPH_ARROWHEAD_LENGTH_PX;
+
+    const shaft = document.createElementNS(SVG_NS, 'line');
+    shaft.setAttribute('x1', '0');
+    shaft.setAttribute('y1', String(-shaftStart));
+    shaft.setAttribute('x2', '0');
+    shaft.setAttribute('y2', String(-shaftEnd));
+    shaft.setAttribute('stroke', color);
+    shaft.setAttribute('stroke-width', String(WIND_GLYPH_STROKE_WIDTH_PX));
+    shaft.setAttribute('stroke-linecap', 'round');
+    if (!fresh) shaft.setAttribute('stroke-dasharray', '3 3');
+    svg.appendChild(shaft);
+
+    const arrow = document.createElementNS(SVG_NS, 'path');
+    arrow.setAttribute(
+      'd',
+      `M0 ${-tipY} L${WIND_GLYPH_ARROWHEAD_HALF_WIDTH_PX} ${-shaftEnd} L${-WIND_GLYPH_ARROWHEAD_HALF_WIDTH_PX} ${-shaftEnd} Z`
+    );
+    arrow.setAttribute('fill', color);
+    arrow.setAttribute('stroke', '#ffffff');
+    arrow.setAttribute('stroke-width', '1');
+    arrow.setAttribute('stroke-linejoin', 'round');
+    svg.appendChild(arrow);
+  }
+
+  return svg;
 }
 
 /**
@@ -227,14 +567,7 @@ function renderStations(map: maplibregl.Map, views: readonly TelemetryMarkerView
  * via `Marker.remove()` so we do not need it today.
  */
 export function deactivate(map: maplibregl.Map): void {
-  if (moveendDebounce) {
-    clearTimeout(moveendDebounce);
-    moveendDebounce = null;
-  }
-  if (currentDiscoveryController) {
-    currentDiscoveryController.abort();
-    currentDiscoveryController = null;
-  }
+  cancelActivation();
   if (moveendHandler) {
     map.off('moveend', moveendHandler);
     moveendHandler = null;
@@ -244,15 +577,37 @@ export function deactivate(map: maplibregl.Map): void {
   clearMarkers();
 }
 
-function clearMarkers(): void {
-  for (const marker of activeMarkers) {
-    const controller = abortControllers.get(marker);
-    if (controller) {
-      controller.abort();
-      abortControllers.delete(marker);
-    }
-    marker.remove();
+/**
+ * Synchronous cancellation seam (the optional LayerModule hook): the layer
+ * controller calls it the moment off intent is recorded, before the queued
+ * teardown, so an in-flight viewport discovery aborts at once instead of
+ * running out its provider budget (DDM-P1-T02). The aborted discovery returns
+ * quietly; `deactivate` still owns marker and handler removal.
+ */
+export function cancelActivation(): void {
+  if (moveendDebounce) {
+    clearTimeout(moveendDebounce);
+    moveendDebounce = null;
   }
+  if (currentDiscoveryController) {
+    currentDiscoveryController.abort();
+    currentDiscoveryController = null;
+  }
+  lastFinalRecords = [];
+}
+
+function removeMarker(marker: maplibregl.Marker): void {
+  const controller = abortControllers.get(marker);
+  if (controller) {
+    controller.abort();
+    abortControllers.delete(marker);
+  }
+  popupOrigins.delete(marker);
+  marker.remove();
+}
+
+function clearMarkers(): void {
+  for (const marker of activeMarkers) removeMarker(marker);
   activeMarkers.length = 0;
   markersByStationId.clear();
 }
@@ -260,25 +615,24 @@ function clearMarkers(): void {
 /**
  * Wire the per-popup open / close handlers that drive live data hydration.
  *
- * Called once at the end of `activate` (so each batch of fresh markers gets
- * its handlers in the same pass). Exported so a future caller could rebind
- * after replacing markers in place; today the only call site is `activate`.
+ * Called for each newly created batch by `renderStations`. Retained markers
+ * keep their original handlers, controller and coordinator-owned popup.
  *
  * On `open`:
- *   1. Abort any prior controller for this marker (defensive; handles the
+ *   1. Hand the popup to the coordinator, which adopts it as the response.
+ *   2. Abort any prior controller for this marker (defensive; handles the
  *      "user opened, closed, reopened within ~8s" race the v0.1.1 review
- *      flagged).
- *   2. Create a fresh `AbortController` and stash it in the WeakMap.
- *   3. Set the popup HTML to the skeleton.
- *   4. Resolve the popup's DOM element and call `hydrateTelemetryPopupData`
- *      with the fresh signal.
+ *      flagged) and stash a fresh one in the WeakMap.
+ *   3. Paint the station's first model through the adoption.
+ *   4. Read the live values with the fresh signal and paint the hydrated
+ *      model, unless the read was aborted.
  *
  * On `close`:
- *   1. Abort and clear the controller so any in-flight USGS fetch can no
- *      longer write into a slot that is about to be detached from the DOM.
+ *   1. Abort and clear the controller so an in-flight read can no longer
+ *      paint the popup.
  */
-export function bindPopups(_map: maplibregl.Map): void {
-  for (const marker of activeMarkers) {
+export function bindPopups(map: maplibregl.Map, markers: readonly maplibregl.Marker[] = activeMarkers): void {
+  for (const marker of markers) {
     const station = stationByMarker.get(marker);
     if (!station) continue;
     const popup = marker.getPopup();
@@ -292,9 +646,11 @@ export function bindPopups(_map: maplibregl.Map): void {
       // station is the table's top point-event, so the marker popup
       // WINS: adopting it dismisses any coordinator response committed
       // for the same click and occupies the single response slot.
-      adoptExternalResponse(popup);
+      const origin = popupOrigins.get(marker) ?? marker.getElement();
+      popupOrigins.delete(marker);
+      const response = adoptExternalResponse(popup, map, origin);
 
-      // Abort any prior in-flight fetch from a popup that the user opened
+      // Abort any prior in-flight read from a popup that the user opened
       // and dismissed quickly.
       const prior = abortControllers.get(marker);
       if (prior) prior.abort();
@@ -302,13 +658,25 @@ export function bindPopups(_map: maplibregl.Map): void {
       const controller = new AbortController();
       abortControllers.set(marker, controller);
 
-      popup.setHTML(buildTelemetryPopupSkeleton(station));
-
-      // `getElement()` returns the popup's outer DOM container once the
-      // popup is added to the map (which `marker.setPopup` + open guarantee).
-      const container = popup.getElement();
-      if (!container) return;
-      void hydrateTelemetryPopupData(station, container, controller.signal);
+      // The frame paints at once (D1 M26c); the live read repaints it whole.
+      response.paint(buildTelemetryPopupModel(station));
+      void hydrateTelemetryPopup(station, controller.signal)
+        .then((hydrated) => {
+          if (hydrated && !controller.signal.aborted) response.paint(hydrated.model, hydrated.mount);
+        })
+        .catch((err: unknown) => {
+          // A hydrated model the frame refuses (a builder bug, never a data
+          // condition) must not leave the head loading: report it and paint
+          // the unavailable state. `paint` ignores it once this adoption is
+          // no longer current (closed, replaced or reopened).
+          console.error('[telemetry] the station popup could not paint its live read:', err);
+          if (controller.signal.aborted) return;
+          try {
+            response.paint(buildTelemetryPopupModel(station, { kind: 'unavailable' }));
+          } catch (fallback) {
+            console.error('[telemetry] the station popup could not paint its unavailable state:', fallback);
+          }
+        });
     });
 
     popup.on('close', () => {
@@ -340,37 +708,43 @@ async function runDiscoveryForCurrentViewport(map: maplibregl.Map): Promise<void
   reportStatus('loading');
 
   const curatedEntries = curatedTelemetryEntries();
+  const isCurrent = (): boolean =>
+    !controller.signal.aborted && controller === currentDiscoveryController;
+  const renderMerged = (records: readonly StationDiscoveryRecord[]) => {
+    const merged = mergeTelemetryStations(
+      curatedEntries.map((entry) => entry.station),
+      records
+    );
+    const capped = capDiscoveredStations(merged, viewportCenter(map));
+    renderStations(map, capped.entries.map(markerViewForEntry));
+    updateCapNote(map, capped.totalDiscovered);
+    return capped;
+  };
   try {
     const result = await discoverStationsForViewport({
       bounds: viewportBounds(map),
       center: viewportCenter(map),
-      signal: controller.signal
+      signal: controller.signal,
+      // Paint each source as it settles; the status waits for the final answer.
+      onProgress: (records) => {
+        if (isCurrent()) renderMerged([...records, ...lastFinalRecords]);
+      }
     });
-    if (controller.signal.aborted || controller !== currentDiscoveryController) return;
+    if (!isCurrent()) return;
 
     if (result.status === 'zoom-in') {
       // The viewport is wider than the discovery area cap (D-0.7.0-007):
       // no discovery ran. The curated seeds still render so the layer is
       // not empty, and the pill reads "zoom in to load" honestly. No cap
       // note at region zoom, per the ruling.
-      const merged = mergeTelemetryStations(
-        curatedEntries.map((entry) => entry.station),
-        result.records
-      );
-      const capped = capDiscoveredStations(merged, viewportCenter(map));
-      renderStations(map, capped.entries.map(markerViewForEntry));
-      updateCapNote(map, capped.totalDiscovered);
+      renderMerged(result.records);
+      lastFinalRecords = result.records;
       reportStatus('zoom-in');
       return;
     }
 
-    const merged = mergeTelemetryStations(
-      curatedEntries.map((entry) => entry.station),
-      result.records
-    );
-    const capped = capDiscoveredStations(merged, viewportCenter(map));
-    renderStations(map, capped.entries.map(markerViewForEntry));
-    updateCapNote(map, capped.totalDiscovered);
+    const capped = renderMerged(result.records);
+    lastFinalRecords = result.records;
     // Honest aggregate status (0.7.0 H4): any source failure reads
     // "live (partial)" instead of an unqualified "live". This includes the
     // every-source-failed case, because the curated seed markers are
@@ -380,16 +754,20 @@ async function runDiscoveryForCurrentViewport(map: maplibregl.Map): Promise<void
     // scrub the layer, unchecking it and clearing the seeds it just
     // rendered (layer-controller.ts, the critical-review #2 guard;
     // adversarial-review finding, 2026-07-10). 'error' remains the catch
-    // branch below, where discovery itself threw.
+    // branch below, where discovery itself threw. The curated seeds render
+    // wherever the map looks, so 'no-data' means no station inside the view.
     if (result.failedSources.length > 0) {
       reportStatus('degraded');
     } else {
-      reportStatus(capped.entries.length > 0 ? 'ready' : 'no-data');
+      const view = map.getBounds();
+      const inView = capped.entries.some((e) => view.contains([e.station.coords[1], e.station.coords[0]]));
+      reportStatus(inView ? 'ready' : 'no-data');
     }
   } catch (err) {
-    if (controller.signal.aborted || controller !== currentDiscoveryController) return;
+    if (!isCurrent()) return;
     console.warn('[telemetry] station discovery failed.', err);
     renderStations(map, curatedEntries.map(markerViewForEntry));
+    lastFinalRecords = [];
     hideCapNote();
     reportStatus('error');
   }
@@ -507,26 +885,6 @@ function categoryLabel(category: PrimaryParameterCategory): string {
   return category.replace(/-/g, ' ');
 }
 
-function distanceMeters(
-  a: readonly [number, number],
-  b: readonly [number, number]
-): number {
-  const [lat1, lon1] = a;
-  const [lat2, lon2] = b;
-  const dLat = radians(lat2 - lat1);
-  const dLon = radians(lon2 - lon1);
-  const rLat1 = radians(lat1);
-  const rLat2 = radians(lat2);
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(rLat1) * Math.cos(rLat2) * Math.sin(dLon / 2) ** 2;
-  return 2 * EARTH_RADIUS_METERS * Math.asin(Math.min(1, Math.sqrt(h)));
-}
-
-function radians(degrees: number): number {
-  return (degrees * Math.PI) / 180;
-}
-
 // ---------------------------------------------------------------------------
 // flyToStation (sidebar telemetry list integration; M8)
 // ---------------------------------------------------------------------------
@@ -541,31 +899,43 @@ function radians(degrees: number): number {
  * finished moving, causing autoPan to over-correct). MapLibre's `moveend`
  * fires once the camera has settled, regardless of duration.
  *
- * Uses `map.once` so a queued open does not survive a subsequent
- * `flyToStation` call to a different station.
+ * Animated movement uses `map.once`; reduced motion opens after the
+ * synchronous camera update instead of waiting for an event already emitted.
  *
  * No-op if `stationId` is not in the active marker set.
  */
-export function flyToStation(map: maplibregl.Map, stationId: string): void {
+export function flyToStation(map: maplibregl.Map, stationId: string, origin?: HTMLElement): void {
   const marker = markersByStationId.get(stationId);
   if (!marker) return;
 
   const lngLat = marker.getLngLat();
   const targetZoom = Math.max(map.getZoom(), 9);
+  const reducedMotion = prefersReducedMotion();
 
   // Jump instead of flying for reduced-motion users (WCAG 2.3.3, #7).
   map.flyTo({
     center: [lngLat.lng, lngLat.lat],
     zoom: targetZoom,
     speed: 1.2,
-    ...(prefersReducedMotion() ? { animate: false } : {})
+    ...(reducedMotion ? { animate: false } : {})
   });
 
-  map.once('moveend', () => {
+  const openPopup = (): void => {
     // Re-check that the marker still exists; a deactivate could have run
     // mid-flight (for example, the user toggled the layer off while the
     // animation was running).
-    if (!markersByStationId.has(stationId)) return;
-    marker.togglePopup();
-  });
+    const currentMarker = markersByStationId.get(stationId);
+    if (!currentMarker) return;
+    popupOrigins.set(currentMarker, origin ?? currentMarker.getElement());
+    try {
+      currentMarker.togglePopup();
+    } finally {
+      // A toggle can close an already-open popup without firing an open event.
+      popupOrigins.delete(currentMarker);
+    }
+  };
+  // animate:false completes and emits moveend inside flyTo. Its camera is
+  // already settled here; registering afterward would miss the only event.
+  if (reducedMotion) openPopup();
+  else map.once('moveend', openPopup);
 }

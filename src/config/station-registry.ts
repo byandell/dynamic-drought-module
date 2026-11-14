@@ -13,14 +13,28 @@ import type {
   StationViewportDiscoveryRequest,
   ViewportBounds
 } from '../types/station-network';
-import { fetchBufferedWithBudget, fetchWithBudget } from '../util/fetch';
-import { quantizeBbox } from '../util/bbox';
+import { escapeSql } from '../util/arcgis-features';
+import { fetchBufferedWithBudget } from '../util/fetch';
+import {
+  bboxCoveredByEnvelope,
+  buildQueryEnvelope,
+  quantizeBbox,
+  toCoverageEnvelope,
+  type ViewEnvelope
+} from '../util/bbox';
 import { isObject } from '../util/guards';
+import {
+  fetchUsgsFeatures,
+  IV_FRESH_WINDOW_MS,
+  usgsLocationId,
+  usgsReading,
+  usgsUnit,
+  type UsgsReading
+} from '../util/usgs';
 import { ExpiringLruCache } from '../util/bounded-cache';
 
 const MINUTE_MS = 60 * 1000;
 const HOUR_MS = 60 * MINUTE_MS;
-const DAY_MS = 24 * HOUR_MS;
 const PROXIMITY_MERGE_METERS = 100;
 // Spatial-hash cell size for the proximity-merge fallback (#1). Chosen so one
 // cell is at least PROXIMITY_MERGE_METERS (100 m) wide in BOTH latitude and
@@ -52,21 +66,32 @@ const HANDLE_MATCH_FIELDS: readonly (keyof StationNetworkHandles)[] = [
   'cocorahsSid',
   'nwrfcId'
 ];
-const USGS_DISCOVERY_TIMEOUT_MS = 8_000;
+const USGS_DISCOVERY_TIMEOUT_MS = 20_000;
 const AWDB_DISCOVERY_TIMEOUT_MS = 12_000;
 const RAWS_DISCOVERY_TIMEOUT_MS = 10_000;
 const COOPS_DISCOVERY_TIMEOUT_MS = 12_000;
 const USGS_BBOX_AREA_CAP = 25;
 const USGS_EXTREME_AREA_FACTOR = 64;
 const USGS_DISCOVERY_PARAMETER_CODES = '00060,00065';
+// Rows per discovery page: a 25-square-degree view over western Washington
+// answered 712 rows (2026-11-06), so a view inside the gate fits one page.
+const USGS_DISCOVERY_PAGE_ROWS = 2_000;
+// Latest readings this recent are asked for: the legacy service counted a
+// site active with automated data "within the last 183 days", so a gauge
+// silent for days still shows, marked stale, as it did (14 of 378 gauges in
+// that view; a one-day window drops them).
+const USGS_DISCOVERY_WINDOW = 'P183D';
+// Ids per name request: 300 measured a 4,955-character URL.
+const USGS_NAME_IDS_PER_REQUEST = 300;
+const USGS_SITE_NAME_TTL_MS = 12 * HOUR_MS;
 const AWDB_DISCOVERY_NETWORKS = ['SNTL', 'SCAN'] as const;
 const AGRIMET_DISCOVERY_TIMEOUT_MS = 12_000;
 const COCORAHS_DISCOVERY_TIMEOUT_MS = 15_000;
 // Per-viewport discovery cache + RAWS zoom gate (#3). Quantizing the query
-// bounds (same 0.25-degree step hydrography's HYDRO_CACHE uses) coalesces nearby
+// bounds (0.25-degree step) coalesces nearby
 // pans onto one key, so USGS Instantaneous Values and NIFC RAWS are fetched once
 // per quantized viewport instead of on every settled pan; the caches live for
-// the session like HYDRO_CACHE (station existence is stable within a session;
+// the session (station existence is stable within a session;
 // popup hydration still re-fetches live values on click). RAWS additionally
 // skips entirely above the area cap, so a national or multi-state framing does
 // not fire a NIFC envelope query for a layer that only reads at regional zoom.
@@ -129,16 +154,6 @@ interface AwdbStationMetadata {
   readonly network: AwdbDiscoveryNetwork;
 }
 
-interface AwdbStationCacheInflight {
-  readonly controller: AbortController;
-  readonly promise: Promise<readonly AwdbStationMetadata[]>;
-  readonly waiters: Set<AbortSignal>;
-  hasEverHadWaiter: boolean;
-}
-
-let awdbStationCache: readonly AwdbStationMetadata[] | null = null;
-let awdbStationCacheInflight: AwdbStationCacheInflight | null = null;
-
 interface CoopsStationMetadata {
   readonly id: string;
   readonly name: string;
@@ -147,16 +162,6 @@ interface CoopsStationMetadata {
   readonly state: string | null;
   readonly productsSelf: string | null;
 }
-
-interface CoopsStationCacheInflight {
-  readonly controller: AbortController;
-  readonly promise: Promise<readonly CoopsStationMetadata[]>;
-  readonly waiters: Set<AbortSignal>;
-  hasEverHadWaiter: boolean;
-}
-
-let coopsStationCache: readonly CoopsStationMetadata[] | null = null;
-let coopsStationCacheInflight: CoopsStationCacheInflight | null = null;
 
 interface AgrimetStationMetadata {
   readonly id: string;
@@ -199,63 +204,54 @@ export const STATION_NETWORKS = [
   {
     key: 'usgs-iv',
     label: 'USGS Instantaneous Values',
-    refreshWindowMs: 6 * HOUR_MS,
     cadence: 'about every 15 to 60 minutes',
     adapter: DISCOVERY_NOT_WIRED_ADAPTER
   },
   {
     key: 'nrcs-awdb',
     label: 'NRCS AWDB SNOTEL and SCAN',
-    refreshWindowMs: 2 * DAY_MS,
     cadence: 'about daily',
     adapter: DISCOVERY_NOT_WIRED_ADAPTER
   },
   {
     key: 'usace-cwms',
     label: 'USACE Corps Water Management System',
-    refreshWindowMs: 6 * HOUR_MS,
     cadence: 'about hourly',
     adapter: DISCOVERY_NOT_WIRED_ADAPTER
   },
   {
     key: 'usbr-hydromet',
     label: 'USBR Hydromet',
-    refreshWindowMs: 2 * DAY_MS,
     cadence: 'about daily',
     adapter: DISCOVERY_NOT_WIRED_ADAPTER
   },
   {
     key: 'raws',
     label: 'NIFC Remote Automated Weather Stations',
-    refreshWindowMs: 3 * HOUR_MS,
     cadence: 'about hourly',
     adapter: RAWS_STATION_ADAPTER
   },
   {
     key: 'noaa-coops',
     label: 'NOAA Tides and Currents',
-    refreshWindowMs: 6 * HOUR_MS,
     cadence: 'about every 6 minutes',
     adapter: COOPS_STATION_ADAPTER
   },
   {
     key: 'usbr-agrimet',
     label: 'USBR AgriMet',
-    refreshWindowMs: 2 * DAY_MS,
     cadence: 'about daily',
     adapter: AGRIMET_STATION_ADAPTER
   },
   {
     key: 'cocorahs',
     label: 'CoCoRaHS (via Iowa Environmental Mesonet)',
-    refreshWindowMs: 2 * DAY_MS,
     cadence: 'daily (volunteer reports)',
     adapter: COCORAHS_STATION_ADAPTER
   },
   {
     key: 'nwrfc',
     label: 'Northwest River Forecast Center', // vocab-allow: verbatim agency name
-    refreshWindowMs: DAY_MS,
     cadence: 'seasonal updates',
     adapter: DISCOVERY_NOT_WIRED_ADAPTER
   }
@@ -347,16 +343,18 @@ export function mergeTelemetryStations(
   return entries;
 }
 
+/** Staleness windows for the timestamped networks read here; daily-duration
+ * readings (AWDB, Hydromet, AgriMet) use dailyFreshness in util/awdb.ts. */
+const FRESH_WINDOW_MS = { 'usgs-iv': IV_FRESH_WINDOW_MS, raws: 3 * HOUR_MS } as const;
+
 export function freshnessForNetwork(
-  network: StationNetworkKey,
+  network: keyof typeof FRESH_WINDOW_MS,
   timestampIso: string,
   nowMs = Date.now()
 ): TelemetryFreshness {
   const timestampMs = Date.parse(timestampIso);
   if (Number.isNaN(timestampMs)) return 'stale';
-  return nowMs - timestampMs <= stationNetworkByKey(network).refreshWindowMs
-    ? 'fresh'
-    : 'stale';
+  return nowMs - timestampMs <= FRESH_WINDOW_MS[network] ? 'fresh' : 'stale';
 }
 
 // Session caches keyed by quantized viewport (#3); see DISCOVERY_BBOX_QUANT.
@@ -371,16 +369,23 @@ export function freshnessForNetwork(
 const DISCOVERY_CACHE_MAX_ENTRIES = 32;
 const DISCOVERY_CACHE_TTL_MS = 15 * MINUTE_MS;
 
-const USGS_DISCOVERY_CACHE = new ExpiringLruCache<
-  string,
-  readonly StationDiscoveryRecord[]
->(DISCOVERY_CACHE_MAX_ENTRIES);
-const RAWS_DISCOVERY_CACHE = new ExpiringLruCache<
-  string,
-  readonly StationDiscoveryRecord[]
->(DISCOVERY_CACHE_MAX_ENTRIES);
+// The key is snapped but the request is not: serve a hit only when the box
+// that was actually queried contains the box now asked for.
+interface DiscoveryCacheEntry {
+  readonly bounds: ViewEnvelope;
+  readonly records: readonly StationDiscoveryRecord[];
+}
+const USGS_DISCOVERY_CACHE = new ExpiringLruCache<string, DiscoveryCacheEntry>(
+  DISCOVERY_CACHE_MAX_ENTRIES
+);
+const RAWS_DISCOVERY_CACHE = new ExpiringLruCache<string, DiscoveryCacheEntry>(
+  DISCOVERY_CACHE_MAX_ENTRIES
+);
+// USGS site names by bare site code, asked once a session (value rows carry
+// none); null remembers a site the answer did not name.
+const USGS_SITE_NAMES = new ExpiringLruCache<string, string | null>(5_000);
 
-/** Quantized cache key for a viewport bbox (mirrors hydrography's HYDRO_CACHE). */
+/** Quantized cache key for a viewport bbox (0.25-degree step). */
 function discoveryCacheKey(bounds: ViewportBounds): string {
   return quantizeBbox(
     [bounds.south, bounds.west, bounds.north, bounds.east],
@@ -399,30 +404,64 @@ function viewportAreaDeg(
   return width * latitudeFactor * height;
 }
 
+// Also checked under this key: the last box queried, so a small pan that
+// crosses a snapped-key edge is still served by the overscan that covers it.
+const LAST_DISCOVERY_KEY = 'last';
+
+/**
+ * Per-viewport cached discovery. The query box is the view plus the 25%
+ * overscan AIANNH, BIA and NIFC use, while that box's raw area stays within
+ * `overscanAreaCap`; above it the raw view is queried. A hit needs the
+ * queried box to contain the view.
+ */
+async function discoverCached(
+  cache: ExpiringLruCache<string, DiscoveryCacheEntry>,
+  view: ViewportBounds,
+  overscanAreaCap: number,
+  query: (bounds: ViewportBounds) => Promise<readonly StationDiscoveryRecord[]>
+): Promise<readonly StationDiscoveryRecord[]> {
+  const asked: ViewEnvelope = [view.west, view.south, view.east, view.north];
+  // The cache keeps the whole overscanned list; callers get only what is in view.
+  const inView = (records: readonly StationDiscoveryRecord[]) =>
+    records.filter((r) => isCoordinateInBounds(r.station.coords[0], r.station.coords[1], view));
+  for (const key of [discoveryCacheKey(view), LAST_DISCOVERY_KEY]) {
+    const cached = cache.get(key);
+    if (cached && bboxCoveredByEnvelope(cached.bounds, asked)) return inView(cached.records);
+  }
+  const envelope = buildQueryEnvelope({
+    getWest: () => view.west,
+    getSouth: () => view.south,
+    getEast: () => view.east,
+    getNorth: () => view.north
+  });
+  const [west, south, east, north] = envelope;
+  const overscan = (east - west) * (north - south) <= overscanAreaCap;
+  const records = await query(overscan ? { west, south, east, north } : view);
+  const entry = { bounds: overscan ? toCoverageEnvelope(envelope) : asked, records };
+  cache.set(discoveryCacheKey(view), entry, DISCOVERY_CACHE_TTL_MS);
+  cache.set(LAST_DISCOVERY_KEY, entry, DISCOVERY_CACHE_TTL_MS);
+  return inView(records);
+}
+
 /** USGS Instantaneous Values discovery, served from the per-viewport cache. */
-async function discoverUsgsStationsCached(
+function discoverUsgsStationsCached(
   queryBounds: StationViewportDiscoveryRequest['bounds'],
   signal: AbortSignal | null
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const key = discoveryCacheKey(queryBounds);
-  const cached = USGS_DISCOVERY_CACHE.get(key);
-  if (cached) return cached;
-  const records = await discoverUsgsStations(queryBounds, signal);
-  USGS_DISCOVERY_CACHE.set(key, records, DISCOVERY_CACHE_TTL_MS);
-  return records;
+  // The overscan must keep the bBox inside the USGS 25-square-degree rule.
+  return discoverCached(USGS_DISCOVERY_CACHE, queryBounds, USGS_BBOX_AREA_CAP, (bounds) =>
+    discoverUsgsStations(bounds, signal)
+  );
 }
 
 /** NIFC RAWS discovery, served from the per-viewport cache. */
-async function discoverRawsStationsCached(
+function discoverRawsStationsCached(
   bounds: StationViewportDiscoveryRequest['bounds'],
   signal: AbortSignal | null
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const key = discoveryCacheKey(bounds);
-  const cached = RAWS_DISCOVERY_CACHE.get(key);
-  if (cached) return cached;
-  const records = await discoverRawsStations(bounds, signal);
-  RAWS_DISCOVERY_CACHE.set(key, records, DISCOVERY_CACHE_TTL_MS);
-  return records;
+  return discoverCached(RAWS_DISCOVERY_CACHE, bounds, Infinity, (box) =>
+    discoverRawsStations(box, signal)
+  );
 }
 
 export async function discoverStationsForViewport(
@@ -473,10 +512,15 @@ export async function discoverStationsForViewport(
     { label: 'CoCoRaHS station discovery', run: () => discoverCocorahsStations(request) }
   ];
 
+  // Each settled source is reported at once, so a slow USGS read does not hold back the rest.
+  const settled: DiscoverySourceOutcome[] = [];
   const outcomes = await Promise.all(
-    sources.map((source) =>
-      settleDiscoverySource(source.label, source.run(), request.signal)
-    )
+    sources.map(async (source, index) => {
+      const outcome = await settleDiscoverySource(source.label, source.run(), request.signal);
+      settled[index] = outcome;
+      if (!request.signal?.aborted) request.onProgress?.(settled.flatMap((o) => o.records));
+      return outcome;
+    })
   );
 
   const records = outcomes.flatMap((outcome) => outcome.records);
@@ -514,9 +558,11 @@ async function settleDiscoverySource(
   try {
     return { label, records: await promise, failed: false };
   } catch (err) {
-    if (isAbortError(err) || signal?.aborted) throw err;
+    // A fetch-helper timeout is also an AbortError; only the caller's own cancel is a cancel.
+    if (signal?.aborted) throw err;
     console.warn(`[telemetry] ${label} failed.`, err);
-    return { label, records: [], failed: true };
+    const records = err instanceof PartialDiscoveryError ? err.records : [];
+    return { label, records, failed: true };
   }
 }
 
@@ -525,29 +571,67 @@ async function discoverUsgsStations(
   signal: AbortSignal | null
 ): Promise<readonly StationDiscoveryRecord[]> {
   const params = new URLSearchParams({
-    format: 'json',
-    bBox: [
+    f: 'json',
+    bbox: [
       queryBounds.west,
       queryBounds.south,
       queryBounds.east,
       queryBounds.north
     ].map(formatBboxNumber).join(','),
-    parameterCd: USGS_DISCOVERY_PARAMETER_CODES,
-    siteStatus: 'active'
+    parameter_code: USGS_DISCOVERY_PARAMETER_CODES,
+    time: USGS_DISCOVERY_WINDOW,
+    limit: String(USGS_DISCOVERY_PAGE_ROWS),
+    properties: 'monitoring_location_id,parameter_code,time,value,unit_of_measure,qualifier'
   });
-
-  const response = await fetchWithBudget(
-    `${URLS.usgsIV}?${params.toString()}`,
-    {},
+  const features = await fetchUsgsFeatures(
+    `${URLS.usgsWaterData}collections/latest-continuous/items?${params.toString()}`,
     signal,
     USGS_DISCOVERY_TIMEOUT_MS
   );
-  if (!response.ok) {
-    throw new Error(`USGS IV discovery HTTP ${response.status}`);
-  }
+  const sites = usgsDiscoverySites(features);
+  const names = await usgsSiteNames([...sites.keys()], signal);
+  return usgsDiscoveryRecords(sites, names);
+}
 
-  const payload: unknown = await response.json();
-  return usgsDiscoveryRecordsFromPayload(payload);
+/**
+ * Names for these sites: the session's own first, then one request per
+ * USGS_NAME_IDS_PER_REQUEST sites it has not named yet.
+ */
+async function usgsSiteNames(
+  siteCodes: readonly string[],
+  signal: AbortSignal | null
+): Promise<ReadonlyMap<string, string>> {
+  const names = new Map<string, string>();
+  const unnamed: string[] = [];
+  for (const code of siteCodes) {
+    const known = USGS_SITE_NAMES.get(code);
+    if (known === undefined) unnamed.push(code);
+    else if (known !== null) names.set(code, known);
+  }
+  for (let i = 0; i < unnamed.length; i += USGS_NAME_IDS_PER_REQUEST) {
+    const chunk = unnamed.slice(i, i + USGS_NAME_IDS_PER_REQUEST);
+    const params = new URLSearchParams({
+      f: 'json',
+      id: chunk.map(usgsLocationId).join(','),
+      properties: 'monitoring_location_name',
+      skipGeometry: 'true',
+      // One more than asked: a page as long as its limit always links a next page, here an empty one.
+      limit: String(chunk.length + 1)
+    });
+    const features = await fetchUsgsFeatures(
+      `${URLS.usgsWaterData}collections/monitoring-locations/items?${params.toString()}`,
+      signal,
+      USGS_DISCOVERY_TIMEOUT_MS
+    );
+    for (const feature of features) {
+      if (!isObject(feature) || !isObject(feature.properties)) continue;
+      const code = usgsSiteCode(feature.id);
+      const name = readNonEmptyString(feature.properties.monitoring_location_name);
+      if (code && name) names.set(code, name);
+    }
+    for (const code of chunk) USGS_SITE_NAMES.set(code, names.get(code) ?? null, USGS_SITE_NAME_TTL_MS);
+  }
+  return names;
 }
 
 export function stationNetworkByKey(key: StationNetworkKey): StationNetwork {
@@ -913,32 +997,47 @@ function boundsFromCenter(
   };
 }
 
-function usgsDiscoveryRecordsFromPayload(payload: unknown): readonly StationDiscoveryRecord[] {
+/** Each USGS site's coordinates and readings, from the one-row-per-observation answer. */
+function usgsDiscoverySites(features: readonly unknown[]): ReadonlyMap<string, UsgsDiscoverySite> {
   const bySite = new Map<string, UsgsDiscoverySite>();
-  for (const series of readUsgsTimeSeries(payload)) {
-    const siteCode = readUsgsSiteCode(series);
-    const siteName = readUsgsSiteName(series);
-    const coords = readUsgsCoords(series);
-    const value = readUsgsStationValue(siteCode, series);
-    if (!siteCode || !siteName || !coords || !value) continue;
+  for (const feature of features) {
+    if (!isObject(feature) || !isObject(feature.properties)) continue;
+    const row = feature.properties;
+    const siteCode = usgsSiteCode(row.monitoring_location_id);
+    const coords = readGeoJsonCoords(feature);
+    const reading = usgsReading(row);
+    if (!siteCode || !coords || !reading) continue;
 
+    const value = usgsDiscoveryValue(siteCode, row.parameter_code, reading, usgsUnit(row.unit_of_measure));
     const current = bySite.get(siteCode);
     if (!current) {
-      bySite.set(siteCode, { siteCode, siteName, coords, values: [value] });
+      bySite.set(siteCode, { siteCode, coords, values: [value] });
       continue;
     }
     current.values.push(value);
   }
+  return bySite;
+}
 
+/** The bare site code of a `USGS-` id (the station handle and page link use it), or null for another agency. */
+function usgsSiteCode(id: unknown): string | null {
+  return typeof id === 'string' && id.startsWith('USGS-') && id.length > 5 ? id.slice(5) : null;
+}
+
+function usgsDiscoveryRecords(
+  sites: ReadonlyMap<string, UsgsDiscoverySite>,
+  names: ReadonlyMap<string, string>
+): readonly StationDiscoveryRecord[] {
   const records: StationDiscoveryRecord[] = [];
-  for (const site of bySite.values()) {
+  for (const site of sites.values()) {
+    const name = names.get(site.siteCode);
     const value = preferredUsgsValue(site.values);
-    if (!value) continue;
+    if (!name || !value) continue;
     records.push({
       network: 'usgs-iv',
       station: {
         id: `usgs-${site.siteCode}`,
-        name: site.siteName,
+        name,
         coords: site.coords,
         region: 'discovered',
         type: 'gage',
@@ -961,111 +1060,35 @@ function usgsDiscoveryRecordsFromPayload(payload: unknown): readonly StationDisc
   return records;
 }
 
-function readUsgsTimeSeries(payload: unknown): readonly Record<string, unknown>[] {
-  if (!isObject(payload) || !isObject(payload.value)) return [];
-  const timeSeries = payload.value.timeSeries;
-  if (!Array.isArray(timeSeries)) return [];
-  return timeSeries.filter(isObject);
-}
-
-function readUsgsSiteCode(series: Record<string, unknown>): string | null {
-  const sourceInfo = series.sourceInfo;
-  if (!isObject(sourceInfo)) return null;
-  const siteCode = sourceInfo.siteCode;
-  if (!Array.isArray(siteCode) || siteCode.length === 0) return null;
-  const first = siteCode[0];
-  if (!isObject(first)) return null;
-  return typeof first.value === 'string' ? first.value : null;
-}
-
-function readUsgsSiteName(series: Record<string, unknown>): string | null {
-  const sourceInfo = series.sourceInfo;
-  if (!isObject(sourceInfo)) return null;
-  return typeof sourceInfo.siteName === 'string' ? sourceInfo.siteName : null;
-}
-
-function readUsgsCoords(series: Record<string, unknown>): readonly [number, number] | null {
-  const sourceInfo = series.sourceInfo;
-  if (!isObject(sourceInfo) || !isObject(sourceInfo.geoLocation)) return null;
-  const geogLocation = sourceInfo.geoLocation.geogLocation;
-  if (!isObject(geogLocation)) return null;
-  const latitude = geogLocation.latitude;
-  const longitude = geogLocation.longitude;
-  if (typeof latitude !== 'number' || typeof longitude !== 'number') return null;
-  return [latitude, longitude];
-}
-
-function readUsgsStationValue(
-  siteCode: string | null,
-  series: Record<string, unknown>
-): StationValue | null {
-  if (!siteCode) return null;
-  const code = readUsgsVariableCode(series);
-  const latest = readLatestUsgsReading(series);
-  if (!latest) return null;
-  const value = Number(latest.value);
-  if (!Number.isFinite(value)) return null;
-
-  const timestamp = latest.dateTime;
-  const freshness = usgsDiscoveryFreshness(timestamp);
+function usgsDiscoveryValue(
+  siteCode: string,
+  code: unknown,
+  reading: UsgsReading,
+  unit: string | null
+): StationValue {
+  const timestamp = reading.dateTime ?? '';
   return {
     stationId: `usgs-${siteCode}`,
     parameter: code === '00065' ? 'gage_height_ft' : 'discharge_cfs',
     label: code === '00065' ? 'Gage height' : 'Discharge',
-    value: Math.round(value * 100) / 100,
-    unit: readUsgsUnitCode(series) ?? '',
+    value: Math.round(Number(reading.value) * 100) / 100,
+    unit: unit ?? '',
     timestamp,
-    freshness,
+    freshness: freshnessForNetwork('usgs-iv', timestamp),
     source: 'usgs-iv'
   };
 }
 
-function readLatestUsgsReading(
-  series: Record<string, unknown>
-): { readonly value: string; readonly dateTime: string } | null {
-  const values = series.values;
-  if (!Array.isArray(values) || values.length === 0) return null;
-  const first = values[0];
-  if (!isObject(first) || !Array.isArray(first.value)) return null;
-
-  for (let i = first.value.length - 1; i >= 0; i--) {
-    const reading = first.value[i];
-    if (!isObject(reading)) continue;
-    if (reading.value === '-999999') continue;
-    if (typeof reading.value !== 'string' || typeof reading.dateTime !== 'string') continue;
-    return { value: reading.value, dateTime: reading.dateTime };
-  }
-  return null;
-}
-
-function readUsgsVariableCode(series: Record<string, unknown>): string | null {
-  const variable = series.variable;
-  if (!isObject(variable) || !Array.isArray(variable.variableCode)) return null;
-  const first = variable.variableCode[0];
-  if (!isObject(first)) return null;
-  return typeof first.value === 'string' ? first.value : null;
-}
-
-function readUsgsUnitCode(series: Record<string, unknown>): string | null {
-  const variable = series.variable;
-  if (!isObject(variable) || !isObject(variable.unit)) return null;
-  return typeof variable.unit.unitCode === 'string' ? variable.unit.unitCode : null;
-}
-
+/** Discharge before gage height; of two sensors on one, the newer reading (rows arrive in no set order). */
 function preferredUsgsValue(values: readonly StationValue[]): StationValue | null {
-  return (
-    values.find((value) => value.parameter === 'discharge_cfs') ??
-    values.find((value) => value.parameter === 'gage_height_ft') ??
-    values[0] ??
-    null
-  );
-}
-
-function usgsDiscoveryFreshness(timestampIso: string): TelemetryFreshness {
-  const timestampMs = Date.parse(timestampIso);
-  if (Number.isNaN(timestampMs)) return 'stale';
-  if (Date.now() - timestampMs > DAY_MS) return 'stale';
-  return freshnessForNetwork('usgs-iv', timestampIso);
+  const newest = (parameter: string): StationValue | null =>
+    values
+      .filter((value) => value.parameter === parameter)
+      .reduce<StationValue | null>(
+        (best, value) => (best === null || Date.parse(value.timestamp) > Date.parse(best.timestamp) ? value : best),
+        null
+      );
+  return newest('discharge_cfs') ?? newest('gage_height_ft');
 }
 
 function formatBboxNumber(value: number): string {
@@ -1079,72 +1102,16 @@ function formatBboxNumber(value: number): string {
 async function discoverAwdbStations(
   request: StationViewportDiscoveryRequest
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const stations = await getAwdbStationCache(request.signal);
+  const { stations, complete } = await awdbStationListCache.get(request.signal);
   if (request.signal?.aborted) return [];
-  return stations
+  const records = stations
     .filter((station) => isCoordinateInBounds(station.latitude, station.longitude, request.bounds))
     .map(awdbDiscoveryRecord);
+  if (!complete) throw new PartialDiscoveryError(records);
+  return records;
 }
 
-async function getAwdbStationCache(
-  signal: AbortSignal | null
-): Promise<readonly AwdbStationMetadata[]> {
-  if (awdbStationCache) return awdbStationCache;
-  const inflight =
-    awdbStationCacheInflight && !awdbStationCacheInflight.controller.signal.aborted
-      ? awdbStationCacheInflight
-      : startAwdbStationCacheFetch();
-  if (signal) addAwdbCacheWaiter(inflight, signal);
-
-  try {
-    if (!signal) return await inflight.promise;
-    return await Promise.race([inflight.promise, abortPromise(signal)]);
-  } finally {
-    if (signal) removeAwdbCacheWaiter(inflight, signal);
-  }
-}
-
-function startAwdbStationCacheFetch(): AwdbStationCacheInflight {
-  const controller = new AbortController();
-  const waiters = new Set<AbortSignal>();
-  const promise = fetchAwdbStationLists(controller.signal)
-    .then((stations) => {
-      awdbStationCache = stations;
-      return stations;
-    })
-    .finally(() => {
-      awdbStationCacheInflight = null;
-    });
-  const inflight = { controller, promise, waiters, hasEverHadWaiter: false };
-  awdbStationCacheInflight = inflight;
-  return inflight;
-}
-
-function addAwdbCacheWaiter(inflight: AwdbStationCacheInflight, signal: AbortSignal): void {
-  if (signal.aborted) {
-    maybeAbortAwdbCacheFetch(inflight);
-    return;
-  }
-  inflight.hasEverHadWaiter = true;
-  inflight.waiters.add(signal);
-  signal.addEventListener('abort', () => removeAwdbCacheWaiter(inflight, signal), { once: true });
-}
-
-function removeAwdbCacheWaiter(inflight: AwdbStationCacheInflight, signal: AbortSignal): void {
-  inflight.waiters.delete(signal);
-  maybeAbortAwdbCacheFetch(inflight);
-}
-
-function maybeAbortAwdbCacheFetch(inflight: AwdbStationCacheInflight): void {
-  if (awdbStationCacheInflight !== inflight) return;
-  if (
-    inflight.hasEverHadWaiter &&
-    inflight.waiters.size === 0 &&
-    !inflight.controller.signal.aborted
-  ) {
-    inflight.controller.abort();
-  }
-}
+const awdbStationListCache = createStationListCache(fetchAwdbStationLists);
 
 function abortPromise(signal: AbortSignal): Promise<never> {
   return new Promise<never>((_resolve, reject) => {
@@ -1160,27 +1127,45 @@ function abortPromise(signal: AbortSignal): Promise<never> {
   });
 }
 
+// A roster plus whether every network or state behind it answered.
+interface StationList<T> {
+  readonly stations: readonly T[];
+  readonly complete: boolean;
+}
+
 interface StationListCache<T> {
-  get(signal: AbortSignal | null): Promise<readonly T[]>;
+  get(signal: AbortSignal | null): Promise<StationList<T>>;
+}
+
+// A partial list is retried soon instead of standing in for the whole roster.
+const PARTIAL_STATION_LIST_TTL_MS = 30 * 1000;
+
+// Records from a roster where some network failed: the source is reported as
+// failed (so the pill reads "live (partial)") but its stations still render.
+class PartialDiscoveryError extends Error {
+  readonly records: readonly StationDiscoveryRecord[];
+  constructor(records: readonly StationDiscoveryRecord[]) {
+    super('station discovery returned a partial list');
+    this.records = records;
+  }
 }
 
 // Reference-counted, single-flight cache for a national or multi-state station
-// list. It generalizes the hand-rolled AWDB and CO-OPS caches above: at most
-// one fetch is in flight; concurrent callers share it; and if every waiter
-// aborts before it resolves, the shared fetch is aborted too. The AWDB and
-// CO-OPS caches predate this helper and are left in place; the newer AgriMet
-// and CoCoRaHS lists share it so the waiter bookkeeping lives in one spot.
+// list: at most one fetch is in flight; concurrent callers share it; and if
+// every waiter aborts before it resolves, the shared fetch is aborted too. A
+// complete list lives for an hour, so a roster that is bad or has changed is
+// read again rather than kept for the whole session; a partial one for 30 s.
 function createStationListCache<T>(
-  fetcher: (signal: AbortSignal) => Promise<readonly T[]>
+  fetcher: (signal: AbortSignal) => Promise<StationList<T>>
 ): StationListCache<T> {
   interface Inflight {
     readonly controller: AbortController;
-    readonly promise: Promise<readonly T[]>;
+    readonly promise: Promise<StationList<T>>;
     readonly waiters: Set<AbortSignal>;
     hasEverHadWaiter: boolean;
   }
 
-  let cache: readonly T[] | null = null;
+  const cache = new ExpiringLruCache<'list', StationList<T>>(1);
   let inflight: Inflight | null = null;
 
   function maybeAbort(target: Inflight): void {
@@ -1217,7 +1202,7 @@ function createStationListCache<T>(
       hasEverHadWaiter: false,
       promise: fetcher(controller.signal)
         .then((list) => {
-          cache = list;
+          cache.set('list', list, list.complete ? HOUR_MS : PARTIAL_STATION_LIST_TTL_MS);
           return list;
         })
         .finally(() => {
@@ -1229,9 +1214,10 @@ function createStationListCache<T>(
   }
 
   return {
-    async get(signal: AbortSignal | null): Promise<readonly T[]> {
-      if (cache) return cache;
-      const target = inflight && !inflight.controller.signal.aborted ? inflight : start();
+    async get(signal: AbortSignal | null): Promise<StationList<T>> {
+      const cached = cache.get('list');
+      if (cached) return cached;
+      const target =inflight && !inflight.controller.signal.aborted ? inflight : start();
       if (signal) addWaiter(target, signal);
       try {
         if (!signal) return await target.promise;
@@ -1245,7 +1231,7 @@ function createStationListCache<T>(
 
 async function fetchAwdbStationLists(
   signal: AbortSignal
-): Promise<readonly AwdbStationMetadata[]> {
+): Promise<StationList<AwdbStationMetadata>> {
   const settled = await Promise.allSettled(
     AWDB_DISCOVERY_NETWORKS.map((network) => fetchAwdbStationsForNetwork(network, signal))
   );
@@ -1258,17 +1244,14 @@ async function fetchAwdbStationLists(
       failures.push(result.reason);
     }
   }
-  const abortFailure = failures.find(isAbortError);
-  if (abortFailure || signal.aborted) {
-    throw abortFailure ?? new DOMException('Aborted', 'AbortError');
-  }
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   if (failures.length === AWDB_DISCOVERY_NETWORKS.length) {
     throw new Error('NRCS AWDB station discovery failed for all requested networks');
   }
   if (failures.length > 0) {
     console.warn('[telemetry] partial NRCS AWDB station discovery failed.', failures);
   }
-  return stations;
+  return { stations, complete: failures.length === 0 };
 }
 
 async function fetchAwdbStationsForNetwork(
@@ -1280,7 +1263,7 @@ async function fetchAwdbStationsForNetwork(
     activeOnly: 'true',
     returnStationElements: 'false'
   });
-  const response = await fetchWithBudget(
+  const response = await fetchBufferedWithBudget(
     `${URLS.nrcsAwdbStations}?${params.toString()}`,
     {},
     signal,
@@ -1290,7 +1273,14 @@ async function fetchAwdbStationsForNetwork(
     throw new Error(`NRCS AWDB station discovery HTTP ${response.status}`);
   }
   const payload: unknown = await response.json();
-  return readAwdbStationList(payload, network);
+  return requireRoster(readAwdbStationList(payload, network), 'NRCS AWDB');
+}
+
+// A readable answer with no stations is a failed read: throwing lets the settle
+// path record it and keeps the cache from holding an empty roster.
+function requireRoster<T>(list: readonly T[], label: string): readonly T[] {
+  if (!list.length) throw new Error(`${label} station list was empty or malformed`);
+  return list;
 }
 
 function readAwdbStationList(
@@ -1352,6 +1342,20 @@ function awdbDiscoveryRecord(station: AwdbStationMetadata): StationDiscoveryReco
   };
 }
 
+// DDM-P9-T05: the field list the RAWS FeatureServer serves for a station's
+// identity AND its current fire-weather conditions (verified live via
+// `?f=pjson` 2026-09-09: RelativeHumidity, WindSpeedMPH, WindDirDegrees,
+// WindSpeedPeak, WindDirPeak, and FuelMoisture are all `esriFieldTypeString`
+// on this layer; the issuer serves the unit as part of the string, for
+// example "21 %", "5 mph", "7.3 (unk)", never a separate numeric+unit pair).
+// One constant so the viewport discovery query below and the popup's
+// per-station hydration query (`fetchRawsStationConditions`) can never drift
+// from each other.
+const RAWS_OUT_FIELDS =
+  'StationName,StationID,MesoWestStationID,Latitude,Longitude,State,Agency,Status,ObservedDate,' +
+  'RelativeHumidity,WindSpeedMPH,WindDirDegrees,WindSpeedPeak,WindDirPeak,FuelMoisture';
+const RAWS_HYDRATE_TIMEOUT_MS = 10_000;
+
 async function discoverRawsStations(
   bounds: ViewportBounds,
   signal: AbortSignal | null
@@ -1364,12 +1368,11 @@ async function discoverRawsStations(
     geometryType: 'esriGeometryEnvelope',
     inSR: '4326',
     spatialRel: 'esriSpatialRelIntersects',
-    outFields:
-      'StationName,StationID,MesoWestStationID,Latitude,Longitude,State,Agency,Status,ObservedDate',
+    outFields: RAWS_OUT_FIELDS,
     f: 'geojson'
   });
 
-  const response = await fetchWithBudget(
+  const response = await fetchBufferedWithBudget(
     `${URLS.nifcRawsFeatureServer}/query?${params.toString()}`,
     {},
     signal,
@@ -1386,6 +1389,8 @@ async function discoverRawsStations(
 }
 
 function readRawsFeatures(payload: unknown): readonly Record<string, unknown>[] {
+  // ArcGIS answers an outage as HTTP 200 with an `error` body: a failure, not an empty roster.
+  if (isObject(payload) && 'error' in payload) throw new Error('NIFC RAWS ArcGIS error body');
   if (!isObject(payload) || !Array.isArray(payload.features)) return [];
   return payload.features.filter(isObject);
 }
@@ -1403,6 +1408,47 @@ function rawsDiscoveryRecord(feature: unknown): StationDiscoveryRecord | null {
 
   const mesowestStationId = readIdentifier(properties.MesoWestStationID);
   const id = `raws-${stationId}`;
+
+  // DDM-P9-T05: an honest headline reading for the marker's freshness pill
+  // (src/layers/telemetry.ts reads `entry.values[0]?.freshness`), parsed
+  // from the SAME discovery response (no second fetch here; the popup's
+  // three-row rendering runs its own per-station query, see
+  // `fetchRawsStationConditions` below). Relative humidity is the headline
+  // parameter because it is the field the service serves most consistently
+  // as a plain "NN %" string. `null` means the station reported none.
+  const relativeHumidityRaw = readNonEmptyString(properties.RelativeHumidity);
+  const headlineRelativeHumidity = relativeHumidityRaw
+    ? parseLeadingNumber(relativeHumidityRaw)
+    : null;
+  const observedMs = readFiniteNumber(properties.ObservedDate);
+  const observedAtIso = observedMs !== null ? new Date(observedMs).toISOString() : null;
+
+  // DDM-P9-T06: the sustained-wind symbol src/layers/telemetry.ts draws on
+  // the marker needs the served speed and direction at DISCOVERY time (the
+  // same bbox response already carries them; RAWS_OUT_FIELDS above), not at
+  // popup-open time (fetchRawsStationConditions below runs a SEPARATE later
+  // fetch for the popup's own three-row read). windDirectionDeg is the one
+  // numeric derivation in this record: a parse of the issuer's own served
+  // direction string, used only to orient the glyph's rotation and never
+  // displayed or spoken in place of the served string itself.
+  // Trimmed the same way `parseRawsConditionProperties`'s `field()` helper
+  // trims below: incidental whitespace around the issuer's own
+  // string is not part of the served value, and an untrimmed trailing
+  // space would double up in the glyph's composed accessible name.
+  const windSpeedRaw = readNonEmptyString(properties.WindSpeedMPH);
+  const windDirectionRaw = readNonEmptyString(properties.WindDirDegrees);
+  const windSpeedServed = windSpeedRaw ? windSpeedRaw.trim() : null;
+  const windDirectionServed = windDirectionRaw ? windDirectionRaw.trim() : null;
+  const windDirectionDeg = windDirectionServed
+    ? parseLeadingNumber(windDirectionServed)
+    : null;
+  const windFields: RawsWindStationFields = {
+    windSpeedServed,
+    windDirectionServed,
+    windDirectionDeg,
+    windObservedAtIso: observedAtIso
+  };
+
   return {
     network: 'raws',
     station: {
@@ -1427,16 +1473,21 @@ function rawsDiscoveryRecord(feature: unknown): StationDiscoveryRecord | null {
               label: 'NIFC RAWS open data',
               url: 'https://data-nifc.opendata.arcgis.com/'
             }
-      ]
-    },
+      ],
+      // Extra properties beyond TelemetryStation (types/station.ts is not
+      // owned by this task): src/layers/telemetry.ts reads them back with
+      // the SAME `RawsWindStationFields` widening cast, and this is the one
+      // place the two ends have to agree, by name, on what rides along.
+      ...windFields
+    } as TelemetryStation & RawsWindStationFields,
     value: {
       stationId: id,
-      parameter: 'fire_weather_conditions',
-      label: 'Fire weather conditions',
-      value: null,
-      unit: '',
-      timestamp: '',
-      freshness: 'unknown',
+      parameter: 'relative_humidity_pct',
+      label: 'Relative humidity',
+      value: headlineRelativeHumidity,
+      unit: '%',
+      timestamp: observedAtIso ?? '',
+      freshness: observedAtIso ? freshnessForNetwork('raws', observedAtIso) : 'unavailable',
       source: 'raws'
     },
     primaryParameterCategory: 'fire-weather',
@@ -1444,10 +1495,120 @@ function rawsDiscoveryRecord(feature: unknown): StationDiscoveryRecord | null {
   };
 }
 
+/**
+ * DDM-P9-T06: the served wind fields riding along on a discovered RAWS
+ * station's OWN identity object, alongside `TelemetryStation`'s declared
+ * shape, rather than through `StationDiscoveryRecord.value` (a single
+ * numeric headline reading; relative humidity already occupies it) or
+ * through `StationRegistryEntry.values` (assembled by `mergeTelemetryStations`
+ * and `markerViewForEntry` in src/layers/telemetry.ts, neither of which is
+ * owned by this task). `TelemetryStation` in types/station.ts is not
+ * extended: both this file's `rawsDiscoveryRecord` and telemetry.ts's
+ * `renderStations` cast to `TelemetryStation & RawsWindStationFields` at
+ * their own ends, by name, so the two stay in agreement without a shared
+ * type-file edit. `windSpeedServed` and `windDirectionServed` are the
+ * issuer's own strings verbatim (never re-derived into an invented unit,
+ * same convention as `RawsStationConditions` below); `windDirectionDeg` is
+ * the one numeric parse, present only to orient the marker glyph's
+ * rotation and never displayed or spoken in place of the served string.
+ * All four are `null` together for any non-RAWS station (the field is
+ * simply absent there) or for a RAWS station the service reports no wind
+ * value for.
+ *
+ * DDM-P9-T06 fix F8 (opus-read.md, recorded constraint, not fixed here):
+ * these fields survive `discoveredEntry` (this file, base = `record.station`)
+ * but NOT `mergeStationHandles` (this file, spreads `current.station` as its
+ * base), so a merge of a discovered RAWS record into an existing registry
+ * entry silently drops them. Unreachable today (no curated seed carries a
+ * `rawsStationId`, and `primaryParameterCategory: 'fire-weather'` is
+ * RAWS-only, so two RAWS discoveries only ever collide with each other, not
+ * with a merge target), but latent: the day a curated seed gains a
+ * `rawsStationId`, the wind glyph disappears for that station with no type
+ * error and no failing test. A follow-up should widen `mergeStationHandles`
+ * or `TelemetryStation` properly rather than leave the drop implicit.
+ */
+export interface RawsWindStationFields {
+  readonly windSpeedServed: string | null;
+  readonly windDirectionServed: string | null;
+  readonly windDirectionDeg: number | null;
+  readonly windObservedAtIso: string | null;
+}
+
+/**
+ * DDM-P9-T05: one RAWS station's current conditions, served-string verbatim
+ * (never re-derived into an invented unit; the issuer already appends its
+ * unit to the value, for example "21 %", "5 mph", "7.3 (unk)"). `null` on
+ * any field means the service affirmatively reported no reading for that
+ * parameter, distinct from the whole fetch failing.
+ */
+export interface RawsStationConditions {
+  readonly relativeHumidity: string | null;
+  readonly windSpeed: string | null;
+  readonly windDirection: string | null;
+  readonly windGustSpeed: string | null;
+  readonly windGustDirection: string | null;
+  readonly fuelMoisture: string | null;
+  readonly observedAtIso: string | null;
+}
+
+function parseRawsConditionProperties(properties: unknown): RawsStationConditions | null {
+  if (!isObject(properties)) return null;
+  const observedMs = readFiniteNumber(properties.ObservedDate);
+  const field = (key: string): string | null => {
+    const raw = readNonEmptyString((properties as Record<string, unknown>)[key]);
+    return raw ? raw.trim() : null;
+  };
+  return {
+    relativeHumidity: field('RelativeHumidity'),
+    windSpeed: field('WindSpeedMPH'),
+    windDirection: field('WindDirDegrees'),
+    windGustSpeed: field('WindSpeedPeak'),
+    windGustDirection: field('WindDirPeak'),
+    fuelMoisture: field('FuelMoisture'),
+    observedAtIso: observedMs !== null ? new Date(observedMs).toISOString() : null
+  };
+}
+
+/**
+ * Live per-station RAWS read for popup hydration (DDM-P9-T05), mirroring the
+ * USGS/AWDB/Hydromet/CWMS hydration fetches in src/ui/popups.ts: viewport
+ * discovery above finds the station; this is the fresh read at popup-open
+ * time, on the exact same field list (`RAWS_OUT_FIELDS`) and the same
+ * `f: 'geojson'` shape as discovery, so one live schema and one test fixture
+ * cover both. Throws on a transport or HTTP failure; the caller's existing
+ * catch renders the honest "unavailable" fallback. Returns `null` only when
+ * the station id resolves no feature at all (distinct from a field the
+ * service reports as null).
+ */
+export async function fetchRawsStationConditions(
+  stationId: string,
+  signal: AbortSignal | null
+): Promise<RawsStationConditions | null> {
+  const params = new URLSearchParams({
+    where: `StationID='${escapeSql(stationId)}'`,
+    outFields: RAWS_OUT_FIELDS,
+    resultRecordCount: '1',
+    f: 'geojson'
+  });
+  const response = await fetchBufferedWithBudget(
+    `${URLS.nifcRawsFeatureServer}/query?${params.toString()}`,
+    {},
+    signal,
+    RAWS_HYDRATE_TIMEOUT_MS
+  );
+  if (!response.ok) {
+    throw new Error(`NIFC RAWS station conditions HTTP ${response.status}`);
+  }
+  const payload: unknown = await response.json();
+  const [feature] = readRawsFeatures(payload);
+  if (!feature) return null;
+  return parseRawsConditionProperties(feature.properties);
+}
+
 async function discoverCoopsStations(
   request: StationViewportDiscoveryRequest
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const stations = await getCoopsStationCache(request.signal);
+  const { stations } = await coopsStationListCache.get(request.signal);
   if (request.signal?.aborted) return [];
   return stations
     .filter((station) => isCoordinateInBounds(station.latitude, station.longitude, request.bounds))
@@ -1455,69 +1616,14 @@ async function discoverCoopsStations(
     .filter(isDiscoveryRecord);
 }
 
-async function getCoopsStationCache(
-  signal: AbortSignal | null
-): Promise<readonly CoopsStationMetadata[]> {
-  if (coopsStationCache) return coopsStationCache;
-  const inflight =
-    coopsStationCacheInflight && !coopsStationCacheInflight.controller.signal.aborted
-      ? coopsStationCacheInflight
-      : startCoopsStationCacheFetch();
-  if (signal) addCoopsCacheWaiter(inflight, signal);
-
-  try {
-    if (!signal) return await inflight.promise;
-    return await Promise.race([inflight.promise, abortPromise(signal)]);
-  } finally {
-    if (signal) removeCoopsCacheWaiter(inflight, signal);
-  }
-}
-
-function startCoopsStationCacheFetch(): CoopsStationCacheInflight {
-  const controller = new AbortController();
-  const waiters = new Set<AbortSignal>();
-  const promise = fetchCoopsStationList(controller.signal)
-    .then((stations) => {
-      coopsStationCache = stations;
-      return stations;
-    })
-    .finally(() => {
-      coopsStationCacheInflight = null;
-    });
-  const inflight = { controller, promise, waiters, hasEverHadWaiter: false };
-  coopsStationCacheInflight = inflight;
-  return inflight;
-}
-
-function addCoopsCacheWaiter(inflight: CoopsStationCacheInflight, signal: AbortSignal): void {
-  if (signal.aborted) {
-    maybeAbortCoopsCacheFetch(inflight);
-    return;
-  }
-  inflight.hasEverHadWaiter = true;
-  inflight.waiters.add(signal);
-  signal.addEventListener('abort', () => removeCoopsCacheWaiter(inflight, signal), { once: true });
-}
-
-function removeCoopsCacheWaiter(inflight: CoopsStationCacheInflight, signal: AbortSignal): void {
-  inflight.waiters.delete(signal);
-  maybeAbortCoopsCacheFetch(inflight);
-}
-
-function maybeAbortCoopsCacheFetch(inflight: CoopsStationCacheInflight): void {
-  if (coopsStationCacheInflight !== inflight) return;
-  if (
-    inflight.hasEverHadWaiter &&
-    inflight.waiters.size === 0 &&
-    !inflight.controller.signal.aborted
-  ) {
-    inflight.controller.abort();
-  }
-}
+const coopsStationListCache = createStationListCache(async (signal) => ({
+  stations: await fetchCoopsStationList(signal),
+  complete: true
+}));
 
 async function fetchCoopsStationList(signal: AbortSignal): Promise<readonly CoopsStationMetadata[]> {
   const params = new URLSearchParams({ type: 'waterlevels' });
-  const response = await fetchWithBudget(
+  const response = await fetchBufferedWithBudget(
     `${URLS.noaaCoopsStations}?${params.toString()}`,
     {},
     signal,
@@ -1527,7 +1633,7 @@ async function fetchCoopsStationList(signal: AbortSignal): Promise<readonly Coop
     throw new Error(`NOAA CO-OPS station discovery HTTP ${response.status}`);
   }
   const payload: unknown = await response.json();
-  return readCoopsStationList(payload);
+  return requireRoster(readCoopsStationList(payload), 'NOAA CO-OPS');
 }
 
 function readCoopsStationList(payload: unknown): readonly CoopsStationMetadata[] {
@@ -1613,12 +1719,15 @@ function coopsDiscoveryRecord(station: CoopsStationMetadata): StationDiscoveryRe
   };
 }
 
-const agrimetStationListCache = createStationListCache(fetchAgrimetStationList);
+const agrimetStationListCache = createStationListCache(async (signal) => ({
+  stations: await fetchAgrimetStationList(signal),
+  complete: true
+}));
 
 async function discoverAgrimetStations(
   request: StationViewportDiscoveryRequest
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const stations = await agrimetStationListCache.get(request.signal);
+  const { stations } = await agrimetStationListCache.get(request.signal);
   if (request.signal?.aborted) return [];
   return stations
     .filter((station) =>
@@ -1651,7 +1760,7 @@ async function fetchAgrimetStationList(
     throw new Error(`USBR AgriMet station discovery HTTP ${response.status}`);
   }
   const text = await response.text();
-  return readAgrimetStationList(text);
+  return requireRoster(readAgrimetStationList(text), 'USBR AgriMet');
 }
 
 function readAgrimetStationList(text: string): readonly AgrimetStationMetadata[] {
@@ -1742,19 +1851,21 @@ const cocorahsStationListCache = createStationListCache(fetchCocorahsStationList
 async function discoverCocorahsStations(
   request: StationViewportDiscoveryRequest
 ): Promise<readonly StationDiscoveryRecord[]> {
-  const stations = await cocorahsStationListCache.get(request.signal);
+  const { stations, complete } = await cocorahsStationListCache.get(request.signal);
   if (request.signal?.aborted) return [];
-  return stations
+  const records = stations
     .filter((station) =>
       isCoordinateInBounds(station.latitude, station.longitude, request.bounds)
     )
     .map((station) => COCORAHS_STATION_ADAPTER.toDiscoveryRecord(station))
     .filter(isDiscoveryRecord);
+  if (!complete) throw new PartialDiscoveryError(records);
+  return records;
 }
 
 async function fetchCocorahsStationLists(
   signal: AbortSignal
-): Promise<readonly CocorahsStationMetadata[]> {
+): Promise<StationList<CocorahsStationMetadata>> {
   // The IEM mirror has no combined-region endpoint, so fetch each state and
   // merge; a per-state failure is contained the same way the AWDB per-network
   // fan-out is (partial results survive, a total failure throws).
@@ -1770,17 +1881,14 @@ async function fetchCocorahsStationLists(
       failures.push(result.reason);
     }
   }
-  const abortFailure = failures.find(isAbortError);
-  if (abortFailure || signal.aborted) {
-    throw abortFailure ?? new DOMException('Aborted', 'AbortError');
-  }
+  if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
   if (failures.length === COCORAHS_DISCOVERY_STATES.length) {
     throw new Error('CoCoRaHS station discovery failed for all requested states');
   }
   if (failures.length > 0) {
     console.warn('[telemetry] partial CoCoRaHS station discovery failed.', failures);
   }
-  return stations;
+  return { stations, complete: failures.length === 0 };
 }
 
 async function fetchCocorahsStationsForState(
@@ -1788,7 +1896,7 @@ async function fetchCocorahsStationsForState(
   signal: AbortSignal
 ): Promise<readonly CocorahsStationMetadata[]> {
   const params = new URLSearchParams({ network: `${state}_COCORAHS` });
-  const response = await fetchWithBudget(
+  const response = await fetchBufferedWithBudget(
     `${URLS.iemCocorahsNetwork}?${params.toString()}`,
     {},
     signal,
@@ -1798,7 +1906,7 @@ async function fetchCocorahsStationsForState(
     throw new Error(`CoCoRaHS station discovery HTTP ${response.status} (${state})`);
   }
   const payload: unknown = await response.json();
-  return readCocorahsStationList(payload);
+  return requireRoster(readCocorahsStationList(payload), 'CoCoRaHS');
 }
 
 function readCocorahsStationList(payload: unknown): readonly CocorahsStationMetadata[] {
@@ -1914,6 +2022,17 @@ function readFiniteNumber(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+/**
+ * The leading numeric token in a served string (DDM-P9-T05), for example
+ * "21" out of "21 % ". Never invents a unit; callers keep the served string
+ * itself as the unit of record and use this only where a genuine number is
+ * required (the marker's headline `StationValue.value`).
+ */
+export function parseLeadingNumber(raw: string): number | null {
+  const match = /-?\d+(?:\.\d+)?/.exec(raw);
+  return match ? Number(match[0]) : null;
+}
+
 function isCoordinateInBounds(lat: number, lon: number, bounds: ViewportBounds): boolean {
   const south = Math.min(bounds.south, bounds.north);
   const north = Math.max(bounds.south, bounds.north);
@@ -1934,17 +2053,12 @@ function normalizeLongitude(value: number): number {
   return value;
 }
 
-function isAbortError(err: unknown): boolean {
-  return err instanceof DOMException && err.name === 'AbortError';
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
 interface UsgsDiscoverySite {
   readonly siteCode: string;
-  readonly siteName: string;
   readonly coords: readonly [number, number];
   readonly values: StationValue[];
 }

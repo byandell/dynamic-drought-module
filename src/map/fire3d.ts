@@ -1,5 +1,5 @@
 /**
- * Desktop 3D Fire mode orchestrator (W3 terrain + camera + sky, W4 smoke).
+ * 3D Fire mode orchestrator (W3 terrain + camera + sky, W4 smoke).
  *
  * One combined mode: 3D terrain over the bundled Pacific Northwest DEM
  * archive, a pitched camera, a dark-palette sky, and (after terrain
@@ -7,11 +7,20 @@
  * governed by the fire3d preference store (URL `fire3d=true`) and applies
  * only behind its full activation gate; see `shouldFire3DBeActive`.
  *
+ * Two shells can present it. The desktop console has since W3. The phone
+ * shell can since owner direction 2026-11-09 (sprint), DR-pending, and only
+ * while its own 3D chrome is mounted (src/ui/fire3d-phone-scene.ts), because
+ * that chrome is where the terrain coverage statement and the non-prediction
+ * disclosure stand on a phone; see `presentingShell`.
+ *
  * Terrain source discipline: this module owns its OWN raster-dem source
  * ('fire3d-terrain-dem') and never reuses the hillshade layer's source, so
- * toggling either feature cannot tear the other down. It DOES reuse the
- * hillshade module's archive resolution (URL preference plus the PMTiles
- * header probe), so both features agree on which archive is trustworthy.
+ * toggling either feature cannot tear the other down. Since DR-079 it also
+ * resolves its own archive, deepest first (`resolveFire3DTerrainUrl`): this
+ * scene is the one place the DEPTH is the point, because it exists to answer
+ * whether a fire sits at the foot of a mountain. It still falls back to the
+ * hillshade module's resolution, so when the deep archive is unreachable both
+ * features agree on which archive is trustworthy, exactly as before.
  *
  * Failure ladder (invariant: never a silent style error):
  *   1. Probe failure before any map mutation: nothing to roll back;
@@ -40,18 +49,39 @@ import type * as maplibregl from 'maplibre-gl';
 
 import type { HazardClusterKey } from '../config/clusters';
 import {
+  FIRE3D_PHONE_CHROME_ATTRIBUTE,
+  FIRE3D_PHONE_MIN_HEIGHT_PX,
+  FIRE3D_PHONE_MIN_HEIGHT_QUERY
+} from '../config/fire3d-phone';
+import {
   FIRE3D_CAMERA_TRANSITION_MS,
+  FIRE3D_CONSOLE_WIDTH_QUERY,
   FIRE3D_COVERAGE_NOTE,
   FIRE3D_MIN_HEIGHT_PX,
   FIRE3D_MIN_HEIGHT_QUERY,
   FIRE3D_MIN_WIDTH_QUERY,
   FIRE3D_NON_PREDICTION_NOTE,
+  FIRE3D_OUT_OF_COVERAGE_STATUS,
+  FIRE3D_PARTIAL_COVERAGE_STATUS,
   FIRE3D_PITCH_DEGREES,
   FIRE3D_SKY_CLEAR_SPECIFICATION,
   FIRE3D_SKY_SPECIFICATION,
-  FIRE3D_TERRAIN_EXAGGERATION
+  FIRE3D_TERRAIN_EXAGGERATION,
+  TERRAIN_EDGE_BUFFER,
+  TERRAIN_EDGE_PAINT,
+  classifyTerrainCoverage,
+  fire3dCoverageNote,
+  isWithinTerrainCoverage,
+  terrainEdgeLine
 } from '../config/fire3d-presentation';
-import { resolveHillshadeArchiveUrl } from '../layers/hillshade';
+import type { Fire3DEntryPhase, TerrainCoverageReading } from '../config/fire3d-presentation';
+import { terrainCoverageFor, terrainCoverageFromHeader, FIRE3D_TERRAIN_COVERAGE,
+  type TerrainCoverage } from '../config/terrain-coverage';
+import { URLS } from '../config/urls';
+import { resolveHillshadeArchive } from '../layers/hillshade';
+import { probeArchiveHeader } from '../util/pmtiles-probe';
+import { holdSatellite } from './basemap-switcher';
+import { BOTTOM_STACK_IDS, firstLayerIdAbove, reassertLabelOrder, reassertThematicOrder } from './layer-order';
 import { watchContextLoss, webGl2Capability } from './gl-capability';
 import {
   getCommittedSnapshot,
@@ -62,14 +92,18 @@ import {
   onFire3DPreferenceChange,
   setFire3DPreference
 } from '../state/fire3d-store';
+import { isPlaceDisplayHeld } from '../state/place-display-hold';
 import { registry } from '../state/registry';
 import { showToast } from '../ui/overlay';
+import { isObject } from '../util/guards';
 import { prefersReducedMotion } from '../util/motion';
-import { watchRasterTiles } from '../util/raster-status';
+import { watchRasterTiles } from '../util/raster-error-watch';
 import type { RasterTileWatch } from '../util/raster-status';
 
 /** Own terrain source; never the hillshade layer's 'hillshade-dem'. */
 const TERRAIN_SOURCE_ID = 'fire3d-terrain-dem';
+/** The edge fade's source and layer (a mirrored literal in layer-order.ts). */
+const TERRAIN_EDGE_ID = 'fire3d-terrain-edge';
 
 /** The fire event layers whose presence keeps an ACTIVE mode alive across
  * an honest 'custom' demotion (the IC refinement to the entry gate). */
@@ -85,6 +119,14 @@ export interface Fire3DStatus {
   readonly state: 'inactive' | 'checking' | 'active' | 'unavailable';
   /** Honest user-facing reason; non-null only for 'unavailable'. */
   readonly reason: string | null;
+  /**
+   * The step of the entry the scene is waiting on, while `checking`; null in
+   * every other state (owner direction 2026-11-09 (sprint), DR-pending). The
+   * steps are the awaits `activateScene` really makes, in order, so a
+   * surface that shows the entry can say what is happening instead of one
+   * word for the whole wait. The console does not render it.
+   */
+  readonly phase: Fire3DEntryPhase | null;
   /** True while the volumetric smoke read is in place beside the terrain;
    * false while active with the flat veil only (partial degrade). */
   readonly smokeVolume: boolean;
@@ -95,10 +137,95 @@ export interface Fire3DStatus {
   /** The context layers actually in the scene (issuer-published landscape
    * context; empty while inactive or when every context layer degraded). */
   readonly contextLayers: readonly string[];
+  /**
+   * The deepest zoom the RESOLVED terrain archive declares in its own
+   * header, while the scene is active; null otherwise. DR-083 step 1
+   * (2026-09-10): the scene probes the deep archive first and falls back
+   * to the bundled one, and the two differ only in depth (10 against 8),
+   * so the coverage sentence's zoom figure is formatted from this value
+   * rather than from the bundled constant, which would be false on the
+   * first frame after the deep archive resolves. It is disclosure only:
+   * the number is never written back into the source as a declared zoom,
+   * because a declared option overrides the archive header permanently.
+   */
+  readonly terrainMaxZoom: number | null;
+  /** Extent of the archive actually installed; null outside an active scene. */
+  readonly terrainExtent?: TerrainCoverage | null;
+  /**
+   * How much of the CURRENT VIEW's ground FIRE3D_TERRAIN_COVERAGE holds,
+   * while the scene is active: `full`, `partial`, or `none`. Uncovered
+   * ground is genuinely flat (MapLibre's terrain sampler has no data to
+   * return), not broken; this is what lets the status line say so instead
+   * of leaving the two readings indistinguishable. `full` while inactive,
+   * checking, or unavailable, so it never competes with those states' own
+   * sentences.
+   *
+   * Three values, not a boolean, since 2026-09-10: this was
+   * `outOfTerrainCoverage`, computed from the view's CENTER, which made a
+   * categorical claim about a footprint from a single point and was wrong
+   * in both directions at the extent's edge (Codex adversarial review
+   * finding 8).
+   */
+  readonly terrainCoverage: TerrainCoverageReading;
+  /**
+   * Whether the scene's OWN sources (the terrain DEM and any drape
+   * source this activation added) are still streaming tiles, or
+   * have all reported loaded. 'streaming' from the moment the scene first
+   * publishes 'active' until every scene source reports loaded via
+   * `map.isSourceLoaded`, then 'settled'; back to 'streaming' if a source
+   * starts loading again (for example a re-fetch after a pan). `null` while
+   * inactive, checking, or unavailable, so it never claims a transport
+   * reading for a scene that is not there.
+   *
+   * Exists because the scene publishes 'active' as soon as its context
+   * layers activate (`publishStatus('active', null)` at the end of
+   * `activateScene`, below), while the terrain DEM and the hazard drape
+   * can still be streaming tiles under it on the
+   * software renderer; a caller that treats 'active' alone as "the scene is
+   * ready" can starve a layer it activates in the same breath. Recorded
+   * 2026-09-10/11: the RAWS station marker case in tests/fire3d-mode.spec.ts
+   * checked the telemetry layer immediately after 'active' and starved
+   * telemetry's own first activation against the still-arriving terrain
+   * traffic; that case now waits on this field instead of on 'active' alone.
+   */
+  readonly transport: SceneTransportReading | null;
+}
+
+/** `Fire3DStatus.transport`'s own two live values (the field is otherwise
+ * `null`). Named separately so the derivation below can be imported and
+ * exercised without a `Fire3DStatus`. */
+export type SceneTransportReading = 'streaming' | 'settled';
+
+/**
+ * Derive the scene transport reading from the scene's own source ids and a
+ * loaded predicate. Pure, so the state machine behind `Fire3DStatus.transport`
+ * is node-testable without a MapLibre map at all (see the node cases beside
+ * `parseFire3dParam` near the top of tests/fire3d-mode.spec.ts, and the
+ * derivation's own cases beside this function's export).
+ *
+ * 'streaming' whenever the scene has not yet added every source it owns (an
+ * activation still building its context layers) or when any added source is
+ * still loading; 'settled' only once every known scene source reports
+ * loaded. An empty source list reads as 'streaming': the scene always adds
+ * at least its own terrain source while active, so an empty list here means
+ * the caller asked before that happened, not that there is nothing left to
+ * wait for.
+ */
+export function deriveSceneTransport(
+  sourceIds: readonly string[],
+  isLoaded: (id: string) => boolean
+): SceneTransportReading {
+  if (sourceIds.length === 0) return 'streaming';
+  return sourceIds.every((id) => isLoaded(id)) ? 'settled' : 'streaming';
 }
 
 export interface Fire3DGateInput {
   readonly preference: boolean;
+  /**
+   * A shell that can present the scene has the viewport. The name is from
+   * when only the desktop console could; since 2026-11-09 the phone shell
+   * can too (`presentingShell`), and the runtime passes true for either.
+   */
   readonly desktopViewport: boolean;
   readonly committedCluster: HazardClusterKey | 'custom';
   readonly activeLayerKeys: ReadonlySet<string>;
@@ -116,6 +243,21 @@ export interface Fire3DGateInput {
    * `window.innerHeight`.
    */
   readonly viewportHeight?: number;
+  /**
+   * The height floor of the shell that would present the scene, in CSS
+   * pixels. Optional: absent, it is the console's FIRE3D_MIN_HEIGHT_PX, so
+   * every caller written before the phone shell could present the scene
+   * keeps its answer. The runtime passes FIRE3D_PHONE_MIN_HEIGHT_PX for the
+   * phone shell.
+   */
+  readonly minViewportHeight?: number;
+  /**
+   * The PLACE studio holds the map display (src/state/place-display-hold.ts):
+   * it has set the Fire layers aside for its clean display and will put back
+   * the display it captured. Optional, and treated as no hold when absent.
+   * Owner direction 2026-11-09 (sprint), DR-pending.
+   */
+  readonly studioHold?: boolean;
 }
 
 /**
@@ -124,8 +266,16 @@ export interface Fire3DGateInput {
  * 'custom' (the user added a reference layer to the Fire view) keeps the
  * mode alive while a fire event layer remains in the active set, so one
  * extra layer never collapses the scene. Switching to another cluster,
- * removing every fire event layer, toggling the preference off, a narrow
- * viewport, a short viewport, or a device without WebGL 2 always exits.
+ * removing every fire event layer, toggling the preference off, a viewport
+ * no shell can present the scene in, a viewport shorter than that shell's
+ * floor, or a device without WebGL 2 always exits.
+ *
+ * The PLACE studio's hold (`studioHold`) keeps a scene that is already up
+ * through the studio's round trip: its clean display sets the Fire layers
+ * aside (a custom set) and puts them back, and a scene torn down for that
+ * would start over on the way back. It never enters a scene, never keeps
+ * one through a switch to another cluster, and never outlasts any refusal
+ * above.
  *
  * DR-025a made the entry test capability plus geometry rather than width
  * alone: a tablet in the 721 to 1024 px band is welcome, a landscape phone
@@ -138,7 +288,7 @@ export function shouldFire3DBeActive(input: Fire3DGateInput): boolean {
   if (input.webgl2 === false) return false;
   if (
     input.viewportHeight !== undefined &&
-    input.viewportHeight < FIRE3D_MIN_HEIGHT_PX
+    input.viewportHeight < (input.minViewportHeight ?? FIRE3D_MIN_HEIGHT_PX)
   ) {
     return false;
   }
@@ -146,6 +296,9 @@ export function shouldFire3DBeActive(input: Fire3DGateInput): boolean {
   if (!input.currentlyActive || input.committedCluster !== 'custom') {
     return false;
   }
+  // The PLACE studio's clean display demotes the set to custom by setting
+  // the Fire layers aside; the scene holds until the studio puts them back.
+  if (input.studioHold === true) return true;
   return FIRE3D_EVENT_LAYER_KEYS.some((key) =>
     input.activeLayerKeys.has(key)
   );
@@ -158,21 +311,50 @@ export function shouldFire3DBeActive(input: Fire3DGateInput): boolean {
 let status: Fire3DStatus = {
   state: 'inactive',
   reason: null,
+  phase: null,
   smokeVolume: false,
   perimeterRibbon: false,
-  contextLayers: []
+  contextLayers: [],
+  terrainMaxZoom: null,
+  terrainExtent: null,
+  terrainCoverage: 'full',
+  transport: null
 };
 const statusListeners = new Set<() => void>();
 
 let controllerWired = false;
 let active = false;
 let activation: AbortController | null = null;
+/** Mirrors Fire3DStatus.phase: the awaited step of the entry in flight. */
+let entryPhase: Fire3DEntryPhase | null = null;
+/** Mirrors Fire3DStatus.terrainCoverage; read by publishStatus and by
+ * syncEmbedNote, kept current by coverageMoveListener while active. `full`
+ * while inactive, so neither coverage sentence renders outside the scene. */
+let terrainCoverage: TerrainCoverageReading = 'full';
+/** Mirrors Fire3DStatus.terrainMaxZoom: the resolved archive's header
+ * depth from activation to rollback, null in between. */
+let resolvedTerrainMaxZoom: number | null = null;
+let resolvedTerrainExtent: TerrainCoverage | null = null;
+/** The 'moveend' listener that keeps terrainCoverage current across a
+ * pan while the scene stays active; detached in rollbackScene. */
+let coverageMoveListener: (() => void) | null = null;
 /** Bumped on every activation start and every teardown so an awaited step
  * (the smoke-volume dynamic import) can detect it was superseded. */
 let generation = 0;
 let savedCamera: { readonly pitch: number; readonly bearing: number } | null =
   null;
-let tileWatch: RasterTileWatch | null = null;
+/**
+ * The camera a leaving scene still owes the flat map (`restoreCamera`): set
+ * while the restoring ease is in flight or has been cut short, null once the
+ * camera is back or something else has taken the pitch and bearing. A scene
+ * that starts again in the meantime found the camera THERE, not at whatever
+ * the unfinished turn happened to read.
+ */
+let owedCamera: { readonly pitch: number; readonly bearing: number } | null =
+  null;
+/** Bumped by each restore and each entry tilt, so an older restore stands down. */
+let cameraIntent = 0;
+let tileWatch: Pick<RasterTileWatch, 'detach'> | null = null;
 let smokeVolumeOn = false;
 let smokeModule: typeof import('../layers/hms-smoke-volume') | null = null;
 let ribbonOn = false;
@@ -180,10 +362,22 @@ let ribbonModule: typeof import('../layers/nifc-perimeter-ribbon') | null =
   null;
 let contextModule: typeof import('./fire3d-context') | null = null;
 let contextKeys: readonly string[] = [];
+/** Mirrors Fire3DStatus.transport; null while inactive, set from the first
+ * 'active' publish and cleared by detachTransportWatch in rollbackScene. */
+let sceneTransport: SceneTransportReading | null = null;
+let transportSourceDataListener: (() => void) | null = null;
+let transportIdleListener: (() => void) | null = null;
 /** Truthful per-layer embed disclosure lines, composed at activation from
  * what actually rendered (never static claims). */
 let contextEmbedLines: readonly string[] = [];
+/** The last `ddm:whp-shade` event's `mounted`: the drape mounts stood down
+ * for the USFS colours row and can stand up later, so its embed line
+ * follows this, not the activation. */
+let whpDrapeMounted = false;
 let contextAbort: AbortController | null = null;
+/** DDM-P9-T13: the dryness ground's lazy chunk and the one activation it serves. */
+let drynessModule: typeof import('../layers/wildfire-dryness') | null = null;
+let drynessAbort: AbortController | null = null;
 
 /** The latest mode status. */
 export function getFire3DStatus(): Fire3DStatus {
@@ -200,6 +394,21 @@ export function onFire3DStatusChange(fn: () => void): () => void {
 
 /** The embed disclosure chip's element id (also asserted by tests). */
 const EMBED_NOTE_ID = 'fire3d-embed-note';
+
+/**
+ * The coverage sentence a reading earns, as a zero-or-one-element list so
+ * both call sites can spread it. `full` earns nothing: a view entirely
+ * within the archive has no gap to disclose, and a standing sentence that
+ * said so anyway would dilute the two that matter. Shared by the embed note
+ * and the sidebar status line (`outOfCoverageLine` in fire3d-control.tsx
+ * selects the same way) so the two surfaces can never disagree about which
+ * sentence a view has earned.
+ */
+function terrainCoverageLines(reading: TerrainCoverageReading): string[] {
+  if (reading === 'none') return [FIRE3D_OUT_OF_COVERAGE_STATUS];
+  if (reading === 'partial') return [FIRE3D_PARTIAL_COVERAGE_STATUS];
+  return [];
+}
 
 /**
  * Embeds hide the sidebar chrome that carries the coverage note, the
@@ -225,8 +434,13 @@ function syncEmbedNote(active: boolean): void {
   }
   const lines = [
     FIRE3D_NON_PREDICTION_NOTE,
-    FIRE3D_COVERAGE_NOTE,
-    ...contextEmbedLines
+    resolvedTerrainMaxZoom === null
+      ? FIRE3D_COVERAGE_NOTE
+      : fire3dCoverageNote(resolvedTerrainExtent ?? resolvedTerrainMaxZoom),
+    ...terrainCoverageLines(terrainCoverage),
+    ...contextEmbedLines.filter(
+      (line) => whpDrapeMounted || line !== contextModule?.WHP_EMBED_LINE
+    )
   ].filter((line) => line.length > 0);
   const note = existing ?? document.createElement('p');
   note.id = EMBED_NOTE_ID;
@@ -236,6 +450,41 @@ function syncEmbedNote(active: boolean): void {
   if (!existing) shell.appendChild(note);
 }
 
+/**
+ * How much of the CURRENT VIEW the bundled archive covers.
+ *
+ * Reads `map.getBounds()`, not `map.getCenter()` (Codex adversarial review
+ * 2026-09-10, finding 8): a centre is a point, and a point cannot answer a
+ * question about a footprint. The old centre test both overstated (a view
+ * two thousandths of a degree past the eastern edge announced that the whole
+ * view had no archived elevation, while most of its ground did) and
+ * understated (a view straddling that edge from the inside said nothing at
+ * all, while half its ground rendered flat).
+ *
+ * A map that cannot report bounds falls back to the centre point, which is
+ * the reading this replaced: strictly no worse than the old behaviour, and it
+ * keeps a harness or a partially-built map from throwing inside a `moveend`
+ * listener. `isWithinTerrainCoverage` is still the point predicate, so both
+ * paths compare against the archive's own numbers and neither hand-types a
+ * second box.
+ */
+function readTerrainCoverage(map: maplibregl.Map): TerrainCoverageReading {
+  const bounds = typeof map.getBounds === 'function' ? map.getBounds() : null;
+  if (bounds) {
+    const west = bounds.getWest();
+    const south = bounds.getSouth();
+    const east = bounds.getEast();
+    const north = bounds.getNorth();
+    if ([west, south, east, north].every(Number.isFinite)) {
+      return classifyTerrainCoverage({ west, south, east, north },
+        resolvedTerrainExtent ?? FIRE3D_TERRAIN_COVERAGE);
+    }
+  }
+  const center = map.getCenter();
+  return isWithinTerrainCoverage(center.lng, center.lat,
+    resolvedTerrainExtent ?? FIRE3D_TERRAIN_COVERAGE) ? 'full' : 'none';
+}
+
 function publishStatus(
   state: Fire3DStatus['state'],
   reason: string | null
@@ -243,9 +492,14 @@ function publishStatus(
   status = {
     state,
     reason,
+    phase: state === 'checking' ? entryPhase : null,
     smokeVolume: state === 'active' && smokeVolumeOn,
     perimeterRibbon: state === 'active' && ribbonOn,
-    contextLayers: state === 'active' ? contextKeys : []
+    contextLayers: state === 'active' ? contextKeys : [],
+    terrainMaxZoom: state === 'active' ? resolvedTerrainMaxZoom : null,
+    terrainExtent: state === 'active' ? resolvedTerrainExtent : null,
+    terrainCoverage: state === 'active' ? terrainCoverage : 'full',
+    transport: state === 'active' ? sceneTransport : null
   };
   // Production-observable truth stamp (the dev-only __ddmMap handle is
   // dead-code-eliminated from dist/, so the verification suite reads mode
@@ -254,6 +508,11 @@ function publishStatus(
   if (typeof document !== 'undefined') {
     const root = document.documentElement;
     root.dataset.ddmFire3d = state;
+    if (state === 'checking' && entryPhase !== null) {
+      root.dataset.ddmFire3dPhase = entryPhase;
+    } else {
+      delete root.dataset.ddmFire3dPhase;
+    }
     if (state === 'active') {
       root.dataset.ddmFire3dSmoke = smokeVolumeOn ? 'volume' : 'flat';
       root.dataset.ddmFire3dRibbon = ribbonOn ? 'on' : 'off';
@@ -266,6 +525,11 @@ function publishStatus(
     } else {
       delete root.dataset.ddmFire3dContext;
     }
+    if (state === 'active' && sceneTransport !== null) {
+      root.dataset.ddmFire3dTransport = sceneTransport;
+    } else {
+      delete root.dataset.ddmFire3dTransport;
+    }
     syncEmbedNote(state === 'active');
   }
   statusListeners.forEach((fn) => {
@@ -273,12 +537,43 @@ function publishStatus(
   });
 }
 
-function desktopViewport(): boolean {
-  return (
-    typeof window !== 'undefined' &&
-    typeof window.matchMedia === 'function' &&
-    window.matchMedia(FIRE3D_MIN_WIDTH_QUERY).matches
-  );
+/** Republish a change made while the scene is up. Between `active = true`
+ * and the scene's first 'active' publish this is a no-op: that publish reads
+ * the same module state, and 'active' must not be seen before it. */
+function republishActive(): void {
+  if (status.state === 'active') publishStatus('active', null);
+}
+
+/** Name the step the entry now waits on. Only while the entry is still
+ * `checking`: a rollback or a failure has already published its own state. */
+function enterPhase(phase: Fire3DEntryPhase): void {
+  entryPhase = phase;
+  if (status.state === 'checking') publishStatus('checking', null);
+}
+
+/**
+ * Which shell could present the scene in this viewport, or null when none
+ * can (owner direction 2026-11-09 (sprint), DR-pending).
+ *
+ * At the console's width it is the desktop console, as it always was. Below
+ * it the phone shell may, on one condition read from the document itself:
+ * its 3D chrome is mounted (FIRE3D_PHONE_CHROME_ATTRIBUTE on #app). That
+ * chrome is the card carrying the terrain coverage statement and the
+ * non-prediction disclosure, so a phone cannot hold the scene without them,
+ * whatever order the two lazy chunks arrive in. A phone-width embed has no
+ * phone shell and no such chrome, so it stays flat exactly as before.
+ */
+function presentingShell(): 'console' | 'phone' | null {
+  if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+    return null;
+  }
+  if (!window.matchMedia(FIRE3D_MIN_WIDTH_QUERY).matches) return null;
+  if (window.matchMedia(FIRE3D_CONSOLE_WIDTH_QUERY).matches) return 'console';
+  const app =
+    typeof document !== 'undefined' && typeof document.getElementById === 'function'
+      ? document.getElementById('app')
+      : null;
+  return app?.hasAttribute(FIRE3D_PHONE_CHROME_ATTRIBUTE) === true ? 'phone' : null;
 }
 
 /**
@@ -298,10 +593,19 @@ function hasWebGl2(): boolean {
   return webGl2Capability().webgl2;
 }
 
-/** The gate's viewport-height input, omitted where there is no window. */
-function viewportHeightInput(): { readonly viewportHeight?: number } {
+/**
+ * The gate's viewport-height inputs, omitted where there is no window: the
+ * height, and the floor of the shell that would present the scene.
+ */
+function viewportHeightInput(shell: 'console' | 'phone' | null): {
+  readonly viewportHeight?: number;
+  readonly minViewportHeight?: number;
+} {
   if (typeof window !== 'undefined' && typeof window.innerHeight === 'number') {
-    return { viewportHeight: window.innerHeight };
+    return {
+      viewportHeight: window.innerHeight,
+      minViewportHeight: shell === 'phone' ? FIRE3D_PHONE_MIN_HEIGHT_PX : FIRE3D_MIN_HEIGHT_PX
+    };
   }
   return {};
 }
@@ -321,20 +625,184 @@ function applyCamera(
   }
 }
 
+/** Two angles in degrees name the same direction (bearings wrap at 180). */
+function sameAngle(a: number, b: number): boolean {
+  return Math.abs(((((a - b) % 360) + 540) % 360) - 180) < 0.001;
+}
+
+/**
+ * Give the flat map back the camera the scene found, and FINISH the job
+ * (owner direction 2026-11-09 (sprint), DR-pending).
+ *
+ * The restore is the same ease as before. But an ease is cancelled by the
+ * next camera call from anywhere, and a cancelled restore leaves the flat
+ * map tilted with the scene gone. A phone makes that ordinary: the phone
+ * sheet jumps the camera padding about 150 ms after any viewport change
+ * (src/ui/mobile-sheet.ts, `settle`), so a phone that turns on its side, or
+ * otherwise drops under its height floor while the scene is on, was left at
+ * the pitch the ease had reached (measured: 41.99 degrees). A region fit or
+ * a pan inside the 800 ms does the same on any screen.
+ *
+ * So when the ease ends short of the camera it was heading for, the rest is
+ * paid by one jump as soon as the map is at rest. It stands down, leaving the
+ * camera alone, if a newer scene has tilted it or if anything else has moved
+ * the pitch or the bearing off the place the ease was cut: that is someone
+ * else's camera now (a person's own two-finger tilt, a reset).
+ *
+ * Nothing is armed when the camera is already there, which is every reduced
+ * motion exit (a jump) and every exit that had nothing to turn.
+ */
+function restoreCamera(
+  map: maplibregl.Map,
+  target: { readonly pitch: number; readonly bearing: number }
+): void {
+  const mine = ++cameraIntent;
+  owedCamera = null;
+  applyCamera(map, target);
+  const there = (at: { readonly pitch: number; readonly bearing: number }): boolean =>
+    sameAngle(map.getPitch(), at.pitch) && sameAngle(map.getBearing(), at.bearing);
+  if (there(target)) return;
+
+  owedCamera = target;
+  let cut: { readonly pitch: number; readonly bearing: number } | null = null;
+  let finished = false;
+  const finish = (): void => {
+    finished = true;
+    map.off('moveend', onMoveEnd);
+    if (cameraIntent === mine) owedCamera = null;
+  };
+  const pay = (): void => {
+    if (finished) return;
+    if (cameraIntent !== mine) {
+      finish();
+      return;
+    }
+    // Whatever cut the ease short is still moving the map (a fit, a hand on
+    // the glass): its own moveend comes back through onMoveEnd.
+    if (map.isMoving()) return;
+    const untouched = cut !== null && there(cut);
+    // One payment, then done either way: the jump's own moveend must not
+    // come back here.
+    finish();
+    if (untouched) map.jumpTo(target);
+  };
+  function onMoveEnd(): void {
+    if (finished) return;
+    if (cameraIntent !== mine || there(target)) {
+      finish();
+      return;
+    }
+    if (cut === null) {
+      cut = { pitch: map.getPitch(), bearing: map.getBearing() };
+    } else if (!there(cut)) {
+      finish();
+      return;
+    }
+    // Not from inside this event: the call that cut the ease is still on the
+    // stack, and the camera is its to finish first.
+    queueMicrotask(pay);
+  }
+  map.on('moveend', onMoveEnd);
+}
+
+/** whp-3d.ts's own private SOURCE_ID, mirrored here rather than imported:
+ * the module is one of the lazy context chunks (fire3d-context.ts), and a
+ * static import into this file would pull it into fire3d's own bundle
+ * instead (the same reasoning TERRAIN_SOURCE_ID's neighbourhood documents
+ * for the deep-archive resolver, and the mobile test above asserts the
+ * chunk boundary this would otherwise break). */
+const WHP_DRAPE_SOURCE_ID = 'whp-2023';
+const STRUCTURES_SOURCE_ID = 'structures-3d';
+
+/** The scene's own source ids that are ACTUALLY on the map right now: the
+ * terrain DEM always, plus whichever context sources this activation added
+ * (read from `contextKeys`, which the context module already reports
+ * truthfully per layer). Filtered by `map.getSource` so a layer that never
+ * activated (a corrupt archive, a chunk load failure) is never asked to be
+ * "loaded". */
+function currentSceneSourceIds(map: maplibregl.Map): string[] {
+  const ids = [TERRAIN_SOURCE_ID];
+  if (contextKeys.includes('whp')) ids.push(WHP_DRAPE_SOURCE_ID);
+  if (contextKeys.includes('structures')) ids.push(STRUCTURES_SOURCE_ID);
+  const dryness = drynessModule?.getDrynessSourceId();
+  if (dryness) ids.push(dryness);
+  return ids.filter((id) => Boolean(map.getSource(id)));
+}
+
+/** `map.isSourceLoaded` under a defensive guard: a Node-level test's fake
+ * map (tests/map-harness.ts) declares no such method, and an unproven
+ * source reads as still streaming rather than as settled, matching this
+ * module's usual honesty bias (see readTerrainCoverage's own fallback). */
+function isSceneSourceLoaded(map: maplibregl.Map, id: string): boolean {
+  if (typeof map.isSourceLoaded !== 'function') return false;
+  try {
+    return map.isSourceLoaded(id);
+  } catch {
+    return false;
+  }
+}
+
+/** Recompute `sceneTransport` from the map's current source-load state and
+ * republish only on an actual change (mirrors reconcileSmokeVolume /
+ * reconcilePerimeterRibbon's own re-publish-on-change shape). */
+function recomputeSceneTransport(map: maplibregl.Map): void {
+  if (!active) return;
+  const next = deriveSceneTransport(currentSceneSourceIds(map), (id) =>
+    isSceneSourceLoaded(map, id)
+  );
+  if (next === sceneTransport) return;
+  sceneTransport = next;
+  publishStatus('active', null);
+}
+
+let transportPoll: ReturnType<typeof setInterval> | undefined;
+
+/** Start watching the scene's own sources for load progress. Idempotent;
+ * detachTransportWatch is its only counterpart. */
+function attachTransportWatch(map: maplibregl.Map): void {
+  if (transportSourceDataListener) return;
+  transportSourceDataListener = () => recomputeSceneTransport(map);
+  transportIdleListener = transportSourceDataListener;
+  // found-130: sourcedata and idle can be coalesced away on a stalled main
+  // thread after the last request ends, so the stamp is also re-read every
+  // 250 ms while the scene is up; it republishes only on a change.
+  transportPoll = setInterval(transportIdleListener, 250);
+  map.on('sourcedata', transportSourceDataListener);
+  map.on('idle', transportIdleListener);
+}
+
+function detachTransportWatch(map: maplibregl.Map): void {
+  if (transportSourceDataListener) {
+    map.off('sourcedata', transportSourceDataListener);
+  }
+  if (transportIdleListener) map.off('idle', transportIdleListener);
+  transportSourceDataListener = null;
+  transportIdleListener = null;
+  clearInterval(transportPoll);
+  sceneTransport = null;
+}
+
 /** Remove everything the activation added, in reverse, then restore the
  * captured camera. Safe against partial setups (defensive guards). */
 function rollbackScene(map: maplibregl.Map): void {
   generation += 1;
   active = false;
-  if (tileWatch) {
-    tileWatch.detach();
-    tileWatch = null;
+  detachTransportWatch(map);
+  if (coverageMoveListener) {
+    map.off('moveend', coverageMoveListener);
+    coverageMoveListener = null;
   }
-  if (contextAbort) {
-    contextAbort.abort();
-    contextAbort = null;
-  }
+  terrainCoverage = 'full';
+  resolvedTerrainMaxZoom = null;
+  resolvedTerrainExtent = null;
+  tileWatch?.detach();
+  tileWatch = null;
+  contextAbort?.abort();
+  contextAbort = null;
   if (contextModule) contextModule.deactivateContextLayers(map);
+  // Aborting the ground's activation aborts its reads and removes its layer.
+  drynessAbort?.abort();
+  drynessAbort = null;
   contextKeys = [];
   contextEmbedLines = [];
   // The ribbon owns its own derived source, so its teardown cannot strand
@@ -348,11 +816,13 @@ function rollbackScene(map: maplibregl.Map): void {
     }
   }
   smokeVolumeOn = false;
+  if (map.getLayer(TERRAIN_EDGE_ID)) map.removeLayer(TERRAIN_EDGE_ID);
+  if (map.getSource(TERRAIN_EDGE_ID)) map.removeSource(TERRAIN_EDGE_ID);
   map.setTerrain(null);
   map.setSky(FIRE3D_SKY_CLEAR_SPECIFICATION);
   if (map.getSource(TERRAIN_SOURCE_ID)) map.removeSource(TERRAIN_SOURCE_ID);
   if (savedCamera) {
-    applyCamera(map, savedCamera);
+    restoreCamera(map, savedCamera);
     savedCamera = null;
   }
 }
@@ -367,18 +837,87 @@ function failScene(map: maplibregl.Map, reason: string, err?: unknown): void {
   showToast('3D Fire view unavailable; the flat map remains accurate.');
 }
 
+/**
+ * The terrain archive this scene should use, deepest first (DR-079).
+ *
+ * The 2D hillshade underlay is a SUBTLE texture and the bundled zoom 8
+ * archive is the honest trade for it, so `resolveHillshadeArchiveUrl` is left
+ * exactly as it was. This scene is the one place the depth is the whole
+ * point: it exists to answer whether a fire sits at the foot of a mountain,
+ * and at about 212 m per pixel there is no foot. Measured in this scene
+ * through `queryTerrainElevation` on 2026-09-10, the bundled archive reads
+ * the Mount Jefferson summit 931 m low while reading the Bend valley floor
+ * within 19 m; the deep archive reads that summit 50 m low.
+ *
+ * The deep archive is a bounded probe away, never a dependency: a failure
+ * here is not a scene failure, it is a fall back to the bundled copy that
+ * every deployer already ships, and the scene then behaves exactly as it did
+ * before this function existed. So a deployer who cannot reach the Worker, or
+ * an installation that has not published one, loses resolution and nothing
+ * else. Only a failure of BOTH reaches the caller's `failScene` ladder.
+ */
+interface ResolvedTerrainArchive {
+  readonly url: string;
+  /** The depth the archive's own header declares (byte 101), for disclosure. */
+  readonly maxZoom: number;
+  readonly coverage: TerrainCoverage;
+}
+
+/** The archive's object key, the last path segment of its URL. */
+const archiveKey = (url: string): string => url.split(/[?#]/)[0].split('/').pop() ?? '';
+
+async function resolveFire3DTerrainUrl(
+  signal: AbortSignal
+): Promise<ResolvedTerrainArchive> {
+  try {
+    const header = await probeArchiveHeader(URLS.terrainPmtilesDeep, signal);
+    return { url: URLS.terrainPmtilesDeep, maxZoom: header.maxZoom,
+      coverage: terrainCoverageFor(archiveKey(URLS.terrainPmtilesDeep), header) };
+  } catch (err) {
+    // An aborted probe is a withdrawn activation, not a missing archive: let
+    // the caller's own abort handling see it rather than spending a second
+    // probe on a scene nobody is waiting for.
+    if (signal.aborted) throw err;
+    const bundled = await resolveHillshadeArchive(signal);
+    return { url: bundled.url, maxZoom: bundled.header.maxZoom,
+      coverage: terrainCoverageFromHeader(bundled.header) };
+  }
+}
+
+function warnComponent(component: string, error: unknown): void {
+  console.warn(`[fire3d] ${component} failed.`, error);
+}
+
+/** One ribbon read: the ribbon module reads the perimeter snapshot
+ * synchronously, so `ribbonOn` holds its answer on return. */
+function readRibbon(
+  map: maplibregl.Map,
+  ribbon: typeof import('../layers/nifc-perimeter-ribbon')
+): void {
+  try {
+    ribbonOn = ribbon.activatePerimeterRibbon(map);
+  } catch (err) {
+    ribbonOn = false;
+    warnComponent('ribbon activation', err);
+  }
+}
+
 async function activateScene(map: maplibregl.Map): Promise<void> {
   if (active || activation !== null) return;
   const myController = new AbortController();
   activation = myController;
   const signal = myController.signal;
   const myGeneration = ++generation;
+  entryPhase = 'probe';
   publishStatus('checking', null);
-  savedCamera = { pitch: map.getPitch(), bearing: map.getBearing() };
+  // The camera as found. While an earlier exit is still handing its camera
+  // back (`restoreCamera`), that is where the flat map stands, not the
+  // reading its unfinished turn happens to give.
+  savedCamera = owedCamera ?? { pitch: map.getPitch(), bearing: map.getBearing() };
 
-  let archiveUrl: string;
+  let resolved: ResolvedTerrainArchive;
   try {
-    archiveUrl = await resolveHillshadeArchiveUrl(signal);
+    resolved = await resolveFire3DTerrainUrl(signal);
   } catch (err) {
     if (activation === myController) activation = null;
     if (signal.aborted || myGeneration !== generation) {
@@ -409,13 +948,35 @@ async function activateScene(map: maplibregl.Map): Promise<void> {
     return;
   }
 
+  // Recorded before the source exists so the first 'active' publish and the
+  // embed note already name the archive that answered.
+  resolvedTerrainMaxZoom = resolved.maxZoom;
+  resolvedTerrainExtent = resolved.coverage;
   try {
     if (!map.getSource(TERRAIN_SOURCE_ID)) {
       map.addSource(TERRAIN_SOURCE_ID, {
         type: 'raster-dem',
-        url: 'pmtiles://' + archiveUrl,
+        url: 'pmtiles://' + resolved.url,
         encoding: 'terrarium',
         tileSize: 512
+        // NO maxzoom (and no minzoom) here, deliberately: the archive that
+        // resolved above decides its own depth, and it is not always the
+        // bundled one.
+        //
+        // An earlier comment here had the mechanism backwards. It claimed
+        // the protocol overwrites a declared zoom once the header round trip
+        // resolves. The opposite is true: MapLibre merges the two with
+        // `extend(tileJSON, options)` (load_tilejson.ts), so a declared
+        // option WINS over the archive header, permanently. With
+        // `maxzoom: 8` declared, a zoom 0-10 archive was read zoom 0-8 only,
+        // because covering_tiles.ts takes `nominalZ = Math.min(desiredZ,
+        // maxZoom)`; the deeper tiles were never requested at all.
+        //
+        // Omit the KEY, never set it to `undefined`. `extend` is a `for...in`
+        // over own enumerable keys, so an explicit `undefined` still
+        // enumerates and still stomps the header, while an absent key leaves
+        // the header's own zooms standing. src/layers/hillshade.ts:113-118
+        // has always had this shape; this call is now the same.
       });
     }
     map.setTerrain({
@@ -423,42 +984,105 @@ async function activateScene(map: maplibregl.Map): Promise<void> {
       exaggeration: FIRE3D_TERRAIN_EXAGGERATION
     });
     map.setSky(FIRE3D_SKY_SPECIFICATION);
+    // The scene's own tilt takes the camera: an exit still owed stands down.
+    cameraIntent += 1;
+    owedCamera = null;
     applyCamera(map, { pitch: FIRE3D_PITCH_DEGREES });
+    // Terrain relief fix lane, 2026-09-10: a fire outside the Pacific
+    // Northwest bake enters this scene exactly as fully as one inside it
+    // (the gate in shouldFire3DBeActive asks nothing about location), so
+    // the camera and context still have value there; only the ground is
+    // flat. Read once at entry and kept current across a pan by
+    // coverageMoveListener, never gating activation itself.
+    terrainCoverage = readTerrainCoverage(map);
+    coverageMoveListener = () => {
+      const next = readTerrainCoverage(map);
+      if (next === terrainCoverage) return;
+      terrainCoverage = next;
+      republishActive();
+    };
+    map.on('moveend', coverageMoveListener);
   } catch (err) {
     failScene(map, 'Terrain setup failed.', err);
     return;
+  }
+  // The edge fade over the archive box that resolved (TERRAIN_EDGE_PAINT). It
+  // is cosmetic and non-fatal: a failure leaves the hard seam and nothing else.
+  try {
+    const beforeId = firstLayerIdAbove(map, BOTTOM_STACK_IDS);
+    map.addSource(TERRAIN_EDGE_ID, {
+      type: 'geojson',
+      data: terrainEdgeLine(resolved.coverage),
+      buffer: TERRAIN_EDGE_BUFFER
+    });
+    map.addLayer({
+      id: TERRAIN_EDGE_ID,
+      type: 'line',
+      source: TERRAIN_EDGE_ID,
+      paint: TERRAIN_EDGE_PAINT
+    }, beforeId);
+    // Re-seat the ruled chain: the veil must sit wherever layer-order.ts rules
+    // (above the drapes, whose stretched texels are what climb the edge face).
+    reassertThematicOrder(map);
+    reassertLabelOrder(map);
+  } catch (err) {
+    warnComponent('terrain edge fade', err);
   }
 
   active = true;
   // Post-probe honesty: a truncated archive or ranged-read failure surfaces
   // as tile errors after a clean header probe; degrade transactionally
   // instead of leaving a silently flat or torn scene.
-  tileWatch = watchRasterTiles(map, TERRAIN_SOURCE_ID, (state) => {
+  const watch = watchRasterTiles(map, TERRAIN_SOURCE_ID, (state) => {
     if (state !== 'error') return;
     failScene(map, 'Terrain tiles failed to load.');
   });
+  // A failed header or directory read fires ONE source-level error with no
+  // tile, which the three-tile watch never counts: roll back on it directly.
+  const onSourceError = (e: maplibregl.ErrorEvent): void => {
+    if (isObject(e) && e.sourceId === TERRAIN_SOURCE_ID && !e.tile) {
+      failScene(map, 'Terrain tiles failed to load.');
+    }
+  };
+  map.on('error', onSourceError);
+  tileWatch = {
+    detach() {
+      watch.detach();
+      map.off('error', onSourceError);
+    }
+  };
 
+  // DDM-P9-T13: the dryness ground rides its own lazy chunk, loaded only here,
+  // and is non-fatal: its own six states say what it shows, and a failure
+  // leaves terrain, hillshade and drapes as they are.
+  const dryness = new AbortController();
+  drynessAbort = dryness;
+  void import('../layers/wildfire-dryness')
+    .then((module) => {
+      drynessModule = module;
+      return dryness.signal.aborted ? undefined : module.activateWildfireDryness(map, dryness.signal);
+    })
+    .catch((err: unknown) => warnComponent('dryness ground', err));
+
+  // The next two awaits are the smoke volume and the perimeter ribbon: say so
+  // to whatever surface is showing the entry (Fire3DStatus.phase).
+  enterPhase('atmosphere');
   // W4: the volumetric smoke rides its own lazy chunk and is non-fatal by
   // contract; terrain stays and the flat veil stays visible on any failure.
   try {
     smokeModule = smokeModule ?? (await import('../layers/hms-smoke-volume'));
   } catch (err) {
     smokeModule = null;
-    console.warn(
-      '[fire3d] the smoke volume chunk failed to load; flat smoke stays.',
-      err
-    );
+    warnComponent('smoke import', err);
   }
   if (myGeneration !== generation || !active) return;
   if (smokeModule) {
     try {
-      smokeVolumeOn = smokeModule.activateSmokeVolume(map);
+      // A source left empty by a failed read is no volume (reconcileSmokeVolume says the same).
+      smokeVolumeOn = registry.getStatus('hms-smoke') !== 'error' && smokeModule.activateSmokeVolume(map);
     } catch (err) {
       smokeVolumeOn = false;
-      console.warn(
-        '[fire3d] the smoke volume failed to activate; flat smoke stays.',
-        err
-      );
+      warnComponent('smoke activation', err);
     }
   }
 
@@ -470,35 +1094,19 @@ async function activateScene(map: maplibregl.Map): Promise<void> {
       ribbonModule ?? (await import('../layers/nifc-perimeter-ribbon'));
   } catch (err) {
     ribbonModule = null;
-    console.warn(
-      '[fire3d] the perimeter ribbon chunk failed to load; the flat perimeter stays.',
-      err
-    );
+    warnComponent('ribbon import', err);
   }
   if (myGeneration !== generation || !active) return;
-  if (ribbonModule) {
-    try {
-      ribbonOn = await ribbonModule.activatePerimeterRibbon(map, signal);
-    } catch (err) {
-      ribbonOn = false;
-      console.warn(
-        '[fire3d] the perimeter ribbon failed to activate; the flat perimeter stays.',
-        err
-      );
-    }
-  }
-  if (myGeneration !== generation || !active) return;
+  if (ribbonModule) readRibbon(map, ribbonModule);
 
+  enterPhase('context');
   // W-CTX: the issuer-published context layers ride their own lazy chunk
   // and are non-fatal by contract; each missing layer degrades alone.
   try {
     contextModule = contextModule ?? (await import('./fire3d-context'));
   } catch (err) {
     contextModule = null;
-    console.warn(
-      '[fire3d] the context chunk failed to load; the scene keeps terrain and smoke.',
-      err
-    );
+    warnComponent('context import', err);
   }
   if (myGeneration !== generation || !active) return;
   if (contextModule) {
@@ -513,12 +1121,20 @@ async function activateScene(map: maplibregl.Map): Promise<void> {
         contextAbort.signal
       );
     } catch (err) {
-      console.warn('[fire3d] context layers failed to activate.', err);
+      warnComponent('context activation', err);
     }
     if (myGeneration !== generation || !active) return;
     contextKeys = activation.keys;
     contextEmbedLines = activation.embedLines;
   }
+  // Every scene source this activation is ever going to add is now known
+  // (contextKeys is final): start watching them, and read the first
+  // transport reading before the FIRST 'active' publish names it, so a
+  // caller polling the stamp never sees 'active' with no transport value.
+  attachTransportWatch(map);
+  sceneTransport = deriveSceneTransport(currentSceneSourceIds(map), (id) =>
+    isSceneSourceLoaded(map, id)
+  );
   publishStatus('active', null);
 }
 
@@ -559,24 +1175,22 @@ export function setFire3DActive(map: maplibregl.Map, next: boolean): void {
  */
 function reconcileSmokeVolume(map: maplibregl.Map): void {
   if (!active || !smokeModule) return;
-  const smokeLayerOn = registry.getActiveKeys().has('hms-smoke');
-  if (smokeVolumeOn && !smokeLayerOn) {
+  // A failed read empties the source but keeps the key active: the volume and its key go with the data.
+  const smokeLayerOn = registry.getActiveKeys().has('hms-smoke') && registry.getStatus('hms-smoke') !== 'error';
+  if (smokeVolumeOn === smokeLayerOn) return;
+  if (smokeVolumeOn) {
     smokeModule.deactivateSmokeVolume(map);
     smokeModule.cleanupOrphanedSmokeSource(map);
     smokeVolumeOn = false;
-    publishStatus('active', null);
-  } else if (!smokeVolumeOn && smokeLayerOn) {
+  } else {
     try {
       smokeVolumeOn = smokeModule.activateSmokeVolume(map);
     } catch (err) {
       smokeVolumeOn = false;
-      console.warn(
-        '[fire3d] the smoke volume failed to re-activate; flat smoke stays.',
-        err
-      );
+      warnComponent('smoke activation', err);
     }
-    publishStatus('active', null);
   }
+  republishActive();
 }
 
 /**
@@ -593,33 +1207,27 @@ function reconcileSmokeVolume(map: maplibregl.Map): void {
  * Nothing here writes a layer status or a preference: the ribbon follows
  * the perimeter layer and never the other way round.
  */
-function reconcilePerimeterRibbon(map: maplibregl.Map): void {
+function reconcilePerimeterRibbon(
+  map: maplibregl.Map,
+  supersede = true
+): void {
   if (!active || !ribbonModule) return;
   const ribbon = ribbonModule;
   const perimetersOn = registry.getActiveKeys().has(PERIMETER_LAYER_KEY);
-  if (ribbonOn && !perimetersOn) {
+  if (!perimetersOn) {
+    if (!ribbonOn) return;
     ribbon.deactivatePerimeterRibbon(map);
     ribbonOn = false;
-    publishStatus('active', null);
+    republishActive();
     return;
   }
-  if (ribbonOn || !perimetersOn) return;
-  const myGeneration = generation;
-  void ribbon
-    .activatePerimeterRibbon(map)
-    .then((on) => {
-      // A teardown or a newer activation while the read was in flight owns
-      // the scene now; leave its state alone.
-      if (myGeneration !== generation || !active || !on) return;
-      ribbonOn = true;
-      publishStatus('active', null);
-    })
-    .catch((err: unknown) => {
-      console.warn(
-        '[fire3d] the perimeter ribbon failed to re-activate; the flat perimeter stays.',
-        err
-      );
-    });
+  // A change that does not concern the perimeters (supersede false) leaves
+  // a standing ribbon alone; a perimeter status change re-reads it, so the
+  // ribbon that stands is the one over the perimeters the layer holds now.
+  if (!supersede && ribbonOn) return;
+  const was = ribbonOn;
+  readRibbon(map, ribbon);
+  if (ribbonOn !== was) republishActive();
 }
 
 /**
@@ -632,21 +1240,23 @@ export function initFire3DController(map: maplibregl.Map): void {
   controllerWired = true;
 
   const evaluate = (): void => {
+    const shell = presentingShell();
     const should = shouldFire3DBeActive({
       preference: getFire3DPreference(),
-      desktopViewport: desktopViewport(),
+      desktopViewport: shell !== null,
       committedCluster: getCommittedSnapshot().cluster,
       activeLayerKeys: registry.getActiveKeys(),
       currentlyActive: active || activation !== null,
       webgl2: hasWebGl2(),
-      ...viewportHeightInput()
+      studioHold: isPlaceDisplayHeld(),
+      ...viewportHeightInput(shell)
     });
     if (should) {
       if (!active && activation === null) {
         void activateScene(map);
       } else {
         reconcileSmokeVolume(map);
-        reconcilePerimeterRibbon(map);
+        reconcilePerimeterRibbon(map, false);
       }
     } else if (active || activation !== null) {
       setFire3DActive(map, false);
@@ -670,9 +1280,11 @@ export function initFire3DController(map: maplibregl.Map): void {
   onCommittedSnapshotChange(evaluate);
   registry.on('change', evaluate);
   // The perimeter layer's DATA lands after its registry membership does, so
-  // the ribbon needs the status seam as well as the change seam (DR-064).
+  // the ribbon needs the status seam as well as the change seam (DR-064);
+  // the smoke source is added only after its fetch, so the volume does too.
   registry.on('status-change', (key) => {
     if (key === PERIMETER_LAYER_KEY) reconcilePerimeterRibbon(map);
+    else if (key === 'hms-smoke') reconcileSmokeVolume(map);
   });
   if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
     window.matchMedia(FIRE3D_MIN_WIDTH_QUERY).addEventListener('change', evaluate);
@@ -681,6 +1293,38 @@ export function initFire3DController(map: maplibregl.Map): void {
     window
       .matchMedia(FIRE3D_MIN_HEIGHT_QUERY)
       .addEventListener('change', evaluate);
+    // Which shell presents the scene turns on the console's width, and the
+    // phone shell has a floor of its own (`presentingShell`).
+    window.matchMedia(FIRE3D_CONSOLE_WIDTH_QUERY).addEventListener('change', evaluate);
+    window.matchMedia(FIRE3D_PHONE_MIN_HEIGHT_QUERY).addEventListener('change', evaluate);
   }
+  // The phone shell presents the scene only while its 3D chrome is mounted,
+  // and that is a fact of the document, not of a media query: the chrome
+  // arrives in its own lazy chunk and leaves when the phone shell does.
+  const appShell =
+    typeof document !== 'undefined' && typeof document.getElementById === 'function'
+      ? document.getElementById('app')
+      : null;
+  if (appShell && typeof MutationObserver === 'function') {
+    new MutationObserver(evaluate).observe(appShell, {
+      attributes: true,
+      attributeFilter: [FIRE3D_PHONE_CHROME_ATTRIBUTE]
+    });
+  }
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('ddm:whp-shade', (event) => {
+      const mounted = (event as CustomEvent<{ mounted?: boolean }>).detail?.mounted;
+      if (mounted === undefined || mounted === whpDrapeMounted) return;
+      whpDrapeMounted = mounted;
+      syncEmbedNote(status.state === 'active');
+    });
+  }
+  // DR-105: no satellite imagery while the scene is opening or open. Synced
+  // once after the first evaluation too, which releases a boot hold
+  // (src/ui/sidebar.ts) when the scene does not open.
+  const syncSatelliteHold = (): void =>
+    holdSatellite(map, status.state === 'checking' || status.state === 'active');
+  onFire3DStatusChange(syncSatelliteHold);
   evaluate();
+  syncSatelliteHold();
 }

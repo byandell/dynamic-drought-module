@@ -1,6 +1,77 @@
 import type * as maplibregl from 'maplibre-gl';
 
+import { HAZARD_CLUSTERS, HEAT_FIRE_ALERTS } from './clusters';
+import type { ProductKey } from './products';
+import { getSelectedHazard } from '../state/cluster-service';
 import type { LayerRole } from '../types/layer';
+import { createChunkLoader } from '../util/chunk-retry';
+
+/**
+ * What one activation attempt hands a layer module (DDM-P1-T02). The layer
+ * controller creates one per attempt and aborts it on deactivate, on a
+ * superseding activate of the same key, and when the attempt stands down;
+ * `generation` is the key's intent generation the attempt was born under, so
+ * a module can tell a response from a superseded attempt apart from its own
+ * even after the boolean intent has aliased back to on.
+ */
+export interface LayerActivation {
+  readonly signal: AbortSignal;
+  readonly generation: number;
+}
+
+/**
+ * The layer-key authority (DDM-P1-T05 microtask 1): every key `LAYER_DEFS`
+ * defines, including the one `DROUGHT_CONDITIONS_DEF` contributes, in the
+ * order `LAYER_DEFS` produces them. This is a VALUE list, not a type
+ * derived from the `LAYER_DEFS` array literal, because `DROUGHT_CONDITIONS_DEF`
+ * is spliced into that array by reference rather than written inline (see
+ * below), so a type derived from the array's own shape could not see its
+ * key. `LayerDef.key` and `LayerDef.coActivateWith` are typed from this
+ * list, so a typo in either place fails `tsc`. `tests/config-key-authority.spec.ts`
+ * is what keeps this list in step with `LAYER_DEFS`: it asserts the two
+ * hold exactly the same set, so an entry added to one and not the other
+ * fails the test rather than drifting silently.
+ */
+export const LAYER_KEYS = Object.freeze([
+  'hydrography',
+  'forests',
+  'railroads',
+  'dams',
+  'public-lands',
+  'ecoregions',
+  'hillshade',
+  'drought',
+  'gridded-index',
+  'usdm',
+  'cdm-drought',
+  'nadm-drought',
+  'aiannh',
+  'tribal',
+  'treaty',
+  'bia-reservations',
+  'states',
+  'places',
+  'power-infrastructure',
+  'nifc-fires',
+  'nws-alerts',
+  'hms-smoke',
+  'heatrisk',
+  'spc-fire-weather',
+  'usfs-whp',
+  'usfs-whp-classes',
+  'sst-anomaly',
+  'tropical-cyclones',
+  'cpc-seasonal-precip',
+  'cpc-seasonal-temp',
+  'cpc-610-precip',
+  'cpc-610-temp',
+  'cpc-814-precip',
+  'cpc-814-temp',
+  'telemetry'
+] as const);
+
+/** The union of every valid layer key, derived from `LAYER_KEYS`. */
+export type LayerKey = (typeof LAYER_KEYS)[number];
 
 /**
  * Layer module contract: every layer file under `src/layers/` exports
@@ -9,7 +80,17 @@ import type { LayerRole } from '../types/layer';
  * the sidebar (M8) consumes when building the toggle list.
  */
 export interface LayerModule {
-  activate(map: maplibregl.Map): Promise<void>;
+  /**
+   * `activation` is the controller-owned cancellation seam (DDM-P1-T02,
+   * 2026-09-08): one signal per activation attempt, aborted the moment off
+   * intent is recorded, when a newer activate of the same key supersedes
+   * this one, and on any stand-down. A module with network work links its
+   * own controllers to it and drops a response whose `generation` is no
+   * longer the module's current one. Optional: a module that fetches
+   * nothing ignores it, and every module keeps working when called without
+   * it (a direct call in a spec, say).
+   */
+  activate(map: maplibregl.Map, activation?: LayerActivation): Promise<void>;
   deactivate(map: maplibregl.Map): void;
   bindPopups?(map: maplibregl.Map): void;
   /**
@@ -57,9 +138,17 @@ export interface LayerModule {
  * cluster tables remain eager by design, because first paint reads them.
  */
 export interface LayerDef {
-  readonly key: string;
+  readonly key: LayerKey;
   readonly name: string;
   readonly source: string;
+  /**
+   * The catalog product this layer visualizes (DDM-P14-T05 microtask 1: the
+   * one product catalog linking each source to its adapter, surfaces and
+   * claims). Type-only import from `./products`, so the catalog stays out of
+   * this eager entry-chunk file (see `PRODUCTS` in `src/config/products.ts`
+   * and `scripts/check-activation-budget.mjs`).
+   */
+  readonly product: ProductKey;
   /** Optional discoverability terms that do not alter the source-honest
    * visible layer name. Used when a familiar hazard term is broader or
    * narrower than the mapped product's formal label. */
@@ -90,11 +179,15 @@ export interface LayerDef {
    * afterward). Applied ONLY on the user-toggle path (`activate`), never on the
    * URL / deep-link restore path (`applyLayerSet`), so a shared link stays
    * authoritative about exactly which layers were on. Cascades one level: a
-   * co-activated partner does not re-trigger co-activation. Used by the
-   * wildfire event pair (Current Mapped Fire Perimeters + Smoke Plumes,
-   * D-0.7.0-018).
+   * co-activated partner does not re-trigger co-activation. No layer declares
+   * partners today: the wildfire event pair (Current Mapped Fire Perimeters +
+   * Smoke Plumes) co-activated under D-0.7.0-018 until the owner's ruling of
+   * 2026-09-28 (found-007) made the two checkboxes independent, each turning
+   * on or off exactly its own layer. The Wildfire mode still shows both
+   * because its recipes and preset name both. The mechanism stays as a typed,
+   * tested no-op.
    */
-  readonly coActivateWith?: readonly string[];
+  readonly coActivateWith?: readonly LayerKey[];
   /**
    * Hidden from every default UI surface (no catalog row, no search result)
    * while OFF; the row appears only when the layer is on (a `?layers=` deep
@@ -124,8 +217,8 @@ export interface LayerDef {
  * are default-off AND ui-hidden: they are only
  * meaningful once a deployer populates them with their own authorized
  * data. Hydrography is
- * intentionally off by default; the live Overpass query is slow and
- * fragile, so leading the bare URL with it produced a flaky first paint.
+ * off by default: it repeats the base map's own rivers and lakes in a
+ * brighter blue, for a reader who wants water to lead.
  */
 /**
  * The honest zero-state wording for LIVE viewport-queried layers: the agency
@@ -135,6 +228,19 @@ export interface LayerDef {
  * the Unit C note on `LayerDef.noDataLabel`).
  */
 export const LIVE_NO_FEATURES_LABEL = 'no features returned for this view';
+
+/**
+ * The Province of British Columbia basin drought-level edition is HELD by
+ * DR-160 (2026-09-28) until the Province's written permission or the
+ * owner's re-ruling: its terms say "you may not reproduce or distribute
+ * them without the prior written permission of the Province". While this
+ * is true, no code path may select, present, or fetch that edition; British
+ * Columbia shows the US Drought Monitor like any other region. This is a
+ * plain text constant so `scripts/check-activation-budget.mjs` can read its
+ * value with a text match instead of importing TypeScript, keeping the two
+ * checks from disagreeing.
+ */
+export const BC_BASIN_EDITION_HELD = true;
 
 export interface DroughtSurfacePresentation {
   readonly edition: 'usdm' | 'bc-basin';
@@ -173,6 +279,7 @@ export function getDroughtSurfacePresentation(): DroughtSurfacePresentation {
 
 const DROUGHT_CONDITIONS_DEF: LayerDef = {
   key: 'usdm',
+  product: 'usdm',
   get name() {
     return droughtSurfacePresentation.name;
   },
@@ -186,8 +293,16 @@ const DROUGHT_CONDITIONS_DEF: LayerDef = {
 };
 
 export const LAYER_DEFS: readonly LayerDef[] = [
-  { key: 'hydrography', name: 'Hydrography', source: 'OpenStreetMap (Overpass)', role: 'reference', defaultOn: false, load: () => import('../layers/hydrography') },
-  { key: 'ecoregions', name: 'Ecoregions (Level III/IV)', source: 'EPA Omernik · PMTiles', role: 'reference', defaultOn: false, load: () => import('../layers/ecoregions') },
+  { key: 'hydrography', product: 'hydrography', name: 'Hydrography', source: 'USGS · Natural Resources Canada · Natural Earth · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/hydrography') },
+  { key: 'forests', product: 'forests', name: 'National Forests', source: 'USDA Forest Service · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/forests') },
+  { key: 'railroads', product: 'railroads', name: 'Railroads', source: 'US Census · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/railroads') },
+  { key: 'dams', product: 'dams', name: 'Dams', source: 'US Army Corps of Engineers · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/dams') },
+  { key: 'public-lands', product: 'public-lands', name: 'Public Lands', source: 'USGS PAD-US · live from zoom 10', role: 'reference', defaultOn: false, load: () => import('../layers/public-lands') },
+  // Audit 10: the bundled archive covers only the Pacific Northwest (its
+  // PMTiles header bounds [-125, 41.5, -110.5, 49.5]) and the layer reads
+  // `live` at any viewport, so the coverage tail rides the source line the
+  // way hillshade's does below. DRAFT wording (DR-177).
+  { key: 'ecoregions', product: 'ecoregions', name: 'Ecoregions (Level III/IV)', source: 'EPA Omernik · PMTiles · Pacific Northwest bundle only', role: 'reference', defaultOn: false, load: () => import('../layers/ecoregions') },
   // Default-on since E1 (D-0.7.0-043 part 3): terrain shading joins the
   // calm default composition so the E1 paint tuning accounts for it from
   // the start; it renders inside the bottom stack, below every data layer.
@@ -196,56 +311,80 @@ export const LAYER_DEFS: readonly LayerDef[] = [
   // src/config/urls.ts on the hillshade entry), but the layer is default-on at
   // every viewport, so a user in Alaska, Hawaii, or the Southeast saw a
   // `live` pill over an empty basemap with nothing saying why. The coverage
-  // qualification rides the source line, mirroring FIRE3D_COVERAGE_NOTE
-  // ("Terrain relief covers the Pacific Northwest data bake; outside it the
-  // ground renders flat."), which the 3D control has always shown.
-  { key: 'hillshade', name: 'Terrain Shading', source: 'USGS 3DEP · PMTiles · Pacific Northwest bake only', role: 'reference', defaultOn: true, load: () => import('../layers/hillshade') },
-  { key: 'drought', name: 'Drought Outlook (CPC)', source: 'NOAA CPC · Monthly & Seasonal', role: 'surface', defaultOn: false, load: () => import('../layers/drought') },
-  { key: 'gridded-index', name: 'Gridded Drought Index (SPI)', source: 'NOAA NIDIS · raster tiles', role: 'surface', defaultOn: false, load: () => import('../layers/gridded-index') },
+  // qualification rides the source line, mirroring HILLSHADE_COVERAGE_SENTENCE
+  // (src/config/terrain-coverage.ts: the USGS 3DEP issuer, the archive's
+  // own bounding box, and its zoom-8 detail limit), which the map key shows.
+  { key: 'hillshade', product: 'hillshade', name: 'Terrain Shading', source: 'USGS 3DEP · PMTiles · Pacific Northwest bake only', role: 'reference', defaultOn: true, load: () => import('../layers/hillshade') },
+  { key: 'drought', product: 'drought', name: 'Drought Outlook (CPC)', source: 'NOAA CPC · Monthly & Seasonal', role: 'surface', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/drought') },
+  // The NIDIS gridded index carries its coverage limit on the source line, the
+  // same way `hillshade` above does: drought.gov gives the ACIS "Grid 1"
+  // dataset's Data Coverage as "Contiguous U.S.", and every wired SPI window
+  // publishes `bbox: -128.8,24.4,-66.0,50.3` in its own `info.json`
+  // (re-verified 2026-09-03). Alaska, Hawaii, Puerto Rico and the Pacific
+  // territories are outside it, and a row that said only "raster tiles" left
+  // that for the user to discover as an empty map.
+  { key: 'gridded-index', product: 'gridded-index', name: 'Gridded Drought Index (SPI)', source: 'NOAA NIDIS · raster tiles · contiguous United States only', role: 'surface', defaultOn: false, load: () => import('../layers/gridded-index') },
   // noDataLabel on the live agency layers below (usdm, wildfire pair, NWS
   // alerts, SPC, bia-reservations): a zero-feature live response is a real,
   // good answer ("no smoke drawn in the query window"), never an "empty placeholder"; the
   // placeholder wording stays only on the bundled deployer slots (tribal,
   // treaty). Unit C of the umbrella build + the Codex Unit C pass.
   DROUGHT_CONDITIONS_DEF,
-  { key: 'cdm-drought', name: 'Canadian Drought Monitor', source: 'Agriculture and Agri-Food Canada · committed monthly snapshot', role: 'surface', defaultOn: false, load: () => import('../layers/cdm-drought') },
-  { key: 'nadm-drought', name: 'North American Drought Monitor', source: 'Tri-national consensus · NCEI direct GeoJSON', role: 'surface', defaultOn: true, noDataLabel: 'no continental polygons returned by the active source', load: () => import('../layers/nadm-drought') },
+  { key: 'cdm-drought', product: 'cdm-drought', name: 'Canadian Drought Monitor', source: 'Agriculture and Agri-Food Canada · committed monthly snapshot', role: 'surface', defaultOn: false, load: () => import('../layers/cdm-drought') },
+  { key: 'nadm-drought', product: 'nadm-drought', name: 'North American Drought Monitor', source: 'Tri-national consensus · NCEI direct GeoJSON', role: 'surface', defaultOn: true, noDataLabel: 'no continental polygons returned by the active source', load: () => import('../layers/nadm-drought') },
   // The Tribal Nations members (D-0.7.0-032/033, narrowed by D-0.7.0-038):
   // the two live present-day layers are default-on (Tribal Nations MUST
   // display); the two bundled deployer slots are default-off, ui-hidden, and
   // labeled so "your own data" is unmistakable. The deployer keys (`tribal`,
   // `treaty`) are shipped public identifiers and keep their meaning (URL
   // policy rule 4); only display names and visibility changed.
-  { key: 'aiannh', name: 'Tribal Lands', source: 'US Census · AIANNH (live)', role: 'reference', defaultOn: true, noDataLabel: 'no features returned for this view (Census-defined Tribal areas only)', load: () => import('../layers/aiannh') },
-  { key: 'tribal', name: 'Tribal Lands (your own data)', source: 'deployer · bundled GeoJSON', role: 'reference', defaultOn: false, uiHidden: true, load: () => import('../layers/tribal') },
-  { key: 'treaty', name: 'Treaty Areas (your own data)', source: 'deployer · bundled GeoJSON', role: 'reference', defaultOn: false, uiHidden: true, load: () => import('../layers/treaty') },
+  { key: 'aiannh', product: 'aiannh', name: 'Tribal Lands', source: 'US Census · AIANNH (live)', role: 'reference', defaultOn: true, noDataLabel: 'no features returned for this view (Census-defined Tribal areas only)', load: () => import('../layers/aiannh') },
+  { key: 'tribal', product: 'tribal', name: 'Tribal Lands (your own data)', source: 'deployer · bundled GeoJSON', role: 'reference', defaultOn: false, uiHidden: true, load: () => import('../layers/tribal') },
+  { key: 'treaty', product: 'treaty', name: 'Treaty Areas (your own data)', source: 'deployer · bundled GeoJSON', role: 'reference', defaultOn: false, uiHidden: true, load: () => import('../layers/treaty') },
   // The BIA label carries the design-required coverage caveat: AIAN-LAR
   // returning nothing here is a statement about the DATASET's coverage (it
   // omits most Oklahoma Tribal Statistical Areas and landless Tribal
   // Nations), never a verified absence of Tribal presence.
-  { key: 'bia-reservations', name: 'Reservation Boundaries', source: 'BIA · AIAN-LAR (live)', role: 'reference', defaultOn: true, noDataLabel: 'no features returned for this view (AIAN-LAR does not cover every Tribal Nation)', load: () => import('../layers/bia-reservations') },
-  { key: 'states', name: 'State Boundaries', source: 'US Census · bundled GeoJSON', role: 'reference', defaultOn: true, load: () => import('../layers/states') },
-  { key: 'places', name: 'City & Town Labels', source: 'Natural Earth · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/places') },
+  { key: 'bia-reservations', product: 'bia-reservations', name: 'Reservation Boundaries', source: 'BIA · AIAN-LAR (live)', role: 'reference', defaultOn: true, noDataLabel: 'no features returned for this view (AIAN-LAR does not cover every Tribal Nation)', load: () => import('../layers/bia-reservations') },
+  { key: 'states', product: 'states', name: 'State Boundaries', source: 'US Census · bundled GeoJSON', role: 'reference', defaultOn: true, load: () => import('../layers/states') },
+  { key: 'places', product: 'places', name: 'City & Town Labels', source: 'Natural Earth · bundled', role: 'reference', defaultOn: false, load: () => import('../layers/places') },
   // Power infrastructure became a catalog row 2026-08-19 (owner direction).
   // It shipped as a companion of the 3D Fire scene, which meant it was
   // always on there and unreachable everywhere else; one toggle now governs
   // it in every view, off by default, drawn from zoom 6. The name states
   // BOTH surfaces because they have different vintages and different
   // failure modes, and either can be live without the other.
-  { key: 'power-infrastructure', name: 'Power Lines & Plants', source: 'HIFLD archive (2024-09-30) · EIA (live)', searchTerms: ['transmission', 'electric', 'grid', 'power plant', 'utility'], role: 'reference', defaultOn: false, load: () => import('../layers/power-3d') },
-  { key: 'nifc-fires', name: 'Current Mapped Fire Perimeters (NIFC)', source: 'NIFC WFIGS · FeatureServer', searchTerms: ['wildfire', 'Prescribed fire', 'fire perimeter'], role: 'event', defaultOn: false, coActivateWith: ['hms-smoke'], noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/nifc-fires') },
-  // vocab-allow: names the NWS alert products layer, upstream data
-  { key: 'nws-alerts', name: 'Heat & Fire Weather Alerts', source: 'NOAA NWS · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/nws-alerts') },
-  { key: 'hms-smoke', name: 'Smoke Plumes (HMS)', source: 'NOAA OSPO · FeatureServer', role: 'event', defaultOn: false, coActivateWith: ['nifc-fires'], noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/hms-smoke') },
-  { key: 'heatrisk', name: 'HeatRisk (Experimental)', source: 'NOAA NWS/WPC · ImageServer', role: 'surface', defaultOn: false, load: () => import('../layers/heatrisk') },
-  { key: 'spc-fire-weather', name: 'Fire Weather Outlook (Day 1)', source: 'NOAA SPC · MapServer', role: 'surface', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/spc-fire-weather') },
-  { key: 'usfs-whp', name: 'Wildfire Hazard Potential', source: 'USFS · GeoPlatform', role: 'surface', defaultOn: false, load: () => import('../layers/usfs-whp') },
-  { key: 'sst-anomaly', name: 'Ocean Temperature Anomaly', source: 'NASA GIBS · GHRSST MUR', role: 'surface', defaultOn: false, load: () => import('../layers/sst-anomaly') },
+  { key: 'power-infrastructure', product: 'power-infrastructure', name: 'Power Lines & Plants', source: 'HIFLD archive (2024-09-30) · EIA (live)', searchTerms: ['transmission', 'electric', 'grid', 'power plant', 'utility'], role: 'reference', defaultOn: false, load: () => import('../layers/power-3d') },
+  { key: 'nifc-fires', product: 'nifc-fires', name: 'Current Mapped Fire Perimeters (NIFC)', source: 'NIFC WFIGS · FeatureServer', searchTerms: ['wildfire', 'Prescribed fire', 'fire perimeter'], role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/nifc-fires') },
+  // Named by the committed mode, beside the products it reads (HazardClusterDef.alerts).
+  { key: 'nws-alerts', product: 'nws-alerts', get name() { return (HAZARD_CLUSTERS[getSelectedHazard()].alerts ?? HEAT_FIRE_ALERTS).name; }, source: 'NOAA NWS · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/nws-alerts') },
+  { key: 'hms-smoke', product: 'hms-smoke', name: 'Smoke Plumes (HMS)', source: 'NOAA OSPO · FeatureServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/hms-smoke') },
+  // HeatRisk reaches no-data only from its coverage check (src/layers/heatrisk.ts), never an empty answer.
+  { key: 'heatrisk', product: 'heatrisk', name: 'HeatRisk (Experimental)', source: 'NOAA NWS/WPC · ImageServer', role: 'surface', defaultOn: false, noDataLabel: 'no data for this view', load: () => import('../layers/heatrisk') },
+  { key: 'spc-fire-weather', product: 'spc-fire-weather', name: 'Fire Weather Outlook (Day 1)', source: 'NOAA SPC · MapServer', role: 'surface', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/spc-fire-weather') },
+  { key: 'usfs-whp', product: 'usfs-whp', name: 'Wildfire Hazard Potential', source: 'USFS · GeoPlatform', role: 'surface', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/usfs-whp') },
+  { key: 'usfs-whp-classes', product: 'usfs-whp', name: 'Wildfire Hazard Potential (USFS colors)', source: 'USFS · GeoPlatform', role: 'surface', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/usfs-whp-classes') },
+  { key: 'sst-anomaly', product: 'sst-anomaly', name: 'Ocean Temperature Anomaly', source: 'NASA GIBS · GHRSST MUR', role: 'surface', defaultOn: false, load: () => import('../layers/sst-anomaly') },
+  // ENSO block B3: on in the ENSO mode's recipe only. Its coverage is the
+  // issuer's three basins, so its zero state names them, never "this view".
+  { key: 'tropical-cyclones', product: 'tropical-cyclones', name: 'Active Tropical Cyclones', source: 'NOAA NHC and CPHC · MapServer', searchTerms: ['hurricane', 'tropical storm', 'cyclone', 'NHC', 'CPHC'], role: 'event', defaultOn: false, noDataLabel: 'no active tropical cyclones in the Atlantic, Eastern North Pacific or Central North Pacific', load: () => import('../layers/tropical-cyclones') },
+  // The CPC seasonal outlooks (Lead 1), named as the issuer's services name
+  // them. Overlays, not surfaces: ENSO's Season ahead draws precipitation
+  // over the sea-surface-temperature surface, and the two outlooks may be on
+  // together, each with its own key and none merged.
+  { key: 'cpc-seasonal-precip', product: 'cpc-seasonal-precip', name: 'Seasonal Precipitation Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-seasonal-precip') },
+  { key: 'cpc-seasonal-temp', product: 'cpcSeasonalTemp', name: 'Seasonal Temperature Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-seasonal-temp') },
+  // The CPC 6-10 and 8-14 day outlooks, the same kind of overlay: ENSO's
+  // Weeks ahead draws the 8-14 day precipitation outlook, the others on request.
+  { key: 'cpc-610-precip', product: 'cpc-610-precip', name: '6-10 Day Precipitation Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-610-precip') },
+  { key: 'cpc-610-temp', product: 'cpc-610-temp', name: '6-10 Day Temperature Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-610-temp') },
+  { key: 'cpc-814-precip', product: 'cpc-814-precip', name: '8-14 Day Precipitation Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-814-precip') },
+  { key: 'cpc-814-temp', product: 'cpc-814-temp', name: '8-14 Day Temperature Outlook', source: 'NOAA CPC · MapServer', role: 'event', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/cpc-814-temp') },
   // Monitoring stations left the default-on set 2026-07-09 (D-0.7.0-018
   // item 1, strengthening the D-0.7.0-007 zoom threshold): at region zoom
   // the layer could only say "zoom in to load", so opening with it on
   // bought noise, not signal.
-  { key: 'telemetry', name: 'Monitoring stations', source: 'USGS · USBR · NRCS · USACE', role: 'stations', defaultOn: false, load: () => import('../layers/telemetry') }
+  { key: 'telemetry', product: 'telemetry', name: 'Monitoring stations', source: 'USGS · USBR · NRCS · USACE', role: 'stations', defaultOn: false, noDataLabel: LIVE_NO_FEATURES_LABEL, load: () => import('../layers/telemetry') }
 ];
 
 /**
@@ -334,13 +473,42 @@ const moduleCache = new Map<string, LayerModule>();
  */
 const moduleInFlight = new Map<string, Promise<LayerModule>>();
 
+/**
+ * Per-key chunk loaders (found-087, DDM-P1-T10). A failed dynamic `import()`
+ * is cached by the engine per URL, so a bare `def.load()` replayed after a
+ * rejection (once `moduleInFlight` has cleared it) rejects again with no new
+ * network request: a layer whose chunk failed once could never load again
+ * this session. Each key gets one `createChunkLoader` wrapper
+ * (`src/util/chunk-retry.ts`), created lazily on that key's first call and
+ * reused for every later one, so a LATER explicit request (a re-check, a
+ * hazard press, a studio restore) imports the chunk under a fresh
+ * `retry=<n>` URL instead of replaying the same cached rejection. `base` is
+ * this module's own `import.meta.url`, exactly how `sidebar.ts`'s
+ * `loadIsland`/`loadLayersStudioChunk` and `view-shell.ts`'s
+ * `loadPlaceStudioChunk` pass their own file's `import.meta.url`: every
+ * `def.load` here is written inline in `LAYER_DEFS`, in this same file, so
+ * this file's own URL is the correct base to resolve each `load`'s relative
+ * specifier against, the same relationship those three call sites rely on
+ * for their own inline importers.
+ */
+const chunkLoaders = new Map<string, () => Promise<LayerModule>>();
+
+function getChunkLoader(def: LayerDef): () => Promise<LayerModule> {
+  let loader = chunkLoaders.get(def.key);
+  if (!loader) {
+    loader = createChunkLoader(def.load, import.meta.url);
+    chunkLoaders.set(def.key, loader);
+  }
+  return loader;
+}
+
 /** Load (and cache) a layer's module, fetching its chunk on first call. */
 export function loadLayerModule(def: LayerDef): Promise<LayerModule> {
   const cached = moduleCache.get(def.key);
   if (cached) return Promise.resolve(cached);
   let pending = moduleInFlight.get(def.key);
   if (!pending) {
-    pending = def.load().then(
+    pending = getChunkLoader(def)().then(
       (mod) => {
         moduleCache.set(def.key, mod);
         moduleInFlight.delete(def.key);

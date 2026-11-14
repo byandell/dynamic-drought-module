@@ -9,12 +9,17 @@
  */
 
 import { execSync } from 'node:child_process';
-import { expect, type BrowserContext, type Page, type Locator } from '@playwright/test';
+import { readFileSync } from 'node:fs';
+import { crc32, deflateSync } from 'node:zlib';
+import { expect, type BrowserContext, type Page, type Locator, type Route } from '@playwright/test';
 import { stubRecentSatellite } from './satellite-fixture';
 import { installMinimapAnalysisStubs } from './minimap-fixtures';
 import { installBoundaryStubs, type BoundaryStubMode } from './tribal-fixtures';
-
-const nadmStubbedPages = new WeakSet<Page>();
+import { installDefaultNifcStub, type NifcStubMode } from './wildfire-fixtures';
+import { installDefaultNwsWwaStub, type NwsWwaStubMode } from './nws-wwa-fixtures';
+import { installDefaultTropicalStub, type TropicalStubMode } from './tropical-fixtures';
+import { untilAnswered } from './answered-read';
+import { cpcExtendedPolygons, cpcSeasonalPolygons } from './cpc-seasonal-polygon-fixtures.mjs';
 
 const TEST_NADM_SNAPSHOT = {
   type: 'FeatureCollection',
@@ -30,16 +35,47 @@ const TEST_NADM_SNAPSHOT = {
   ]
 } as const;
 
-async function stubDefaultNadm(page: Page): Promise<void> {
-  if (nadmStubbedPages.has(page)) return;
-  nadmStubbedPages.add(page);
-  await page.route('**/NADM-current.geojson', (route) =>
-    route.fulfill({
+/** How a boot answers the North American Drought Monitor's continental snapshot query. */
+export type NadmStubMode = 'fixture' | 'live';
+
+interface NadmStubState {
+  mode: NadmStubMode;
+}
+
+const nadmStubStates = new WeakMap<BrowserContext, NadmStubState>();
+
+/**
+ * Route `NADM-current.geojson` on the browser CONTEXT (DDM-P1-T09 step 2
+ * part d), for the same two reasons `installBoundaryStubs` and
+ * `installMinimapAnalysisStubs` already do: a context handler covers a Page
+ * this suite never routed by hand, and Playwright checks Page routes before
+ * Context routes, so a spec that registers its own `page.route` for this
+ * pattern (a custom body, a delay, a held request, a failure status) wins
+ * over this backstop whatever order the two were registered in. `fixture`
+ * is fail-closed: it answers the same deterministic single-feature snapshot
+ * every routine boot claims. `live` installs a pass-through context route
+ * (the handler calls `route.fallback()`), the explicit opt-out for a spec,
+ * or the daily source-health probe (which boots outside
+ * this helper entirely and never reaches this function), that wants the
+ * unstubbed request to reach whatever it or a page-level route provides.
+ */
+async function installDefaultNadmStub(page: Page, mode: NadmStubMode): Promise<void> {
+  const context = page.context();
+  const existing = nadmStubStates.get(context);
+  if (existing) {
+    existing.mode = mode;
+    return;
+  }
+  const state: NadmStubState = { mode };
+  nadmStubStates.set(context, state);
+  await context.route('**/NADM-current.geojson', (route) => {
+    if (state.mode === 'live') return route.fallback();
+    return route.fulfill({
       status: 200,
       contentType: 'application/geo+json',
       body: JSON.stringify(TEST_NADM_SNAPSHOT)
-    })
-  );
+    });
+  });
 }
 
 const coveredContexts = new WeakSet<BrowserContext>();
@@ -47,17 +83,20 @@ const coveredContexts = new WeakSet<BrowserContext>();
 /**
  * Carry the PAGE-level stubs onto any Page this context opens later.
  *
- * The two stubs that matter most for a retained artifact, the sovereign
- * boundaries and the minimap's continental analysis inputs, are registered on
- * the CONTEXT, so a popup or a `context.newPage()` inherits them with no help
- * from here. The satellite and NADM stubs are still page-level, and a Page
- * this helper never navigated would reach those services live. Nothing in
- * this suite opens a second Page today (`tests/boundary-boot-inventory.test.mjs`
- * fails the gate on the first `newPage(` or popup wait that is not recorded),
- * so this hook is defense in depth for the day one appears: it closes the
- * page-level half of the same hole context routing already closed.
+ * The four stubs that matter most for a retained artifact, the sovereign
+ * boundaries, the minimap's continental analysis inputs, the NADM
+ * continental snapshot (DDM-P1-T09 step 2 part d), and the NIFC WFIGS
+ * current perimeters (J12, `installDefaultNifcStub` in
+ * `tests/wildfire-fixtures.ts`), are registered on the
+ * CONTEXT, so a popup or a `context.newPage()` inherits them with no help
+ * from here. The satellite stub is still page-level, and a Page this helper
+ * never navigated would reach that service live. Nothing in this suite opens
+ * a second Page today (`tests/boundary-boot-inventory.test.mjs` fails the
+ * gate on the first `newPage(` or popup wait that is not recorded), so this
+ * hook is defense in depth for the day one appears: it closes the page-level
+ * half of the same hole context routing already closed.
  */
-function coverFuturePages(page: Page): void {
+export function coverFuturePages(page: Page): void {
   const context = page.context();
   if (coveredContexts.has(context)) return;
   coveredContexts.add(context);
@@ -66,7 +105,6 @@ function coverFuturePages(page: Page): void {
     // the test that opened it, because the guarantee that matters is already
     // held by the context-level routes above.
     void stubRecentSatellite(opened).catch(() => undefined);
-    void stubDefaultNadm(opened).catch(() => undefined);
   });
 }
 
@@ -80,7 +118,7 @@ export const PILL = {
   live: 'live',
   degraded: 'live (partial)',
   unavailable: 'unavailable',
-  noData: 'no data (see data/README.md)',
+  noData: 'no data',
   zoomIn: 'zoom in to load'
 } as const;
 
@@ -102,15 +140,6 @@ export const ROLE_GROUPS: ReadonlyArray<{ title: string; hint: string | null }> 
   { title: 'Place', hint: 'boundaries & rivers' },
   { title: 'Events', hint: null },
   { title: 'Stations', hint: null }
-];
-
-/** Preset chip labels in order, mirroring `VIEW_PRESETS` in `src/config/presets.ts`. */
-export const PRESET_LABELS: readonly string[] = [
-  'Right now',
-  'This week',
-  'Season ahead',
-  'Fire risk',
-  'Whose land'
 ];
 
 /** Default-on layer keys, mirroring `defaultOn: true` rows in `LAYER_DEFS`.
@@ -136,6 +165,7 @@ export const SURFACE_KEYS = [
   'heatrisk',
   'spc-fire-weather',
   'usfs-whp',
+  'usfs-whp-classes',
   'sst-anomaly'
 ] as const;
 
@@ -179,10 +209,10 @@ export function stationValues(page: Page, id: string): Locator {
 
 /**
  * Navigate to the app (optionally with a query string like
- * `?region=central_oregon&layers=usdm,tribal`) and wait for boot to finish.
+ * `?region=washington_state&layers=usdm,tribal`) and wait for boot to finish.
  *
  * Boot completes only after the map fires `load`, at which point `buildSidebar`
- * synchronously renders the preset chips and the region radios. Waiting on
+ * synchronously renders the region options. Waiting on
  * those two DOM facts is a network-independent boot signal: it does not depend
  * on any live agency layer succeeding, only on the map's WebGL context coming
  * up and the sidebar building. `domcontentloaded` (not `load`) avoids blocking
@@ -193,10 +223,16 @@ export function stationValues(page: Page, id: string): Locator {
  * (headroom C1), so waiting on it would hang exactly the boots the embed
  * specs exercise. Every other boot mounts the island, so the strong
  * catalog-present contract is kept for the specs that drive its rows.
- * The brief-embed detection mirrors `deriveViewMode` (src/state/
+ * The brief-embed detection mirrors `deriveViewMode`'s embed clause (src/state/
  * view-mode.ts): embed plus nothing that routes to the console.
  */
 export interface GotoAppOptions {
+  /**
+   * True navigates the query exactly as written, so the app's own view
+   * derivation picks the door. Default false pins a full-site display boot
+   * to `view=console` (see the shortcut in `gotoApp`).
+   */
+  readonly derivedView?: boolean;
   /**
    * How this boot answers the Census AIANNH and BIA AIAN-LAR queries.
    * Defaults to `fixture`, the synthetic bodies in `tests/tribal-fixtures.ts`.
@@ -209,15 +245,224 @@ export interface GotoAppOptions {
    */
   readonly boundaries?: BoundaryStubMode;
   /**
+   * How this boot answers the North American Drought Monitor's continental
+   * snapshot query (DDM-P1-T09 step 2 part d). Defaults to `fixture`, the
+   * deterministic single-feature body in this file (`TEST_NADM_SNAPSHOT`),
+   * claimed unconditionally so every routine boot is offline and
+   * reproducible regardless of what the query string names. `live` is the
+   * explicit opt-out: it installs a pass-through context route, for a
+   * spec that wants the request to reach whatever its own page-level
+   * `page.route` provides (a delay, a failure status, a malformed body) or,
+   * unstubbed entirely, the live agency. A spec that registers its own
+   * `page.route('**\/NADM-current.geojson', ...)` before or after this call
+   * needs neither option: Playwright checks Page routes before Context
+   * routes, so that handler always wins over this backstop
+   * (`tests/tribal-fixtures.ts`'s ordering rule, the same one this stub
+   * now follows).
+   */
+  readonly nadm?: NadmStubMode;
+  /**
+   * How this boot answers the NIFC WFIGS current-perimeters service (J12,
+   * DDM-P10-T13). Defaults to `fixture`: a fail-closed CONTEXT route in
+   * `tests/wildfire-fixtures.ts` (`installDefaultNifcStub`) answers the
+   * perimeter layer's and the briefing's GET queries with `NIFC_STUB`, the
+   * minimap's count POSTs with a successful `{ count: 0 }`, and any other
+   * WFIGS request with a 400, so no boot reaches the live service by
+   * default. The reason is the national default region (60c3a66): an
+   * unrouted Wildfire boot asked for every current perimeter in the
+   * contiguous United States and the boot-idle seam waited on it. `live`
+   * is the explicit opt-out: the context route passes every request
+   * through, to whatever a spec's own earlier context route provides or,
+   * unrouted, the live agency; the mode-switch measurement
+   * (`tests/mode-switch-cost.spec.ts`) uses it because its recorded
+   * baseline measured the live reads. A spec that registers its own
+   * `page.route` for WFIGS (`stubWildfireFeeds`, a held or failed request)
+   * needs neither option: Playwright checks Page routes before Context
+   * routes, so that handler always wins, whatever the order. A page route
+   * that calls `route.fallback()` now falls through to this stub rather
+   * than to the network.
+   */
+  readonly nifc?: NifcStubMode;
+  /**
+   * How this boot answers the NOAA NWS WWA watch/warning/advisory MapServer
+   * (S30D P2-CI). Defaults to `fixture`: a fail-closed CONTEXT route in
+   * `tests/nws-wwa-fixtures.ts` (`installDefaultNwsWwaStub`) answers the NWS
+   * alerts layer's one GET query with a valid EMPTY FeatureCollection, so no
+   * boot waits on NOAA. The reason is `cluster=heat` and `layers=nws-alerts`:
+   * the layer's 15 s budget outlasts `gotoApp`'s 10 s boot-idle wait, so a
+   * slow NOAA answer from a CI runner failed tests/map-drawers.spec.ts.
+   * `live` is the explicit opt-out: the context route passes every request
+   * through, to a context route the spec registered earlier or, unrouted, the
+   * live service. A spec that registers its own `page.route` for the WWA
+   * path (a feature body, a delay, a held or failed request) needs neither
+   * option: Playwright checks Page routes before Context routes, so that
+   * handler always wins, whatever the order. A page route that calls
+   * `route.fallback()` now falls through to this stub rather than to the
+   * network.
+   */
+  readonly nwsWwa?: NwsWwaStubMode;
+  /**
+   * How this boot answers the NOAA NHC and CPHC Tropical Weather MapServer
+   * (ENSO block B3). Defaults to `allEmpty`: a fail-closed CONTEXT route in
+   * `tests/tropical-fixtures.ts` (`installDefaultTropicalStub`) answers every
+   * slot query with a valid empty collection, so an ENSO boot (the layer is in
+   * every ENSO recipe) never reads NOAA. A spec names another fixture arm
+   * (`occupiedOne`, `arcgisError`, ...) here, never its own `page.route` for
+   * the service; `live` passes through.
+   */
+  readonly tropical?: TropicalStubMode;
+  /**
    * Wait for the boot-idle seam (`<html data-ddm-boot="idle">`, DR-052
    * follow-up): the map has loaded, every layer the URL asked for has left
    * `loading`, and no shared transport is in flight. Defaults to true, so
-   * every assertion after `gotoApp` runs against a settled boot rather than
-   * against the preset chips. A spec that deliberately HOLDS a boot open (a
-   * routed request that never answers, a layer it wants to observe mid-load)
-   * passes false and owns its own waits.
+   * every assertion after `gotoApp` runs against a settled boot. A spec that
+   * deliberately HOLDS a boot open (a routed request that never answers, a
+   * layer it wants to observe mid-load) passes false and owns its own waits.
+   *
+   * What `false` means since the map-free sidebar (2026-09-03 launch ruling
+   * section 4): the caller still gets a MAP-READY page, because `gotoApp`
+   * waits unconditionally for `<html data-ddm-controls="ready">`, which
+   * `buildSidebar` stamps after it has built the controller and applied the
+   * synchronous URL state. It does not get a SETTLED page: layers may still
+   * be loading and shared transport may still be in flight, which is the
+   * point of opting out. Before this change the same two guarantees were
+   * carried by one signal, the generated controls, which now appear at DOM ready
+   * and prove neither.
    */
   readonly bootIdle?: boolean;
+  /** Shorter assertion budget for deliberate boot-idle diagnostic failures only.
+   * The normal 10 s ceiling and every application/network budget stay unchanged. */
+  readonly bootIdleBudgetMs?: number;
+  /**
+   * Whether this boot's ENSO flowing paths may run their motion loop
+   * (ENSO-FLOW-PLAN E2-4). ENSO opens with wind on (`flowDefault`), and a
+   * running loop asks MapLibre for a frame every 33 ms, so MapLibre never
+   * fires `idle` and every spec that waits on `'idle'` would hang. Defaults to
+   * `hold`: the page's sessionStorage carries the viewer's stored Pause choice
+   * (`ddm:flow-motion` = `paused`, read by src/layers/flow/motion-loop.ts)
+   * before any script runs, only where the page has no choice of its own. The
+   * paths still load, decode and draw, in their still form: the drawer and the
+   * panel read `live` and `data-flow-drawn` is set, and the map takes no
+   * continuous repaint. `live` is the explicit opt-out for a spec that reads
+   * the moving form (a `data-flow-form` of `moving`, a repaint or step rate, a
+   * Pause toggle from the playing state); that spec owns its own waits and
+   * must not wait on `'idle'`. A spec that stores its own choice, or turns on
+   * `prefers-reduced-motion`, is unaffected by `hold`.
+   */
+  readonly flowMotion?: FlowMotionHold;
+  /**
+   * How this boot stands toward Locate's first-launch offer (owner direction
+   * 2026-11-09 (sprint), DR-pending). A phone-shell boot with no stored
+   * launch preference, no `select=` and no studio puts an offer card over
+   * the lower map (src/ui/locate-control.ts). Defaults to `declined`: the
+   * page's localStorage carries the stored answer `no`
+   * (`ddm.locate.launch`, read by src/state/locate-preference.ts) before any
+   * script runs, only where the page has no answer of its own. That is the
+   * state of every returning visitor who has answered the offer, so a spec
+   * written before Locate keeps the map it was written against. The Locate
+   * cell itself is unaffected and still starts a search when pressed.
+   * `fresh` is the explicit opt-out for a spec about the offer: storage is
+   * left alone and the first launch makes its offer. A spec that stores its
+   * own answer is unaffected by `declined`.
+   */
+  readonly locateOffer?: LocateOfferMode;
+}
+
+/** `declined` stores the answer `no` for the boot; `fresh` leaves the first launch to the page. */
+export type LocateOfferMode = 'declined' | 'fresh';
+
+/** src/state/locate-preference.ts LAUNCH_PREFERENCE_KEY; tests/geolocate.test.mjs pins the two together. */
+export const LOCATE_LAUNCH_STORAGE_KEY = 'ddm.locate.launch';
+
+/**
+ * Seed the stored answer to Locate's first-launch offer, so a routine phone
+ * boot shows the map without the offer card. Set only where no answer is
+ * stored, so a reload keeps an answer the viewer (or the spec) gave. Storage
+ * can be blocked; then the app makes no offer either, as it does for a
+ * viewer in that state.
+ */
+export async function installLocateOfferSeed(page: Page, mode: LocateOfferMode = 'declined'): Promise<void> {
+  if (mode === 'fresh') return;
+  await page.addInitScript((key) => {
+    try {
+      if (window.localStorage.getItem(key) === null) window.localStorage.setItem(key, 'no');
+    } catch {
+      // storage blocked: nothing to seed
+    }
+  }, LOCATE_LAUNCH_STORAGE_KEY);
+}
+
+/** `hold` pauses the flowing paths' motion loop for the boot; `live` leaves it to the page. */
+export type FlowMotionHold = 'hold' | 'live';
+
+/** src/layers/flow/motion-loop.ts MOTION_STORAGE_KEY; tests/enso-flow-default.spec.ts pins the two together. */
+export const FLOW_MOTION_STORAGE_KEY = 'ddm:flow-motion';
+
+/**
+ * Seed the viewer's stored Pause choice (E2-4), so the motion loop starts
+ * paused and MapLibre can reach `idle`. Set only where no choice is stored, so
+ * a reload keeps a choice the viewer (or the spec) made. Storage can be
+ * blocked; then the loop runs, as it would for a viewer in that state.
+ */
+export async function installFlowMotionHold(page: Page, mode: FlowMotionHold = 'hold'): Promise<void> {
+  if (mode === 'live') return;
+  await page.addInitScript((key) => {
+    try {
+      // Under prefers-reduced-motion the loop is already still, and its own
+      // word (`reduced`) must stay readable: a stored choice would read `paused`.
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+      if (window.sessionStorage.getItem(key) === null) window.sessionStorage.setItem(key, 'paused');
+    } catch {
+      // storage blocked: nothing to seed
+    }
+  }, FLOW_MOTION_STORAGE_KEY);
+}
+
+/**
+ * Step the open Impact Briefing from the priority view, where every open lands
+ * (owner 2026-11-13), to its full detail, so a spec can see or click matrix
+ * nodes. A briefing with no switch (impact synthesis unavailable) already
+ * shows its one presentation and is left as it is.
+ */
+export async function showFullDetail(page: Page): Promise<void> {
+  const panel = page.locator('#impact-panel');
+  await expect(panel).toBeVisible();
+  const full = panel.locator('.briefing-view-btn[data-briefing-view="matrix"]');
+  if ((await full.count()) === 0) return;
+  // A hydration re-render replaces the switch; a click on a node it removed is retried.
+  await expect(async () => {
+    if ((await full.getAttribute('aria-pressed')) !== 'true') await full.click();
+    await expect(full).toHaveAttribute('aria-pressed', 'true', { timeout: 1_000 });
+  }).toPass();
+}
+
+/**
+ * DR-258: a briefing for a place in the United States reads Grants.gov once per
+ * page (src/impact/grants.ts). Every routine boot answers that POST with a valid
+ * empty search, so no spec reaches the live API or a strict backstop; a spec's
+ * own `page.route` registered later still wins.
+ */
+export async function installDefaultGrantsStub(page: Page): Promise<void> {
+  await page.route('https://api.grants.gov/v1/api/search2', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      headers: { 'access-control-allow-origin': '*' },
+      body: JSON.stringify({ errorcode: 0, data: { hitCount: 0, oppHits: [] } })
+    })
+  );
+}
+
+/**
+ * DR-263: on desktop an open briefing covers the map. A spec that next acts on
+ * the map (the Key, Reset, a map control) goes back to it first, the way a
+ * reader would; the place stays selected. No-op when no briefing covers the map.
+ */
+export async function backToMap(page: Page): Promise<void> {
+  const back = page.locator('#impact-panel.open .impact-panel-close');
+  if (!(await back.isVisible())) return;
+  await back.click();
+  await expect(page.locator('#impact-panel')).toBeHidden();
 }
 
 export async function gotoApp(
@@ -244,14 +489,87 @@ export async function gotoApp(
   // bodies. See tests/minimap-fixtures.ts for why they are stubbed rather
   // than waived.
   await installMinimapAnalysisStubs(page);
+  // DDM-P7-T07: the season-ahead heat cell reads the CPC seasonal
+  // temperature outlook live, independent of any map layer, on every
+  // briefing whose selection falls inside the regional impact synthesis
+  // capability. Stubbed unconditionally, like the three calls above, so no
+  // spec that opens the briefing sends this new query to the live agency
+  // (see `stubCpcSeasonalTempOutlook`'s own comment).
+  await stubCpcSeasonalTempOutlook(page);
+  // ENSO's Weeks ahead and Season ahead draw CPC outlooks (the others on
+  // request): all six national map reads are answered.
+  await stubCpcSeasonalOutlookMaps(page);
+  // DDM-P7-T03: the near-term fire cell reads the SPC Day 1-8 Fire Weather
+  // Outlook live, independent of any map layer, on every briefing. Stubbed
+  // unconditionally, like the calls above, so no spec that opens the
+  // briefing sends these eight new queries to the live agency (see
+  // `stubSpcFireOutlook`'s own comment; S17's lesson, missed in round 1).
+  await stubSpcFireOutlook(page);
+  // DDM-P1-T09 step 2 part d: every routine boot claims the deterministic
+  // NADM fixture unconditionally, whatever the query string names. The
+  // continental snapshot used to be skipped for `layers=`/`cluster=` boots
+  // on the theory that those specs always claim it themselves, which left
+  // every OTHER such boot (activation, ENSO, embed, studio, and more) free
+  // to reach the live NCEI endpoint through the always-mounted minimap. See
+  // `installDefaultNadmStub`'s own comment for the opt-out and why a spec's
+  // own `page.route` for this pattern is unaffected either way.
+  await installDefaultNadmStub(page, options.nadm ?? 'fixture');
+  // J12 (DDM-P10-T13): every routine boot answers the NIFC WFIGS
+  // current-perimeters service from the deterministic fixture, whatever the
+  // query string names. Under the national default region an unrouted
+  // Wildfire boot used to wait on the live national payload. See
+  // `installDefaultNifcStub`'s own comment for the three request kinds, the
+  // opt-out, and why a spec's own `page.route` for WFIGS still wins.
+  await installDefaultNifcStub(page, options.nifc ?? 'fixture');
+  // S30D P2-CI: every routine boot answers the NWS WWA MapServer with a valid
+  // empty collection, whatever the query string names, so a `cluster=heat`
+  // boot never waits on NOAA's answer. See `installDefaultNwsWwaStub`'s own
+  // comment for the opt-out and why a spec's own `page.route` still wins.
+  await installDefaultNwsWwaStub(page, options.nwsWwa ?? 'fixture');
+  // DR-258: see `installDefaultGrantsStub`.
+  await installDefaultGrantsStub(page);
+  // ENSO block B3: every routine boot answers the tropical MapServer from
+  // tests/tropical-fixtures.ts (an empty season unless the spec names an arm).
+  await installDefaultTropicalStub(page, options.tropical ?? 'allEmpty');
+  // ENSO-FLOW-PLAN E1-5: every routine boot answers the NOAA NODD GFS bucket
+  // from tests/fixtures/flow/, and an unstubbed NODD read is answered 404 and
+  // fails the spec (`installDefaultNoddStub`'s own comment). The ENSO flowing
+  // paths read that bucket at runtime; without this every ENSO spec would
+  // read AWS, and the repo has no egress host list to catch it.
+  await installDefaultNoddStub(page);
+  // ENSO-FLOW-PLAN E2-4: ENSO opens with wind on, so a routine ENSO boot holds
+  // the motion loop (still form, same data) and 'idle' stays reachable. See
+  // `GotoAppOptions.flowMotion` for the opt-out.
+  await installFlowMotionHold(page, options.flowMotion ?? 'hold');
+  // Locate (owner direction 2026-11-09 (sprint), DR-pending): a first launch
+  // on the phone shell makes an offer over the lower map. A routine boot
+  // stores the answer `no` first, so no spec meets that card unless it asks
+  // for it. See `GotoAppOptions.locateOffer` for the opt-out.
+  await installLocateOfferSeed(page, options.locateOffer ?? 'declined');
+  // DDM-P9-T13: entering Wildfire 3D reads the NOAA STAR VHI tiles and the
+  // USGS Relative Greenness WMS. Every boot answers both from synthetic
+  // fixtures (`installDefaultDrynessStub`), so no spec reaches either agency.
+  await installDefaultDrynessStub(page);
   coverFuturePages(page);
-  if (!/[?&](?:layers|cluster)=/.test(query)) {
-    await stubDefaultNadm(page);
-  }
+  // shortcut: a full-site display boot written before 0.7.7 derived the console; pin it so those specs keep their door; drop once specs name view=console themselves.
+  if (!options.derivedView && !/[?&]embed=(true|1)\b/.test(query) && !/[?&](view|select)=/.test(query) && /[?&](layers=|region=|cluster=|ocean=|framing=)/.test(query)) query += '&view=console';
   await page.goto(query, { waitUntil: 'domcontentloaded' });
-  await expect(page.locator('#preset-chips .preset-chip')).toHaveCount(PRESET_LABELS.length);
-  await assertBuildIdentity(page);
+  // DOM READY, and no longer a proxy for a finished boot. The generated
+  // sidebar controls are built from the static registry tables before the
+  // renderer is probed (the 2026-09-03 launch ruling section 4), so the
+  // region options now appear on every boot path, including one that never
+  // gets a map. These two assertions still earn their place (a boot that
+  // never runs its entry chunk fails them), but the wait that used to mean
+  // "the map loaded and the sidebar built" is the `data-ddm-controls`
+  // assertion below.
   await expect(page.locator('#region-select option')).not.toHaveCount(0);
+  await assertBuildIdentity(page);
+  // MAP READY: `buildSidebar` has created the layer controller, applied the
+  // synchronous URL state, and enabled the map-dependent controls, which is
+  // exactly what the generated-control count used to prove. Asserted for every
+  // caller, `bootIdle: false` included, so a spec that deliberately holds a
+  // boot open still starts from a wired interface rather than a shell.
+  await expect(page.locator('html')).toHaveAttribute('data-ddm-controls', 'ready');
   const isEmbed = /[?&]embed=(true|1)\b/.test(query);
   const isConsole =
     /[?&]view=console\b/.test(query) ||
@@ -268,8 +586,51 @@ export async function gotoApp(
   // transport in flight. It moves the moment a spec's own assertions run,
   // and changes none of them. Derived from registry and transport state,
   // never from elapsed time, so it cannot flip early and hide a failure.
+  //
+  // The explicit 10 s answered-read budget matches the current
+  // `playwright.config.ts` expect.timeout; it does not inherit config changes.
+  // Only a blocked page read is capped, following the Fire 3D wait model;
+  // responsive reads and Node polling pauses keep the existing budget.
+  // on a miss the diagnostic reads `window.__ddm.snapshot()` (DDM-P1-T09
+  // step 2 parts a, b and c; src/state/boot-idle.ts's `DdmSeam`, mirrored
+  // here as `DdmSeamRead`, `:901-906`) instead of inferring from pills and
+  // checkboxes. That seam names the pending layer keys
+  // (`pendingBootLayers()`, boot-idle.ts:213) AND, since M3, each pending
+  // shared-transport key with its in-flight count
+  // (`pendingSharedTransportKeys()`, src/util/fetch.ts:259), so a miss says
+  // exactly what holds the boot rather than only that a layer is still
+  // loading. The read itself is wrapped in its own try/catch: a page
+  // teardown race during the evaluate must not replace the original
+  // boot-idle failure with an unrelated one, so the fallback is a literal
+  // clause and the original error survives as `cause`, never flattened.
   if (options.bootIdle !== false) {
-    await expect(page.locator('html')).toHaveAttribute('data-ddm-boot', 'idle');
+    const bootIdleBudgetMs = Math.min(options.bootIdleBudgetMs ?? 10_000, 10_000);
+    try {
+      await untilAnswered(
+        () => page.evaluate(() => document.documentElement.getAttribute('data-ddm-boot')),
+        (value) => value === 'idle',
+        bootIdleBudgetMs,
+        'boot-idle never reached "idle"'
+      );
+    } catch (err) {
+      let diagnostic: string;
+      try {
+        const seam = await readDdmSeam(page);
+        diagnostic =
+          seam === null
+            ? 'window.__ddm is not installed (markBooting has not run; a pre-boot ' +
+              'navigation or a page that is not the app)'
+            : `pending layer keys = ${JSON.stringify(seam.pendingLayerKeys)}; ` +
+              `pending shared transports = ${seam.pendingTransportCount} ` +
+              `(by key: ${JSON.stringify(seam.pendingTransportKeys)})`;
+      } catch (evalErr) {
+        diagnostic = `the boot-idle seam could not be read (${(evalErr as Error).message})`;
+      }
+      throw new Error(
+        `boot-idle never reached "idle" within the ${bootIdleBudgetMs / 1_000} s answered-read budget; ${diagnostic}.`,
+        { cause: err }
+      );
+    }
   }
 }
 
@@ -323,7 +684,7 @@ function localBuildSha(): string | undefined {
  * must carry the same values, or the shard proved the wrong build (a stale
  * dist, another lane's preview, a rebuild without the variables under a
  * running preview: the 2026-08-28 qualification run caught exactly that,
- * `<sha>-dirty` against `<sha>`). It runs after the preset chips are
+ * `<sha>-dirty` against `<sha>`). It runs after the region options are
  * present, so a boot that never ran reads as a boot failure, not as a
  * wrong build; a missing stamp after a successful boot is named as such.
  *
@@ -335,7 +696,7 @@ function localBuildSha(): string | undefined {
  * asserts the page carries it. If git cannot answer, it keeps the old
  * posture and asserts nothing.
  */
-async function assertBuildIdentity(page: Page): Promise<void> {
+export async function assertBuildIdentity(page: Page): Promise<void> {
   const expectedSha = process.env['DDM_BUILD_SHA'] ?? localBuildSha();
   const expectedNonce = process.env['DDM_BUILD_NONCE'];
   if (!expectedSha && !expectedNonce) return;
@@ -380,16 +741,17 @@ const TERMINAL_STATUS_CLASSES: readonly string[] = [
  * the URL assertions deterministic regardless of how slow the upstream is.
  */
 export async function waitForLayerSettled(page: Page, key: string, timeout = 25_000): Promise<void> {
-  await expect
-    .poll(
-      async () => {
-        const cls = (await layerPill(page, key).getAttribute('class')) ?? '';
-        const tokens = cls.split(/\s+/);
-        return TERMINAL_STATUS_CLASSES.some((status) => tokens.includes(status));
-      },
-      { message: `layer "${key}" never left the loading state`, timeout }
-    )
-    .toBe(true);
+  await untilAnswered(
+    // An absent pill is an immediate null, not a locator's auto-wait.
+    () => page.evaluate((layerKey) =>
+      document.querySelector(`[data-layer-status="${layerKey}"]`)?.getAttribute('class') ?? null, key),
+    (cls) => {
+      const tokens = (cls ?? '').split(/\s+/);
+      return TERMINAL_STATUS_CLASSES.some((status) => tokens.includes(status));
+    },
+    timeout,
+    `layer "${key}" never left the loading state`
+  );
 }
 
 /**
@@ -407,6 +769,406 @@ export async function openTribalNationsDetails(page: Page): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// NWS HeatRisk network stub (DDM-P7-T05 F2)
+// ---------------------------------------------------------------------------
+
+const HEATRISK_IMAGE_SERVER_PATH =
+  '/experimental/rest/services/NWS_HeatRisk/ImageServer';
+
+/** HeatRisk publishes seven daily granules, one day apart (mirrors src/layers/heatrisk.ts). */
+const HEATRISK_DAY_MS = 24 * 60 * 60 * 1000;
+
+/** A one-pixel PNG for the layer's `/exportImage` tile requests. */
+const HEATRISK_ONE_PIXEL_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64'
+);
+
+export interface HeatRiskCatalogReceipt {
+  /** Every `/identify` request's `time` param, in call order. */
+  readonly identifyCalls: number[];
+  /** The seven granule times this stub advertises, day 1 first. */
+  readonly frameTimes: readonly number[];
+}
+
+export interface StubHeatRiskCatalogOptions {
+  /** The seven days' issuer classes, day 1 first; default has one of each and one no-data day. */
+  readonly values?: readonly (number | null)[];
+}
+
+/**
+ * Route the NWS HeatRisk ImageServer (service metadata, the catalog
+ * `/query`, `/identify`, and `/exportImage`) to a deterministic seven-frame
+ * fixture. `fetchHeatRiskClaims` (src/impact/sources.ts) reads this catalog
+ * independently of whether the HeatRisk map layer is on (DR-014 a), so ANY
+ * briefing boot reaches this service; without this stub, a spec that never
+ * names the `heatrisk` layer still sends the metadata/query/identify
+ * requests to the live agency, against playwright.config.ts's "Deterministic
+ * backbone only" (lines 16-23).
+ *
+ * Day 1's period is built relative to THIS CALL's own clock, three hours in,
+ * so it reads in force (the outlook register, DR-070 amended 2026-09-08,
+ * DR-071) at the moment a caller boots the briefing right after calling
+ * this. A spec that needs an ENDED period for its own assertions builds its
+ * own fixture instead (see tests/heat-h2-point-heat.spec.ts's DR-014 a
+ * describe block, which keeps fixed literal frame times for exactly that
+ * reason and says so in its own comment).
+ */
+export async function stubHeatRiskCatalog(
+  page: Page,
+  options: StubHeatRiskCatalogOptions = {}
+): Promise<HeatRiskCatalogReceipt> {
+  const day1Start = Date.now() - 3 * 60 * 60 * 1000;
+  const frameTimes = Array.from(
+    { length: 7 },
+    (_, index) => day1Start + index * HEATRISK_DAY_MS
+  );
+  const values: readonly (number | null)[] =
+    options.values ?? [2, 1, 0, 3, 4, null, 2];
+  const identifyCalls: number[] = [];
+
+  await page.route(
+    (url) => url.pathname.startsWith(HEATRISK_IMAGE_SERVER_PATH),
+    async (route) => {
+      const requestUrl = new URL(route.request().url());
+      if (requestUrl.pathname.endsWith('/query')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            features: frameTimes.map((validTime, index) => ({
+              attributes: {
+                name: `HeatRisk_${index + 1}_Mercator`,
+                idp_validtime: validTime
+              }
+            }))
+          })
+        });
+        return;
+      }
+      if (requestUrl.pathname.endsWith('/identify')) {
+        const time = Number(requestUrl.searchParams.get('time'));
+        identifyCalls.push(time);
+        const index = frameTimes.indexOf(time);
+        const value = index < 0 ? undefined : values[index];
+        if (value === undefined) {
+          await route.fulfill({
+            status: 400,
+            contentType: 'application/json',
+            body: JSON.stringify({ error: { message: 'unknown time' } })
+          });
+          return;
+        }
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            value: value === null ? 'NoData' : String(value),
+            catalogItems: {
+              features:
+                value === null
+                  ? []
+                  : [{ attributes: { idp_validtime: time } }]
+            }
+          })
+        });
+        return;
+      }
+      if (requestUrl.pathname.endsWith('/exportImage')) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'image/png',
+          body: HEATRISK_ONE_PIXEL_PNG
+        });
+        return;
+      }
+      // Service metadata: reached by the map layer's own activation
+      // (src/layers/heatrisk.ts) AND the briefing's independent-catalog
+      // fallback (src/ui/heatrisk-sequence.ts identifyHeatRiskForBriefing);
+      // neither depends on the other being present on the page.
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          timeInfo: { timeExtent: [frameTimes[0], frameTimes.at(-1)] }
+        })
+      });
+    }
+  );
+
+  return { identifyCalls, frameTimes };
+}
+
+// ---------------------------------------------------------------------------
+// CPC seasonal temperature outlook network stub (DDM-P7-T07)
+// ---------------------------------------------------------------------------
+
+const CPC_SEASONAL_TEMP_OUTLOOK_PATH =
+  '/vector/rest/services/outlooks/cpc_sea_temp_outlk/MapServer';
+
+export interface CpcSeasonalTempReading {
+  /** The issuer's own `cat` string; default `'Above'`. */
+  readonly cat?: string;
+  /** The issuer's own `prob` value; default `50`. */
+  readonly prob?: number;
+  /** The issuer's own `valid_seas` label, verbatim; default `'SON 2026'`. */
+  readonly validSeas?: string;
+  /** The issuer's `fcst_date`, epoch ms; default a fixed 2026 literal. */
+  readonly fcstDate?: number | null;
+  /** Serve zero features (the empty-read case) instead of the fixture row. */
+  readonly empty?: boolean;
+  /** Serve an ArcGIS HTTP-200 error envelope instead of the fixture row. */
+  readonly errorEnvelope?: boolean;
+  /** Serve this HTTP status with a plain failure body (the 500 case). */
+  readonly httpStatus?: number;
+}
+
+export interface StubCpcSeasonalTempOutlookOptions extends CpcSeasonalTempReading {
+  /**
+   * Per-request readings in call order, for a spec proving supersession: the
+   * Nth matching request is answered from `sequence[N-1]` (the last entry
+   * repeats once the sequence is exhausted). The top-level fixture fields
+   * above are ignored once `sequence` is given.
+   */
+  readonly sequence?: readonly CpcSeasonalTempReading[];
+  /**
+   * Resolved externally to delay only the FIRST matching request's
+   * response, so a spec can hold an old generation's read open while a
+   * newer selection's read (the second matching request) answers at once.
+   */
+  readonly holdFirst?: Promise<void>;
+}
+
+/**
+ * Route the CPC seasonal temperature outlook MapServer (`cpc_sea_temp_outlk`,
+ * `src/config/urls.ts` `cpcSeasonalTempOutlookMapServer`) to a deterministic
+ * fixture. `fetchCpcSeasonalTempClaims` (src/impact/sources.ts) reads this
+ * service on every briefing whose selection falls inside the regional impact
+ * synthesis capability (the same gate `cpcSeasonal` and `cpcExtended`
+ * already read), independent of any map layer, so `gotoApp` below calls this
+ * unconditionally with its defaults (S17's lesson: an unstubbed briefing
+ * lane reaches the live agency).
+ *
+ * De-duplicated per page (mirrors `stubRecentSatellite`): a spec that needs
+ * a specific reading, a failure arm, or a held-open supersession race calls
+ * this itself, WITH its own options, BEFORE `gotoApp`; `gotoApp`'s own later
+ * call then finds this page already stubbed and is a no-op, so the spec's
+ * reading is never shadowed by the default one.
+ */
+export async function stubCpcSeasonalTempOutlook(
+  page: Page,
+  options: StubCpcSeasonalTempOutlookOptions = {}
+): Promise<void> {
+  if (cpcSeasonalTempOutlookStubbedPages.has(page)) return;
+  cpcSeasonalTempOutlookStubbedPages.add(page);
+
+  const fulfillReading = async (
+    route: Route,
+    reading: CpcSeasonalTempReading
+  ): Promise<void> => {
+    const {
+      cat = 'Above',
+      prob = 50,
+      validSeas = 'SON 2026',
+      fcstDate = Date.UTC(2026, 8, 1),
+      empty = false,
+      errorEnvelope = false,
+      httpStatus = 200
+    } = reading;
+    if (httpStatus !== 200) {
+      await route.fulfill({
+        status: httpStatus,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'stubbed upstream failure' })
+      });
+      return;
+    }
+    if (errorEnvelope) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/plain',
+        body: JSON.stringify({
+          status: 'error',
+          messages: ['Could not access any server machines.']
+        })
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify({
+        type: 'FeatureCollection',
+        features: empty
+          ? []
+          : [
+              {
+                type: 'Feature',
+                geometry: null,
+                properties: {
+                  cat,
+                  prob,
+                  valid_seas: validSeas,
+                  fcst_date: fcstDate
+                }
+              }
+            ]
+      })
+    });
+  };
+
+  let requestIndex = 0;
+  await page.route(
+    (url) => url.pathname.startsWith(CPC_SEASONAL_TEMP_OUTLOOK_PATH),
+    async (route) => {
+      const index = requestIndex;
+      requestIndex += 1;
+      if (index === 0 && options.holdFirst) await options.holdFirst;
+      const reading = options.sequence
+        ? (options.sequence[Math.min(index, options.sequence.length - 1)] ?? {})
+        : options;
+      await fulfillReading(route, reading);
+    }
+  );
+}
+
+const cpcSeasonalTempOutlookStubbedPages = new WeakSet<Page>();
+
+// ---------------------------------------------------------------------------
+// CPC outlook maps (the ENSO Weeks ahead and Season ahead layers)
+// ---------------------------------------------------------------------------
+
+/** The national Lead 1 query paths `src/layers/cpc-seasonal-read.ts` reads. */
+const CPC_SEASONAL_OUTLOOK_MAP_PATHS: readonly string[] = [
+  '/vector/rest/services/outlooks/cpc_sea_precip_outlk/MapServer/0/query',
+  `${CPC_SEASONAL_TEMP_OUTLOOK_PATH}/0/query`
+];
+
+/** The same reader's 6-10 and 8-14 day query paths (each service: 0 temperature, 1 precipitation). */
+const CPC_EXTENDED_OUTLOOK_MAP_PATHS: readonly string[] = ['6_10', '8_14'].flatMap((days) =>
+  [0, 1].map((layer) => `/vector/rest/services/outlooks/cpc_${days}_day_outlk/MapServer/${layer}/query`)
+);
+
+/**
+ * Answer the six outlook layers' national queries (`cpc-seasonal-*`,
+ * `cpc-610-*`, `cpc-814-*`) with one square per class of that layer's own
+ * renderer (`tests/cpc-seasonal-polygon-fixtures.mjs`: the seasonal clock SON
+ * 2026 issued 2026-09-01; the day-range clock Nov 11 to 15, 2026 issued
+ * 2026-11-05), so a legend reads every class. Every in-session entry into
+ * ENSO draws an outlook, so `gotoApp` calls this on every boot. A point read
+ * (a `geometry=` parameter: the briefing's temperature and day-range cells)
+ * is left to `stubCpcSeasonalTempOutlook` above and to each spec's own
+ * briefing routes. De-duplicated per page.
+ */
+export async function stubCpcSeasonalOutlookMaps(page: Page): Promise<void> {
+  if (cpcSeasonalOutlookMapPages.has(page)) return;
+  cpcSeasonalOutlookMapPages.add(page);
+  await page.route(
+    (url) =>
+      (CPC_SEASONAL_OUTLOOK_MAP_PATHS.includes(url.pathname) || CPC_EXTENDED_OUTLOOK_MAP_PATHS.includes(url.pathname)) &&
+      !url.searchParams.has('geometry'),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify(
+          CPC_EXTENDED_OUTLOOK_MAP_PATHS.includes(new URL(route.request().url()).pathname)
+            ? cpcExtendedPolygons()
+            : cpcSeasonalPolygons()
+        )
+      })
+  );
+}
+
+const cpcSeasonalOutlookMapPages = new WeakSet<Page>();
+
+// ---------------------------------------------------------------------------
+// SPC Day 1-8 Fire Weather Outlook network stub (DDM-P7-T03)
+// ---------------------------------------------------------------------------
+
+export interface StubSpcFireOutlookOptions {
+  /** Serve this HTTP status with a plain failure body (the 503 case). */
+  readonly httpStatus?: number;
+  /** Serve an ArcGIS HTTP-200 error envelope instead of the fixture rows. */
+  readonly errorEnvelope?: boolean;
+}
+
+/**
+ * Route every SPC fire weather outlook layer query
+ * (`spcFireWeatherOutlookMapServer`, the SPC_firewx MapServer,
+ * `src/impact/sources.ts` `fetchSpcFireOutlookClaims`) to a deterministic
+ * fixture, keyed by ArcGIS layer id (1 Day 1, 4 Day 2, 8/11/14/17/20/23 Days
+ * 3-8). A layer with no entry in `layerFeatures` answers with an empty
+ * FeatureCollection, the honest "no area drawn" case, on the
+ * `stubCpcSeasonalTempOutlook` model above (S17's lesson: an unstubbed
+ * briefing lane reaches the live agency).
+ *
+ * De-duplicated per browser context (the guard is keyed on the context the
+ * route is registered on): a spec that
+ * needs a specific reading or a failure arm calls this itself, WITH its own
+ * `layerFeatures`/`options`, BEFORE `gotoApp`; `gotoApp`'s own later call
+ * then finds this context already stubbed and is a no-op, so the spec's own
+ * reading is never shadowed by the default empty one (Playwright tries the
+ * most recently registered matching route handler first).
+ *
+ * Registered on the browser CONTEXT, not the page: Playwright resolves a
+ * page-level `page.route` ahead of a context-level `browserContext.route`
+ * regardless of registration order, so `gotoApp`'s later, context-level
+ * default here can never shadow an already-page-level SPC stub a spec set
+ * up its own way before calling `gotoApp` (found in
+ * tests/fire-heat-time-bar.spec.ts's `stubFire`, which this lane does not
+ * own and so cannot rewrite onto this helper this round); it still answers
+ * every spec that has no page-level SPC stub of its own.
+ */
+export async function stubSpcFireOutlook(
+  page: Page,
+  layerFeatures: Partial<Record<number, unknown[]>> = {},
+  options: StubSpcFireOutlookOptions = {}
+): Promise<void> {
+  const context = page.context();
+  if (spcFireOutlookStubbedContexts.has(context)) return;
+  spcFireOutlookStubbedContexts.add(context);
+
+  await context.route('**/SPC_firewx/MapServer/*/query?*', async (route: Route) => {
+    if (options.httpStatus !== undefined && options.httpStatus !== 200) {
+      await route.fulfill({
+        status: options.httpStatus,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'stubbed upstream failure' })
+      });
+      return;
+    }
+    if (options.errorEnvelope) {
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/plain',
+        body: JSON.stringify({
+          status: 'error',
+          messages: ['Could not access any server machines.']
+        })
+      });
+      return;
+    }
+    const url = new URL(route.request().url());
+    const layerMatch = /\/MapServer\/(\d+)\/query/.exec(url.pathname);
+    const layer = layerMatch ? Number(layerMatch[1]) : NaN;
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify({
+        type: 'FeatureCollection',
+        features: layerFeatures[layer] ?? []
+      })
+    });
+  });
+}
+
+// Keyed on the CONTEXT the route lives on (not the page), so a second page in
+// one context can never register a second context-level default that would
+// shadow the first page's fixture (the `coveredContexts` precedent above).
+const spcFireOutlookStubbedContexts = new WeakSet<BrowserContext>();
+
 /**
  * The set of layer keys currently encoded in the URL's `layers=` parameter.
  * Empty set for an explicit `?layers=` (all off) or when the parameter is a
@@ -417,4 +1179,530 @@ export async function urlLayers(page: Page): Promise<Set<string>> {
   const raw = new URLSearchParams(s).get('layers');
   if (!raw) return new Set();
   return new Set(raw.split(',').map((x) => x.trim()).filter(Boolean));
+}
+
+/**
+ * One read of the `window.__ddm` seam (DDM-P1-T09 step 1;
+ * src/state/boot-idle.ts `DdmSeam`): the boot phase, the layer keys still
+ * owed, and the shared-transport count. Mirrors `DdmSeamSnapshot` there.
+ */
+export interface DdmSeamRead {
+  readonly phase: 'booting' | 'idle' | null;
+  readonly pendingLayerKeys: readonly string[];
+  readonly pendingTransportCount: number;
+  readonly pendingTransportKeys: Readonly<Record<string, number>>;
+}
+
+type DdmSeamWindow = Window & {
+  __ddm?: {
+    snapshot(): DdmSeamRead;
+    whenQuiescent(budgetMs?: number): Promise<DdmSeamRead>;
+  };
+};
+
+/**
+ * Read the seam once, or `null` when the page has not reached
+ * `markBooting()` (a pre-boot navigation, or a page that is not the app).
+ * A diagnostic that wants to NAME what holds a wait open reads this rather
+ * than inferring from pills and checkboxes.
+ */
+export async function readDdmSeam(page: Page): Promise<DdmSeamRead | null> {
+  return page.evaluate(() => {
+    const seam = (window as DdmSeamWindow).__ddm;
+    return seam ? seam.snapshot() : null;
+  });
+}
+
+/**
+ * Wait until no layer is pending and no shared transport is in flight,
+ * event-driven inside the page and never polled, within `budgetMs`
+ * (default 10 s, the same as `expect.timeout`). On a miss the page's own
+ * `DdmQuiescenceTimeout` names both readings, and this helper re-throws
+ * it with the seam read attached as `cause` so nothing is flattened.
+ *
+ * This is the session-wide sibling of the boot-only `data-ddm-boot`
+ * attribute `gotoApp` waits on: use it after a toggle, a preset swap, or
+ * a region jump, where a spec would otherwise reach for a fixed timeout.
+ * Demonstrative for now; `gotoApp`'s boot-idle diagnostic is the next
+ * consumer (DDM-P1-T09 step 2).
+ */
+export async function awaitQuiescence(page: Page, budgetMs = 10_000): Promise<DdmSeamRead> {
+  const outcome = await page.evaluate(async (budget) => {
+    const seam = (window as DdmSeamWindow).__ddm;
+    if (!seam) return { ok: false as const, message: 'window.__ddm is not installed (markBooting has not run)' };
+    try {
+      return { ok: true as const, snapshot: await seam.whenQuiescent(budget) };
+    } catch (err) {
+      return { ok: false as const, message: (err as Error).message, snapshot: seam.snapshot() };
+    }
+  }, budgetMs);
+  if (outcome.ok) return outcome.snapshot;
+  throw new Error(`awaitQuiescence: ${outcome.message}`, { cause: outcome.snapshot ?? null });
+}
+
+// ---------------------------------------------------------------------------
+// NOAA NODD (the GFS bucket the ENSO flowing paths read)
+// ---------------------------------------------------------------------------
+
+/**
+ * The NOAA Open Data Dissemination bucket the ENSO wind and wave paths read
+ * at runtime by `.idx` GET and one Range GET per GRIB2 message
+ * (ENSO-FLOW-PLAN section 2.2; B-grib.md). Matched as the bucket's whole
+ * host family: the virtual-hosted name, its regional and dualstack forms,
+ * and the path-style form on any S3 endpoint.
+ */
+export const NODD_BUCKET = 'noaa-gfs-bdp-pds';
+
+export function isNoddRequestUrl(url: URL): boolean {
+  const host = url.hostname;
+  if (!host.endsWith('.amazonaws.com')) return false;
+  if (host.startsWith(`${NODD_BUCKET}.s3.`) || host.startsWith(`${NODD_BUCKET}.s3-`)) return true;
+  return /^s3[.-]/.test(host) && url.pathname.startsWith(`/${NODD_BUCKET}/`);
+}
+
+/** One NODD object or message the default stub answers from tests/fixtures/flow/ (E1-1's fixtures). */
+interface NoddFixture {
+  /** The object key, as a virtual-hosted path without its leading slash. */
+  readonly key: string;
+  /**
+   * The exact Range header a message read sends (its `.idx` span), or null
+   * for a whole `.idx` object, which is answered to any GET, with or without
+   * a Range, as S3 answers it (`installDefaultNoddStub`).
+   */
+  readonly range: string | null;
+  /** The fixture file under tests/fixtures/flow/. */
+  readonly file: string;
+}
+
+/**
+ * Every NODD read with a fixture: the three `.idx` files and the nine
+ * messages of cycle 2026-10-05 06Z, f006 (five cut on 2026-10-05 by E1-1,
+ * the global.0p25 DIRPW by E2a for found-146, the 250 mb UGRD and VGRD on
+ * 2026-10-13 for the jet-level kind, PWAT the same day for precipitable
+ * water), each with the key and range its
+ * tests/fixtures/flow/reference.json `source` records. Every kind of
+ * src/layers/flow/source.ts reads here in full: wind and jet-level wind
+ * (UGRD and VGRD, at 10 m and at 250 mb) and precipitable water (PWAT),
+ * all from the one atmos file, and waves (DIRPW and HTSGW on global.0p25).
+ * A read not listed here is unstubbed (`installDefaultNoddStub`).
+ */
+export const NODD_FIXTURES: readonly NoddFixture[] = [
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006.idx', range: null, file: 'gfs.t06z.pgrb2.1p00.f006.idx' },
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006', range: 'bytes=34998139-35077224', file: 'gfs1p00-UGRD-10m-f006.grib2' },
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006', range: 'bytes=35077225-35156831', file: 'gfs1p00-VGRD-10m-f006.grib2' },
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006', range: 'bytes=17851986-17905646', file: 'gfs1p00-UGRD-250mb-f006.grib2' },
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006', range: 'bytes=17905647-17960139', file: 'gfs1p00-VGRD-250mb-f006.grib2' },
+  { key: 'gfs.20261005/06/atmos/gfs.t06z.pgrb2.1p00.f006', range: 'bytes=36424556-36522245', file: 'gfs1p00-PWAT-atmos-f006.grib2' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.global.0p25.f006.grib2.idx', range: null, file: 'gfswave.t06z.global.0p25.f006.grib2.idx' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.global.0p25.f006.grib2', range: 'bytes=3029161-3457288', file: 'global0p25-HTSGW-f006.grib2' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.global.0p25.f006.grib2', range: 'bytes=3968286-4855671', file: 'global0p25-DIRPW-f006.grib2' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.wcoast.0p16.f006.grib2.idx', range: null, file: 'gfswave.t06z.wcoast.0p16.f006.grib2.idx' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.wcoast.0p16.f006.grib2', range: 'bytes=65805-75391', file: 'wcoast0p16-HTSGW-f006.grib2' },
+  { key: 'gfs.20261005/06/wave/gridded/gfswave.t06z.wcoast.0p16.f006.grib2', range: 'bytes=87636-106888', file: 'wcoast0p16-DIRPW-f006.grib2' }
+];
+
+/**
+ * How the default stub answered one NODD request: from a fixture (200 or
+ * 206), 416 for an `.idx` range that starts past the object's end (S3's
+ * answer, not a test failure), absent (404 for the `.idx` of a cycle the
+ * fixtures do not cover, E2-4: NODD's answer for an unpublished cycle, not a
+ * test failure), or unstubbed (404, and the test fails).
+ */
+export type NoddStubAnswer = 'fixture' | 'unsatisfiable' | 'absent' | 'unstubbed';
+
+/**
+ * The `.idx` keys the ENSO reader asks for (src/layers/flow/source.ts): the
+ * atmos 1.00 degree index (wind at either level) and the global 0.25 degree wave index, for any
+ * cycle and forecast hour. A GET for one with no fixture is `absent`.
+ */
+const NODD_READER_INDEX_KEYS: readonly RegExp[] = [
+  /^gfs\.\d{8}\/\d{2}\/atmos\/gfs\.t\d{2}z\.pgrb2\.1p00\.f\d{3}\.idx$/,
+  /^gfs\.\d{8}\/\d{2}\/wave\/gridded\/gfswave\.t\d{2}z\.global\.0p25\.f\d{3}\.grib2\.idx$/
+];
+
+/** One NODD request the default stub answered. */
+export interface NoddStubEntry {
+  readonly method: string;
+  readonly url: string;
+  readonly range: string | null;
+  readonly answer: NoddStubAnswer;
+}
+
+const noddStubLogs = new WeakMap<BrowserContext, NoddStubEntry[]>();
+
+/** Every NODD request the default stub answered in this page's context, in order. */
+export function noddStubLog(page: Page): readonly NoddStubEntry[] {
+  return noddStubLogs.get(page.context()) ?? [];
+}
+
+/** The object key a NODD URL names, in either addressing style. */
+function noddKey(url: URL): string {
+  const path = decodeURIComponent(url.pathname).replace(/^\//, '');
+  return url.hostname.startsWith(`${NODD_BUCKET}.`) ? path : path.slice(NODD_BUCKET.length + 1);
+}
+
+/**
+ * An `.idx` fixture's bytes as NODD serves them: LF line ends, whatever the
+ * checkout holds (core.autocrlf writes these text files CRLF on Windows).
+ */
+function noddIndexBody(file: string): Buffer {
+  const text = readFileSync(new URL(`./fixtures/flow/${file}`, import.meta.url), 'latin1');
+  return Buffer.from(text.replaceAll('\r\n', '\n'), 'latin1');
+}
+
+/**
+ * How S3 answers a GET on an object of `length` bytes with this Range
+ * header: 200 with no Range, 206 for `bytes=A-B` or `bytes=A-` (the end
+ * clamped to the object), 416 when A is at or past the end. Null for a
+ * Range this stub does not model (suffix, multi-part, B before A), which
+ * is then unstubbed.
+ */
+function noddIndexRead(
+  length: number,
+  range: string | null
+): { readonly status: 200 } | { readonly status: 206; readonly first: number; readonly last: number } | { readonly status: 416 } | null {
+  if (range === null) return { status: 200 };
+  const m = /^bytes=(\d+)-(\d*)$/.exec(range);
+  if (!m) return null;
+  const first = Number(m[1]);
+  const end = m[2] === '' ? Infinity : Number(m[2]);
+  if (end < first) return null;
+  if (first >= length) return { status: 416 };
+  return { status: 206, first, last: Math.min(end, length - 1) };
+}
+
+/**
+ * Answer the NODD bucket on the browser CONTEXT on every routine boot
+ * (ENSO-FLOW-PLAN E1-5), so no spec reads AWS: without it every ENSO spec
+ * would, once the flowing paths read NODD. There is no unexpected-egress
+ * host list in this repo, so this route is the guard.
+ *
+ * It answers as src/layers/flow/nodd.ts reads (found-146). Every answer
+ * carries the `Access-Control-Allow-Origin: *` NODD sends.
+ * - An `.idx` row (`range: null`) is answered as S3 answers a GET on that
+ *   object: with no Range, 200 and the whole object; with `bytes=A-B` or
+ *   `bytes=A-`, 206 with bytes A to min(B, length - 1) and
+ *   `Content-Range: bytes A-<end>/<length>`, so the reader's capped read
+ *   (`bytes=0-65535` atmos, `bytes=0-4095` wave, longer than either index)
+ *   gets 206 and the whole index; a range starting at or past the end is
+ *   416 with S3's InvalidRange body (logged `unsatisfiable`, not a
+ *   failure: it is S3's answer). The index body is served with LF line
+ *   ends whatever the checkout holds (a Windows checkout with
+ *   core.autocrlf writes these text files CRLF), since NODD serves LF.
+ * - A message row is answered only to a GET whose Range is exactly its
+ *   `.idx` span: 206 with the message.
+ *
+ * FAIL-CLOSED, and LOUD. Anything else (another key, a message range with
+ * no fixture, a whole-message GET, a suffix or multi-part range, HEAD, a
+ * LIST) is answered 404 with that same header, as NODD answers a missing
+ * key (B-grib.md section 2.1), recorded in `noddStubLog`, and fails the
+ * running test through `expect.soft`, naming the method, URL and range: add
+ * a fixture row, or route the read in the spec. One shape is not a failure
+ * (E2-4, answer `absent`): a plain GET for an `.idx` under the reader's own
+ * product paths (NODD_READER_INDEX_KEYS) that has no fixture, which is what
+ * every routine ENSO boot at the real date asks first (a cycle the fixtures do
+ * not cover); it is answered 404 and logged. Like the other suite-wide
+ * stubs, a spec's own `page.route` for the bucket wins (Playwright checks
+ * Page routes before Context routes). Idempotent per context.
+ */
+export async function installDefaultNoddStub(page: Page): Promise<void> {
+  const context = page.context();
+  if (noddStubLogs.has(context)) return;
+  const log: NoddStubEntry[] = [];
+  noddStubLogs.set(context, log);
+  await context.route(
+    (url) => isNoddRequestUrl(url),
+    async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      const range = (await request.headerValue('range')) ?? null;
+      const key = noddKey(url);
+      const get = request.method() === 'GET' && url.search === '';
+      const index = get ? NODD_FIXTURES.find((row) => row.key === key && row.range === null) : undefined;
+      const message =
+        get && range !== null ? NODD_FIXTURES.find((row) => row.key === key && row.range === range) : undefined;
+      const indexBody = index ? noddIndexBody(index.file) : null;
+      const indexRead = indexBody ? noddIndexRead(indexBody.length, range) : null;
+      // E2-4: ENSO opens with wind on, so a routine ENSO boot reads the bucket
+      // at the machine's real date, a cycle no fixture covers. Its `.idx` is
+      // answered 404, as NODD answers a cycle it has not published, and the
+      // reader steps back and reads `unavailable`. That one shape is `absent`:
+      // logged as its own answer, not a failure. It is only a plain GET of an
+      // `.idx` under the reader's own two product paths; every other key, and
+      // every message, HEAD, LIST or query read, is still `unstubbed` and fails.
+      const absent = get && !index && NODD_READER_INDEX_KEYS.some((pattern) => pattern.test(key));
+      log.push({
+        method: request.method(),
+        url: request.url(),
+        range,
+        answer:
+          message || (indexRead !== null && indexRead.status !== 416)
+            ? 'fixture'
+            : indexRead !== null
+              ? 'unsatisfiable'
+              : absent
+                ? 'absent'
+                : 'unstubbed'
+      });
+      if (indexBody && indexRead) {
+        const headers = { 'access-control-allow-origin': '*', 'accept-ranges': 'bytes' };
+        if (indexRead.status === 200) {
+          await route
+            .fulfill({ status: 200, headers, contentType: 'binary/octet-stream', body: indexBody })
+            .catch(() => undefined);
+        } else if (indexRead.status === 206) {
+          const { first, last } = indexRead;
+          await route
+            .fulfill({
+              status: 206,
+              headers: { ...headers, 'content-range': `bytes ${first}-${last}/${indexBody.length}` },
+              contentType: 'binary/octet-stream',
+              body: indexBody.subarray(first, last + 1)
+            })
+            .catch(() => undefined);
+        } else {
+          await route
+            .fulfill({
+              status: 416,
+              headers: { 'access-control-allow-origin': '*' },
+              contentType: 'application/xml',
+              body:
+                '<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>InvalidRange</Code>' +
+                `<Message>The requested range is not satisfiable</Message><RangeRequested>${range ?? ''}</RangeRequested>` +
+                `<ActualObjectSize>${indexBody.length}</ActualObjectSize></Error>`
+            })
+            .catch(() => undefined);
+        }
+        return;
+      }
+      const fixture = message;
+      if (absent) {
+        await route
+          .fulfill({ status: 404, headers: { 'access-control-allow-origin': '*' }, contentType: 'application/xml', body: '' })
+          .catch(() => undefined);
+        return;
+      }
+      if (!fixture || fixture.range === null) {
+        try {
+          expect
+            .soft(
+              `${request.method()} ${request.url()} range=${range ?? 'none'}`,
+              'unstubbed NODD request (tests/helpers.ts NODD_FIXTURES): answered 404'
+            )
+            .toBe('a NODD read with a fixture');
+        } catch {
+          // No test is running (a request after teardown): the 404 and the
+          // log still stand.
+        }
+        await route
+          .fulfill({ status: 404, headers: { 'access-control-allow-origin': '*' }, contentType: 'application/xml', body: '' })
+          .catch(() => undefined);
+        return;
+      }
+      const body = readFileSync(new URL(`./fixtures/flow/${fixture.file}`, import.meta.url));
+      const [first, last] = fixture.range.slice('bytes='.length).split('-');
+      await route
+        .fulfill({
+          status: 206,
+          headers: {
+            'access-control-allow-origin': '*',
+            'accept-ranges': 'bytes',
+            'content-range': `bytes ${first}-${last}/*`
+          },
+          contentType: 'binary/octet-stream',
+          body
+        })
+        .catch(() => undefined);
+    }
+  );
+}
+
+// ---------------------------------------------------------------------------
+// The Wildfire 3D dryness ground (DDM-P9-T13): NOAA STAR VHI and USGS RG arms
+// ---------------------------------------------------------------------------
+
+/** The STAR tile host and path the runtime builds (src/config/urls.ts starVhiJ01TileTemplate). */
+export const STAR_VHI_TILE_PATH = 'https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/image_mapTile.php';
+/** The USGS RG WMS the runtime reads (src/config/urls.ts usgsRgConusWeekWms). */
+export const USGS_RG_WMS = 'https://dmsdata.cr.usgs.gov/geoserver/firedanger_rg_conus_week_data/wms';
+/** Monday TIMEs the capabilities fixture lists, oldest first, as the issuer lists them. */
+export const RG_FIXTURE_TIMES = ['2026-09-14T00:00:00.000Z', '2026-09-21T00:00:00.000Z', '2026-09-28T00:00:00.000Z'] as const;
+
+export type StarArm = 'fixture' | 'unknown-colour' | 'abort' | 'corrupt' | 'wrong-mime' | 'hold';
+export type RgArm = 'fixture' | 'service-exception' | 'abort' | 'hold';
+
+export interface DrynessStubEntry {
+  /** 'landcover' is STAR's land-cover tile, read beside each plant-health tile (src/config/dryness-ground.ts DRYNESS_GROUND_URLS). */
+  readonly host: 'star' | 'landcover' | 'rg';
+  readonly url: string;
+  /** STAR and land cover: the requested zoom; RG: null. */
+  readonly z: number | null;
+  /** STAR: the yyyy0WW week; land cover: 'landcover'; RG: the TIME, or 'capabilities'. */
+  readonly frame: string;
+  readonly answer: string;
+}
+
+/** Mutable per context: a spec sets an arm before (or between) entries into Wildfire 3D. */
+export interface DrynessStubState {
+  star: StarArm;
+  /** The first N distinct STAR weeks requested (k, then k-1) answer like STAR's CORS-less 500. */
+  starFailWeeks: number;
+  /** One palette index filling every STAR tile, or null for bands of index 0 and all nine classes. */
+  starFill: number | null;
+  rg: RgArm;
+  readonly weeks: string[];
+  readonly log: DrynessStubEntry[];
+}
+
+const drynessStubStates = new WeakMap<BrowserContext, DrynessStubState>();
+
+/** The arms of this page's context (installed by `gotoApp`). */
+export function drynessStub(page: Page): DrynessStubState {
+  const state = drynessStubStates.get(page.context());
+  if (!state) throw new Error('installDefaultDrynessStub has not run for this context');
+  return state;
+}
+
+const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(data.length, 0);
+  head.write(type, 4, 'ascii');
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])) >>> 0, 0);
+  return Buffer.concat([head, data, crc]);
+}
+
+/** A 256 px paletted PNG (colour type 3), the form both issuers serve. */
+function palettedPng(palette: Buffer, transparency: Buffer | null, pixel: (x: number, y: number) => number): Buffer {
+  const size = 256;
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(size, 0);
+  header.writeUInt32BE(size, 4);
+  header[8] = 8;
+  header[9] = 3;
+  const rows = Buffer.alloc(size * (size + 1));
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) rows[y * (size + 1) + 1 + x] = pixel(x, y);
+  }
+  return Buffer.concat([
+    PNG_SIGNATURE, pngChunk('IHDR', header), pngChunk('PLTE', palette),
+    ...(transparency ? [pngChunk('tRNS', transparency)] : []),
+    pngChunk('IDAT', deflateSync(rows)), pngChunk('IEND', Buffer.alloc(0))
+  ]);
+}
+
+/** The observed STAR palette (102 entries, index 0 transparent) from the committed synthetic receipt. */
+function starPalette(): Buffer {
+  const receipt = Buffer.from(
+    readFileSync(new URL('./fixtures/vhi/lb5-palette.png.base64', import.meta.url), 'utf8').trim(), 'base64'
+  );
+  for (let offset = 8; offset < receipt.length;) {
+    const size = receipt.readUInt32BE(offset);
+    if (receipt.toString('ascii', offset + 4, offset + 8) === 'PLTE') return Buffer.from(receipt.subarray(offset + 8, offset + 8 + size));
+    offset += size + 12;
+  }
+  throw new Error('the STAR receipt has no PLTE chunk');
+}
+
+/** Index 0 (no measurement) and one index inside each of STAR's nine colour runs. */
+const STAR_BAND_INDICES = [0, 3, 9, 18, 30, 42, 54, 66, 78, 90] as const;
+
+function starTile(fill: number | null, unknownColour: boolean): Buffer {
+  const palette = starPalette();
+  // A tenth colour no class table names: the pixel protocol must fail closed.
+  if (unknownColour) palette.set([0x12, 0x34, 0x56], 3 * 3);
+  return palettedPng(palette, Buffer.from([0]), (_x, y) =>
+    unknownColour ? 3 : fill ?? STAR_BAND_INDICES[Math.floor((y * STAR_BAND_INDICES.length) / 256)]!);
+}
+
+/**
+ * STAR's land-cover palette as observed live 2026-10-11: index 0 transparent
+ * (Undefined), 1 to 14 drawn, 15 Snow and Ice, 16 Bare Ground, 17 Water Bodies.
+ * The fixture tile is class 1 everywhere, so it knocks out no plant stress.
+ */
+const STAR_LAND_COVER_PALETTE = ['#000080', '#008000', '#00FF00', '#99CC00', '#99FF99', '#339966', '#993366', '#FFCC99',
+  '#CCFFCC', '#FFCC00', '#FF9900', '#006699', '#FFFF00', '#FF0000', '#999966', '#FFFFFF', '#808080', '#000080'] as const;
+
+function starLandCoverTile(): Buffer {
+  const palette = Buffer.from(STAR_LAND_COVER_PALETTE.flatMap((hex) => [1, 3, 5].map((at) => Number.parseInt(hex.slice(at, at + 2), 16))));
+  return palettedPng(palette, Buffer.from([0]), () => 1);
+}
+
+/** RG's ten classes, then its white, No Data and Water (tests/fixtures/vhi/rg-legend.json). */
+const RG_PALETTE = ['#732600', '#E60000', '#F57A7A', '#FFD37F', '#FFFF00', '#C7D79E', '#89CD66', '#98E600', '#70A800', '#5C8944',
+  '#FFFFFF', '#1E1E1E', '#73B2FF'] as const;
+
+function rgTile(): Buffer {
+  const palette = Buffer.from(RG_PALETTE.flatMap((hex) => [1, 3, 5].map((at) => Number.parseInt(hex.slice(at, at + 2), 16))));
+  return palettedPng(palette, null, (_x, y) => Math.floor((y * RG_PALETTE.length) / 256));
+}
+
+const RG_CAPABILITIES =
+  '<?xml version="1.0" encoding="UTF-8"?><WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms">' +
+  '<Service><Name>WMS</Name></Service><Capability><Layer><Title>fixture</Title><Layer><Name>rg_conus_week_data</Name>' +
+  `<Dimension name="time" units="ISO8601">${RG_FIXTURE_TIMES.join(',')}</Dimension></Layer></Layer></Capability></WMS_Capabilities>`;
+
+const RG_SERVICE_EXCEPTION =
+  '<?xml version="1.0" encoding="UTF-8"?><ServiceExceptionReport version="1.3.0" xmlns="http://www.opengis.net/ogc">' +
+  '<ServiceException code="InvalidDimensionValue">TIME is not a listed value</ServiceException></ServiceExceptionReport>';
+
+const CORS = { 'access-control-allow-origin': '*' };
+
+/**
+ * Route both dryness issuers on the CONTEXT, fail-closed, with fresh bytes on
+ * every request (no fixture caches a tile, so a changed arm is what the next
+ * entry reads, as a NOAA revision would be). A spec's own page route wins.
+ */
+export async function installDefaultDrynessStub(page: Page): Promise<void> {
+  const context = page.context();
+  if (drynessStubStates.has(context)) return;
+  const state: DrynessStubState = { star: 'fixture', starFailWeeks: 0, starFill: null, rg: 'fixture', weeks: [], log: [] };
+  drynessStubStates.set(context, state);
+  await context.route((url) => url.href.startsWith(STAR_VHI_TILE_PATH), async (route) => {
+    const url = new URL(route.request().url());
+    const z = Number(url.searchParams.get('Z'));
+    if (url.searchParams.get('type') === 'ancillary//IGBPlandtype') {
+      // The land-cover tile on the same grid: one fixed tile, and Z=8 answers like STAR's CORS-less 500.
+      const answer = z >= 8 ? 'abort' : 'fixture';
+      state.log.push({ host: 'landcover', url: url.href, z, frame: 'landcover', answer });
+      if (answer === 'abort') return route.abort('failed').catch(() => undefined);
+      return route.fulfill({ status: 200, headers: CORS, contentType: 'image/png', body: starLandCoverTile() }).catch(() => undefined);
+    }
+    const frame = /\/j01_500m_VHI\/(\d{7})$/.exec(url.searchParams.get('type') ?? '')?.[1] ?? 'unparsed';
+    if (frame !== 'unparsed' && !state.weeks.includes(frame)) state.weeks.push(frame);
+    const failedWeek = state.weeks.indexOf(frame) < state.starFailWeeks;
+    // STAR answers a missing week, an unparsed request and Z=8 with a 500 that carries no CORS header.
+    const answer = frame === 'unparsed' || z >= 8 || failedWeek ? 'abort' : state.star;
+    state.log.push({ host: 'star', url: url.href, z, frame, answer });
+    if (answer === 'hold') return;
+    if (answer === 'abort') return route.abort('failed').catch(() => undefined);
+    const body = answer === 'corrupt'
+      ? Buffer.concat([starTile(null, false).subarray(0, 33), Buffer.alloc(64, 7)])
+      : starTile(state.starFill, answer === 'unknown-colour');
+    return route.fulfill({
+      status: 200, headers: CORS, contentType: answer === 'wrong-mime' ? 'text/html' : 'image/png', body
+    }).catch(() => undefined);
+  });
+  await context.route((url) => url.href.startsWith(USGS_RG_WMS), async (route) => {
+    const url = new URL(route.request().url());
+    const capabilities = url.searchParams.get('REQUEST') === 'GetCapabilities';
+    const frame = capabilities ? 'capabilities' : url.searchParams.get('TIME') ?? 'unparsed';
+    const listed = capabilities || (RG_FIXTURE_TIMES as readonly string[]).includes(frame);
+    const answer = state.rg === 'fixture' && !listed ? 'service-exception' : state.rg;
+    state.log.push({ host: 'rg', url: url.href, z: null, frame, answer });
+    if (answer === 'hold') return;
+    if (answer === 'abort') return route.abort('failed').catch(() => undefined);
+    if (capabilities) {
+      return route.fulfill({ status: 200, headers: CORS, contentType: 'text/xml', body: RG_CAPABILITIES }).catch(() => undefined);
+    }
+    if (answer === 'service-exception') {
+      // The issuer's off-list TIME answer: HTTP 200 with an XML body, never a PNG.
+      return route.fulfill({
+        status: 200, headers: CORS, contentType: 'application/vnd.ogc.se_xml', body: RG_SERVICE_EXCEPTION
+      }).catch(() => undefined);
+    }
+    return route.fulfill({ status: 200, headers: CORS, contentType: 'image/png', body: rgTile() }).catch(() => undefined);
+  });
 }

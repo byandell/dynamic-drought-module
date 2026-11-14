@@ -1,10 +1,9 @@
 /**
- * Shared discipline for the shell's S4 popovers (the "More time" detail
- * and the compact "Map areas" minimap; the S4c focus-restoration
- * contract, applied uniformly so the two popovers cannot disagree):
+ * Shared discipline for the shell's compact "Map areas" minimap popover
+ * (the S4c focus-restoration contract):
  *
- *   - FOCUS: opening moves focus to the first operable control inside
- *     the card; closing restores focus to the door that opened it, or to
+ *   - FOCUS: opening moves focus to the framing radiogroup's current stop
+ *     (else the first operable control inside the card); closing restores focus to the door that opened it, or to
  *     the given fallback when the door has unmounted (a spec teardown
  *     can re-render the compact row without its button; focus must never
  *     silently drop to the document body).
@@ -24,6 +23,13 @@ export function wireShellPopover(
   getFallbackFocus?: () => HTMLElement | null
 ): () => void {
   let swallowNextClick = false;
+  let swallowTimer: ReturnType<typeof setTimeout> | undefined;
+  // A dismissing press that becomes a pan fires no click: the flag must not
+  // outlive the gesture and cancel the next real tap.
+  const clearSwallow = (): void => {
+    swallowNextClick = false;
+    clearTimeout(swallowTimer);
+  };
 
   const onToggle = (event: Event): void => {
     const state = (event as ToggleEvent).newState;
@@ -31,9 +37,12 @@ export function wireShellPopover(
     // (W2-D9) so it matches the app's other aria-expanded disclosures.
     getDoor()?.setAttribute('aria-expanded', String(state === 'open'));
     if (state === 'open') {
-      pop
-        .querySelector<HTMLElement>('button:not([disabled]), input, [tabindex="0"]')
-        ?.focus();
+      // The framing radiogroup's roving stop first: the ocean zones precede
+      // it in the DOM and Enter on one switches the display to ENSO.
+      (
+        pop.querySelector<HTMLElement>('[role="radiogroup"] [tabindex="0"]') ??
+        pop.querySelector<HTMLElement>('button:not([disabled]), input, [tabindex="0"]')
+      )?.focus();
     } else {
       const door = getDoor();
       if (door && door.isConnected) {
@@ -45,6 +54,7 @@ export function wireShellPopover(
   };
 
   const onPointerDown = (event: Event): void => {
+    clearSwallow();
     if (!pop.matches(':popover-open')) return;
     const target = event.target instanceof Node ? event.target : null;
     const door = getDoor();
@@ -55,22 +65,26 @@ export function wireShellPopover(
     event.preventDefault();
     event.stopPropagation();
     swallowNextClick = true;
+    swallowTimer = setTimeout(clearSwallow, 400);
     pop.hidePopover();
   };
 
   const onClick = (event: Event): void => {
     if (!swallowNextClick) return;
-    swallowNextClick = false;
+    clearSwallow();
     event.preventDefault();
     event.stopPropagation();
   };
 
   pop.addEventListener('toggle', onToggle);
   document.addEventListener('pointerdown', onPointerDown, true);
+  document.addEventListener('pointercancel', clearSwallow, true);
   document.addEventListener('click', onClick, true);
   return () => {
+    clearSwallow();
     pop.removeEventListener('toggle', onToggle);
     document.removeEventListener('pointerdown', onPointerDown, true);
+    document.removeEventListener('pointercancel', clearSwallow, true);
     document.removeEventListener('click', onClick, true);
   };
 }

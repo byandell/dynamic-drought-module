@@ -55,20 +55,17 @@
 import * as maplibregl from 'maplibre-gl';
 
 import {
+  BC_BASIN_EDITION_HELD,
   LAYER_DEFS,
   getLayerDef,
   resetDroughtSurfacePresentation,
   setDroughtSurfacePresentation
 } from '../config/layers';
-import { MOBILE_HAZARD_PRESETS, VIEW_PRESETS } from '../config/presets';
+import { MOBILE_HAZARD_PRESETS } from '../config/presets';
 import type { ViewPreset } from '../config/presets';
-import {
-  REGIONS,
-  DEFAULT_REGION,
-  regionToMapLibreBounds
-} from '../config/regions';
+import { hazardRailMarkup } from './hazard-rail';
+import { REGIONS, DEFAULT_REGION } from '../config/regions';
 import type { RegionKey, Region } from '../config/regions';
-import { regionCapabilityLevel } from '../config/region-capability';
 // The featured-station table (`src/config/telemetry.ts`) is imported
 // dynamically inside `ensureTelemetryList` below, not here (DR-008a,
 // 2026-09-03). It feeds only the Water & Snow list, which sits behind a
@@ -85,7 +82,9 @@ import {
   openImpactPanel,
   closeImpactPanel
 } from './impact-panel';
+import { regionIsUnitedStates } from '../config/region-capability';
 import { getPlaceSelection, onPlaceSelectionChange } from '../state/place-selection';
+import type { PlaceSelection } from '../state/place-selection';
 import {
   ensureBriefHeadSearch,
   ensureBriefHeadTribalAction,
@@ -93,6 +92,7 @@ import {
   renderStudioLoadFailure
 } from './view-shell';
 import { prefersReducedMotion } from '../util/motion';
+import { bindStudioEscape, trapStudioTabFocus } from './island/studio-inert';
 // The four telemetry network adapters (NRCS AWDB, USACE CWMS, USBR
 // Hydromet, USGS Instantaneous Values) are imported dynamically inside
 // `fetchPrimaryStationValue` below, not here (DR-008a). They were about
@@ -100,11 +100,13 @@ import { prefersReducedMotion } from '../util/motion';
 // user reveals the telemetry list, and each station uses exactly one of the
 // four, so a boot now pays for none of them.
 import type { StationValue, TelemetryStation } from '../types/station';
+import { formatStationNumber } from '../util/station-format';
 import { setCurrentRegion } from '../state/region-store';
 import type { LayerStatus } from '../types/layer';
-import { parseUrlParams, syncUrl } from '../state/url';
+import { SIDEBAR_DESKTOP_QUERY, parseSelectParam, parseUrlParams, syncFire3dParam, syncUrl } from '../state/url';
 import type { ParsedUrlParams } from '../state/url';
 import {
+  backToMap,
   getStudioRoute,
   initializeStudioRoute,
   isPhysicallyFramed,
@@ -117,12 +119,11 @@ import type {
 import {
   getViewMode,
   onViewModeChange,
-  setViewMode,
-  setExplicitBriefBoot
+  setViewMode
 } from '../state/view-mode';
 import { installPopupViewportContainment } from './popup-viewport';
-import { getBasemapMode, onBasemapChange, setBasemapMode } from '../state/basemap-store';
-import { seedFire3DPreference } from '../state/fire3d-store';
+import { defaultBasemapFor, getBasemapMode, onBasemapChange, setBasemapMode } from '../state/basemap-store';
+import { FIRE3D_CHUNK_WIDTH_QUERY, getFire3DPreference, seedFire3DPreference, setFire3DPreference } from '../state/fire3d-store';
 import { getFraming, onFramingChange, setFraming } from '../state/framing-store';
 import {
   clearOceanFraming,
@@ -131,7 +132,16 @@ import {
   onHazardClusterChange,
   setHazardCluster
 } from '../state/cluster-store';
-import { reconcileClusterWithLayerIntent } from '../state/cluster-service';
+import {
+  getCommittedSnapshot,
+  getSelectedHazard,
+  initClusterService,
+  isCustomComposition,
+  onCommittedSnapshotChange,
+  reconcileClusterWithLayerIntent,
+  requestOcean,
+  requestPresetHorizon
+} from '../state/cluster-service';
 import {
   ALL_FRAMING_BOUNDS,
   FRAMING_KEYS,
@@ -139,8 +149,23 @@ import {
   framingFitBounds
 } from '../config/framings';
 import type { FramingKey } from '../config/framings';
-import { OCEANS } from '../config/oceans';
-import { applyBasemapMode, requestBasemapMode } from '../map/basemap-switcher';
+import { OCEAN_KEYS, OCEANS } from '../config/oceans';
+import type { OceanKey } from '../config/oceans';
+import { applyBasemapMode, holdSatellite, requestBasemapMode } from '../map/basemap-switcher';
+import {
+  cameraMatchesTarget,
+  cameraStateUnchanged,
+  committedCameraTarget,
+  fitCameraTarget,
+  fitOcean,
+  fitRegion,
+  oceanTarget,
+  readCameraState,
+  regionTarget,
+  restoreCameraState
+} from '../map/camera-fit';
+import { ensoBootFitsPacific, ensoCameraAction, hasHeldEnsoCamera, holdEnsoCamera, takeEnsoCamera } from '../map/enso-camera';
+import type { CameraState, CameraTarget } from '../map/camera-fit';
 import { timeline } from '../state/timeline';
 import { resolveStatusPillText } from './island/pill-text';
 import {
@@ -154,6 +179,8 @@ import { getSheetDetent, isSheetActive, revealSheetAtPeek, setSheetDetent } from
 import { wireShareButton } from './share';
 import { showToast } from './overlay';
 import { escapeHtml } from '../util/escape';
+import { createChunkLoader } from '../util/chunk-retry';
+import { loadSearchController } from './search-chunk';
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -166,18 +193,50 @@ import { escapeHtml } from '../util/escape';
  * selection (after a click) and for the embed flag (after the user
  * expands the sidebar in embed mode).
  *
- * Reset and URL sync read this object; keep mutations restricted to
- * `selectRegion` and the expand-button handler.
+ * Reset and URL sync read this object. `currentRegion` changes only in
+ * `selectRegion`; `embed` only at the boot seed and in the expand-button
+ * handler; `desktopSidebarClosed` only at the boot seed, in the collapse
+ * and expand handlers (the two explicit controls), and in Reset, which
+ * reopens it.
  */
 interface SidebarState {
   currentRegion: RegionKey | null;
   embed: boolean;
+  /**
+   * The ONE live desktop sidebar preference (D1 M7, DDM-P10-T07, DR-139;
+   * the Codex Tier 2 disposition, S2). Seeded from `sidebar=` at the start
+   * of `applyUrlStateSync`, set synchronously by collapse and expand before
+   * they serialize, and read by every canonical write through `pushUrl`. It
+   * is independent of the DOM class and of the mobile sheet's detents: a
+   * phone preserves it without applying it, and it is applied to the
+   * `sidebar-collapsed` class only at desktop width and never in an embed.
+   */
+  desktopSidebarClosed: boolean;
 }
 
 const STATE: SidebarState = {
   currentRegion: null,
-  embed: false
+  embed: false,
+  desktopSidebarClosed: false
 };
+
+/** The region an embed's own link names; Reset returns an embed there (its frame is the embedder's choice). */
+let embedHomeRegion: RegionKey = DEFAULT_REGION;
+
+/**
+ * Apply the live desktop preference to the column, and nothing else: no URL
+ * write, no focus move. A no-op in an embed (the embed class governs) and
+ * below the desktop breakpoint (the mobile shell governs, F5), so a phone
+ * boot never shows the expand control over the rail. Called at the boot
+ * seed, on the first widening of a phone boot, and on a bfcache restore.
+ */
+function applyDesktopSidebarPreference(): void {
+  if (STATE.embed) return;
+  if (!window.matchMedia(SIDEBAR_DESKTOP_QUERY).matches) return;
+  document
+    .getElementById('app')
+    ?.classList.toggle('sidebar-collapsed', STATE.desktopSidebarClosed);
+}
 
 /**
  * Cached reference to the MapLibre map. Stored at `buildSidebar` time so
@@ -189,7 +248,7 @@ let mapRef: maplibregl.Map | null = null;
 /**
  * The layer-activation controller (the extracted spine, D-ARCH-004). Created
  * once in `buildSidebar` with the map plus the DOM view adapter below; the
- * toggle rows, preset chips, and the URL-boot path drive layer state through
+ * toggle rows, hazard rail, and the URL-boot path drive layer state through
  * it. Held module-level, mirroring `mapRef`, so the DOM builders can reach it
  * without threading it through every signature.
  */
@@ -210,6 +269,252 @@ let onStudioRouteNeeded:
 /** Mount the catalog/strip island if it is not already mounted or mounting. */
 export function mountSidebarIslandNow(): Promise<void> {
   return onIslandNeeded?.() ?? Promise.resolve();
+}
+
+// ---------------------------------------------------------------------------
+// The map-free shell and its honest disabled state
+// (2026-09-03 launch ruling section 4; DR-065; DDM-P14-T02)
+// ---------------------------------------------------------------------------
+
+/**
+ * The region observer the orchestrator hands to `buildSidebar`. Held here
+ * so the dropdown built at DOM ready can reach it once the map exists.
+ */
+let onRegionSelectRef: ((key: RegionKey) => void) | null = null;
+
+/** The shell builds once per page; its builders clear and refill their hosts. */
+let shellBuilt = false;
+
+/**
+ * False until `buildSidebar` has wired the map-dependent half. Every
+ * generated control reads it before acting, so a click landing in the
+ * window between DOM ready and map ready does nothing rather than half of
+ * something.
+ */
+let mapDependentControlsEnabled = false;
+
+/**
+ * What the interface says about a control it cannot honor yet. One reason
+ * at a time, in the words a person who is not a specialist reads, and each
+ * says only what was observed: none names a cause, promises a fix, or asks
+ * the user to do anything.
+ *
+ * `map-starting` is the ordinary boot window. `map-not-started` is the
+ * DR-035a bounded wait expiring (`MAP_LOAD_BOUND_MS`, `src/main.ts`): the
+ * map may still arrive, and the copy says so without claiming it will.
+ * `no-map` is boot deciding there will be no renderer at all.
+ *
+ * These are CONTROL affordances. They are not layer states: the six honest
+ * layer states (`loading`, `live`, `live (partial)`, `unavailable`,
+ * `no data`, `zoom in to load`) neither gain a seventh member here nor lend
+ * one of their words to this vocabulary.
+ */
+export type SidebarControlReason = 'map-starting' | 'map-not-started' | 'no-map';
+
+const CONTROL_REASON_TEXT: Readonly<Record<SidebarControlReason, string>> = {
+  'map-starting':
+    'The map is still starting. These controls turn on when it is ready.',
+  'map-not-started':
+    'The map has not started yet. These controls turn on if it does.',
+  'no-map':
+    'This browser cannot show the map, so these controls have nothing to change.'
+};
+
+/**
+ * The machine-readable half, on `<html data-ddm-controls>`, beside
+ * `data-ddm-boot`. Three words chosen so none of them is a layer state:
+ * `waiting` while the map may still arrive, `no-map` once boot has decided
+ * it will not, `ready` once the controls answer for what their names say.
+ */
+const CONTROL_PHASE: Readonly<Record<SidebarControlReason, string>> = {
+  'map-starting': 'waiting',
+  'map-not-started': 'waiting',
+  'no-map': 'no-map'
+};
+
+const CONTROL_NOTE_ID = 'sidebar-control-note';
+
+/**
+ * Every generated control the map has to be alive for. Read fresh on each
+ * call: the dropdown is rebuilt by the shell builders, and
+ * the hazard rail's buttons are generated by `wireHazardRail`.
+ *
+ * Deliberately NOT included: the share button (wired by `wireTopLevelEvents`
+ * on the map-ready path, so until then it is inert rather than disabled;
+ * recorded by S14, 2026-09-08), the sidebar collapse and expand controls
+ * (chrome geometry), and the reset button, which lives in the map overlay
+ * rather than the sidebar and would carry a reason the embed cannot show.
+ */
+function mapDependentControls(): HTMLElement[] {
+  const found: HTMLElement[] = [];
+  const push = (el: Element | null): void => {
+    if (el instanceof HTMLElement) found.push(el);
+  };
+  push(document.getElementById('region-select'));
+  push(document.getElementById('region-briefing-btn'));
+  for (const btn of document.querySelectorAll('#hazard-rail button[data-preset]')) {
+    push(btn);
+  }
+  return found;
+}
+
+/**
+ * The visible half of the disabled state: one line seated in the region
+ * panel, which travels with those controls through every surface that
+ * shows them (desktop console, the Brief shell host, the sheet's half and
+ * full console detents). A polite live region rather than an alert: the
+ * wait is ordinary and must not talk over the boot announcements.
+ */
+function ensureControlNote(): HTMLElement | null {
+  const existing = document.getElementById(CONTROL_NOTE_ID);
+  if (existing) return existing;
+  const host = document.getElementById('panel-region');
+  if (!host) return null;
+  const note = document.createElement('p');
+  note.id = CONTROL_NOTE_ID;
+  note.className = 'sidebar-control-note';
+  note.setAttribute('role', 'status');
+  note.setAttribute('aria-live', 'polite');
+  host.appendChild(note);
+  return note;
+}
+
+/**
+ * Honest disablement, following the pattern this project already uses for
+ * the horizon chips: `aria-disabled` rather than the `disabled` property,
+ * so the control keeps its place in the tab order and a keyboard or
+ * screen-reader user can still reach it and its reason. Its accessible NAME
+ * is untouched, so a disabled control still says what it will do, and the
+ * reason arrives as its description.
+ *
+ * The one exception is the native `<select>`, which ignores `aria-disabled`
+ * and would otherwise let a person change a value nothing would honor. It
+ * takes the native property as well; its `aria-label` is unchanged.
+ */
+function applyDisabledAffordance(el: HTMLElement, describe: boolean): void {
+  el.setAttribute('aria-disabled', 'true');
+  if (describe) el.setAttribute('aria-describedby', CONTROL_NOTE_ID);
+  if (el instanceof HTMLSelectElement) el.disabled = true;
+}
+
+/**
+ * Say why the map-dependent controls cannot act, and keep saying it until
+ * they can. Called at DOM ready by the shell, and again by the boot
+ * watchdog when the bounded wait expires or boot decides there will be no
+ * renderer (DDM-P14-T02). A no-op once the controls are live: nothing may
+ * re-disable a working interface.
+ */
+export function setSidebarControlReason(reason: SidebarControlReason): void {
+  if (typeof document === 'undefined') return;
+  if (mapDependentControlsEnabled) return;
+  document.documentElement.dataset['ddmControls'] = CONTROL_PHASE[reason];
+  const note = ensureControlNote();
+  if (note) note.textContent = CONTROL_REASON_TEXT[reason];
+  for (const el of mapDependentControls()) {
+    applyDisabledAffordance(el, note !== null);
+  }
+}
+
+/**
+ * The map is wired: the controls now do what their names say. Removes the
+ * note rather than rewriting it, so nothing on screen keeps saying
+ * something that has stopped being true.
+ */
+function enableMapDependentControls(): void {
+  mapDependentControlsEnabled = true;
+  if (typeof document === 'undefined') return;
+  document.documentElement.dataset['ddmControls'] = 'ready';
+  for (const el of mapDependentControls()) {
+    el.removeAttribute('aria-disabled');
+    if (el.getAttribute('aria-describedby') === CONTROL_NOTE_ID) {
+      el.removeAttribute('aria-describedby');
+    }
+    if (el instanceof HTMLSelectElement) el.disabled = false;
+  }
+  document.getElementById(CONTROL_NOTE_ID)?.remove();
+}
+
+/**
+ * Build the sidebar's generated controls WITHOUT a map (the 2026-09-03
+ * launch ruling, section 4; the shared root of DR-065 modes 1 and 2, the
+ * no-WebGL-2 shell gap, and the DDM-P14 boot watchdog).
+ *
+ * Called from the first lines of `boot()`, before the WebGL 2 probe, so the
+ * dropdown and the hazard rail exist on EVERY boot path, including the two that
+ * never get a map. Until the map is ready they are visibly and audibly
+ * disabled with a reason a non-specialist reads; `buildSidebar` enables
+ * them when the map-dependent wiring is live.
+ *
+ * State discipline: this function writes no application state. `STATE`, the
+ * timeline, the region and framing stores, and the checkbox bridge are all
+ * still seeded by `applyUrlStateSync` when the map arrives, and it applies
+ * every one of them again. What the shell reads from the URL it uses for
+ * presentation only, so a control a person can see never shows a region the
+ * link did not ask for and an iframe does not flash a populated sidebar it
+ * is about to hide.
+ *
+ * The embed class is the one piece of chrome the shell does apply early, and
+ * it comes with an obligation. `#app.embed` collapses the sidebar and REVEALS
+ * `#sidebar-expand`, whose handler resizes the map, mounts the catalog island
+ * and rebuilds the Brief head, so it cannot act until `wireTopLevelEvents`
+ * has run with a live map. Applying the class early therefore used to put a
+ * control on screen that existed and did nothing, which is the exact defect
+ * this shell exists to remove. The stylesheet closes it: the expand control
+ * is withheld until `<html data-ddm-controls="ready">`, which is where it
+ * became reachable before this change too, because the embed class itself
+ * did not exist until then.
+ *
+ * Since D1 M7 (DR-139; the Codex Tier 2 disposition, S1) an inline classic
+ * bootstrap in index.html applies the embed class, and a desktop
+ * `sidebar=closed`, even earlier, before `#sidebar` is parsed, so neither
+ * boot paints an open column while this module graph loads. The toggle
+ * below agrees with it (the same first-wins `true`/`1` grammar); the same
+ * stylesheet rule withholds the expand control either way.
+ */
+export function buildSidebarShell(): void {
+  if (shellBuilt) return;
+  shellBuilt = true;
+  if (typeof document === 'undefined') return;
+  ensureLiveRegion();
+
+  let boot: ParsedUrlParams | null = null;
+  try {
+    boot = parseUrlParams();
+  } catch (err) {
+    console.error('[sidebar] the shell could not read the URL:', err);
+  }
+
+  const app = document.getElementById('app');
+  if (app && boot) {
+    app.classList.toggle('embed', boot.embed);
+  }
+
+  buildRegionSelect();
+  wireHazardRail();
+
+  if (boot) {
+    const select = document.getElementById('region-select');
+    if (select instanceof HTMLSelectElement) {
+      select.value =
+        boot.framing !== null
+          ? `framing:${boot.framing}`
+          : `region:${boot.region}`;
+    }
+  }
+
+  setSidebarControlReason('map-starting');
+}
+
+/**
+ * A region choice from the dropdown. Inert until the map is wired: the
+ * control is disabled in that window, and this guard is the second lock so
+ * a programmatic or assistive dispatch cannot slip through it either.
+ */
+function handleRegionChoice(key: RegionKey): void {
+  const map = mapRef;
+  if (!map || !mapDependentControlsEnabled) return;
+  selectRegion(map, key);
+  onRegionSelectRef?.(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,11 +611,16 @@ function selectRegion(
   const region: Region | undefined = REGIONS[key];
   if (!region) return;
 
-  // A region without impact-synthesis capability cannot inherit a briefing
-  // from the prior region. The matrix is authoritative: closing here aborts
-  // hydration, clears the panel-owned place selection, and drops the mobile
-  // at-hand briefing before the new region is presented or printed.
-  if (regionCapabilityLevel(key, 'impactSynthesis') === 'none') {
+  // A move between United States regions keeps an open briefing (DR-256: it
+  // reads wherever its sources cover the place). An EXPLICIT move into a region
+  // outside the United States (Canada, transboundary) still closes it, so a
+  // United States briefing is never presented or printed over a Canadian map;
+  // closing aborts hydration, clears the panel-owned place selection and drops
+  // the mobile at-hand briefing. DR-109 precedence D2 / Q6: never on the silent
+  // boot fit (`silent`) or a same-region Reset (`key === priorRegion`).
+  const priorRegion = STATE.currentRegion;
+  dropPlaceView();
+  if (!silent && key !== priorRegion && !regionIsUnitedStates(key)) {
     closeImpactPanel();
   }
 
@@ -325,7 +635,10 @@ function selectRegion(
   }
 
   STATE.currentRegion = key;
-  if (key === 'british_columbia') {
+  // DR-160 (2026-09-28): the basin presentation is held; while
+  // BC_BASIN_EDITION_HELD is true, British Columbia never sets it and
+  // shows the US Drought Monitor presentation like any other region.
+  if (key === 'british_columbia' && !BC_BASIN_EDITION_HELD) {
     setDroughtSurfacePresentation({
       edition: 'bc-basin',
       name: 'British Columbia Basin Drought Levels',
@@ -340,19 +653,9 @@ function selectRegion(
   // layer signature. See src/state/region-store.ts.
   setCurrentRegion(key);
 
-  const [west, south, east, north] = regionToMapLibreBounds(region);
-  const pad = region.padding;
-  map.fitBounds(
-    [
-      [west - pad, south - pad],
-      [east + pad, north + pad]
-    ],
-    {
-      padding: 20,
-      // Suppress the fit animation for reduced-motion users (WCAG 2.3.3, #7).
-      animate: !silent && !prefersReducedMotion()
-    }
-  );
+  // The region math lives once, in src/map/camera-fit.ts (D1 M8). Suppress
+  // the fit animation for reduced-motion users (WCAG 2.3.3, #7).
+  fitRegion(map, key, !silent && !prefersReducedMotion());
 
   syncRegionSelect();
 
@@ -402,6 +705,9 @@ function pushUrl(): void {
     region: framing !== null ? null : STATE.currentRegion,
     layers: checkedLayerKeys(),
     embed: STATE.embed,
+    // syncUrl rebuilds the query from scratch, so the preference survives
+    // only by riding here (DR-139); an embed drops it inside syncUrl.
+    sidebarClosed: STATE.desktopSidebarClosed,
     view: getViewMode(),
     usdmWeek: timeline.usdmWeek,
     usdmMode: timeline.usdmMode,
@@ -412,6 +718,7 @@ function pushUrl(): void {
     framing,
     cluster: getHazardCluster(),
     ocean: getOceanFraming(),
+    hazard: getSelectedHazard(),
     studio: getStudioRoute()
   });
 }
@@ -420,21 +727,80 @@ function pushUrl(): void {
 // Region and minimap-framing selector
 // ---------------------------------------------------------------------------
 
+/**
+ * A place chosen by search or deep link moves the camera without touching the
+ * region, framing or ocean stores, so the menu kept naming the region it left
+ * (Colorado chosen, "United States" shown). This holds the camera the place
+ * ended on, and the menu then shows the neutral entry (never a region option,
+ * so picking any region from the menu always fires a change). Any region,
+ * framing or ocean choice drops it, and so does a camera that has moved off it.
+ */
+let placeView: CameraState | null = null;
+/** Bumped by every drop, so a settle that was waiting when the view was dropped stands down. */
+let placeViewGen = 0;
+
+function dropPlaceView(): void {
+  placeView = null;
+  placeViewGen += 1;
+}
+
+/** Once the camera settles, record it if it left the committed view. */
+function noteViewLeftRegion(map: maplibregl.Map): void {
+  // The new choice replaces the earlier place view now. Left standing, this
+  // flight's own moveend dropped it and stood the settle below down, so every
+  // second search fell back to the region (Colorado, then Alaska).
+  dropPlaceView();
+  const gen = placeViewGen;
+  const settle = (): void => {
+    // A later choice interrupts the flight and fires moveend; its camera is mid-flight, not the place.
+    if (gen !== placeViewGen) return;
+    const target = committedCameraTarget();
+    placeView = target && !cameraMatchesTarget(map, target) ? readCameraState(map) : null;
+    syncRegionSelect();
+  };
+  // The fit is usually under way when the choice lands; wait for it to end.
+  if (map.isMoving()) map.once('moveend', settle);
+  else settle();
+}
+
+/** Every moveend: once the camera leaves the chosen place the neutral entry no longer applies; fall back to the committed region. */
+function dropMovedPlaceView(map: maplibregl.Map): void {
+  if (placeView && !cameraStateUnchanged(map, placeView)) {
+    dropPlaceView();
+    syncRegionSelect();
+  }
+}
+
+/** A search or deep-link place choice. */
+function notePlaceView(map: maplibregl.Map, place: PlaceSelection): void {
+  // A map click carries no pointInsidePlace and does not move the camera.
+  if (place.context.pointInsidePlace) noteViewLeftRegion(map);
+}
+
 function syncRegionSelect(): void {
   const select = document.getElementById('region-select');
   if (!(select instanceof HTMLSelectElement)) return;
+  const ocean = getOceanFraming();
   const framing = getFraming();
-  select.value = framing !== null
-    ? `framing:${framing}`
-    : `region:${STATE.currentRegion ?? DEFAULT_REGION}`;
+  // A place view wins over the stores it did not change; an ocean camera
+  // has precedence over the framing it leaves in the store.
+  select.value = placeView && mapRef && cameraStateUnchanged(mapRef, placeView)
+    ? 'view:place'
+    : ocean !== null
+      ? `ocean:${ocean}`
+      : framing !== null
+        ? `framing:${framing}`
+        : `region:${STATE.currentRegion ?? DEFAULT_REGION}`;
 }
 
 /** Build one dropdown that follows minimap choices while preserving every
- * established detailed `region=` camera as a second option group. */
-function buildRegionSelect(
-  map: maplibregl.Map,
-  onRegionSelect: (key: RegionKey) => void
-): void {
+ * established detailed `region=` camera as a second option group.
+ *
+ * Map-free (2026-09-03 launch ruling section 4): the options come from the
+ * static `REGIONS`, `FRAMINGS` and `FRAMING_KEYS` tables, and the handlers
+ * read the module-level `mapRef` when they fire rather than closing over a
+ * map that does not exist yet. */
+function buildRegionSelect(): void {
   const select = document.getElementById('region-select');
   if (!(select instanceof HTMLSelectElement)) return;
   select.replaceChildren();
@@ -445,10 +811,19 @@ function buildRegionSelect(
   allOption.value = 'framing:all';
   allOption.textContent = 'All of North America';
   overviewGroup.appendChild(allOption);
+  // Every Jump to region option label must be unique (D1 M4, found-026): an
+  // editorial framing (Hawaii) can share its label with the detailed region
+  // it was drawn to match (regions.ts's comment at :299-302). Disambiguate
+  // only the overview option text here, never the config label itself or the
+  // detail option at REGIONS[key].label below, which u3i.spec.ts pins 1:1.
+  const regionLabels = new Set(
+    (Object.values(REGIONS) as Region[]).map((region) => region.label)
+  );
   for (const key of FRAMING_KEYS) {
     const option = document.createElement('option');
     option.value = `framing:${key}`;
-    option.textContent = FRAMINGS[key].label;
+    const label = FRAMINGS[key].label;
+    option.textContent = regionLabels.has(label) ? `${label} (overview)` : label;
     overviewGroup.appendChild(option);
   }
 
@@ -461,12 +836,39 @@ function buildRegionSelect(
     option.title = region.description;
     detailGroup.appendChild(option);
   }
-  select.append(overviewGroup, detailGroup);
+
+  const oceanGroup = document.createElement('optgroup');
+  oceanGroup.label = 'Ocean views';
+  for (const key of OCEAN_KEYS) {
+    const option = document.createElement('option');
+    option.value = `ocean:${key}`;
+    option.textContent = OCEANS[key].label;
+    oceanGroup.appendChild(option);
+  }
+  // Shown only after a place choice moved the camera off every region; it names none.
+  const placeOption = document.createElement('option');
+  placeOption.value = 'view:place';
+  placeOption.textContent = 'Selected place';
+  placeOption.hidden = true;
+  placeOption.disabled = true;
+  select.append(placeOption, overviewGroup, oceanGroup, detailGroup);
 
   select.addEventListener('change', () => {
+    const map = mapRef;
+    if (!map || !mapDependentControlsEnabled) return;
+    dropPlaceView();
     const [kind, rawKey] = select.value.split(':', 2);
     if (kind === 'region' && rawKey && rawKey in REGIONS) {
-      onRegionSelect(rawKey as RegionKey);
+      handleRegionChoice(rawKey as RegionKey);
+      return;
+    }
+    if (kind === 'ocean' && rawKey && rawKey in OCEANS) {
+      // One gesture enters ENSO and fits the ocean camera (D-0.7.0-053); the
+      // framing store is untouched so the prior land framing survives a clear.
+      const key = rawKey as OceanKey;
+      requestOcean(key);
+      requestBasemapMode(map, defaultBasemapFor('enso'));
+      fitOcean(map, key);
       return;
     }
     if (kind !== 'framing') return;
@@ -501,6 +903,8 @@ function buildRegionSelect(
   briefingBtn.className = 'region-briefing-btn';
   briefingBtn.hidden = true;
   briefingBtn.addEventListener('click', () => {
+    const map = mapRef;
+    if (!map || !mapDependentControlsEnabled) return;
     // Front door (F3): a selected map place takes precedence, opening the same
     // briefing its boundary popup would. Otherwise fall back to the
     // region-anchored briefing. The anchor path resolves after an async
@@ -521,6 +925,21 @@ function buildRegionSelect(
     });
   });
   select.insertAdjacentElement('afterend', briefingBtn);
+
+  // The door's plain-text alternate (D1 M4 repair, found-024): the second
+  // shell row is never empty, so when the door has nothing to show, this
+  // statement takes its place instead of a reserved but empty band. It is
+  // not a button (no click handler, no URL state) and is not a live region
+  // (no per-change announcement); updateRegionBriefingTrigger keeps it the
+  // exact inverse of the door's own hidden state, so exactly one of the two
+  // occupies the row.
+  const briefingNote = document.createElement('span');
+  briefingNote.id = 'region-briefing-note';
+  briefingNote.className = 'region-briefing-note';
+  briefingNote.textContent = 'Pick a place to open its briefing.';
+  briefingNote.hidden = true;
+  briefingBtn.insertAdjacentElement('afterend', briefingNote);
+
   // Reflect the region active at build time (boot applies it again via selectRegion).
   syncRegionSelect();
   updateRegionBriefingTrigger(STATE.currentRegion);
@@ -530,29 +949,54 @@ function buildRegionSelect(
  * Show, label, or hide the region-briefing trigger for the active region (#9).
  * A region with a briefing anchor shows an explicit trigger naming the boundary
  * the briefing describes; a region that spans several states (or the national
- * framing) has no anchor and hides the trigger.
+ * framing) has no anchor and hides the trigger. So does an active minimap
+ * framing camera (D1 M4, found-025): the door never names a place the camera
+ * has left, so it hides under a framing and returns once a region is chosen
+ * again (selectRegion clears the framing before relabeling, :585-586, :623).
  */
 function updateRegionBriefingTrigger(regionKey: RegionKey | null | undefined): void {
   const btn = document.getElementById('region-briefing-btn');
   if (!(btn instanceof HTMLButtonElement)) return;
+  // The plain-text alternate (D1 M4 repair, found-024) is optional only for
+  // callers that run before buildRegionSelect has inserted it; every real
+  // path keeps it the exact inverse of the door below.
+  const note = document.getElementById('region-briefing-note');
   // A selected map place takes precedence over the region anchor (F3, the
-  // answer-first front door): the button becomes "See what this means" for the
-  // place the user just clicked.
+  // answer-first front door): the button becomes "Open briefing" for the
+  // place the user just clicked, the phone's and the Place studio's words.
+  // The door carries the place's name on its first line, whole (repair R2):
+  // it is the one place the column names the chosen place.
   const place = getPlaceSelection();
   if (place) {
     btn.hidden = false;
-    btn.textContent = 'See what this means';
-    btn.setAttribute('aria-label', `See what the drought means for ${place.label}`);
+    const name = document.createElement('span');
+    name.className = 'region-briefing-place';
+    name.textContent = place.label;
+    const action = document.createElement('span');
+    action.className = 'region-briefing-action';
+    action.textContent = 'Open briefing';
+    btn.replaceChildren(name, action);
+    // Mode-neutral on purpose: the door opens the same briefing in every mode.
+    // The name starts with the visible words (WCAG 2.5.3) and adds the place.
+    btn.setAttribute('aria-label', `Open briefing for ${place.label}`);
+    if (note) note.hidden = true;
+    return;
+  }
+  if (getFraming() !== null) {
+    btn.hidden = true;
+    if (note) note.hidden = false;
     return;
   }
   const anchor = regionKey ? REGIONS[regionKey]?.briefing : undefined;
   if (!anchor) {
     btn.hidden = true;
+    if (note) note.hidden = false;
     return;
   }
   btn.hidden = false;
   btn.textContent = `Impact briefing: ${anchor.label}`;
   btn.setAttribute('aria-label', `Open the impact briefing for ${anchor.label}`);
+  if (note) note.hidden = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -569,57 +1013,41 @@ function updateRegionBriefingTrigger(regionKey: RegionKey | null | undefined): v
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// View preset chips (UX-2)
+// Hazard presets (phone rail)
 // ---------------------------------------------------------------------------
 
 /**
- * Build the question-first preset chip row from `VIEW_PRESETS`. Each chip
- * is a plain button (not a toggle: presets set state without locking it,
- * so no chip carries a pressed state) whose click applies the preset's
- * layer-set and any explicit preferred basemap. The tooltip carries the
- * question the preset answers.
+ * Apply one hazard-rail preset, in a fixed order (D1 M6, 2026-09-27;
+ * found-005):
+ *
+ *   1. The layer set, through the controller (`applyPreset`). Every
+ *      checkbox flip it makes reconciles the cluster claim synchronously
+ *      (the checked-change subscription in `wireSidebar`; the bridge
+ *      notifies in the same turn), and no preset set equals a hazard's
+ *      clean composition, so the display is a custom set when this returns.
+ *   2. The horizon an entry into the preset's mode lands on, on the
+ *      register only (a custom set keeps its layers; ENSO's rail entry
+ *      commits Season ahead, which its layers already show, and a later
+ *      preset of another mode lands on Current, `requestPresetHorizon`).
+ *   3. The explicit preferred basemap, if any.
  */
-function applyViewPreset(map: maplibregl.Map, preset: ViewPreset): void {
-  if (!controllerRef) return;
+function applyViewPreset(preset: ViewPreset): void {
+  const map = mapRef;
+  if (!map || !controllerRef) return;
   controllerRef.applyPreset(preset);
+  requestPresetHorizon(preset.mode);
   if (preset.preferredBasemap) {
     requestBasemapMode(map, preset.preferredBasemap);
   }
 }
 
-function buildPresetChips(map: maplibregl.Map): void {
-  const container = document.getElementById('preset-chips');
-  if (!container) return;
-  container.innerHTML = '';
-
-  for (const preset of VIEW_PRESETS) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'preset-chip';
-    btn.textContent = preset.label;
-    btn.title = preset.description;
-    // Preset application (deactivate the non-wanted, activate the wanted,
-    // preserving the at-most-one-surface invariant) now lives in the
-    // controller; the chip is a thin trigger.
-    btn.addEventListener('click', () => {
-      applyViewPreset(map, preset);
-      // Mobile shell (the mockup's rule 5): a quick view applies its
-      // preset and closes the sheet so the map answers. Desktop is
-      // untouched (the sheet is never active there).
-      if (isSheetActive()) {
-        const d = getSheetDetent();
-        if (d === 'half' || d === 'full') setSheetDetent('closed');
-      }
-    });
-    container.appendChild(btn);
-  }
-}
-
 /**
  * Wire the mobile hazard rail (0.7.0 mobile shell; the ratified 2026-07-11
- * mockup's lower-right thumb rail). The rail's markup is static in
- * index.html; visibility is stylesheet-gated to the mobile shell's
- * map-visible detents, so this wiring is inert on desktop and in embed.
+ * mockup's lower-right thumb rail). The rail's container is static in
+ * index.html and its buttons are generated here, one per mode, from
+ * src/ui/hazard-rail.ts (DR-113); visibility is stylesheet-gated to the
+ * mobile shell's map-visible detents, so this wiring is inert on desktop
+ * and in embed.
  * Each button applies its hazard preset through the one controller, requests
  * its preferred basemap when declared, and then an open sheet closes to the
  * edgeless map (the mockup: a quick select is a
@@ -628,22 +1056,27 @@ function buildPresetChips(map: maplibregl.Map): void {
  * reads pressed while its surface layer is actually active, so the rail
  * never claims a hazard the map is not showing.
  */
-function wireHazardRail(map: maplibregl.Map): void {
+function wireHazardRail(): void {
   const rail = document.getElementById('hazard-rail');
   if (!rail) return;
-  const buttons: Array<{ btn: HTMLButtonElement; surface: string }> = [];
+  rail.innerHTML = hazardRailMarkup();
+  const buttons: Array<{ btn: HTMLButtonElement; surface: string; mode: string }> = [];
   for (const btn of rail.querySelectorAll<HTMLButtonElement>('button[data-preset]')) {
     const preset = MOBILE_HAZARD_PRESETS.find((p) => p.key === btn.dataset.preset);
     if (!preset) continue;
     // Accessible name only (W2-D7): a title that duplicates the accessible
     // name verbatim adds a redundant tooltip and double speech, not information.
-    btn.setAttribute('aria-label', preset.description);
+    // The name leads with the word the cell shows (owner direction 2026-11-09
+    // (sprint), DR-pending: the right-edge column labels every hazard view),
+    // so the word a sighted voice-control user reads operates it (WCAG 2.5.3).
+    btn.setAttribute('aria-label', `${preset.label}. ${preset.description}`);
     // The preset's first layer is its condition surface (the table is
     // ordered surface-first); the pressed state mirrors that layer.
     const surface = preset.layers[0] ?? '';
-    buttons.push({ btn, surface });
+    buttons.push({ btn, surface, mode: preset.mode });
     btn.addEventListener('click', () => {
-      applyViewPreset(map, preset);
+      if (!mapDependentControlsEnabled) return;
+      applyViewPreset(preset);
       if (isSheetActive()) {
         const d = getSheetDetent();
         if (d === 'half' || d === 'full') setSheetDetent('closed');
@@ -651,13 +1084,21 @@ function wireHazardRail(map: maplibregl.Map): void {
     });
   }
   if (buttons.length === 0) return;
+  // Pressed while the map is showing that hazard: its surface layer is
+  // active, or its mode is the committed one (a shared `cluster=` link opens
+  // the mode's own recipe, whose surface can differ from the rail preset's;
+  // before 2026-11-09 such a link left all four cells unpressed). A custom
+  // layer set commits no mode, so only the surface rule can press a cell
+  // then, and the rail still never claims a hazard the map is not showing.
   const reflect = (): void => {
     const active = registry.getActiveKeys();
-    for (const { btn, surface } of buttons) {
-      btn.setAttribute('aria-pressed', String(active.has(surface)));
+    const committed = getCommittedSnapshot().cluster;
+    for (const { btn, surface, mode } of buttons) {
+      btn.setAttribute('aria-pressed', String(active.has(surface) || committed === mode));
     }
   };
   registry.on('change', reflect);
+  onCommittedSnapshotChange(reflect);
   reflect();
 }
 
@@ -729,7 +1170,7 @@ function buildTelemetryList(
       // from cache or joins the in-flight fetch.
       void import('../layers/telemetry')
         .then(({ flyToStation }) => {
-          flyToStation(map, station.id);
+          flyToStation(map, station.id, item);
         })
         .catch((err: unknown) => {
           console.error('[sidebar] telemetry fly-to failed to load:', err);
@@ -766,18 +1207,17 @@ function wireTelemetryReveal(map: maplibregl.Map): void {
 // ---------------------------------------------------------------------------
 
 /**
- * One-shot-per-session guard for the station-value hydration. The skill
- * vocabulary's `unknown` state is "not yet fetched in this session"; the
- * first telemetry-layer activation triggers the fetch round trip.
+ * Guard against a second hydration while telemetry stays on. Every
+ * telemetry layer-off clears it, so each activation fetches again.
  */
 let stationValuesHydrated = false;
 
 /** Master abort for in-flight value fetches; fired on telemetry layer-off. */
 let stationValuesController: AbortController | null = null;
 
-/** Compact display date for a YYYY-MM-DD reading ("Jun 30"). */
+/** Compact display date ("Jun 30") for a YYYY-MM-DD day or a full timestamp, in the reader's local time. */
 function shortReadingDate(iso: string): string {
-  const d = new Date(`${iso}T00:00:00`);
+  const d = new Date(iso.length === 10 ? `${iso}T00:00:00` : iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
@@ -802,7 +1242,8 @@ async function fetchPrimaryStationValue(
       await import('../util/awdb');
     const elements = elementsForAwdbStationTriplet(station.awdbStation);
     const series = await fetchAwdbDailySeries(station.awdbStation, elements, 7, signal);
-    const primary = series.find((s) => s.element === elements[0]);
+    // The request may carry a depth selector (`SMS:*`); the payload's element code does not.
+    const primary = series.find((s) => s.element === elements[0]?.split(':')[0]);
     return primary ? toStationValue(station.id, primary) : null;
   }
   if (station.hydrometParams && station.hydrometParams.length > 0) {
@@ -828,21 +1269,17 @@ async function fetchPrimaryStationValue(
 
 /**
  * Compact display label for a station's primary value. Snow Water
- * Equivalent keeps its conventional SWE shorthand; storage readings get a
- * thousands separator; everything else renders label, value, and unit as
+ * Equivalent keeps its conventional SWE shorthand; storage and discharge
+ * readings get a thousands separator; everything else renders label, value, and unit as
  * the source reported them.
  */
 function formatStationValue(value: StationValue): string {
   const label = value.parameter === 'snow_water_equivalent_in' ? 'SWE' : value.label;
-  const wantsThousands =
-    value.parameter === 'reservoir_storage_acft' || value.parameter === 'discharge_cfs';
-  const num =
-    wantsThousands && value.value !== null
-      ? value.value.toLocaleString('en-US', { maximumFractionDigits: 0 })
-      : String(value.value);
-  const day = value.timestamp ? ` · ${shortReadingDate(value.timestamp.slice(0, 10))}` : '';
+  const num = formatStationNumber(value.value, value.parameter);
+  const day = value.timestamp ? ` · ${shortReadingDate(value.timestamp)}` : '';
   const staleNote = value.freshness === 'stale' ? ' (stale)' : '';
-  return `${label} ${num} ${value.unit}${day}${staleNote}`;
+  const estimatedNote = value.estimated ? ' (Estimated)' : '';
+  return `${label} ${num} ${value.unit}${estimatedNote}${day}${staleNote}`;
 }
 
 /**
@@ -853,9 +1290,9 @@ function formatStationValue(value: StationValue): string {
  *
  * Each station renders its primary parameter compactly (the 400 pixel
  * embed is first-class), with the reading date, "(stale)" appended when
- * the reading is older than its freshness window, or "values
- * unavailable" on fetch failure. A zero reading renders as 0; summer
- * snowpack is legitimately zero.
+ * the reading is older than its freshness window, "no data" when the read
+ * answered with no recent value, or "values unavailable" on fetch failure.
+ * A zero reading renders as 0; summer snowpack is legitimately zero.
  */
 function hydrateStationValues(map: maplibregl.Map): void {
   const controller = new AbortController();
@@ -871,7 +1308,7 @@ function hydrateStationValues(map: maplibregl.Map): void {
       if (!station.awdbStation && !station.hydrometParams && !station.cwms && !station.usgsSite)
         continue;
       const slot = document.querySelector<HTMLElement>(
-        `[data-station-values="${cssAttrEscape(station.id)}"]`
+        `[data-station-values="${CSS.escape(station.id)}"]`
       );
       if (!slot) continue;
 
@@ -885,7 +1322,8 @@ function hydrateStationValues(map: maplibregl.Map): void {
         .then((value) => {
           if (signal.aborted || !slot.isConnected) return;
           if (!value || value.value === null) {
-            slot.textContent = 'values unavailable';
+            // The read answered with no recent value: the station popup's state word.
+            slot.textContent = 'no data';
             slot.className = 'telemetry-values unavailable';
             return;
           }
@@ -902,11 +1340,11 @@ function hydrateStationValues(map: maplibregl.Map): void {
 }
 
 /**
- * Registry hook for the value lifecycle: first telemetry activation
- * hydrates once per session; a telemetry layer-off aborts anything still
- * in flight (the cancellation invariant). Values already rendered
- * stay rendered; the list is catalog metadata plus last-known readings,
- * not something to blank on toggle.
+ * Registry hook for the value lifecycle: each telemetry activation
+ * hydrates; a telemetry layer-off aborts anything still in flight (the
+ * cancellation invariant) and re-arms the next activation. Values already
+ * rendered stay rendered; the list is catalog metadata plus last-known
+ * readings, not something to blank on toggle.
  */
 function onActiveChangeForStationValues(
   map: maplibregl.Map,
@@ -918,6 +1356,13 @@ function onActiveChangeForStationValues(
   } else if (!active.has('telemetry') && stationValuesController) {
     stationValuesController.abort();
     stationValuesController = null;
+    // Rows still loading are emptied (the :empty rule hides them); resolved
+    // rows keep their last-known values. The next activation refetches.
+    for (const slot of document.querySelectorAll<HTMLElement>('.telemetry-values.loading')) {
+      slot.textContent = '';
+      slot.className = 'telemetry-values';
+    }
+    stationValuesHydrated = false;
   }
 }
 
@@ -946,33 +1391,102 @@ function ensureTelemetryActive(_map: maplibregl.Map): void {
 function wireTopLevelEvents(map: maplibregl.Map): void {
   wireShareButton('share-btn');
 
-  const resetBtn = document.getElementById('reset-btn');
-  if (resetBtn) {
-    resetBtn.addEventListener('click', () => {
-      if (STATE.currentRegion) {
-        selectRegion(map, STATE.currentRegion);
-      }
-    });
+  // The refit on a sidebar toggle (D1 M8, found-029, DDM-P10-T07). Opening or
+  // closing the desktop column changes the map's width; when the camera still
+  // shows the committed target (the ocean, framing or region last committed),
+  // it is refitted to the new canvas, and otherwise (a pan, zoom, pitch or
+  // rotation) the camera keeps its live centre and zoom, the plain resize.
+  // The snapshot is taken synchronously in the click, before the column moves
+  // or the canvas resizes; the refit is camera-only and writes no store and no
+  // URL (the camera is not URL state). Below the desktop breakpoint (the phone
+  // embed exit) the toggle keeps the plain resize.
+  interface SidebarCameraSnapshot {
+    /** The committed target, kept only when the live camera showed it. */
+    readonly target: CameraTarget | null;
+    /** The live camera at the click. */
+    readonly camera: CameraState;
   }
+  const snapshotSidebarCamera = (): SidebarCameraSnapshot => {
+    const committed = window.matchMedia(SIDEBAR_DESKTOP_QUERY).matches
+      ? committedCameraTarget()
+      : null;
+    const showsCommitted = committed !== null && cameraMatchesTarget(map, committed);
+    return {
+      target: showsCommitted ? committed : null,
+      camera: readCameraState(map)
+    };
+  };
+  // ONE pending timer for both controls: a re-toggle inside the delay clears
+  // it, and its own snapshot decides (the resizeTimer pattern below).
+  let sidebarRefitTimer: number | null = null;
+  let stopWatchingCamera: (() => void) | null = null;
+  const clearSidebarRefit = (): void => {
+    if (sidebarRefitTimer !== null) window.clearTimeout(sidebarRefitTimer);
+    sidebarRefitTimer = null;
+    stopWatchingCamera?.();
+    stopWatchingCamera = null;
+  };
+  // A forced (Reset) refit is only for as long as Reset is the latest camera
+  // intent: any later move that is not a resize (a gesture, a region, framing,
+  // ocean or search fit) cancels it. A resize starts its own movestart only
+  // when idle, and fires `resize` in the same call, so the microtask skips it.
+  const cancelRefitOnNewerCamera = (): void => {
+    let resized = false;
+    const onResize = (): void => { resized = true; };
+    const onMoveStart = (): void => {
+      resized = false;
+      queueMicrotask(() => { if (!resized) clearSidebarRefit(); });
+    };
+    map.on('resize', onResize);
+    map.on('movestart', onMoveStart);
+    stopWatchingCamera = () => {
+      map.off('resize', onResize);
+      map.off('movestart', onMoveStart);
+    };
+  };
+  const resizeAfterSidebarToggle = (snapshot: SidebarCameraSnapshot, refitAlways = false): void => {
+    clearSidebarRefit();
+    if (refitAlways) cancelRefitOnNewerCamera();
+    // Allow the CSS grid transition to settle before resizing the map. The
+    // 220 ms delay matches the vanilla baseline; it is kept under reduced
+    // motion too, where the transition itself is instant (a known mismatch,
+    // left as it is by M8).
+    sidebarRefitTimer = window.setTimeout(() => {
+      sidebarRefitTimer = null;
+      stopWatchingCamera?.();
+      stopWatchingCamera = null;
+      map.resize();
+      const { target, camera } = snapshot;
+      // A pan, zoom or pitch during the transition cancels the refit, except
+      // after Reset, whose own fit is still animating at this mark.
+      if (target !== null && (refitAlways || cameraStateUnchanged(map, camera))) {
+        fitCameraTarget(map, target, !prefersReducedMotion());
+      }
+    }, 220);
+  };
 
   const collapseBtn = document.getElementById('sidebar-collapse');
   if (collapseBtn) {
     collapseBtn.addEventListener('click', () => {
+      const snapshot = snapshotSidebarCamera();
       const app = document.getElementById('app');
       if (app) app.classList.add('sidebar-collapsed');
-      // Allow the CSS grid transition to settle before resizing the
-      // map. The 220 ms delay matches the vanilla baseline.
-      window.setTimeout(() => {
-        map.resize();
-      }, 220);
+      // An explicit desktop choice (DR-139): the live preference first, then
+      // the write, so the URL carries `sidebar=closed` (replaceState, R5 a).
+      STATE.desktopSidebarClosed = true;
+      pushUrl();
+      document.getElementById('sidebar-expand')?.focus();
+      resizeAfterSidebarToggle(snapshot);
     });
   }
 
   const expandBtn = document.getElementById('sidebar-expand');
   if (expandBtn) {
     expandBtn.addEventListener('click', () => {
+      const snapshot = snapshotSidebarCamera();
       const app = document.getElementById('app');
       if (app) app.classList.remove('sidebar-collapsed', 'embed');
+      if (!window.matchMedia('(max-width: 720px)').matches) collapseBtn?.focus();
       // Expanding always exits embed mode so the user gets the full
       // chrome back. Persist that to the URL so a refresh holds. A brief
       // embed deferred the catalog island (headroom C1); the full chrome
@@ -988,6 +1502,9 @@ function wireTopLevelEvents(map: maplibregl.Map): void {
       // the full chrome's host is the Brief head. Idempotent (Codex
       // S2/E1 integration finding 2).
       ensureBriefHeadTribalAction();
+      // Expanding also opens the desktop preference, so the write below
+      // drops `sidebar=` (DR-139); the embed exit opens with the key absent.
+      STATE.desktopSidebarClosed = false;
       pushUrl();
       refreshLayersStudioEntry();
       onStudioRouteNeeded?.(getStudioRoute(), 'push');
@@ -995,9 +1512,36 @@ function wireTopLevelEvents(map: maplibregl.Map): void {
       // at peek (the ratified embed-exit path, D-0.7.0-017); a desktop
       // expand is a no-op inside the helper.
       revealSheetAtPeek();
-      window.setTimeout(() => {
-        map.resize();
-      }, 220);
+      resizeAfterSidebarToggle(snapshot);
+    });
+  }
+
+  // Reset is the mode's bare link (owner, 2026-10-19): the default region (an
+  // embed's own link region), the Pacific in ENSO, the mode's base map, and the
+  // desktop column reopened. Mode, horizon, layers and view stay.
+  const resetBtn = document.getElementById('reset-btn');
+  if (resetBtn) {
+    resetBtn.addEventListener('click', () => {
+      // The person's hazard: a custom set made in ENSO still resets to the Pacific.
+      const cluster = getSelectedHazard();
+      const reopen = !STATE.embed && STATE.desktopSidebarClosed
+        && window.matchMedia(SIDEBAR_DESKTOP_QUERY).matches;
+      if (reopen) {
+        // Before selectRegion, so its URL write already drops sidebar=closed.
+        STATE.desktopSidebarClosed = false;
+        applyDesktopSidebarPreference();
+      }
+      requestBasemapMode(map, defaultBasemapFor(cluster));
+      const home = STATE.embed ? embedHomeRegion : DEFAULT_REGION;
+      // An explicit choice: clears framing= and ocean=, fits, writes the URL.
+      selectRegion(map, home);
+      const pacific = ensoBootFitsPacific(cluster, false, false, home === DEFAULT_REGION, false);
+      if (pacific) fitOcean(map, 'pacific');
+      // The reopened column narrows the canvas under the fit: refit once it settles.
+      if (reopen) {
+        const target = pacific ? oceanTarget('pacific') : regionTarget(home);
+        resizeAfterSidebarToggle({ target, camera: readCameraState(map) }, true);
+      }
     });
   }
 
@@ -1010,6 +1554,27 @@ function wireTopLevelEvents(map: maplibregl.Map): void {
       map.resize();
       resizeTimer = null;
     }, 150);
+  });
+
+  // The desktop sidebar preference across the breakpoint (D1 M7, S2; F5).
+  // A boot below it preserves `sidebar=` without applying it; the FIRST
+  // widening applies the live preference once (the one-shot widen precedent
+  // at main.ts's Fire 3D gate). After that the column follows only explicit
+  // choices, so they survive repeated crossings. Applying writes nothing.
+  const desktopSidebar = window.matchMedia(SIDEBAR_DESKTOP_QUERY);
+  if (!desktopSidebar.matches) {
+    const onWiden = (): void => {
+      if (!desktopSidebar.matches) return;
+      desktopSidebar.removeEventListener('change', onWiden);
+      applyDesktopSidebarPreference();
+    };
+    desktopSidebar.addEventListener('change', onWiden);
+  }
+  // A document restored from the back-forward cache may have missed a
+  // widening while it was frozen: reconcile the column with the LIVE
+  // preference (never with the restored URL, and never with a write).
+  window.addEventListener('pageshow', (event) => {
+    if (event.persisted) applyDesktopSidebarPreference();
   });
 }
 
@@ -1031,20 +1596,21 @@ function wireTopLevelEvents(map: maplibregl.Map): void {
  */
 function applyUrlStateSync(map: maplibregl.Map): ParsedUrlParams {
   const params = parseUrlParams();
+  // Read now: the first canonical write below drops the one-shot `select=`.
+  const placeSelected = parseSelectParam() !== null;
   STATE.embed = params.embed;
+  // Seed the desktop sidebar preference FIRST (D1 M7, S2): the store seeds
+  // below can each fire a canonical write through listeners registered
+  // before this function runs, and every write must carry the preference.
+  // An embed has already folded it to open. The inline bootstrap in
+  // index.html applied the same state before first paint; this re-applies
+  // it idempotently at desktop width and leaves a phone untouched.
+  STATE.desktopSidebarClosed = params.sidebarClosed;
+  applyDesktopSidebarPreference();
 
   // Seed the view mode BEFORE the first pushUrl below (selectRegion syncs
   // the URL, and the URL must carry the derived mode from its first write).
   setViewMode(params.view);
-
-  // Record the RAW explicit-view ask beside the mode (U-UX-FIX-1 DEF-2):
-  // once the first pushUrl stamps `view=` onto every URL, only this
-  // parse-time flag still distinguishes a shared `?view=brief` link from
-  // a bare boot's derived Brief mode. The mobile sheet consumes it at its
-  // boot activation (see initMobileSheet) to honor the shared link with
-  // the half-detent Brief surface while a bare boot stays map-first
-  // closed (D-0.7.0-041).
-  setExplicitBriefBoot(params.explicitView && params.view === 'brief');
 
   // Seed the region-shell stores (S2) BEFORE the first pushUrl for the
   // same reason: a `framing=` or `cluster=` deep link must survive the
@@ -1053,6 +1619,10 @@ function applyUrlStateSync(map: maplibregl.Map): ParsedUrlParams {
   // so the seeds are the committed truth.
   setFraming(params.framing);
   setHazardCluster(params.cluster, params.ocean);
+  // The person's hazard from the link, before the first write carries it. A
+  // brief embed never mounts the shell, so this is its only initialization;
+  // mountShell's later call is a no-op.
+  initClusterService(params.hazard);
 
   // Seed the temporal store BEFORE any layer activates, so a layer module
   // that reads the timeline during activate() (USDM restoring a scrubbed
@@ -1072,6 +1642,24 @@ function applyUrlStateSync(map: maplibregl.Map): ParsedUrlParams {
   // visual switch is kicked off here and settles asynchronously (the
   // desaturated default paints first; the U1 boot-split precedent).
   setBasemapMode(params.basemap);
+  // DR-122: fire3d= is Wildfire-scoped, so an old link outside Wildfire
+  // boots flat and drops the token (before the hold below is ever taken).
+  // shortcut: a custom set made in Wildfire also boots flat and drops it, since
+  // the Fire3D gate admits no custom boot; read the hazard here only once the gate does.
+  const fire3d = params.fire3d && params.cluster === 'wildfire';
+  if (params.fire3d && !fire3d) syncFire3dParam(false);
+  // DR-105: a `fire3d=true` boot that loads the 3D chunk (main.ts) holds the
+  // imagery until the scene's controller decides; it releases the hold when
+  // the scene does not open. The same rule as main.ts's load: at the chunk's
+  // width, and below the console's width only outside an embed, which never
+  // loads the controller that would release the hold (review finding R2-10).
+  if (
+    fire3d &&
+    window.matchMedia(FIRE3D_CHUNK_WIDTH_QUERY).matches &&
+    (window.matchMedia(SIDEBAR_DESKTOP_QUERY).matches || !params.embed)
+  ) {
+    holdSatellite(map, true);
+  }
   if (params.basemap === 'satellite') {
     void applyBasemapMode(map, 'satellite');
   }
@@ -1081,7 +1669,7 @@ function applyUrlStateSync(map: maplibregl.Map): ParsedUrlParams {
   // write (syncUrl re-reads the parameter fresh). The seed never writes the
   // URL; the orchestrator (src/map/fire3d.ts, a desktop-only lazy chunk
   // loaded from main.ts) observes the store and applies the map side.
-  seedFire3DPreference(params.fire3d);
+  seedFire3DPreference(fire3d);
 
   // The studio composes with all map state. Seed it only after every
   // underlying store above is ready, and before selectRegion performs the
@@ -1104,20 +1692,36 @@ function applyUrlStateSync(map: maplibregl.Map): ParsedUrlParams {
   // bookkeeping (STATE.currentRegion, the radio marks, the store
   // mirror), and both fits are instant in the same task, so only the
   // winning camera ever paints.
+  if (params.embed) embedHomeRegion = params.region;
   selectRegion(map, params.region, true);
+
+  // A boot into ENSO whose URL names no camera of its own enters the way the
+  // mode button does (F9): hold the region view just fitted, so leaving ENSO
+  // returns to it, then fit the Pacific. The hold replaces the one the cluster
+  // subscriber took at the seed above, before the region fit.
+  const ensoBoot = ensoBootFitsPacific(
+    params.hazard,
+    params.ocean !== null,
+    params.framing !== null,
+    params.region === DEFAULT_REGION,
+    placeSelected
+  );
+  if (ensoBoot) holdEnsoCamera(readCameraState(map));
 
   // The boot camera precedence (S2): `ocean=` (the most specific gesture,
   // pairing display with camera, D-0.7.0-053) wins over `framing=`
   // (D-0.7.0-039/041), which wins over the legacy `region=` fit above.
   // Both are camera-only: they select nothing and brief nothing.
-  const cameraDef = params.ocean
-    ? OCEANS[params.ocean]
-    : params.framing === 'all'
-      ? { bounds: ALL_FRAMING_BOUNDS, padding: 0 }
-      : params.framing
-        ? FRAMINGS[params.framing]
-        : null;
-  if (cameraDef) {
+  const oceanBoot = params.ocean ?? (ensoBoot ? 'pacific' : null);
+  const cameraDef = params.framing === 'all'
+    ? { bounds: ALL_FRAMING_BOUNDS, padding: 0 }
+    : params.framing
+      ? FRAMINGS[params.framing]
+      : null;
+  if (oceanBoot) {
+    // The shared ocean fit, so a small map keeps the zoom floor on the Nino 3.4 box.
+    fitCameraTarget(map, oceanTarget(oceanBoot), false);
+  } else if (cameraDef) {
     map.fitBounds(
       framingFitBounds(cameraDef),
       { padding: 20, animate: false }
@@ -1144,8 +1748,24 @@ export function buildSidebar(
   map: maplibregl.Map,
   onRegionSelect: (key: RegionKey) => void
 ): void {
+  // Ruling A3 (foundations plan v2; S14, 2026-09-08): the wiring can throw
+  // midway, and the note then kept saying "still starting" beside a painted
+  // map. The enable runs in a finally; the throw still reaches boot().
+  try {
+    wireSidebar(map, onRegionSelect);
+  } finally {
+    enableMapDependentControls();
+  }
+}
+
+function wireSidebar(map: maplibregl.Map, onRegionSelect: (key: RegionKey) => void): void {
   mapRef = map;
-  ensureLiveRegion();
+  onRegionSelectRef = onRegionSelect;
+  // The shell (the dropdown, the hazard rail, the live region)
+  // normally built at DOM ready from `boot()`. Idempotent, and called here
+  // too so a host that reaches `buildSidebar` by another route still gets
+  // one complete sidebar rather than half of one.
+  buildSidebarShell();
 
   // U-UX-FIX-1 DEF-3/DEF-4 (triage 2026-07-24): clamp every MapLibre
   // popup card toward its reachable region (the visual viewport
@@ -1190,14 +1810,8 @@ export function buildSidebar(
   // invoke it.
   bindLayerToggleController(controllerRef);
 
-  const handleRegion = (key: RegionKey): void => {
-    selectRegion(map, key);
-    onRegionSelect(key);
-  };
-
-  buildRegionSelect(map, handleRegion);
-  buildPresetChips(map);
-  wireHazardRail(map);
+  // The dropdown and the hazard rail are already built (the
+  // shell above); what follows is the half that needs a live map.
   // The Water & Snow list is not built here (DR-008a): the reveal and the
   // first telemetry activation each build it on demand.
   wireTelemetryReveal(map);
@@ -1216,21 +1830,52 @@ export function buildSidebar(
   // deferred, not dropped: expanding the sidebar or switching to console
   // calls `ensureIslandMounted` below, and the island snapshots the bridge
   // and the registry at that moment, so a late mount is always consistent.
+  //
+  // DDM-P1-T04: the island chunk and the search-controller chunk fail
+  // independently, and both requests start together so a slow link never
+  // pays for the search chunk only after the island chunk resolves.
+  // `loadSearchController` (src/ui/search-chunk.ts) is shared across every
+  // host, so its retry memory is shared too; a search failure here only
+  // drops search props, never the catalog. The island's own loader retries
+  // under a new URL (src/util/chunk-retry.ts) on a later
+  // `ensureIslandMounted` call (a mode switch re-arms it below), since a
+  // second `import()` of the SAME failed URL never issues a new request.
   const controllerForIsland = controllerRef;
+  const loadIsland = createChunkLoader(() => import('./island'), import.meta.url);
   let islandPromise: Promise<void> | null = null;
   const ensureIslandMounted = (): Promise<void> => {
     if (!islandPromise) {
-      // The search controller rides the same lazy chunk as the island (U3d):
-      // it reaches impact / deep-link, which the pure island must not, so it
-      // stays outside the island and is injected as props. Loading it here
-      // keeps it off the entry chunk.
-      islandPromise = Promise.all([import('./island'), import('./search-controller')])
-        .then(([{ mountSidebarIsland }, { buildSearchWiring }]) => {
-          mountSidebarIsland(map, controllerForIsland, buildSearchWiring(map));
-        })
-        .catch((err: unknown) => {
+      // Started immediately, alongside loadIsland() below, with its .catch
+      // attached right here so it can never surface as an unhandled
+      // rejection while the island chunk is still loading.
+      const searchLoad = loadSearchController().catch((err: unknown) => {
+        console.error(
+          '[sidebar] search chunk failed; the catalog mounts without search:',
+          err
+        );
+        return null;
+      });
+      // The island chunk's own load failure (the `onRejected` sibling of
+      // this `.then`) resets `islandPromise` so a later call retries under
+      // a new URL. A mount-time throw once the chunk DID load (below) is a
+      // different failure and must NOT reset: a second mount would double
+      // every registry listener the island wires up.
+      const promise: Promise<void> = loadIsland().then(
+        ({ mountSidebarIsland }) =>
+          searchLoad
+            .then((searchModule) => {
+              const searchProps = searchModule?.buildSearchWiring(map);
+              mountSidebarIsland(map, controllerForIsland, searchProps);
+            })
+            .catch((err: unknown) => {
+              console.error('[sidebar] island mount failed:', err);
+            }),
+        (err: unknown) => {
+          if (islandPromise === promise) islandPromise = null;
           console.error('[sidebar] island mount failed:', err);
-        });
+        }
+      );
+      islandPromise = promise;
     }
     return islandPromise;
   };
@@ -1240,6 +1885,15 @@ export function buildSidebar(
   let studioModule: typeof import('./island/layers-studio') | null = null;
   let studioPromise: Promise<typeof import('./island/layers-studio')> | null = null;
   let studioOpener: HTMLElement | null = null;
+  let releaseStudioTabTrap: (() => void) | null = null;
+  let releaseStudioEscape: (() => void) | null = null;
+  // DDM-P1-T10: the same createChunkLoader pattern loadIsland uses above,
+  // so a studio chunk that failed once retries a LATER call under a new
+  // `retry=<n>` url instead of replaying the same cached rejection.
+  const loadLayersStudioChunk = createChunkLoader(
+    () => import('./island/layers-studio'),
+    import.meta.url
+  );
 
   const restoreLayersStudioFocus = (opener: HTMLElement | null): void => {
     if (opener?.isConnected) {
@@ -1252,11 +1906,59 @@ export function buildSidebar(
     mapContainer.focus({ preventScroll: true });
   };
 
+  // found-012: the LAYERS entry's held-chunk feedback. Set synchronously
+  // from `syncStudioRoute`, itself called synchronously from
+  // `enterStudio`'s `notify('push')`, so it paints within one frame of the
+  // press instead of the 2.4 to 3.6 s of recorded silence. Mirrors
+  // view-shell.ts's PLACE equivalent; kept separate (not shared) because
+  // the two doors already keep independent open paths throughout this file
+  // and view-shell.ts.
+  const markLayersStudioEntryPending = (el: HTMLElement | null): void => {
+    if (!el) return;
+    el.setAttribute('aria-busy', 'true');
+    el.classList.add('studio-entry-pending');
+    if (!el.querySelector('.studio-entry-pending-spinner')) {
+      const spinner = document.createElement('span');
+      spinner.className = 'impact-spinner studio-entry-pending-spinner';
+      spinner.setAttribute('aria-hidden', 'true');
+      el.appendChild(spinner);
+    }
+    let status = document.getElementById('layers-studio-entry-status');
+    if (!status) {
+      status = document.createElement('p');
+      status.id = 'layers-studio-entry-status';
+      status.className = 'sr-only';
+      status.setAttribute('role', 'status');
+      status.setAttribute('aria-live', 'polite');
+      document.body.appendChild(status);
+    }
+    status.textContent = 'Opening the LAYERS studio.';
+  };
+
+  const clearLayersStudioEntryPending = (el: HTMLElement | null): void => {
+    if (!el) return;
+    el.removeAttribute('aria-busy');
+    el.classList.remove('studio-entry-pending');
+    el.querySelector('.studio-entry-pending-spinner')?.remove();
+  };
+
   const loadStudio = (root: HTMLElement): void => {
-    const promise = studioPromise ?? import('./island/layers-studio');
+    const promise = studioPromise ?? loadLayersStudioChunk();
     studioPromise = promise;
-    void Promise.all([promise, import('./search-controller')])
-      .then(([module, { buildSearchWiring }]) => {
+    // The search half is loaded and caught on its own (DDM-P1-T04), so the
+    // failure panel below is reached only by the studio chunk's own
+    // failure, never by a search-controller failure.
+    void Promise.all([
+      promise,
+      loadSearchController().catch((err: unknown) => {
+        console.error(
+          '[sidebar] search chunk failed; the catalog mounts without search:',
+          err
+        );
+        return null;
+      })
+    ])
+      .then(([module, searchModule]) => {
         studioModule = module;
         if (
           getStudioRoute() !== 'layers' ||
@@ -1266,14 +1968,12 @@ export function buildSidebar(
         ) {
           return;
         }
-        module.mountLayersStudio(
-          root,
-          controllerForIsland,
-          buildSearchWiring(map, {
-            permittedKinds: ['layer'],
-            placeholder: 'Search layers'
-          })
-        );
+        clearLayersStudioEntryPending(studioOpener);
+        const search = searchModule?.buildSearchWiring(map, {
+          permittedKinds: ['layer'],
+          placeholder: 'Search layers'
+        });
+        module.mountLayersStudio(root, controllerForIsland, search);
       })
       .catch((err: unknown) => {
         if (studioPromise === promise) studioPromise = null;
@@ -1284,6 +1984,7 @@ export function buildSidebar(
           !isPhysicallyFramed() &&
           studioRoot === root
         ) {
+          clearLayersStudioEntryPending(studioOpener);
           renderStudioLoadFailure(root, 'layers-studio-failure-heading');
         }
       });
@@ -1312,6 +2013,15 @@ export function buildSidebar(
       if (studioRoot) {
         const opener = studioOpener;
         studioOpener = null;
+        clearLayersStudioEntryPending(opener);
+        if (releaseStudioTabTrap) {
+          releaseStudioTabTrap();
+          releaseStudioTabTrap = null;
+        }
+        if (releaseStudioEscape) {
+          releaseStudioEscape();
+          releaseStudioEscape = null;
+        }
         if (studioModule) studioModule.unmountLayersStudio(studioRoot);
         studioRoot.remove();
         studioRoot = null;
@@ -1324,6 +2034,9 @@ export function buildSidebar(
       studioRoot = document.createElement('div');
       studioRoot.id = 'layers-studio-root';
       document.body.appendChild(studioRoot);
+      releaseStudioTabTrap = trapStudioTabFocus(studioRoot);
+      releaseStudioEscape = bindStudioEscape(studioRoot, '.layers-studio-back', backToMap);
+      markLayersStudioEntryPending(studioOpener);
     }
     const root = studioRoot;
     loadStudio(root);
@@ -1356,15 +2069,66 @@ export function buildSidebar(
   // swaps between the one-word `cluster=` claim and the granular
   // `layers=` list (D-0.7.0-044).
   onFramingChange(() => {
+    dropPlaceView();
+    syncRegionSelect();
+    // The door follows the camera (D1 M4, found-025): hide it the instant a
+    // framing takes over, and let a later region choice bring it back.
+    updateRegionBriefingTrigger(STATE.currentRegion);
+    pushUrl();
+  });
+  // DR-122: fire3d= is dropped when the selected hazard leaves Wildfire. A
+  // custom set inside Wildfire keeps it; terrain3d=, which would re-emit it on
+  // return, is not built, so a return to Wildfire opens flat.
+  onCommittedSnapshotChange(() => {
+    if (getCommittedSnapshot().selectedHazard !== 'wildfire') setFire3DPreference(false);
+  });
+  // ENSO camera (F9): entering fits the Pacific, leaving restores the view from
+  // before entering. The boot seed fires this too, but the boot's own fits
+  // follow it in the same task, so applyUrlStateSync owns the boot camera.
+  let previousCluster = getHazardCluster();
+  onHazardClusterChange(() => {
+    const next = getHazardCluster();
+    const map = mapRef;
+    if (map) {
+      const action = ensoCameraAction(
+        previousCluster,
+        next,
+        hasHeldEnsoCamera(),
+        getOceanFraming() !== null,
+        isCustomComposition()
+      );
+      // Entering ENSO ends the 3D Fire view now (DR-122), so its ease back
+      // starts before the ocean fit and cannot cancel it; the view held for
+      // leaving ENSO is flat and north-up, as the scene's own exit leaves it.
+      const scene = (action.capture || action.fitPacific) && getFire3DPreference();
+      if (scene) setFire3DPreference(false);
+      if (action.capture) {
+        const camera = readCameraState(map);
+        holdEnsoCamera(scene ? { ...camera, pitch: 0, bearing: 0 } : camera);
+      }
+      if (action.fitPacific) fitOcean(map, 'pacific');
+      if (action.restore) {
+        const heldCamera = takeEnsoCamera();
+        if (heldCamera) restoreCameraState(map, heldCamera);
+      }
+    }
+    previousCluster = next;
+    // The ocean framing rides the cluster store; keep the dropdown on it.
+    dropPlaceView();
     syncRegionSelect();
     pushUrl();
   });
-  onHazardClusterChange(pushUrl);
 
   // The front-door trigger (F3): when a map place is selected or cleared, the
-  // region-briefing button relabels to "See what this means" for that place, or
+  // region-briefing button relabels to "Open briefing" for that place, or
   // reverts to the region anchor.
-  onPlaceSelectionChange(() => updateRegionBriefingTrigger(STATE.currentRegion));
+  onPlaceSelectionChange((place) => {
+    updateRegionBriefingTrigger(STATE.currentRegion);
+    if (place) notePlaceView(map, place);
+  });
+  // A city sets no place, so its search (in any host) announces the view instead.
+  window.addEventListener('ddm:city-view', () => noteViewLeftRegion(map));
+  map.on('moveend', () => dropMovedPlaceView(map));
 
   // Apply the URL state, split per the ADR 0002 U1 integration note. The
   // synchronous half (embed class, timeline seed, region fit) applies NOW,
@@ -1404,6 +2168,7 @@ export function buildSidebar(
     // Defensive fallback: at least fit the default region so the user
     // sees the map.
     selectRegion(map, DEFAULT_REGION, true);
+    initClusterService();
   }
 
   // Every checkbox-intent flip serializes the URL the moment it happens
@@ -1458,22 +2223,18 @@ export function buildSidebar(
       // success and failure paths alike.
       pushUrl();
     });
+
+  // The map-dependent half is wired and the URL state is applied, so the
+  // controls now do what their names say (2026-09-03 launch ruling section
+  // 4). The enable itself runs in `buildSidebar`'s finally, synchronously
+  // after this returns or throws: `<html data-ddm-controls="ready">` is the
+  // signal a verification suite waits on in place of the generated
+  // controls, which do not prove a finished boot because they exist before one.
 }
 
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Escape a value for safe use inside a CSS attribute selector. The
- * layer keys and region keys we accept are restricted (kebab-case
- * identifiers) so this is defensive rather than load-bearing, but it
- * keeps the behavior correct if a future config table introduces a
- * key with a quote or backslash.
- */
-function cssAttrEscape(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-}
 
 /**
  * Re-export internal handles for test harnesses and the toast helper.
@@ -1482,12 +2243,3 @@ function cssAttrEscape(value: string): string {
  * the sidebar is the only UI module already in scope.
  */
 export { showToast };
-
-/**
- * Read-only getter for the cached map reference. Exists so future test
- * harnesses can assert that `buildSidebar` was called; the harness
- * checks this is non-null after boot.
- */
-export function getMapRef(): maplibregl.Map | null {
-  return mapRef;
-}

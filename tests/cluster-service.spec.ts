@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 
 import {
   composeClusterIntent,
@@ -7,12 +7,15 @@ import {
   onCommittedSnapshotChange,
   reconcileClusterWithLayerIntent,
   requestCluster,
-  requestOcean
+  requestHorizon,
+  requestOcean,
+  resolveHorizonForCluster
 } from '../src/state/cluster-service';
 import { LAYER_DEFS, getLayerDef } from '../src/config/layers';
-import { HAZARD_CLUSTERS } from '../src/config/clusters';
+import { HAZARD_CLUSTER_KEYS, HAZARD_CLUSTERS, TEMPORAL_HORIZON_KEYS } from '../src/config/clusters';
 import { registry } from '../src/state/registry';
 import { timeline } from '../src/state/timeline';
+import { parseUrlParams } from '../src/state/url';
 import {
   getHazardCluster,
   getOceanFraming,
@@ -66,9 +69,6 @@ const harnessController: LayerController = {
   },
   applyLayerSet(): Promise<void> {
     throw new Error('applyLayerSet is not part of the S3 path');
-  },
-  ensureActive(): void {
-    throw new Error('ensureActive is not part of the S3 path');
   }
 };
 
@@ -143,7 +143,8 @@ test.describe('S3 composeClusterIntent (the composition the URL boot shares)', (
     expect(composeClusterIntent('wildfire')).toContain('nifc-fires');
     timeline.setHorizon('season-ahead');
     expect(composeClusterIntent('wildfire')).toContain('usfs-whp');
-    expect(composeClusterIntent('wildfire')).not.toContain('nifc-fires');
+    // DR-022: the live perimeters stay in every horizon.
+    expect(composeClusterIntent('wildfire')).toContain('nifc-fires');
     timeline.reset();
   });
 });
@@ -196,26 +197,36 @@ test.describe('S3 requestCluster (the transaction)', () => {
     }
   });
 
-  test('temporal persistence: the committed horizon survives cluster flips and re-resolves each recipe', () => {
+  test('temporal persistence: a horizon picked inside a mode re-resolves its recipe, and a move into another mode opens on Current', () => {
     resetWorld();
     const dispose = initClusterService();
     try {
-      timeline.setHorizon('season-ahead');
+      // DR-190 as amended 2026-11-13: a move into Wildfire opens on Current Conditions.
       requestCluster('wildfire');
+      expect(getCommittedSnapshot().horizon).toBe('current');
+      requestHorizon('season-ahead');
       expect(getCommittedSnapshot().horizon).toBe('season-ahead');
       expect(getCommittedSnapshot().intendedKeys.has('usfs-whp')).toBe(true);
-      expect(getCommittedSnapshot().intendedKeys.has('nifc-fires')).toBe(false);
+      // DR-022: live perimeters in every horizon, Long Range included.
+      expect(getCommittedSnapshot().intendedKeys.has('nifc-fires')).toBe(true);
 
-      // Flip clusters: the register persists; the flip re-resolves at
-      // the same horizon.
+      // Flip clusters: Drought opens on Current Conditions too. A Long Range
+      // carried in had drawn the CPC outlook instead of the current drought map
+      // (the owner's report of 2026-11-13).
       requestCluster('drought');
-      expect(timeline.horizon).toBe('season-ahead');
+      expect(timeline.horizon).toBe('current');
+      expect(getCommittedSnapshot().horizon).toBe('current');
+      expect(getCommittedSnapshot().intendedKeys.has('nadm-drought')).toBe(true);
+      expect(getCommittedSnapshot().intendedKeys.has('drought')).toBe(false);
+
+      // A horizon picked inside Drought re-resolves its recipe at that horizon.
+      requestHorizon('season-ahead');
       expect(getCommittedSnapshot().horizon).toBe('season-ahead');
       expect(getCommittedSnapshot().intendedKeys.has('drought')).toBe(true);
-      expect(getCommittedSnapshot().intendedKeys.has('usdm')).toBe(false);
+      expect(getCommittedSnapshot().intendedKeys.has('nadm-drought')).toBe(false);
       // The timeline owns the horizon-to-register mapping.
       expect(timeline.outlookRange).toBe('seasonal');
-      timeline.setHorizon('weeks-ahead');
+      requestHorizon('weeks-ahead');
       expect(timeline.outlookRange).toBe('monthly');
     } finally {
       dispose();
@@ -285,31 +296,148 @@ test.describe('S3 requestCluster (the transaction)', () => {
     }
   });
 
-  test('the empty recipe: heat at season-ahead commits references only plus the honest caveat, no faked surface', () => {
+  test('DR-190: an unsupported mode switch commits Current and its recipe in one revision', () => {
     resetWorld();
     const dispose = initClusterService();
+    let unsubscribe = () => {};
     try {
-      timeline.setHorizon('season-ahead');
-      // The horizon change itself re-resolves the committed drought
-      // cluster at season-ahead (its own transaction, covered by the
-      // horizon-coherence spec below); this test asserts only what the
-      // HEAT transaction activates.
+      // Wildfire opens on Current; the person then picks Long Range inside it.
+      requestCluster('wildfire');
+      requestHorizon('season-ahead');
+      expect(getCommittedSnapshot().horizon).toBe('season-ahead');
+      const revisions: ReturnType<typeof getCommittedSnapshot>[] = [];
+      unsubscribe = onCommittedSnapshotChange(() => revisions.push(getCommittedSnapshot()));
       activationLog.length = 0;
       requestCluster('heat');
 
       const snapshot = getCommittedSnapshot();
-      expect([...snapshot.intendedKeys].sort()).toEqual([...REFERENCE_KEYS].sort());
-      expect(snapshot.summary.primary).toContain('No verified Extreme Heat surface');
-      // NOTHING with a surface or event role was activated.
-      for (const entry of activationLog) {
-        if (entry.op !== 'activate') continue;
-        expect(getLayerDef(entry.key)?.role).toBe('reference');
-      }
-      expect(registry.getActiveKeys().has('heatrisk')).toBe(false);
-      expect(registry.getActiveKeys().has('usdm')).toBe(false);
+      expect(revisions).toHaveLength(1);
+      expect(revisions[0]).toBe(snapshot);
+      expect(snapshot.horizon).toBe('current');
+      expect(timeline.horizon).toBe('current');
+      expect([...snapshot.intendedKeys].sort()).toEqual(
+        [...composeClusterIntent('heat', 'current')].sort()
+      );
+      expect(snapshot.summary.primary).toContain('HeatRisk');
+      expect(registry.getActiveKeys().has('heatrisk')).toBe(true);
+      expect(registry.getActiveKeys().has('usfs-whp')).toBe(false);
+      expect(registry.getActiveKeys().has('drought')).toBe(false);
       expect(getHazardCluster()).toBe('heat');
     } finally {
+      unsubscribe();
       dispose();
+      timeline.reset();
+    }
+  });
+
+  test('DR-190 (amended 2026-11-13): an entry into a mode that opens on Current lands on its current map, not the horizon carried in', () => {
+    // The owner's report: Wildfire's Near Term or Long Range carried into
+    // Drought showed the CPC outlook instead of the current drought map.
+    const opensOnCurrent = HAZARD_CLUSTER_KEYS.filter((key) => HAZARD_CLUSTERS[key].entryHorizon === 'current');
+    expect(opensOnCurrent).toContain('drought');
+    for (const carried of ['weeks-ahead', 'season-ahead'] as const) {
+      for (const destination of opensOnCurrent) {
+        // Leave from a mode that can show the carried horizon, so it is really held.
+        const source = HAZARD_CLUSTER_KEYS.find(
+          (key) => key !== destination && resolveHorizonForCluster(key, carried) === carried
+        );
+        expect(source, `a mode that shows ${carried}`).toBeDefined();
+        if (source === undefined) continue;
+        resetWorld();
+        const dispose = initClusterService();
+        try {
+          requestCluster(source);
+          requestHorizon(carried);
+          expect(timeline.horizon, `${source} holds ${carried}`).toBe(carried);
+          requestCluster(destination);
+          const snapshot = getCommittedSnapshot();
+          const moment = `${source} at ${carried} to ${destination}`;
+          expect(snapshot.cluster, moment).toBe(destination);
+          expect(snapshot.horizon, moment).toBe('current');
+          expect(timeline.horizon, moment).toBe('current');
+          expect([...snapshot.intendedKeys].sort(), moment).toEqual(
+            [...composeClusterIntent(destination, 'current')].sort()
+          );
+        } finally {
+          dispose();
+        }
+      }
+    }
+    // The named case: Wildfire at Long Range or Near Term, then Drought, draws the current drought map.
+    for (const carried of ['weeks-ahead', 'season-ahead'] as const) {
+      resetWorld();
+      const dispose = initClusterService();
+      try {
+        requestCluster('wildfire');
+        requestHorizon(carried);
+        requestCluster('drought');
+        const snapshot = getCommittedSnapshot();
+        expect(snapshot.horizon, carried).toBe('current');
+        expect(snapshot.intendedKeys.has('nadm-drought'), carried).toBe(true);
+        expect(snapshot.intendedKeys.has('drought'), carried).toBe(false);
+        expect(registry.getActiveKeys().has('nadm-drought'), carried).toBe(true);
+      } finally {
+        dispose();
+      }
+    }
+    // Current holds for a custom set too: Places on does not let Long Range carry in.
+    resetWorld();
+    const dispose = initClusterService();
+    try {
+      requestLayerOn('places');
+      requestCluster('wildfire');
+      requestHorizon('season-ahead');
+      expect(timeline.horizon).toBe('season-ahead');
+      requestCluster('drought');
+      const snapshot = getCommittedSnapshot();
+      expect(snapshot.cluster).toBe('custom');
+      expect(timeline.horizon).toBe('current');
+      expect(snapshot.intendedKeys.has('nadm-drought')).toBe(true);
+      expect(snapshot.intendedKeys.has('places')).toBe(true);
+      expect(snapshot.intendedKeys.has('drought')).toBe(false);
+    } finally {
+      dispose();
+      requestLayerOff('places');
+      timeline.reset();
+    }
+  });
+
+  test('DR-190: every mode switch resolves the same horizon and recipe as its shared link', () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    try {
+      for (const cluster of HAZARD_CLUSTER_KEYS) {
+        for (const horizon of TEMPORAL_HORIZON_KEYS) {
+          resetWorld();
+          // Set the held horizon before subscribing: this case isolates the
+          // destination transaction from the preceding mode's capability.
+          timeline.setHorizon(horizon);
+          // A press of another mode than the reset one is an entry: its entry
+          // horizon replaces the held one (ENSO opens on Season ahead), and
+          // the link that press writes says so.
+          const entered =
+            cluster === getHazardCluster() ? horizon : (HAZARD_CLUSTERS[cluster].entryHorizon ?? horizon);
+          Object.defineProperty(globalThis, 'window', {
+            configurable: true,
+            value: { location: { search: `?cluster=${cluster}&horizon=${entered}` } }
+          });
+          const boot = parseUrlParams();
+          const dispose = initClusterService();
+          try {
+            requestCluster(cluster);
+            const snapshot = getCommittedSnapshot();
+            const moment = `${cluster} from ${horizon}`;
+            expect(snapshot.horizon, moment).toBe(boot.horizon);
+            expect(timeline.horizon, moment).toBe(boot.horizon);
+            expect([...snapshot.intendedKeys].sort(), moment).toEqual([...boot.layers].sort());
+            expect([...checkedKeys()].sort(), moment).toEqual([...boot.layers].sort());
+          } finally {
+            dispose();
+          }
+        }
+      }
+    } finally {
+      if (originalWindow) Object.defineProperty(globalThis, 'window', originalWindow);
+      else Reflect.deleteProperty(globalThis, 'window');
       timeline.reset();
     }
   });
@@ -327,7 +455,7 @@ test.describe('S3 requestCluster (the transaction)', () => {
       requestCluster('wildfire');
       expect(registry.getActiveKeys().has('nifc-fires')).toBe(true);
       expect(registry.getActiveKeys().has('hms-smoke')).toBe(true);
-      expect(registry.getActiveKeys().has('usdm')).toBe(false);
+      expect(registry.getActiveKeys().has('nadm-drought')).toBe(false);
       // ...and the reference extra survives (never deactivated)...
       expect(registry.getActiveKeys().has('hydrography')).toBe(true);
       expect(checkedKeys().has('hydrography')).toBe(true);
@@ -389,7 +517,7 @@ test.describe('S3 requestCluster (the transaction)', () => {
       expect(observed.length).toBeGreaterThanOrEqual(1);
       for (const rev of observed) {
         if (rev.horizon === 'season-ahead') {
-          expect(rev.hasNifc).toBe(false);
+          expect(rev.hasNifc).toBe(true);
           expect(rev.hasWhp).toBe(true);
         } else {
           expect(rev.hasWhp).toBe(false);
@@ -402,10 +530,10 @@ test.describe('S3 requestCluster (the transaction)', () => {
       expect(snapshot.cluster).toBe('wildfire');
       expect(snapshot.horizon).toBe('season-ahead');
       expect(snapshot.intendedKeys.has('usfs-whp')).toBe(true);
-      expect(snapshot.intendedKeys.has('nifc-fires')).toBe(false);
+      expect(snapshot.intendedKeys.has('nifc-fires')).toBe(true);
       expect(getHazardCluster()).toBe('wildfire');
       expect(registry.getActiveKeys().has('usfs-whp')).toBe(true);
-      expect(registry.getActiveKeys().has('nifc-fires')).toBe(false);
+      expect(registry.getActiveKeys().has('nifc-fires')).toBe(true);
     } finally {
       dispose();
       timeline.reset();
@@ -425,7 +553,7 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
       const after = getCommittedSnapshot();
       expect(after.revision).toBeGreaterThan(before.revision);
       expect(after.summary.caveat).toContain(
-        'Current Mapped Fire Perimeters (National Interagency Fire Center, NIFC) is live with partial coverage'
+        'Current Mapped Fire Perimeters (National Interagency Fire Center, NIFC) are live with partial coverage'
       );
     } finally {
       dispose();
@@ -440,14 +568,15 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
       const before = getCommittedSnapshot();
 
       // A late status write for the dropped drought surface (the old
-      // generation resolving after the switch).
-      registry.setStatus('usdm', 'error');
+      // generation resolving after the switch): at the current horizon the
+      // Drought surface is nadm-drought.
+      registry.setStatus('nadm-drought', 'error');
       const after = getCommittedSnapshot();
       expect(after.revision).toBe(before.revision);
-      expect(after.summary.caveat ?? '').not.toContain('US Drought Monitor');
-      expect(after.statuses.has('usdm')).toBe(false);
+      expect(after.summary.caveat ?? '').not.toContain('North American Drought Monitor');
+      expect(after.statuses.has('nadm-drought')).toBe(false);
       // Clean up the stray status.
-      registry.deactivate('usdm');
+      registry.deactivate('nadm-drought');
     } finally {
       dispose();
     }
@@ -472,13 +601,67 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
     }
   });
 
-  test('deferred activations: rapid cluster switching drops stale generations and every snapshot stays coherent (DG-080 finding 5)', () => {
-    // The named async-race pressure point: a DEFERRED controller whose
-    // per-key activations settle out of order, mirroring the real
-    // controller's observable behavior (loading at request; active +
-    // terminal status only when the op settles; a settle superseded by
-    // a newer per-key request or deactivate is DROPPED, the real
-    // per-key generation guard). The synchronous harness above cannot
+  test('an optional layer keeps the mode: Wildfire plus Fuel risk stays Wildfire at every horizon', () => {
+    resetWorld();
+    const dispose = initClusterService();
+    try {
+      requestCluster('wildfire');
+      requestLayerOn('usfs-whp');
+      expect(getHazardCluster()).toBe('wildfire');
+      expect(getCommittedSnapshot().cluster).toBe('wildfire');
+      expect(getCommittedSnapshot().intendedKeys.has('usfs-whp')).toBe(true);
+
+      // Off again from the catalog: back to the composition, still Wildfire.
+      requestLayerOff('usfs-whp');
+      expect(getCommittedSnapshot().cluster).toBe('wildfire');
+      expect([...getCommittedSnapshot().intendedKeys].sort()).toEqual(
+        [...composeClusterIntent('wildfire', 'current')].sort()
+      );
+
+      // A horizon change re-applies the recipe, so the optional layer follows it.
+      requestLayerOn('usfs-whp');
+      timeline.setHorizon('weeks-ahead');
+      let snapshot = getCommittedSnapshot();
+      expect(snapshot.cluster).toBe('wildfire');
+      expect(snapshot.horizon).toBe('weeks-ahead');
+      expect(checkedKeys().has('usfs-whp')).toBe(false);
+      expect(checkedKeys().has('spc-fire-weather')).toBe(true);
+
+      // Near Term: the optional surface stands in for the recipe's surface (the
+      // harness controller has no one-surface rule, so the case does its swap).
+      requestLayerOn('usfs-whp');
+      requestLayerOff('spc-fire-weather');
+      snapshot = getCommittedSnapshot();
+      expect(getHazardCluster()).toBe('wildfire');
+      expect(snapshot.cluster).toBe('wildfire');
+      expect(snapshot.horizon).toBe('weeks-ahead');
+
+      // The switch's off press re-applies the recipe: the outlook returns.
+      requestCluster('wildfire');
+      expect(checkedKeys().has('spc-fire-weather')).toBe(true);
+      expect(checkedKeys().has('usfs-whp')).toBe(false);
+      expect(getCommittedSnapshot().cluster).toBe('wildfire');
+    } finally {
+      dispose();
+    }
+  });
+
+  test('deferred activations: the service stays coherent under a controller that drops stale settles, A -> B -> A (DG-080 finding 5; the real controller drop is proved in tests/stale-generation.test.mjs)', () => {
+    // WHAT THIS PROVES: the cluster SERVICE (intent, claim, snapshot
+    // revisions) stays coherent when the controller below it settles
+    // activations out of order. The controller here is a test-local fake
+    // whose `settle` carries the stale drop itself (a settle superseded by
+    // a newer per-key request or deactivate is dropped), so this case
+    // cannot fail when the production drop breaks; it is not the proof of
+    // that drop. The proof of the real controller's drop (the abort at off
+    // intent, the per-key operation chain, the intent generation) is
+    // tests/stale-generation.test.mjs, which runs the production
+    // `createLayerController` under these same service transactions, and the
+    // browser case in tests/cluster-controller-integration.spec.ts.
+    //
+    // The pressure point: a DEFERRED controller whose per-key activations
+    // settle out of order (loading at request; active + terminal status
+    // only when the op settles). The synchronous harness above cannot
     // exercise this; here the old generation writes late, including for
     // a key that has become intended AGAIN under a newer generation.
     resetWorld();
@@ -506,9 +689,6 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
       },
       applyLayerSet(): Promise<void> {
         throw new Error('applyLayerSet is not part of the S3 path');
-      },
-      ensureActive(): void {
-        throw new Error('ensureActive is not part of the S3 path');
       }
     };
     const settle = (op: PendingOp): void => {
@@ -546,7 +726,9 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
       // The OLD generations resolve late, after the same keys became
       // intended again under newer generations: every one is dropped.
       for (const op of [...staleFire, ...staleDrought]) settle(op);
-      expect(registry.getActiveKeys().has('usdm')).toBe(false);
+      // The surface the Drought press switched to at the current horizon
+      // is nadm-drought (clusters.ts recipes.current), not usdm.
+      expect(registry.getActiveKeys().has('nadm-drought')).toBe(false);
       expect(registry.getActiveKeys().has('nifc-fires')).toBe(false);
       expect(getCommittedSnapshot().statuses.get('nifc-fires')).toBe('loading');
       // No published snapshot has EVER claimed the pair displayed.
@@ -559,7 +741,7 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
       for (const op of freshFire) settle(op);
       expect(registry.getActiveKeys().has('nifc-fires')).toBe(true);
       expect(registry.getActiveKeys().has('hms-smoke')).toBe(true);
-      expect(registry.getActiveKeys().has('usdm')).toBe(false);
+      expect(registry.getActiveKeys().has('nadm-drought')).toBe(false);
 
       // Final checked intent is exactly the wildfire composition.
       expect([...checkedKeys()].sort()).toEqual(
@@ -599,14 +781,18 @@ test.describe('S3 snapshot revisions and honesty under later changes', () => {
     }
   });
 
-  test('a terminal activation failure that unchecks a recipe member also drops the claim (deliberate honesty)', () => {
+  test('an explicit uncheck after a terminal activation error also drops the claim (deliberate honesty)', () => {
     resetWorld();
     const dispose = initClusterService();
     try {
       requestCluster('wildfire');
       expect(getHazardCluster()).toBe('wildfire');
 
-      // The controller's failure path: terminal error, checkbox off.
+      // A terminal error, then an explicit uncheck: layer-controller.ts's
+      // failActivation (near :221-238) keeps a committed-composition
+      // member's checkbox and on-intent on failure, so this simulates the
+      // user unchecking it themselves, not the controller's own failure
+      // path unchecking it.
       registry.setStatus('nifc-fires', 'error');
       registry.deactivate('nifc-fires');
       setChecked('nifc-fires', false);

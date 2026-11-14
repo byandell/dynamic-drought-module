@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 
 import { gotoApp, layerCheckbox, urlLayers } from './helpers';
 import { getLayerDef, DEFAULT_ON_KEYS } from '../src/config/layers';
@@ -23,10 +23,9 @@ test.describe('E1 deliverable 1: Brief-mode progressive disclosure', () => {
 
     await expect(page.locator('#app')).toHaveClass(/\bview-brief\b/);
 
-    // Hidden in Brief: Quick views, the Layers catalog, Water & Snow, and
+    // Hidden in Brief: the Layers catalog, Water & Snow, and
     // the persistent footer (review E1.2). CSS-first: the DOM stays
     // mounted, so counts still resolve while nothing displays.
-    await expect(page.locator('#panel-quick-views')).toBeHidden();
     await expect(page.locator('#panel-layers')).toBeHidden();
     await expect(page.locator('#panel-telemetry')).toBeHidden();
     await expect(page.locator('.sidebar-footer')).toBeHidden();
@@ -38,26 +37,23 @@ test.describe('E1 deliverable 1: Brief-mode progressive disclosure', () => {
     // switch is the honest console escape that restores the instrument.
     const entry = page.locator('#layers-studio-entry');
     await expect(entry).toBeVisible();
-    await expect(entry).toHaveText('LAYERS');
+    await expect(entry).toHaveText('Layers'); // mixed case since visual uniformity wave 1, D1
     await page.locator('.view-switch [data-view="console"]').click();
 
     await expect(page.locator('#app')).toHaveClass(/\bview-console\b/);
-    await expect(page.locator('#panel-quick-views')).toBeVisible();
     await expect(page.locator('#panel-layers')).toBeVisible();
     await expect(page.locator('#panel-telemetry')).toBeVisible();
     await expect(page.locator('.sidebar-footer')).toBeVisible();
   });
 
-  test('the Brief head is worded around map selection, and console mode is untouched', async ({
+  test('the Brief head keeps one clear search without repeating selection instructions', async ({
     page
   }) => {
     await gotoApp(page);
-    // The reworded lede leads with selecting on the map, not with an
-    // already-open report (review E1.2).
-    await expect(page.locator('.brief-head-lede')).toContainText('Select a Tribal land area');
+    await expect(page.locator('.brief-head-lede')).toHaveCount(0);
+    await expect(page.locator('#brief-search [data-ddm-search]')).toBeVisible();
 
     await gotoApp(page, '?view=console');
-    await expect(page.locator('#panel-quick-views')).toBeVisible();
     await expect(page.locator('#panel-layers')).toBeVisible();
     await expect(page.locator('.sidebar-footer')).toBeVisible();
   });

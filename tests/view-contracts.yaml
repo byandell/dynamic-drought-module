@@ -19,6 +19,8 @@
 # description   one sentence: the contract, not the mechanics
 # url           query string handed to `gotoApp` ('' for a bare boot)
 # stub_wildfire when true, pin NIFC / HMS / SPC / EIA before boot
+# reduced_motion when true, boot with prefers-reduced-motion: reduce (no
+#               wildfire pulse refilling the software renderer's draw queue)
 # timeout_ms    per-row budget; raise it for rows that build terrain
 # steps         ordered actions (see the step vocabulary below)
 # expect        invariants asserted after the last step
@@ -30,6 +32,11 @@
 #   set_layer: { key: <layer>, on: <bool> }
 #   wait_settled: <layer key>        wait for a terminal status pill
 #   wait_fire3d: <active|inactive>   wait for the document stamp
+#   settle_scene: true               wait for the application-reported 3D
+#                                    context to equal "whp structures"
+#   hold_first_power_probe: <ms>     hold the power layer's first line archive
+#                                    header read for <ms> (past its 10 s probe
+#                                    budget) before letting it through
 #   zoom_out: <n>                    press the map's own zoom-out key n times
 #   reload: true                     reload at the current URL
 #
@@ -83,10 +90,10 @@ rows:
     description: >
       The 3D toggle activates the scene, writes the durable preference to the
       URL, and brings up the context layers the mode owns: the WHP hazard
-      drape and the structures pilot. Power is not among them, since it
+      drape and the buildings. Power is not among them, since it
       became a catalog layer on 2026-08-19 and is off unless someone asks
-      for it (see the two power rows below).
-    url: '?cluster=wildfire'
+      for it (see the power rows below).
+    url: '?region=washington_state&cluster=wildfire'
     stub_wildfire: true
     timeout_ms: 150000
     steps:
@@ -105,7 +112,7 @@ rows:
     description: >
       Turning the toggle off returns the flat scene and drops the parameter,
       so a share of the flat view never claims 3D.
-    url: '?cluster=wildfire&fire3d=true'
+    url: '?region=washington_state&cluster=wildfire&fire3d=true'
     stub_wildfire: true
     timeout_ms: 150000
     steps:
@@ -119,12 +126,12 @@ rows:
         fire3d: null
         cluster: wildfire
 
-  - id: 3d-exits-with-the-cluster-and-re-applies-on-return
+  - id: 3d-exits-with-the-cluster-and-returns-flat
     description: >
-      Leaving the Fire view exits the scene and hides the control, but the
-      preference survives in the URL and re-applies on return. This is the
-      contract documented at src/state/fire3d-store.ts:8-13.
-    url: '?cluster=wildfire&fire3d=true'
+      Leaving the Fire view exits the scene and drops fire3d= (DR-122: the
+      parameter is Wildfire-scoped), so a return to Wildfire opens flat until
+      terrain3d=, which would re-emit it, is built.
+    url: '?region=washington_state&cluster=wildfire&fire3d=true'
     stub_wildfire: true
     timeout_ms: 180000
     steps:
@@ -132,19 +139,19 @@ rows:
       - click_cluster: drought
       - wait_fire3d: inactive
       - click_cluster: wildfire
-      - wait_fire3d: active
     expect:
       cluster_pressed: wildfire
-      fire3d_stamp: active
-      fire3d_toggle: pressed
+      fire3d_stamp: inactive
+      fire3d_toggle: unpressed
       url_params:
-        fire3d: 'true'
+        fire3d: null
+        cluster: wildfire
 
   - id: a-region-jump-preserves-the-3d-preference
     description: >
       An ordinary camera write must not drop an unrelated durable parameter
       (the heatday preservation idiom inside syncUrl).
-    url: '?cluster=wildfire&fire3d=true'
+    url: '?region=washington_state&cluster=wildfire&fire3d=true'
     stub_wildfire: true
     timeout_ms: 150000
     steps:
@@ -166,12 +173,15 @@ rows:
       base only; the committed display is 'custom'
       (src/state/cluster-service.ts:351) and the chrome must not claim
       otherwise.
-    url: '?layers=usdm'
+    url: '?region=washington_state&layers=usdm'
+    stub_usdm: true
     steps: []
     expect:
       cluster_pressed: none
       layers_checked: [usdm]
       url_layers_include: [usdm]
+      layer_status:
+        usdm: ready
       url_params:
         cluster: null
       fire3d_toggle: absent
@@ -180,7 +190,7 @@ rows:
     description: >
       An embed has no shell chrome, so the 3D scene must carry its honesty
       note as in-map chrome instead of losing it.
-    url: '?cluster=wildfire&fire3d=true&embed=true'
+    url: '?region=washington_state&cluster=wildfire&fire3d=true&embed=true'
     stub_wildfire: true
     timeout_ms: 150000
     steps:
@@ -199,7 +209,7 @@ rows:
       Fire scene does not turn it on behind the toggle. Before 2026-08-19 it
       rode the scene's own activation and was always on there; one toggle
       now governs it everywhere.
-    url: '?cluster=wildfire'
+    url: '?region=washington_state&cluster=wildfire'
     stub_wildfire: true
     timeout_ms: 150000
     steps:
@@ -221,13 +231,14 @@ rows:
       display to custom, so power must be switched on after the scene rather
       than before it. The same is true of any extra layer; it is not
       something power introduced. The scene's context stamp is written once
-      at activation and therefore still reads 'fuels structures' here. That
+      at activation and therefore still reads 'whp structures' here. That
       under-claims rather than over-claims, and no user-facing disclosure is
       affected: the legend is written by the power layer itself, and the
       embed chip only renders in embeds, where the layer set is fixed at
       boot and cannot change under it.
-    url: '?cluster=wildfire'
+    url: '?region=washington_state&cluster=wildfire'
     stub_wildfire: true
+    reduced_motion: true
     timeout_ms: 180000
     steps:
       - wait_settled: hms-smoke
@@ -241,12 +252,39 @@ rows:
       fire3d_stamp: active
       url_layers_include: [power-infrastructure]
 
+  - id: a-slow-first-power-read-still-reaches-ready-while-the-scene-streams
+    description: >
+      Power switched on while the 3D scene is still streaming reaches live
+      even when its first archive read takes longer than the layer's own
+      probe budget: the layer reads its missing half again instead of
+      reporting partial for good (found-125). The held read stands in for
+      the software renderer's startup stall, which on a loaded machine or
+      GitHub's runner keeps the page busy past the 10 s probe budget, so this
+      row is red on a build that never reads again whatever the machine's
+      speed, and the row above covers the same switch with the stall the
+      machine actually produces.
+    url: '?region=washington_state&cluster=wildfire'
+    stub_wildfire: true
+    reduced_motion: true
+    timeout_ms: 180000
+    steps:
+      - wait_settled: hms-smoke
+      - fire3d: on
+      - wait_fire3d: active
+      - hold_first_power_probe: 12000
+      - set_layer: { key: power-infrastructure, on: true }
+    expect:
+      layers_checked: [power-infrastructure]
+      layer_status:
+        power-infrastructure: ready
+      fire3d_stamp: active
+
   - id: power-below-its-zoom-gate-says-zoom-in-to-load
     description: >
       Zoomed out past the gate the layer draws nothing and says so in the
       canonical vocabulary, instead of painting a continental smear that can
       be neither read nor clicked.
-    url: '?cluster=wildfire'
+    url: '?region=washington_state&cluster=wildfire'
     stub_wildfire: true
     timeout_ms: 180000
     steps:
@@ -263,13 +301,15 @@ rows:
       The URL is the whole restorable claim: reloading a shared 3D Fire link
       returns the same committed cluster, the same scene, and the same
       pressed control.
-    url: '?cluster=wildfire&fire3d=true'
+    url: '?region=washington_state&cluster=wildfire&fire3d=true'
     stub_wildfire: true
+    reduced_motion: true
     timeout_ms: 180000
     steps:
       - wait_fire3d: active
       - reload: true
       - wait_fire3d: active
+      - settle_scene: true
     expect:
       cluster_pressed: wildfire
       fire3d_stamp: active

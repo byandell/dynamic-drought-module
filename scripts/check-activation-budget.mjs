@@ -44,8 +44,17 @@
  *      runtime residual, owned by the rendered verifier lane).
  *      Statically checkable columns are enforced the moment they carry
  *      a number:
- *        - activationJsGzipKb: summed gzip kB of the closure's chunks
- *          (kB = 1000 bytes, matching the bundle gate and Vite).
+ *        - measuredJsGzipKb: the last ratified measurement of the
+ *          closure's summed gzip kB (kB = 1000 bytes, matching the
+ *          bundle gate and Vite). The enforced budget is DERIVED from
+ *          it by budgetForMeasurement(): the measurement plus
+ *          ACTIVATION_HEADROOM, rounded to one decimal. Growth beyond
+ *          that headroom fails the gate until a commit re-records the
+ *          measurement with a dated reason in the row's label. The
+ *          rule replaced the per-row "measurement plus whatever
+ *          headroom the row carried" convention on 2026-09-10 (S28),
+ *          which had left rows sharing a chunk with unequal margins
+ *          (fire3d-mode 0.7 kB, power-infrastructure 0.1 kB).
  *        - dataAssets[].maxBytes: on-disk size of a bundled asset
  *          file, path-contained under dist/.
  *      networkBytes / requestCount cannot be measured without a live
@@ -53,8 +62,8 @@
  *      verified by the T-M0-6 transport spike and the rendered
  *      verifier lane. Every column must be the exact sentinel
  *      'pending-measurement' or a finite number (positive for the JS
- *      budget, since the enforcement line is `total >= budget` and a
- *      zero budget could never pass; non-negative elsewhere); anything
+ *      measurement, since the enforcement line is `total >= budget` and
+ *      a zero budget could never pass; non-negative elsewhere); anything
  *      else fails. A numeric JS budget requires declared roots that
  *      exist in the manifest AND resolve to a nonempty closure outside
  *      the initial set (a missing root or an empty resolved closure is
@@ -99,8 +108,10 @@
  * nonempty marker; pass cases must be clean. The self-test runs before
  * every real scan; --self-test runs it alone.
  *
- * The two enforced bundle-size lines (45 kB entry / 100 kB eager app)
- * live in check-bundle-size.mjs and are deliberately untouched here.
+ * The two enforced bundle-size lines live in check-bundle-size.mjs and
+ * are deliberately untouched here; since DR-085 amendment_2026_09_12
+ * both follow the same ratified-measurement-plus-ACTIVATION_HEADROOM
+ * rule as this file's rows, stated independently there.
  * Portability: plain node:fs/os/path/zlib; no version-specific APIs.
  * Exit 0 = clean; exit 1 = any finding or self-test failure.
  */
@@ -111,6 +122,22 @@ import { tmpdir } from 'node:os';
 import { gzipSync } from 'node:zlib';
 
 const PENDING = 'pending-measurement';
+
+// The one headroom every JS row carries above its ratified measurement.
+// Eight percent is about 1.5 kB on the largest row and 0.5 kB on the
+// smallest: one small helper module, the size of change that should
+// force a written reason. Not a latency target; no network profile has
+// been stated for this gate, and a ceiling derived from one would be an
+// owner decision recorded here when it exists.
+// Fifty percent by the owner's word of 2026-10-12 ("loosen them up so
+// that we can get a fully functioning tool"): 0.8.0 is every feature
+// working, and 0.8.x re-measures and tightens this back (it was 0.08).
+const ACTIVATION_HEADROOM = 0.5;
+
+/** The enforced budget for a ratified measurement, in kB to one decimal. */
+function budgetForMeasurement(measuredKb) {
+  return Math.round(measuredKb * (1 + ACTIVATION_HEADROOM) * 10) / 10;
+}
 
 // The governed ZIP-library list. Extend it (with the tripwire below
 // keeping it honest) rather than claiming universality.
@@ -155,6 +182,31 @@ const EAGER_FORBIDDEN = [
     name: 'landscape-artifact loader',
     pattern: /src\/impact\/landscape\.ts$/,
     reason: 'The T-M0-3 loader is lazy by contract (the import-graph assertion proves the loader stays out of the eager graph). Absent today; this guards it forward.',
+  },
+  {
+    name: 'product catalog',
+    pattern: /src\/config\/products\.ts$/,
+    reason: 'DDM-P14-T05 (2026-09-12): LayerDef and SourcedClaim read ProductKey as a type-only import, so this catalog must stay out of the initial static set; a value import would hoist it here.',
+  },
+  {
+    name: 'popup frame renderer',
+    pattern: /src\/ui\/popup-frame\.ts$/,
+    // The one row allowed to count it (runChecks, soleFeatureFindings).
+    soleFeature: 'popup-frame',
+    reason: 'S30D P1-FRAME (2026-10-04; it replaced the D1 M23 rule, under which the lazy layer builders imported the frame): the InteractionCoordinator is the frame\'s one caller and loads it with one dynamic import, warmed when the first click target registers; builders hand it a model and import only the frame\'s types. So the frame is in the initial static set never, and in no feature\'s first-activation closure but its own popup-frame row.',
+  },
+  {
+    name: 'flow paths renderer',
+    pattern: /src\/layers\/flow\/(?:ribbon-layer|advect|still|ink|motion-loop)\.ts$/,
+    // The one row allowed to count it (runChecks, soleFeatureFindings).
+    soleFeature: 'enso-flow-paths',
+    reason: 'ENSO-FLOW-PLAN E2-2 (2026-10-05): the flowing paths\' renderer (the WebGL2 ribbon layer, the advection, the still form, the ink table and the motion clock) is the lazy flow chunk, reached by one dynamic import in src/layers/enso-flow.ts and counted by the enso-flow-paths row alone. It is in the initial static set never, and in no other feature\'s first-activation closure.',
+  },
+  {
+    name: 'flow paths decoder',
+    pattern: /src\/layers\/flow\/(?:grib2|jpx|decode-worker)\.ts$/,
+    soleFeature: 'enso-flow-paths',
+    reason: 'ENSO-FLOW-PLAN E2-2 (2026-10-05): DDM\'s own GRIB2 and JPEG 2000 decoder runs in the flow Worker (src/layers/flow/decode-worker.ts), a root of the enso-flow-paths row. It is in the initial static set never, and in no other feature\'s first-activation closure.',
   },
   {
     name: 'impact briefing cluster panel runtime',
@@ -280,18 +332,35 @@ const MAP_EXEMPT = [
     maxRawBytes: 4096,
     reason: 'generated Vite dependency-preload helper; no source modules by construction',
   },
+  {
+    // The bundler's class-field helper as its own initial chunk: absent at
+    // 9ec3f7b, present since the dryness ground was wired (9bcb72c); why the
+    // bundler split it out was not established. 707 bytes raw, one more
+    // first-paint request, counted by the bundle gate's eager total.
+    pattern: /^defineProperty-/,
+    maxRawBytes: 2048,
+    reason: 'generated class-field helper; no source modules by construction',
+  },
 ];
 
 /* ------------------------------------------------------------------ *
  * The per-feature activation budget table. Row contract is enforced
  * by validateBudgets(); see the header for column semantics.
+ *
+ * measuredJsGzipKb is the closure's last ratified measurement, taken
+ * with `npm run build && npm run check:activation`; the budget is
+ * derived from it (ACTIVATION_HEADROOM). Re-recorded 2026-09-10 (S28)
+ * from the gate's own numbers on c894c3a: every row's label keeps the
+ * history of why the closure has the size it has, and the "budget is
+ * the measurement plus the same headroom" sentences in those labels
+ * describe the convention this rule replaced.
  * ------------------------------------------------------------------ */
 const FEATURE_BUDGETS = [
   {
     key: 'landscape-signature-artifact',
     label: 'rebalanced 2026-09-03 with DR-064, the perimeter ribbon: the fade slabs, the band geometry and their presentation constants add a fourth dynamically imported root to this closure (src/layers/nifc-perimeter-ribbon.ts, declared beside the smoke and context roots for the same reason), and the ribbon constants grew the shared fire3d-presentation chunk; measured 18.1 kB, up from 16.6, and the budget is that measurement plus the same 0.7 kB headroom the row has carried since the v6 landing. The ribbon fetches nothing: it derives its geometry from the perimeter GeoJSON the flat layer already holds, so the network and request columns below are unchanged. Earlier: rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 6.2 kB; Landscape signature briefing consumer (T3-2 measured 3.33 kB gzip in its first-activation static closure and one 531,090-byte bundled artifact request on 2026-07-29; unsupported boundary kinds do not request the artifact)',
     rootModules: ['src/impact/landscape-consumer.ts'],
-    activationJsGzipKb: 6.7,
+    measuredJsGzipKb: 6.1,
     networkBytes: 531_090,
     requestCount: 1,
     dataAssets: [{
@@ -303,64 +372,65 @@ const FEATURE_BUDGETS = [
     key: 'mco-gridded-index',
     label: 'MCO gridded drought indices (T-M0-6 spike records the first real numbers; U-MCO-SHIP declares roots and enforces)',
     rootModules: [], // no MCO module exists yet; U-MCO-SHIP names it here
-    activationJsGzipKb: PENDING,
+    measuredJsGzipKb: PENDING,
     networkBytes: PENDING,
     requestCount: PENDING,
     dataAssets: [],
   },
   {
     key: 'heatrisk-days',
-    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 7.0 kB; HeatRisk multi-day selector (JS budget 5.0 kB; 4.2 kB covered the 4.1 kB shared HeatRisk closure measured after H2 integration; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 4.3 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; the H0 coverage qualification measured 3.5 kB across three chunks on 2026-07-28; network numbers measured 30,326 bytes / 18 requests at 1280x720 on 2026-07-27)',
+    label: 're-recorded 2026-10-12 for release 0.7.3: the time bar keeping keyboard focus across a redraw (632a818, src/ui/time-bar.ts, a chunk this closure shares) used the last 12 bytes of the row\'s headroom, and GitHub\'s release gate measured 10.4 kB across the same seven chunks on ce82099; the budget is that measurement plus the standard headroom; rebalanced 2026-09-08 with DDM-P8-T02 (the fire and heat time bar): src/layers/heatrisk.ts now installs the time bar, so the shared src/ui/time-bar.ts chunk (2.1 kB gzip, already inside every drought closure) enters this first-activation closure, and the layer itself grew by the seven-stop rail and the per-frame stamp; measured 9.5 kB across seven chunks; the budget is the measurement plus the same 0.5 kB headroom as before; a user who opens the Extreme Heat screen transfers the same time-bar chunk the Drought screen already transfers; rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 7.0 kB; HeatRisk multi-day selector (JS budget 5.0 kB; 4.2 kB covered the 4.1 kB shared HeatRisk closure measured after H2 integration; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 4.3 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; the H0 coverage qualification measured 3.5 kB across three chunks on 2026-07-28; network numbers measured 30,326 bytes / 18 requests at 1280x720 on 2026-07-27)',
     rootModules: ['src/layers/heatrisk.ts'],
-    activationJsGzipKb: 7.5,
+    measuredJsGzipKb: 10.4,
     networkBytes: 30_326,
     requestCount: 18,
     dataAssets: [],
   },
   {
     key: 'point-heat-briefing',
-    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 28.8 kB; Point heat briefing with bounded NWS discovery, nearby observation, grid time series, point forecast, and alerts (21.2 kB measured first-activation closure on 2026-09-02, including the shared impact hydrator; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 26.1 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; the ENSO module loads lazily inside the long-range horizon; six-request ceiling; completed responses use the bounded client cache and the Worker retains its 60-second edge cache)',
+    label: "rebalanced 2026-09-09 with DDM-P7-T03: the near-term fire cell's SPC Day 1-8 Fire Weather Outlook read (src/impact/sources.ts fetchSpcFireOutlookClaims with its layer tables, the shared moment formatter and sentence builders, plus the spcFireOutlook lane in src/impact/hydrate.ts) grew this closure from 30.1 to 31.3 kB, measured by the director with npm run build && npm run check:activation on the lane tip after the round-2 fixes (S20, 2026-09-09; the coder's own row was an unmeasured 31.5 estimate, since a coder lane may not build); the budget is the measurement plus the same 0.2 kB headroom the row carried; the briefing now issues eight SPC point queries beside the six-request NWS ceiling stated below, which this row's requestCount does not count (the ceiling names the point-heat feature's own NWS reads); " +"rebalanced 2026-09-09 with DDM-P7-T07: the season-ahead heat cell's CPC seasonal temperature outlook read (src/impact/sources.ts fetchCpcSeasonalTempClaims with its legend and season tables, and the cpcSeasonalTemp lane in src/impact/hydrate.ts) grew this closure from 29.5 to 30.1 kB; the budget is the measurement plus the same 0.2 kB headroom the row carried; " + 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 28.8 kB; Point heat briefing with bounded NWS discovery, nearby observation, grid time series, point forecast, and alerts (21.2 kB measured first-activation closure on 2026-09-02, including the shared impact hydrator; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 26.1 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; the ENSO module loads lazily inside the long-range horizon; six-request ceiling; completed responses use the bounded client cache and the Worker retains its 60-second edge cache)',
     rootModules: ['src/impact/point-heat.ts'],
-    activationJsGzipKb: 29.7,
+    measuredJsGzipKb: 31.3,
     networkBytes: 3_000_000,
     requestCount: 6,
     dataAssets: [],
   },
   {
     key: 'bc-basin-drought',
-    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 7.9 kB; Province of British Columbia basin drought levels (measured 3,908,396 bytes and one request with the 0.01-degree generalized query on 2026-07-27)',
+    label: 'HELD by DR-160 (2026-09-28) until the Province\'s written permission or the owner\'s re-ruling; the row and its measurement are kept for the hold\'s eventual release. rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 7.9 kB; Province of British Columbia basin drought levels (measured 3,908,396 bytes and one request with the 0.01-degree generalized query on 2026-07-27)',
+    heldBy: 'DR-160',
     rootModules: ['src/layers/bc-drought.ts'],
-    activationJsGzipKb: 8.2,
+    measuredJsGzipKb: 7.9,
     networkBytes: 4_250_000,
     requestCount: 1,
     dataAssets: [],
   },
   {
     key: 'canadian-drought-monitor-snapshot',
-    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 8.3 kB; Canadian Drought Monitor monthly committed snapshot (June 2026 artifact measured 960,818 bytes on 2026-07-28; S4 shared time-bar closure measured 5,591 gzip bytes on 2026-07-29)',
+    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 8.3 kB; Canadian Drought Monitor monthly committed snapshot (June 2026 artifact measured 960,818 bytes on 2026-07-28; S4 shared time-bar closure measured 5,591 gzip bytes on 2026-07-29); re-recorded 2026-11-06: the September 2026 artifact (the latest published month; October was not yet published) measured 1,633,864 bytes on disk and 493,276 bytes gzip, so the data line is that measurement plus ACTIVATION_HEADROOM (named at the landing stop for the owner\'s word)',
     rootModules: ['src/layers/cdm-drought.ts'],
-    activationJsGzipKb: 8.6,
-    networkBytes: 1_000_000,
+    measuredJsGzipKb: 8.4,
+    networkBytes: 2_450_000,
     requestCount: 1,
     dataAssets: [{
       path: 'data/cdm-drought-areas.json',
-      maxBytes: 1_000_000,
+      maxBytes: 2_450_000,
     }],
   },
   {
     key: 'north-american-drought-monitor',
     label: 'rebalanced again 2026-09-03 with the shared NADM verdict (DR-052 follow-up): src/util/nadm-collection.ts replaced the layer\'s local validator and is its own 0.4 kB chunk in this closure because the minimap shares it, so the closure measured 8.2 kB; budget 8.5 kB, the measurement plus the same headroom; rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 7.8 kB; North American Drought Monitor continental context (measured 616,132 bytes and one direct request on 2026-07-27)',
     rootModules: ['src/layers/nadm-drought.ts'],
-    activationJsGzipKb: 8.5,
+    measuredJsGzipKb: 8.2,
     networkBytes: 650_000,
     requestCount: 1,
     dataAssets: [],
   },
   {
     key: 'fire3d-mode',
-    label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 15.8 kB; Desktop 3D Fire mode: terrain + camera + sky orchestrator, the volumetric smoke companion, and the issuer-published context chunk with the WHP 2023 hazard drape and the structures pilot (JS budget 14 kB; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 13.0 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; archive transport at 1280x720 measured 2,278,573 terrain bytes over 19 ranged requests; the hazard drape replaced the 25.7 MB FBFM40 fuels drape 2026-08-19 at roughly half the archive weight, and its transport is logged by the fire3d spec; the z13-14 structures archive measured 16,512 activation-time bytes over 2 ranged reads with tile reads only when zoomed into the pilot area; power infrastructure left this closure 2026-08-19 when it became its own catalog layer, below; the smoke and context roots are reached via dynamic import from the first root and are invisible to the static closure walk, so ALL roots are declared)',
-    rootModules: ['src/map/fire3d.ts', 'src/layers/hms-smoke-volume.ts', 'src/map/fire3d-context.ts', 'src/layers/nifc-perimeter-ribbon.ts'],
-    activationJsGzipKb: 18.8,
+    label: 'line set to 33.5 kB by the owner on 2026-10-12 (DR-205: "The 33.4kb can meet the needs") for the session cache of land-cover mask tiles; the gate derives a line as the recorded figure plus 8%, so 31.0 is recorded here to give 33.5 and is not a measurement (the closure measured 33.4 kB at 46b5b0b); before that, 33.0 kB (DR-203) for the fire-perimeter cut and its softened edge (the closure measured 32.1 kB at 9aa85ac); re-recorded 2026-10-11 for release 0.7.3, by the owner\'s word ("set the size limit to what is required"): the Wildfire 3D dryness ground (DDM-P9-T13) is a fifth dynamically imported root, src/layers/wildfire-dryness.ts, declared here so the row counts what entering the scene downloads; its chunk brings the shared raster-status and raster-proof chunks with it, and the scene itself grew by the ground\'s wiring and the satellite hold; measured 29.8 kB across eighteen chunks, up from 20.5 across fifteen without the ground declared. The network columns below do not yet count the NOAA STAR and USGS tiles; that measurement is the leg\'s per-view step. Earlier: rebalanced 2026-09-10 with DR-083 (S27):src/util/pmtiles-probe.ts now reads and parses the whole 127-byte PMTiles header and checks the archive\'s declared extent against Content-Range (Codex finding S1), which grew the shared pmtiles-probe chunk from 0.40 to 0.98 kB gzip, and the resolved-depth coverage sentence (Fire3DStatus.terrainMaxZoom, the fire3dCoverageNote formatter, resolveHillshadeArchive keeping the header) grew fire3d, fire3d-presentation and hillshade by 0.13 kB together; measured 19.3 kB across the same fourteen chunks; the budget is the measurement plus the same 0.7 kB headroom the row has carried since the ribbon landing; the probe was first trimmed to the four header fields a caller reads before this row moved; ' +'measured 17.9 kB on 2026-09-09 at the DDM-P9-T04 landing (3c12f66) and again at 4b1b007, against the 18.8 kB budget below (the perimeter-ribbon landing of 2026-09-03, 4d49192, set that budget; this sentence records the gate\'s own number so the row is not read as the 15.8 kB the 2026-09-03 sentence measured before the ribbon joined the closure); ' +'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 15.8 kB; Desktop 3D Fire mode: terrain + camera + sky orchestrator, the volumetric smoke companion, and the issuer-published context chunk with the WHP 2023 hazard drape and the structures pilot (JS budget 14 kB; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 13.0 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; archive transport at 1280x720 measured 2,278,573 terrain bytes over 19 ranged requests; the hazard drape replaced the 25.7 MB FBFM40 fuels drape 2026-08-19 at roughly half the archive weight, and its transport is logged by the fire3d spec; the z13-14 structures archive measured 16,512 activation-time bytes over 2 ranged reads with tile reads only when zoomed into the pilot area; power infrastructure left this closure 2026-08-19 when it became its own catalog layer, below; the smoke and context roots are reached via dynamic import from the first root and are invisible to the static closure walk, so ALL roots are declared)',
+    rootModules: ['src/map/fire3d.ts', 'src/layers/hms-smoke-volume.ts', 'src/map/fire3d-context.ts', 'src/layers/nifc-perimeter-ribbon.ts', 'src/layers/wildfire-dryness.ts'],
+    measuredJsGzipKb: 31.0,
     networkBytes: 4_800_000,
     requestCount: 56,
     dataAssets: [{
@@ -372,8 +442,8 @@ const FEATURE_BUDGETS = [
       maxBytes: 16_000_000,
     }, {
       // MUST equal MAX_ARCHIVE_BYTES in scripts/build-structures-tiles.mjs
-      // (same cross-gate agreement rule).
-      path: 'data/structures-central-oregon.pmtiles',
+      // (same cross-gate agreement rule; tests/structures-3d.test.mjs).
+      path: 'data/structures-central-oregon-2023.pmtiles',
       maxBytes: 16_000_000,
     }],
   },
@@ -381,7 +451,7 @@ const FEATURE_BUDGETS = [
     key: 'power-infrastructure',
     label: 'rebalanced 2026-09-03 with the URL-catalog split: DR-008 a moved the two boot values into src/config/urls-boot.ts and the seventy-entry catalog out of the entry chunk (entry 33.6 to 29.7 kB gzip, eager app 49.9 to 45.8), so the 2.7 kB urls chunk now lands in this first-activation closure instead of first paint; the default-on layers fetch it in parallel with their own chunks at boot, so total boot transfer is unchanged and the critical path is shorter; the budget is the new measurement plus the same headroom as before; measured 11.6 kB; JS budget 9.5 kB; rebalanced 2026-09-02 with the MapLibre 6 landing: DR-008 a made the map key and the telemetry adapters lazy, which dropped the entry chunk from 43.4 to 33.6 kB gzip and moved the shared guards, legend-registry, style-expressions and wildfire-presentation chunks from the eager closure into first activation, so this closure measured 8.9 kB; the budget is the measurement plus headroom, and a user who activates the feature now transfers less in total; Power lines and plants as a catalog layer (owner direction 2026-08-19; it left the 3D Fire closure above). Nothing is fetched below zoom 6, where the layer reports zoom in to load. Above the gate: the bundled z0-11 transmission archive over ranged requests, plus ONE bounded live EIA plants read probed at 174,970 raw bytes',
     rootModules: ['src/layers/power-3d.ts'],
-    activationJsGzipKb: 12.2,
+    measuredJsGzipKb: 12.1,
     networkBytes: 1_200_000,
     requestCount: 20,
     dataAssets: [{
@@ -390,6 +460,46 @@ const FEATURE_BUDGETS = [
       path: 'data/power-lines-pnw.pmtiles',
       maxBytes: 8_000_000,
     }],
+  },
+  {
+    key: 'popup-frame',
+    label: 'NEW 2026-10-04 with S30D P1-FRAME, ratified by the owner on 2026-10-05 (RATIFICATION-11 row 14): the popup frame (src/ui/popup-frame.ts) as its own first-use cost. The InteractionCoordinator is its one caller and loads it with one dynamic import, warmed when the first click target registers; builders hand the coordinator a model and import only the frame\'s types, so the frame rides no other row (the popup frame renderer rule above holds that). Its first-activation closure is the frame chunk plus the shared text-tokens chunk it imports: measured 5.5 kB (5,471 bytes gzip, the frame chunk 5,176 plus text-tokens 295) by the worker gate p1frame-4 on a94eee5 plus this change. The frame fetches nothing, so its network columns are zero. Remeasured 2026-10-08 for release 0.7.1: 530f5f0 moved popup DOM painting out of the eager app into this lazy closure (by design), which now also carries briefing-door-color, wildfire-presentation and style-expressions; measured 10.6 kB gzip on e12251a.',
+    rootModules: ['src/ui/popup-frame.ts'],
+    measuredJsGzipKb: 10.6,
+    networkBytes: 0,
+    requestCount: 0,
+    dataAssets: [],
+  },
+  {
+    key: 'enso-flow-paths',
+    label: 'NEW, measured 2026-10-05, for the owner to ratify at the next landing (ENSO-FLOW-PLAN Q1, DR-184 pattern): the ENSO flowing paths (wind streaks, wave crest marks and their still form) as their own first-use cost. src/layers/enso-flow.ts reaches the chunk with one dynamic import, so it rides no other row (the flow paths renderer and flow paths decoder rules above hold that). Its first-activation closure is the flow chunk (flow-BejF4yQP.js, 14,360 bytes gzip), the shared time-bar chunk it imports (2,552) and the decode Worker bundle (decode-worker-B-SLxx84.js, 9,470, which has no manifest entry and is resolved by its name and sourcemap): measured 26.4 kB (26,382 bytes gzip) by npm run build && npm run check:activation on the E2-1 tree (local base 14b0d9e) plus this change; a standalone rolldown build gzipped the Worker at 9,532 bytes and the chunk (time-bar folded in) at 14,822. Network columns are the larger kind, waves: three requests (the .idx 1,005 bytes, DIRPW 887,386, HTSGW 428,128) and 1,316,519 bytes, measured from CDP Network.dataReceived in tests/flow-measure.spec.ts; wind is three requests and 198,399 bytes (39,706 + 79,086 + 79,607). The paths fetch nothing else.',
+    // Two roots: the flow chunk (src/layers/enso-flow.ts reaches it with one dynamic import) and the decode Worker, which
+    // src/layers/flow/nodd.ts starts with `new Worker(new URL(...))`. A Worker chunk has no static edge from the flow
+    // chunk, so it is declared here beside the chunk root, as the fire3d row declares its dynamically imported roots.
+    rootModules: ['src/layers/flow/index.ts', 'src/layers/flow/decode-worker.ts'],
+    measuredJsGzipKb: 26.4,
+    networkBytes: 1_316_519,
+    requestCount: 3,
+    // The committed NOAA RTOFS surface-current frame (admission rtofs-currents-producer line 10), written by
+    // scripts/build-rtofs-currents.mjs and read same-origin by src/layers/flow/currents.ts: ocean currents are three
+    // requests and 74,399 bytes (the header 1,772, the 1.0 degree grid 19,938 and the 0.3 degree grid 52,689 as gzip;
+    // 248,400 bytes of Int16 inflated), measured 2026-10-13 on the 2026-10-13 00Z frame, so under the network columns
+    // above, which stay the larger kind. Each line is that measurement plus ACTIVATION_HEADROOM; a landing replaces the
+    // frame, and one that crosses a line re-records it here.
+    dataAssets: [
+      { path: 'data/rtofs-surface-currents.json', maxBytes: 2_658 },
+      { path: 'data/rtofs-surface-currents-trop-paci.i16.gz', maxBytes: 29_907 },
+      { path: 'data/rtofs-surface-currents-alaska.i16.gz', maxBytes: 79_033 },
+    ],
+  },
+  {
+    key: 'tropical-cyclones',
+    label: 'NEW 2026-10-13 with ENSO block B3, measured at the build of the first commit (7.9 kB gzip, 8.0 kB after the key and popup fixes, across tropical-cyclones, urls, guards, style-expressions and tropical-presentation; the admission noaa-tropical-cyclones.md line 10 estimate was 11 kB): the active tropical cyclones layer (src/layers/tropical-cyclones.ts with its reader, popup builder and presentation tables) as its own first-use cost. Network, from the admission, not yet measured live: the worst case of fifteen occupied slots, 15 presence reads plus 3 per occupied slot = 60 requests and about 261,690 bytes gzip on the wire (one measured slot, Hurricane Simon EP5, 17,446 bytes, times fifteen), rounded to 300,000; a typical day is 18 requests, an empty season 15 requests of 42 bytes each.',
+    rootModules: ['src/layers/tropical-cyclones.ts'],
+    measuredJsGzipKb: 8.0,
+    networkBytes: 300_000,
+    requestCount: 60,
+    dataAssets: [],
   },
 ];
 
@@ -614,6 +724,29 @@ function checkZipDependencyNames(depNames) {
   return findings;
 }
 
+let cachedBcBasinHeld;
+
+/**
+ * DR-160 (2026-09-28): whether the Province of British Columbia basin
+ * drought edition is held, read as a simple text match of
+ * `BC_BASIN_EDITION_HELD`'s line in src/config/layers.ts so this script and
+ * the source constant it mirrors can never disagree (no TypeScript import
+ * seam exists in this plain .mjs checker). Cached for the run; a test
+ * supplies its own `bcBasinHeld` option instead of touching the real file.
+ */
+function isBcBasinEditionHeld() {
+  if (cachedBcBasinHeld !== undefined) return cachedBcBasinHeld;
+  let src;
+  try {
+    src = readFileSync('src/config/layers.ts', 'utf8');
+  } catch {
+    cachedBcBasinHeld = false;
+    return cachedBcBasinHeld;
+  }
+  cachedBcBasinHeld = /\bBC_BASIN_EDITION_HELD\s*=\s*true\b/.test(src);
+  return cachedBcBasinHeld;
+}
+
 function validateBudgets(budgets) {
   const findings = [];
   const invalidKeys = new Set();
@@ -622,21 +755,21 @@ function validateBudgets(budgets) {
     const before = findings.length;
     if (!f.key || keys.has(f.key)) findings.push(`budget table: missing or duplicate feature key "${f.key}"`);
     keys.add(f.key);
-    for (const col of ['activationJsGzipKb', 'networkBytes', 'requestCount']) {
+    for (const col of ['measuredJsGzipKb', 'networkBytes', 'requestCount']) {
       if (!isPendingOrBudget(f[col])) {
         findings.push(`feature ${f.key}: invalid ${col} (${String(f[col])}); must be a finite non-negative number or '${PENDING}'`);
       }
     }
-    if (f.activationJsGzipKb === 0) {
+    if (f.measuredJsGzipKb === 0) {
       // The enforcement line is `total >= budget`; zero could never pass.
-      findings.push(`feature ${f.key}: invalid activationJsGzipKb; an enforced JS budget must be positive (use '${PENDING}' to declare without enforcing)`);
+      findings.push(`feature ${f.key}: invalid measuredJsGzipKb; an enforced JS budget must be positive (use '${PENDING}' to declare without enforcing)`);
     }
     if (!Array.isArray(f.dataAssets)) {
       findings.push(`feature ${f.key}: invalid dataAssets; must be an array (empty is fine)`);
     }
     if (!Array.isArray(f.rootModules) || f.rootModules.some((r) => typeof r !== 'string')) {
       findings.push(`feature ${f.key}: invalid rootModules; must be an array of manifest keys`);
-    } else if (typeof f.activationJsGzipKb === 'number' && isPendingOrBudget(f.activationJsGzipKb) && f.rootModules.length === 0) {
+    } else if (typeof f.measuredJsGzipKb === 'number' && isPendingOrBudget(f.measuredJsGzipKb) && f.rootModules.length === 0) {
       findings.push(`feature ${f.key}: a numeric activation budget needs at least one root module; filename guessing undercounts and is not supported`);
     }
     for (const a of Array.isArray(f.dataAssets) ? f.dataAssets : []) {
@@ -649,11 +782,97 @@ function validateBudgets(budgets) {
   return { findings, invalidKeys };
 }
 
+/**
+ * ENSO-FLOW-PLAN E2-2: the dist bundle of a Worker root (`assets/<stem>-<hash>.js`,
+ * stem = the root file's name without its extension), or null. Proven two ways,
+ * never by name alone: exactly one chunk has that stem and its sourcemap lists
+ * the root among its `sources`.
+ */
+function workerBundleFor(root, assets, manifestFiles) {
+  if (!existsSync(assets)) return null;
+  const stem = root.split('/').pop().replace(/\.[^.]+$/, '');
+  const proven = readdirSync(assets).filter((f) => {
+    // Vite never lists a Worker bundle in the manifest, so a file that IS some
+    // manifest entry's `file` (a shared chunk named after the stem, say) is a
+    // page chunk, never the Worker: a root that lost its manifest key by being
+    // folded into one stays drift.
+    if (manifestFiles.has(f)) return false;
+    if (!f.startsWith(`${stem}-`) || !f.endsWith('.js') || !existsSync(join(assets, `${f}.map`))) return false;
+    const { sources } = validateSourcemap(join(assets, `${f}.map`));
+    return Array.isArray(sources) && sources.some((s) => s.endsWith(`/${root}`));
+  });
+  return proven.length === 1 ? proven[0] : null;
+}
+
+/**
+ * S30D P1-FRAME (2026-10-04): a forbidden rule that names a `soleFeature`
+ * may ride NO feature's first-activation closure but that row's own. Two
+ * kinds of evidence, either one a finding: the module's own manifest key in
+ * the closure (it kept its own chunk, as a dynamically imported module
+ * does), or a closure chunk whose sourcemap `sources` fold the module in.
+ * A closure chunk the check cannot see into is a finding too (P1-FRAME
+ * repair round 1, the Codex diff review finding 4: a missing, unparseable,
+ * empty or indexed map must never hide the module): only the generated
+ * helpers MAP_EXEMPT already names, under the same raw-size caps, may lack
+ * a map (the entry is never in an activation closure). Only rows declared
+ * in the table are walked; a layer module without a row is held to the
+ * same rule at the source level by tests/identify-paths.spec.ts (no static
+ * value import of the frame anywhere in src/).
+ */
+function soleFeatureFindings(feature, closureKeys, activationFiles, manifest, assets, forbidden, mapExempt) {
+  const findings = [];
+  // ENSO-FLOW-PLAN E2-2: a second and third sole-feature rule (the flow
+  // renderer and decoder, owned by enso-flow-paths) share one blind-chunk
+  // finding per chunk, naming every rule the chunk cannot be ruled out of,
+  // so the pinned P1-FRAME cases (every finding carries "popup frame
+  // renderer") still hold: a blind chunk could hide any of them.
+  const governed = forbidden.filter((rule) => rule.soleFeature && rule.soleFeature !== feature.key);
+  const governedNames = governed.map((rule) => rule.name).join(', ');
+  const governedOwners = [...new Set(governed.map((rule) => rule.soleFeature))].join(' and ');
+  const blindReported = new Set();
+  for (const rule of forbidden) {
+    if (!rule.soleFeature || rule.soleFeature === feature.key) continue;
+    const chunks = new Set();
+    for (const key of closureKeys) {
+      const file = (manifest[key].file ?? '').replace(/^assets\//, '');
+      if (rule.pattern.test(key) && activationFiles.includes(file)) chunks.add(file);
+    }
+    for (const file of activationFiles) {
+      if (chunks.has(file)) continue;
+      const chunkPath = join(assets, file);
+      const mapPath = `${chunkPath}.map`;
+      let blind = null;
+      if (!existsSync(mapPath)) {
+        const ex = mapExempt.find((e) => e.pattern.test(file));
+        const size = existsSync(chunkPath) ? statSync(chunkPath).size : Infinity;
+        if (!ex) blind = 'has no sourcemap';
+        else if (size > ex.maxRawBytes) blind = `has no sourcemap and is ${size} bytes, over its ${ex.maxRawBytes} byte map exemption`;
+      } else {
+        const { sources, error } = validateSourcemap(mapPath);
+        if (error) blind = `sourcemap ${error}`;
+        else if (sources.some((s) => rule.pattern.test(s))) chunks.add(file);
+      }
+      if (blind && !blindReported.has(file)) {
+        blindReported.add(file);
+        findings.push(
+          `CLOSURE VIOLATION: ${governedNames} cannot be ruled out of feature ${feature.key}'s first-activation closure: chunk ${file} ${blind}; only the ${governedOwners} row(s) may count them, so every chunk of another row's closure must prove its contents.`
+        );
+      }
+    }
+    for (const file of chunks) {
+      findings.push(
+        `CLOSURE VIOLATION: ${rule.name} is in feature ${feature.key}'s first-activation closure (chunk ${file}); only the ${rule.soleFeature} row may count it. ${rule.reason}`
+      );
+    }
+  }
+  return findings;
+}
+
 /* ------------------------------------------------------------------ *
  * The checker, pure over a dist directory and a config, so the
  * self-test runs the same code path as the real tree.
  * ------------------------------------------------------------------ */
-function runChecks(distDir, { forbidden, mapExempt, budgets }) {
+function runChecks(distDir, { forbidden, mapExempt, budgets, bcBasinHeld }) {
   const findings = [];
   const report = [];
   const assets = join(distDir, 'assets');
@@ -762,18 +981,48 @@ function runChecks(distDir, { forbidden, mapExempt, budgets }) {
   const distRoot = resolve(distDir);
   for (const feature of budgets) {
     if (invalidKeys.has(feature.key)) continue;
-    const jsKb = feature.activationJsGzipKb;
+    const measuredKb = feature.measuredJsGzipKb;
+    const jsKb = typeof measuredKb === 'number' ? budgetForMeasurement(measuredKb) : measuredKb;
     const roots = Array.isArray(feature.rootModules) ? feature.rootModules : [];
-    const missingRoots = roots.filter((r) => !(r in manifest));
+    // ENSO-FLOW-PLAN E2-2: a Worker started with `new Worker(new URL(...))`
+    // is bundled on its own and has no manifest entry, so a root absent from
+    // the manifest may still be a Worker bundle proven by name and sourcemap.
+    const workerBundles = new Map();
+    const manifestFiles = new Set(Object.values(manifest).map((entry) => String(entry.file ?? '').replace(/^assets\//, '')));
+    for (const r of roots) {
+      if (r in manifest) continue;
+      const bundle = workerBundleFor(r, assets, manifestFiles);
+      if (bundle) workerBundles.set(r, bundle);
+    }
+    const missingRoots = roots.filter((r) => !(r in manifest) && !workerBundles.has(r));
+    // DR-160: a feature marked `heldBy` is neither enforced nor drift while
+    // the source constant it names is true, root(s) missing or not; the
+    // marker is honoured only then, so a released hold (constant flipped to
+    // false) with a stale marker falls straight through to normal
+    // enforcement below instead of silently staying exempt.
+    if (feature.heldBy) {
+      const held = typeof bcBasinHeld === 'boolean' ? bcBasinHeld : isBcBasinEditionHeld();
+      if (held) {
+        report.push(
+          `  ${feature.key}: HELD by ${feature.heldBy} (BC_BASIN_EDITION_HELD is true in src/config/layers.ts); neither enforced nor drift${
+            missingRoots.length
+              ? ` (root module(s) absent from the manifest while held, as expected: ${missingRoots.join(', ')})`
+              : ''
+          }`
+        );
+        continue;
+      }
+    }
     if (missingRoots.length) {
       const msg = `feature ${feature.key}: root module(s) not in the manifest: ${missingRoots.join(', ')}`;
       if (typeof jsKb === 'number') findings.push(`${msg}; an enforced budget with a missing root is drift, not a pass`);
       else report.push(`  ${feature.key}: ${msg} (declared, not enforced)`);
     }
     const presentRoots = roots.filter((r) => r in manifest);
-    if (presentRoots.length) {
+    if (presentRoots.length || workerBundles.size) {
       const closureKeys = staticClosure(manifest, presentRoots);
-      const activationFiles = [...jsFilesOf(manifest, closureKeys)].filter((f) => !initialFiles.has(f));
+      const activationFiles = [...new Set([...jsFilesOf(manifest, closureKeys), ...workerBundles.values()])].filter((f) => !initialFiles.has(f));
+      findings.push(...soleFeatureFindings(feature, closureKeys, activationFiles, manifest, assets, forbidden, mapExempt));
       const total = activationFiles.reduce((sum, f) => sum + gz(join(assets, f)), 0);
       const line = `first-activation static closure ${kb(total)} kB gzip across ${activationFiles.length} chunk(s): ${activationFiles.join(', ') || '(none beyond the initial set)'}`;
       if (typeof jsKb === 'number' && missingRoots.length === 0) {
@@ -781,7 +1030,7 @@ function runChecks(distDir, { forbidden, mapExempt, budgets }) {
           findings.push(`feature ${feature.key}: the resolved first-activation set is empty (roots resolve inside the initial set or to non-JS); an enforced budget needs a nonempty lazy closure, else a typo or a feature that stopped being lazy passes silently`);
           continue;
         }
-        report.push(`  ${feature.key}: ${line}; budget ${jsKb} kB`);
+        report.push(`  ${feature.key}: ${line}; budget ${jsKb} kB (ratified ${measuredKb} kB plus ${Math.round(ACTIVATION_HEADROOM * 100)}% headroom)`);
         if (total / 1000 >= jsKb) {
           findings.push(`feature ${feature.key} first-activation JS ${kb(total)} kB gzip is at or over its ${jsKb} kB budget (chunks: ${activationFiles.join(', ')})`);
         }
@@ -895,6 +1144,118 @@ const SELF_TEST_CASES = [
     },
   },
   {
+    // The Codex review's "transitive popup frame in initial closure fails":
+    // the frame rides a shared chunk the entry imports, not the entry itself.
+    name: 'fail-eager-popup-frame-transitive', kind: 'fail', expect: 'popup frame renderer',
+    files: {
+      'index.html': htmlWith('shared-test.js'), '.vite/manifest.json': manifestWith(['_shared-test.js'], SHARED),
+      ...CLEAN_ENTRY,
+      'assets/shared-test.js': 'console.log("shared");',
+      'assets/shared-test.js.map': M(['../../src/map/response-sections.ts', '../../src/ui/popup-frame.ts']),
+    },
+  },
+  {
+    // S30D P1-FRAME: a layer row whose closure statically imports the frame
+    // (its own chunk, the shape a builder calling the serializer produces).
+    // The frame chunk has no sourcemap here, so its manifest key is the
+    // evidence (the layer's own chunk proves its contents with a map).
+    name: 'fail-popup-frame-in-feature-closure', kind: 'fail', expect: 'popup frame renderer',
+    budgets: [{ key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: ['src/ui/popup-frame.ts'] },
+        'src/ui/popup-frame.ts': { file: 'assets/popup-frame-test.js', isDynamicEntry: true, imports: [] },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/popup-frame-test.js': 'export const frame = true;',
+    },
+  },
+  // S30D P1-FRAME repair round 1 (the Codex diff review, finding 4): a
+  // chunk in another feature's first-activation closure that the check
+  // cannot see into (no map, an unparseable map, an indexed map) is itself
+  // a finding, so a missing or broken map can never hide the frame.
+  ...[
+    ['fail-popup-frame-closure-missing-map', null],
+    ['fail-popup-frame-closure-invalid-map', '{ not json'],
+    ['fail-popup-frame-closure-indexed-map', JSON.stringify({ version: 3, sections: [] })],
+  ].map(([name, map]) => ({
+    name, kind: 'fail', expect: 'popup frame renderer',
+    budgets: [{ key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: ['_shared-frame.js'] },
+        '_shared-frame.js': { file: 'assets/shared-frame.js' },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/shared-frame.js': 'export const shared = true;',
+      ...(map === null ? {} : { 'assets/shared-frame.js.map': map }),
+    },
+  })),
+  {
+    // The frame folded into a shared chunk a layer row imports: no manifest
+    // key of its own, so the chunk's sourcemap is the evidence.
+    name: 'fail-popup-frame-folded-in-feature-closure', kind: 'fail', expect: 'popup frame renderer',
+    budgets: [{ key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: ['_shared-frame.js'] },
+        '_shared-frame.js': { file: 'assets/shared-frame.js' },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/shared-frame.js': 'export const shared = true;',
+      'assets/shared-frame.js.map': M(['../../src/util/escape.ts', '../../src/ui/popup-frame.ts']),
+    },
+  },
+  {
+    // ENSO-FLOW-PLAN E2-2: the flow renderer rides a shared chunk the entry
+    // imports (the shape one static import from eager code would produce).
+    name: 'fail-eager-flow-renderer-transitive', kind: 'fail', expect: 'flow paths renderer',
+    files: {
+      'index.html': htmlWith('shared-test.js'), '.vite/manifest.json': manifestWith(['_shared-test.js'], SHARED),
+      ...CLEAN_ENTRY,
+      'assets/shared-test.js': 'console.log("shared");',
+      'assets/shared-test.js.map': M(['../../src/layers/enso-flow.ts', '../../src/layers/flow/ribbon-layer.ts']),
+    },
+  },
+  {
+    // The same for the decoder: grib2 and jpx are the Worker's, never eager.
+    name: 'fail-eager-flow-decoder-transitive', kind: 'fail', expect: 'flow paths decoder',
+    files: {
+      'index.html': htmlWith('shared-test.js'), '.vite/manifest.json': manifestWith(['_shared-test.js'], SHARED),
+      ...CLEAN_ENTRY,
+      'assets/shared-test.js': 'console.log("shared");',
+      'assets/shared-test.js.map': M(['../../src/layers/flow/grib2.ts', '../../src/layers/flow/jpx.ts']),
+    },
+  },
+  {
+    // Another row's first-activation closure folds the decoder in (a static
+    // import from a layer that is not the flow chunk): only enso-flow-paths
+    // may count it, and the sourcemap is the evidence.
+    name: 'fail-flow-decoder-in-feature-closure', kind: 'fail', expect: 'flow paths decoder',
+    budgets: [{ key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: ['_shared-flow.js'] },
+        '_shared-flow.js': { file: 'assets/shared-flow.js' },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/shared-flow.js': 'export const shared = true;',
+      'assets/shared-flow.js.map': M(['../../src/util/escape.ts', '../../src/layers/flow/decode-worker.ts']),
+    },
+  },
+  {
     name: 'fail-eager-zip', kind: 'fail', expect: 'ZIP library',
     files: {
       'index.html': htmlWith('shared-test.js'), '.vite/manifest.json': manifestWith(['_shared-test.js'], SHARED),
@@ -945,6 +1306,15 @@ const SELF_TEST_CASES = [
     },
   },
   {
+    name: 'fail-class-field-helper-oversize', kind: 'fail', expect: 'map-exempt',
+    files: {
+      'index.html': htmlWith('defineProperty-test.js'),
+      '.vite/manifest.json': manifestWith(['_dp.js'], { '_dp.js': { file: 'assets/defineProperty-test.js' } }),
+      ...CLEAN_ENTRY,
+      'assets/defineProperty-test.js': 'x'.repeat(3000),
+    },
+  },
+  {
     name: 'fail-forged-vendor-no-pmtiles', kind: 'fail', expect: 'allowance rejected',
     files: {
       'index.html': htmlWith('pmtiles-test.js'),
@@ -980,32 +1350,92 @@ const SELF_TEST_CASES = [
   },
   {
     name: 'fail-budget-over', kind: 'fail', expect: 'kB budget',
-    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], activationJsGzipKb: 0.05, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], measuredJsGzipKb: 0.05, ...PENDING_COLS }],
     files: {
       'index.html': htmlWith(),
       '.vite/manifest.json': manifestWith([], { 'src/features/fixture.ts': { file: 'assets/feature-big.js', isDynamicEntry: true, imports: [] } }),
       ...CLEAN_ENTRY,
       'assets/feature-big.js': BIG_WORDS,
+      // Every chunk of a feature's closure proves its contents (P1-FRAME r1).
+      'assets/feature-big.js.map': M(['../../src/features/fixture.ts']),
+    },
+  },
+  {
+    // ENSO-FLOW-PLAN E2-2: a Worker root has no manifest entry; its bundle is
+    // counted once proven, so a Worker that grows past the budget fails it.
+    name: 'fail-budget-worker-root-counted', kind: 'fail', expect: 'kB budget',
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts', 'src/features/fixture-worker.ts'], measuredJsGzipKb: 0.05, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], { 'src/features/fixture.ts': { file: 'assets/feature-small.js', isDynamicEntry: true, imports: [] } }),
+      ...CLEAN_ENTRY,
+      'assets/feature-small.js': 'export const s = 1;',
+      'assets/feature-small.js.map': M(['../../src/features/fixture.ts']),
+      'assets/fixture-worker-abc123.js': BIG_WORDS,
+      'assets/fixture-worker-abc123.js.map': M(['../../src/features/fixture-worker.ts']),
+    },
+  },
+  {
+    // A chunk with the Worker's stem whose sourcemap does not list the root
+    // proves nothing: the root stays missing (drift), never silently counted.
+    name: 'fail-budget-worker-root-unproven', kind: 'fail', expect: 'root module',
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts', 'src/features/fixture-worker.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], { 'src/features/fixture.ts': { file: 'assets/feature-small.js', isDynamicEntry: true, imports: [] } }),
+      ...CLEAN_ENTRY,
+      'assets/feature-small.js': 'export const s = 1;',
+      'assets/feature-small.js.map': M(['../../src/features/fixture.ts']),
+      'assets/fixture-worker-abc123.js': 'export const w = 1;',
+      'assets/fixture-worker-abc123.js.map': M(['../../src/features/other.ts']),
+    },
+  },
+  {
+    // Review of E2-2: a root that lost its manifest key by becoming a shared
+    // chunk (listed in the manifest under its own key, file named after the
+    // stem) is drift, never a Worker bundle: Vite never lists a Worker bundle.
+    name: 'fail-budget-worker-root-shared-chunk', kind: 'fail', expect: 'root module',
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts', 'src/features/fixture-worker.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/features/fixture.ts': { file: 'assets/feature-small.js', isDynamicEntry: true, imports: ['_fixture-worker-abc123.js'] },
+        '_fixture-worker-abc123.js': { file: 'assets/fixture-worker-abc123.js' },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/feature-small.js': 'export const s = 1;',
+      'assets/feature-small.js.map': M(['../../src/features/fixture.ts']),
+      'assets/fixture-worker-abc123.js': 'export const w = 1;',
+      'assets/fixture-worker-abc123.js.map': M(['../../src/features/fixture-worker.ts']),
     },
   },
   {
     name: 'fail-budget-root-missing', kind: 'fail', expect: 'root module',
-    budgets: [{ key: 'fx', rootModules: ['src/features/nope.ts'], activationJsGzipKb: 10, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: ['src/features/nope.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
+    files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
+  },
+  {
+    // DR-160: a stale `heldBy` marker (source constant false) must NOT
+    // exempt a missing root; it falls straight through to the normal
+    // missing-root drift finding, same as fail-budget-root-missing above.
+    name: 'fail-budget-held-flag-mismatch', kind: 'fail', expect: 'root module',
+    bcBasinHeld: false,
+    budgets: [{ key: 'fx-held', heldBy: 'DR-160', rootModules: ['src/features/nope.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-budget-no-roots', kind: 'fail', expect: 'root module',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: 10, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: 10, ...PENDING_COLS }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-budget-invalid-value', kind: 'fail', expect: 'invalid',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: Number.NaN, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: Number.NaN, ...PENDING_COLS }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-data-asset-over', kind: 'fail', expect: 'over its',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data/big.json', maxBytes: 10 }] }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data/big.json', maxBytes: 10 }] }],
     files: {
       'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY,
       'data/big.json': JSON.stringify({ padding: 'x'.repeat(100) }),
@@ -1013,12 +1443,12 @@ const SELF_TEST_CASES = [
   },
   {
     name: 'fail-data-asset-escape', kind: 'fail', expect: 'escapes',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: '../outside.json', maxBytes: 10 }] }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: '../outside.json', maxBytes: 10 }] }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-budget-empty-closure', kind: 'fail', expect: 'first-activation set is empty',
-    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], activationJsGzipKb: 5, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], measuredJsGzipKb: 5, ...PENDING_COLS }],
     files: {
       'index.html': htmlWith(),
       // The root's file IS the entry file: the closure resolves entirely inside the initial set.
@@ -1028,7 +1458,7 @@ const SELF_TEST_CASES = [
   },
   {
     name: 'fail-budget-zero', kind: 'fail', expect: 'invalid',
-    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], activationJsGzipKb: 0, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], measuredJsGzipKb: 0, ...PENDING_COLS }],
     files: {
       'index.html': htmlWith(),
       '.vite/manifest.json': manifestWith([], { 'src/features/fixture.ts': { file: 'assets/feature-big.js', isDynamicEntry: true, imports: [] } }),
@@ -1038,30 +1468,30 @@ const SELF_TEST_CASES = [
   },
   {
     name: 'fail-budget-invalid-network', kind: 'fail', expect: 'invalid',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: -1, requestCount: PENDING, dataAssets: [] }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: -1, requestCount: PENDING, dataAssets: [] }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-budget-duplicate-key', kind: 'fail', expect: 'duplicate',
     budgets: [
-      { key: 'fx', rootModules: [], activationJsGzipKb: PENDING, ...PENDING_COLS },
-      { key: 'fx', rootModules: [], activationJsGzipKb: PENDING, ...PENDING_COLS },
+      { key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, ...PENDING_COLS },
+      { key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, ...PENDING_COLS },
     ],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-data-assets-not-array', kind: 'fail', expect: 'invalid dataAssets',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: 'nope' }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: 'nope' }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-data-asset-missing', kind: 'fail', expect: 'is not in',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data/absent.json', maxBytes: 10 }] }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data/absent.json', maxBytes: 10 }] }],
     files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
   },
   {
     name: 'fail-data-asset-directory', kind: 'fail', expect: 'regular file',
-    budgets: [{ key: 'fx', rootModules: [], activationJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data', maxBytes: 10 }] }],
+    budgets: [{ key: 'fx', rootModules: [], measuredJsGzipKb: PENDING, networkBytes: PENDING, requestCount: PENDING, dataAssets: [{ path: 'data', maxBytes: 10 }] }],
     files: {
       'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY,
       'data/inner.json': '{}',
@@ -1110,8 +1540,95 @@ const SELF_TEST_CASES = [
     },
   },
   {
+    // DR-160: a `heldBy` feature with a missing root, while the source
+    // constant is true, reports HELD (neither enforced nor drift) instead
+    // of the missing-root drift finding fail-budget-root-missing proves.
+    name: 'pass-budget-held-missing-root', kind: 'pass',
+    bcBasinHeld: true,
+    budgets: [{ key: 'fx-held', heldBy: 'DR-160', rootModules: ['src/features/nope.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
+    files: { 'index.html': htmlWith(), '.vite/manifest.json': manifestWith([]), ...CLEAN_ENTRY },
+  },
+  {
+    // S30D P1-FRAME: the frame counted by its own row, and a layer row that
+    // reaches it only through a dynamic import (no static edge) stays clean.
+    name: 'pass-popup-frame-own-row', kind: 'pass',
+    budgets: [
+      { key: 'popup-frame', rootModules: ['src/ui/popup-frame.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS },
+      { key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS },
+    ],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: [], dynamicImports: ['src/ui/popup-frame.ts'] },
+        'src/ui/popup-frame.ts': { file: 'assets/popup-frame-test.js', isDynamicEntry: true, imports: [] },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/popup-frame-test.js': 'export const frame = true;',
+      'assets/popup-frame-test.js.map': M(['../../src/ui/popup-frame.ts']),
+    },
+  },
+  {
+    // ENSO-FLOW-PLAN E2-2: the flow chunk and the decode Worker counted by
+    // their own row, with a layer that reaches the chunk only dynamically.
+    name: 'pass-flow-paths-own-row', kind: 'pass',
+    budgets: [
+      { key: 'enso-flow-paths', rootModules: ['src/layers/flow/index.ts', 'src/layers/flow/decode-worker.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS },
+      { key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS },
+    ],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: [], dynamicImports: ['src/layers/flow/index.ts'] },
+        'src/layers/flow/index.ts': { file: 'assets/flow-test.js', isDynamicEntry: true, imports: ['_flow-shared.js'] },
+        '_flow-shared.js': { file: 'assets/flow-shared.js' },
+        'src/layers/flow/decode-worker.ts': { file: 'assets/decode-worker-test.js', isDynamicEntry: true, imports: [] },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/flow-test.js': 'export const flow = true;',
+      'assets/flow-test.js.map': M(['../../src/layers/flow/index.ts', '../../src/layers/flow/ribbon-layer.ts']),
+      'assets/flow-shared.js': 'export const shared = true;',
+      'assets/flow-shared.js.map': M(['../../src/layers/flow/field.ts']),
+      'assets/decode-worker-test.js': 'export const worker = true;',
+      'assets/decode-worker-test.js.map': M(['../../src/layers/flow/decode-worker.ts', '../../src/layers/flow/grib2.ts', '../../src/layers/flow/jpx.ts']),
+    },
+  },
+  {
+    // The same generated helpers MAP_EXEMPT names for the initial set, under
+    // the same size caps, need no map in a feature's closure either.
+    name: 'pass-popup-frame-closure-exempt-helper', kind: 'pass',
+    budgets: [{ key: 'fx', rootModules: ['src/layers/fixture.ts'], measuredJsGzipKb: PENDING, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], {
+        'src/layers/fixture.ts': { file: 'assets/fixture-layer.js', isDynamicEntry: true, imports: ['_preload.js'] },
+        '_preload.js': { file: 'assets/preload-helper-test.js' },
+      }),
+      ...CLEAN_ENTRY,
+      'assets/fixture-layer.js': 'export const layer = true;',
+      'assets/fixture-layer.js.map': M(['../../src/layers/fixture.ts']),
+      'assets/preload-helper-test.js': 'const seen = new Map;',
+    },
+  },
+  {
+    name: 'pass-budget-worker-root-resolved', kind: 'pass',
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts', 'src/features/fixture-worker.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
+    files: {
+      'index.html': htmlWith(),
+      '.vite/manifest.json': manifestWith([], { 'src/features/fixture.ts': { file: 'assets/feature-small.js', isDynamicEntry: true, imports: [] } }),
+      ...CLEAN_ENTRY,
+      'assets/feature-small.js': 'export const s = 1;',
+      'assets/feature-small.js.map': M(['../../src/features/fixture.ts']),
+      'assets/fixture-worker-abc123.js': 'export const w = 1;',
+      'assets/fixture-worker-abc123.js.map': M(['../../src/features/fixture-worker.ts']),
+    },
+  },
+  {
     name: 'pass-budget-under-closure', kind: 'pass',
-    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], activationJsGzipKb: 10, ...PENDING_COLS }],
+    budgets: [{ key: 'fx', rootModules: ['src/features/fixture.ts'], measuredJsGzipKb: 10, ...PENDING_COLS }],
     files: {
       'index.html': htmlWith(),
       '.vite/manifest.json': manifestWith([], {
@@ -1120,7 +1637,10 @@ const SELF_TEST_CASES = [
       }),
       ...CLEAN_ENTRY,
       'assets/feature-big.js': BIG_WORDS,
+      // Every chunk of a feature's closure proves its contents (P1-FRAME r1).
+      'assets/feature-big.js.map': M(['../../src/features/fixture.ts']),
       'assets/feature-shared.js': 'export const shared = true;',
+      'assets/feature-shared.js.map': M(['../../src/util/fetch.ts']),
     },
   },
 ];
@@ -1130,11 +1650,19 @@ const SELF_TEST_CASES = [
 const EXPECTED_CASE_NAMES = [
   'fail-eager-geotiff', 'fail-eager-landscape', 'fail-eager-zip',
   'fail-eager-impact-briefing-cluster',
+  'fail-eager-popup-frame-transitive',
+  'fail-popup-frame-in-feature-closure', 'fail-popup-frame-folded-in-feature-closure',
+  'fail-popup-frame-closure-missing-map', 'fail-popup-frame-closure-invalid-map',
+  'fail-popup-frame-closure-indexed-map',
+  'fail-eager-flow-renderer-transitive', 'fail-eager-flow-decoder-transitive',
+  'fail-flow-decoder-in-feature-closure',
   'fail-missing-map', 'fail-empty-sources', 'fail-indexed-map',
   'fail-runtime-oversize', 'fail-preload-helper-oversize',
+  'fail-class-field-helper-oversize',
   'fail-forged-vendor-no-pmtiles',
   'fail-vendor-firstparty-share', 'fail-manifest-html-mismatch',
   'fail-no-manifest', 'fail-budget-over', 'fail-budget-root-missing',
+  'fail-budget-held-flag-mismatch',
   'fail-budget-no-roots', 'fail-budget-invalid-value',
   'fail-data-asset-over', 'fail-data-asset-escape',
   'fail-budget-empty-closure', 'fail-budget-zero',
@@ -1144,6 +1672,12 @@ const EXPECTED_CASE_NAMES = [
   'pass-clean-with-lazy-geotiff', 'pass-runtime-exempt',
   'pass-preload-helper-exempt',
   'pass-vendor-allowance', 'pass-budget-under-closure',
+  'pass-budget-held-missing-root',
+  'pass-popup-frame-own-row', 'pass-popup-frame-closure-exempt-helper',
+  'pass-flow-paths-own-row',
+  'fail-budget-worker-root-counted', 'fail-budget-worker-root-unproven',
+  'fail-budget-worker-root-shared-chunk',
+  'pass-budget-worker-root-resolved',
 ];
 
 function runSelfTest() {
@@ -1233,6 +1767,12 @@ function runSelfTest() {
     }
   }
   // Pure-function directions that need no dist tree.
+  // The derived budget: 50% headroom to one decimal, on the two rows that
+  // share the pmtiles-probe chunk, so the rule is proven by its own numbers.
+  if (budgetForMeasurement(19.3) !== 29 || budgetForMeasurement(12.1) !== 18.2 || budgetForMeasurement(0) !== 0) {
+    console.error(`  self-test FAIL: budgetForMeasurement direction broken (19.3 -> ${budgetForMeasurement(19.3)}, 12.1 -> ${budgetForMeasurement(12.1)})`);
+    ok = false;
+  }
   if (checkZipDependencyNames(['node-stream-zip']).length !== 0) {
     // node-stream-zip IS on the governed list; it must NOT trip.
     console.error('  self-test FAIL: governed ZIP package tripped the dependency tripwire');
@@ -1256,6 +1796,7 @@ function runSelfTest() {
         forbidden: EAGER_FORBIDDEN,
         mapExempt: MAP_EXEMPT,
         budgets: testCase.budgets ?? [],
+        bcBasinHeld: testCase.bcBasinHeld,
       });
       if (testCase.kind === 'fail') {
         if (findings.length === 0) {

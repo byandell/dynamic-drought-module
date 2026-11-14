@@ -1,12 +1,16 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './offline-test';
 
-import { deriveDisplaySummary } from '../src/state/display-summary';
+import {
+  deriveDisplaySummary,
+  isUsScopeCautionLayer
+} from '../src/state/display-summary';
 import type {
   DisplaySummaryInput,
   TimelineSnapshot
 } from '../src/types/display-summary';
 import type { LayerStatus } from '../src/types/layer';
 import { LAYER_DEFS } from '../src/config/layers';
+import { FRAMINGS, FRAMING_KEYS } from '../src/config/framings';
 import { STATUS_PILL_TEXT } from '../src/ui/island/pill-text';
 
 /**
@@ -141,7 +145,7 @@ test.describe('S3 display summary: the six ruled statuses', () => {
     const summary = deriveDisplaySummary(
       input(keys, { ...allReady(DROUGHT_KEYS), telemetry: 'zoom-in' })
     );
-    expect(summary.caveat).toContain('Monitoring stations appears after you zoom in');
+    expect(summary.caveat).toContain('Monitoring stations appear after you zoom in');
   });
 
   test('several problems still make ONE caveat string, never a dashboard', () => {
@@ -160,25 +164,37 @@ test.describe('S3 display summary: the six ruled statuses', () => {
   });
 });
 
-test.describe('S3 display summary: coverage honesty (the framing caveat)', () => {
-  test('Mexico framing over a ready US-scoped surface states the display does not cover Mexico', () => {
+test.describe('S3 display summary: coverage honesty relocated to the on-map key (DDM fix lane, 2026-09-10)', () => {
+  // The framing coverage caution used to lead this module's own caveat AND
+  // pop up a second time on the minimap's own caption (src/ui/island/minimap.tsx)
+  // for the same click: the same sentence, twice, at once. The owner called
+  // the popup noise; the fix retired BOTH renderings in favor of one, the
+  // on-map key (src/ui/map-key.ts). The tests below now prove the NEGATIVE
+  // half of that (this module never re-adds the clause) and unit-test what
+  // the key drives directly: `isUsScopeCautionLayer`, and the structure of
+  // the framing coverage clauses themselves, since the key's own gating is
+  // DOM-driven and is proven in tests/s4-minimap.spec.ts instead.
+
+  test('Mexico framing over a ready US-scoped surface adds no caveat here; the on-map key states the caution instead', () => {
     const summary = deriveDisplaySummary(
       input(DROUGHT_KEYS, allReady(DROUGHT_KEYS), { framing: 'mexico' })
     );
-    expect(summary.caveat).toContain('The current display layers do not cover Mexico');
+    expect(summary.caveat).toBeNull();
   });
 
-  test('a ready status over an out-of-coverage framing never reads as unqualified coverage', () => {
+  test('a ready status over an out-of-coverage framing (Boreal & Arctic) also adds no caveat here now', () => {
     const summary = deriveDisplaySummary(
       input(DROUGHT_KEYS, allReady(DROUGHT_KEYS), { framing: 'boreal-arctic' })
     );
-    expect(summary.caveat).not.toBeNull();
+    expect(summary.caveat).toBeNull();
   });
 
-  test('an events-only US-scoped display (wildfire at current) still triggers the Mexico coverage caution', () => {
+  test('an events-only US-scoped display (wildfire at current) still adds no caveat coverage clause here', () => {
     // The wildfire 'current' recipe has no condition surface, only the
-    // NIFC/HMS event pair; NIFC WFIGS is US-scoped, so the framing
-    // caution applies to display LAYERS, not only surfaces.
+    // NIFC/HMS event pair; NIFC WFIGS is US-scoped, so the retired rule
+    // applied to display LAYERS, not only surfaces. The key's own
+    // frameCoverageNote (src/ui/map-key.ts) applies the identical rule via
+    // the same exported isUsScopeCautionLayer, unit-tested below.
     const keys = [...REFERENCE_KEYS, 'nifc-fires', 'hms-smoke'];
     const summary = deriveDisplaySummary(
       input(keys, allReady(keys), { cluster: 'wildfire', framing: 'mexico' })
@@ -186,29 +202,75 @@ test.describe('S3 display summary: coverage honesty (the framing caveat)', () =>
     expect(summary.primary).toContain(
       'Current Mapped Fire Perimeters (National Interagency Fire Center, NIFC)'
     );
-    expect(summary.caveat).toContain('The current display layers do not cover Mexico');
+    expect(summary.caveat).toBeNull();
   });
 
-  test('a substantive second coverage clause survives (Alaska & Northwest); authoring guidance is still dropped', () => {
-    const alaska = deriveDisplaySummary(
-      input(DROUGHT_KEYS, allReady(DROUGHT_KEYS), { framing: 'alaska-northwest' })
-    );
-    expect(alaska.caveat).toContain('US display layers cover Alaska variably');
-    expect(alaska.caveat).toContain(
+  test('isUsScopeCautionLayer: the exemption rule the on-map key now applies, unit-tested directly since it no longer drives a caveat here', () => {
+    expect(isUsScopeCautionLayer({ key: 'usdm', role: 'surface' })).toBe(true);
+    expect(isUsScopeCautionLayer({ key: 'nifc-fires', role: 'event' })).toBe(true);
+    expect(isUsScopeCautionLayer({ key: 'telemetry', role: 'stations' })).toBe(true);
+    // The two named exceptions: the ocean anomaly is global, NADM is the
+    // tri-national continental product.
+    expect(isUsScopeCautionLayer({ key: 'sst-anomaly', role: 'surface' })).toBe(false);
+    expect(isUsScopeCautionLayer({ key: 'nadm-drought', role: 'surface' })).toBe(false);
+    // Reference layers never count, regardless of key.
+    expect(isUsScopeCautionLayer({ key: 'hillshade', role: 'reference' })).toBe(false);
+  });
+
+  test('every framing coverage clause is filed by what it describes, and no clause smuggles a second subject in with it', () => {
+    // The structural half of Codex adversarial review finding 5. The clauses
+    // used to share one string and were rendered together; the defect was
+    // never a wording defect, it was that a display claim, a minimap claim
+    // and a place-selection claim have different conditions of truth and
+    // cannot be gated as one. This asserts the separation itself, so a future
+    // edit cannot quietly re-merge them by appending a second sentence to
+    // whichever field was handy.
+    const alaska = FRAMINGS['alaska-northwest'].coverage;
+    expect(alaska?.displayScope).toContain('US display layers cover Alaska variably');
+    expect(alaska?.displayScope).toContain(
       'Yukon and British Columbia are outside US-scoped sources'
     );
+    expect(alaska?.minimapProvenance).toContain('informs this minimap');
 
-    // The guidance tails (naming the shell or the status machinery)
-    // never surface to the user.
-    const mexico = deriveDisplaySummary(
-      input(DROUGHT_KEYS, allReady(DROUGHT_KEYS), { framing: 'mexico' })
+    // The authoring-guidance tails the old regex stripped are simply gone:
+    // a structured shape has no field for text a reader never saw.
+    const boreal = FRAMINGS['boreal-arctic'].coverage;
+    expect(boreal?.displayScope).toBe('Mostly outside US-scoped display sources.');
+    expect(boreal?.displayScope).not.toContain('per-layer status');
+    expect(FRAMINGS['hawaii'].coverage?.displayScope).not.toContain('per-layer status');
+
+    // Mexico is the framing the finding was found on. Its ruled display
+    // sentence is preserved verbatim and marked as a whole-display claim,
+    // which is what earns it the stricter gate in the on-map key; its
+    // minimap and place-selection clauses are now separate subjects.
+    const mexico = FRAMINGS['mexico'].coverage;
+    expect(mexico?.displayScope).toBe('The current display layers do not cover Mexico.');
+    expect(mexico?.claimsWholeDisplay).toBe(true);
+    expect(mexico?.minimapProvenance).toBe(
+      'The monthly North American Drought Monitor informs this minimap in Mexico.'
     );
-    expect(mexico.caveat).not.toContain('the shell');
-    const boreal = deriveDisplaySummary(
-      input(DROUGHT_KEYS, allReady(DROUGHT_KEYS), { framing: 'boreal-arctic' })
+    expect(mexico?.briefingScope).toBe(
+      'Place selection and local briefings are unavailable.'
     );
-    expect(boreal.caveat).toContain('Mostly outside US-scoped display sources');
-    expect(boreal.caveat).not.toContain('per-layer status');
+
+    for (const key of FRAMING_KEYS) {
+      const coverage = FRAMINGS[key].coverage;
+      if (coverage === undefined) continue;
+      // A minimap clause talks about the minimap and nothing else; a display
+      // clause never claims to speak for the minimap. Either would put a
+      // subject back under a gate that is not its own.
+      if (coverage.displayScope !== undefined) {
+        expect(coverage.displayScope).not.toContain('minimap');
+      }
+      if (coverage.briefingScope !== undefined) {
+        expect(coverage.briefingScope).not.toContain('minimap');
+      }
+      // Only a whole-display claim gets the strict gate, and only Mexico
+      // phrases one; a new one is a deliberate act, not an accident.
+      if (coverage.claimsWholeDisplay === true) {
+        expect(key).toBe('mexico');
+      }
+    }
   });
 
   test('a globally-scoped surface (Ocean Temperature Anomaly) does not trigger the US-coverage caution', () => {

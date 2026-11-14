@@ -12,7 +12,7 @@
  * remains in urls.ts as the documented fallback) so the forecast register
  * can visibly CHANGE INSTRUMENT:
  *
- *   - hatched, see-through class fills (src/util/hatch.ts), never solid;
+ *   - solid class fills at the current-conditions opacity (owner 2026-10-19; formerly hatched);
  *   - an ISSUED date plus valid-through range in the time bar's outlook
  *     typography (warn amber, body face), never a hard VALID stamp;
  *   - the ENSO doctrine's framing in every copy surface: a shift in odds,
@@ -43,16 +43,20 @@ import { requestLayerOn } from '../ui/layer-toggle-command';
 import { timeline, horizonForOutlookRange, type OutlookRange } from '../state/timeline';
 import { requestHorizon } from '../state/cluster-service';
 import { fetchJsonWithBudget } from '../util/fetch';
-import { escapeHtml } from '../util/escape';
-import { ensureHatchImages, hatchImageId } from '../util/hatch';
-import { DROUGHT_COLORS } from '../config/palette';
+import { ExpiringLruCache } from '../util/bounded-cache';
+import type { ClockValue, IssuedModel, PopupClock } from '../ui/popup-frame';
+import { hideLoading, showLoading } from '../ui/overlay';
+import { DROUGHT_COLORS, OUTLOOK_LEGEND } from '../config/palette';
 import { setTimeBar, clearTimeBar } from '../ui/time-bar';
+import { SHELL_HORIZON_KEY } from '../impact/horizon-chrome';
 import { showLegend, hideLegend, LEGEND_ORDER, renderSwatchLegend } from '../ui/legend-registry';
 
 const LAYER_KEY = 'drought';
 const SOURCE_ID = 'drought-outlook';
 const FILL_LAYER_ID = 'drought-outlook-fill';
 const OUTLINE_LAYER_ID = 'drought-outlook-outline';
+// Same display transform as the current-conditions NADM fill (nadm-drought.ts).
+const FILL_OPACITY = 0.48;
 
 /** Fade targets for the sidebar's toggle transitions (LayerModule contract). */
 export const fadeLayerIds = [FILL_LAYER_ID, OUTLINE_LAYER_ID] as const;
@@ -92,21 +96,18 @@ let unsubscribeTimeline: (() => void) | null = null;
  * cleared on deactivate. */
 let latestRangeRun: Promise<void> | null = null;
 
-/** Session cache per range; an outlook re-issue lands on the next boot. */
-const outlookCache = new Map<OutlookRange, GeoJSON.FeatureCollection>();
+/** Session cache per range; an outlook re-issue lands within the hour. An
+ * expired range refetches behind the polygons already on the map. */
+const OUTLOOK_CACHE_TTL_MS = 60 * 60 * 1000;
+const outlookCache = new ExpiringLruCache<OutlookRange, GeoJSON.FeatureCollection>(2);
+/** Whether the rendered range drew no polygons, for the failure rollback. */
+let renderedEmpty = false;
 
 type OutlookStatus = 'loading' | 'ready' | 'error' | 'no-data';
 
 function reportStatus(state: OutlookStatus): void {
   registry.setStatus(LAYER_KEY, state);
 }
-
-const OUTLOOK_LEGEND: ReadonlyArray<{ color: string; label: string }> = [
-  { color: DROUGHT_COLORS['PERSISTS']!, label: 'Drought persists' },
-  { color: DROUGHT_COLORS['DEVELOPS']!, label: 'Drought develops' },
-  { color: DROUGHT_COLORS['IMPROVES']!, label: 'Drought improves' },
-  { color: DROUGHT_COLORS['REMOVAL']!, label: 'Drought removal likely' }
-];
 
 function buildQueryUrl(range: OutlookRange): string {
   const params = new URLSearchParams({
@@ -170,6 +171,11 @@ function installTimeBar(map: maplibregl.Map, fc: GeoJSON.FeatureCollection): voi
   setTimeBar(LAYER_KEY, {
     ariaLabel: 'CPC Drought Outlook register',
     stamp: {
+      // The horizon the rendered range answers, through the same mapping
+      // the timeline uses (monthly = weeks-ahead = Near Term, seasonal =
+      // season-ahead = Long Range), so the stamp and the pressed chip can
+      // only disagree if the mapping itself does.
+      horizon: SHELL_HORIZON_KEY[horizonForOutlookRange(range)],
       headline: `${issuedPart}${targetPart}`,
       // vocab-allow: honesty disclaimer, denies being a forecast
       detail: `CPC ${rangeName(range)} Drought Outlook · a shift in odds, not a forecast of outcomes`,
@@ -198,8 +204,7 @@ function installTimeBar(map: maplibregl.Map, fc: GeoJSON.FeatureCollection): voi
         {
           key: 'observed',
           label: 'Observed weeks',
-          title: 'Back to the US Drought Monitor: observed conditions, solid fills',
-          hatched: false
+          title: 'Back to the US Drought Monitor: observed conditions'
         }
       ],
       onJump: () => switchToObserved()
@@ -231,18 +236,8 @@ function switchToObserved(): void {
 // Rendering
 // ---------------------------------------------------------------------------
 
-/** Hatch pattern per class; No_Drought matches nothing and renders blank. */
-const patternExpression: maplibregl.ExpressionSpecification = [
-  'match',
-  ['get', 'outlook'],
-  'Persistence', hatchImageId('PERSISTS'),
-  'Development', hatchImageId('DEVELOPS'),
-  'Improvement', hatchImageId('IMPROVES'),
-  'Removal', hatchImageId('REMOVAL'),
-  ''
-];
-
-const outlineColorExpression: maplibregl.ExpressionSpecification = [
+/** Issuer class colors for the fill and the outline; No_Drought matches nothing and renders blank. */
+const classColorExpression: maplibregl.ExpressionSpecification = [
   'match',
   ['get', 'outlook'],
   'Persistence', DROUGHT_COLORS['PERSISTS']!,
@@ -251,6 +246,18 @@ const outlineColorExpression: maplibregl.ExpressionSpecification = [
   'Removal', DROUGHT_COLORS['REMOVAL']!,
   'rgba(0,0,0,0)'
 ];
+
+/**
+ * The outlook register's fill paint: a solid issuer-class `fill-color` at the
+ * current-conditions opacity. The owner's words (2026-10-19) supersede the
+ * earlier hatch grammar (DR-070): the observed/outlook split is carried by
+ * the time stamp and the key title, not the fill texture. Exported as a pure
+ * seam, mirroring `buildUsdmFillPaint` in usdm.ts, so a test pins it
+ * (tests/drought-semantics.spec.ts).
+ */
+export function buildOutlookFillPaint(): NonNullable<maplibregl.FillLayerSpecification['paint']> {
+  return { 'fill-color': classColorExpression, 'fill-opacity': FILL_OPACITY };
+}
 
 /** Forecast classes only; No_Drought stays blank like CPC's own map. */
 function outlookOnly(fc: GeoJSON.FeatureCollection): GeoJSON.FeatureCollection {
@@ -270,16 +277,14 @@ function outlookOnly(fc: GeoJSON.FeatureCollection): GeoJSON.FeatureCollection {
  * URL claiming a range the old polygons still render. Re-commit the
  * DISPLAYED range's horizon and register in one synchronous pass (the
  * sidebar's timeline subscription re-serializes the URL from the same
- * writes) and restore the honest status of what is on screen. The
- * rendered range's features are in the session cache by construction
- * (they rendered), so the status mirrors the render-time report.
+ * writes) and restore the honest status of what is on screen, as
+ * recorded at render time (the session cache may have expired since).
  */
 function rollBackToRenderedRange(range: OutlookRange): void {
   requestedRange = range;
   timeline.setHorizon(horizonForOutlookRange(range));
   timeline.setOutlookRange(range);
-  const fc = outlookCache.get(range);
-  reportStatus(fc !== undefined && fc.features.length === 0 ? 'no-data' : 'ready');
+  reportStatus(renderedEmpty ? 'no-data' : 'ready');
 }
 
 /**
@@ -354,10 +359,25 @@ async function runShowRange(map: maplibregl.Map, range: OutlookRange): Promise<v
   timeline.setHorizon(horizonForOutlookRange(range));
   timeline.setOutlookRange(range);
 
+  let loadToken: number | null = null;
+
   try {
     let fc = outlookCache.get(range);
     if (!fc) {
       reportStatus('loading');
+      // SURFACE CONTINUITY ACROSS A HORIZON CHANGE (DDM-P8-T05). A horizon
+      // flip between the two outlook horizons never leaves the map blank,
+      // because `setData` below is the only thing that replaces the
+      // polygons and it runs after the fetch. That is the good half: what
+      // it costs is that the PREVIOUS range's polygons stay on screen
+      // while the pressed horizon chip already claims the new one, and
+      // until now nothing on the map said the surface underneath was
+      // still resolving. A stale product presented as current is a worse
+      // claim than an empty map, so the indicator says so for exactly as
+      // long as the fetch runs. Released in the `finally` below, which
+      // covers the abort, supersede, failure and success exits alike.
+      // Cached ranges take no token: there is no fetch to describe.
+      loadToken = showLoading(`Loading the CPC ${rangeName(range)} Drought Outlook...`);
       try {
         // fetchJsonWithBudget, NOT fetchWithBudget + response.json(): the
         // latter's contract ends at response HEADERS, so a stalled body
@@ -372,7 +392,7 @@ async function runShowRange(map: maplibregl.Map, range: OutlookRange): Promise<v
           FETCH_TIMEOUT_MS
         );
         fc = outlookOnly(parsed as GeoJSON.FeatureCollection);
-        outlookCache.set(range, fc);
+        outlookCache.set(range, fc, OUTLOOK_CACHE_TTL_MS);
       } catch (err) {
         // Aborted (layer-off or a newer range request) or superseded:
         // the newer owner holds the claim; do not touch it.
@@ -399,8 +419,9 @@ async function runShowRange(map: maplibregl.Map, range: OutlookRange): Promise<v
     const src = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
     src?.setData(fc);
     renderedRange = range;
+    renderedEmpty = fc.features.length === 0;
 
-    if (fc.features.length === 0) {
+    if (renderedEmpty) {
       // A whole-country outlook with no forecast-class polygons would be
       // extraordinary; surface it honestly rather than as a blank surprise.
       reportStatus('no-data');
@@ -409,13 +430,14 @@ async function runShowRange(map: maplibregl.Map, range: OutlookRange): Promise<v
     }
     installTimeBar(map, fc);
   } finally {
+    hideLoading(loadToken);
     masterSignal.removeEventListener('abort', onMasterAbort);
     if (rangeController === myController) rangeController = null;
   }
 }
 
 /**
- * Add the outlook source, the hatched fill, the class outline, the legend,
+ * Add the outlook source, the class fill, the class outline, the legend,
  * and the time bar, then load the range the timeline selects. Idempotent:
  * a re-activation with the source present re-renders the selected range
  * only if it changed.
@@ -451,8 +473,6 @@ export async function activate(map: maplibregl.Map): Promise<void> {
   reportStatus('loading');
 
   try {
-    ensureHatchImages(map);
-
     map.addSource(SOURCE_ID, {
       type: 'geojson',
       data: { type: 'FeatureCollection', features: [] },
@@ -466,12 +486,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
         id: FILL_LAYER_ID,
         type: 'fill',
         source: SOURCE_ID,
-        paint: {
-          'fill-pattern': patternExpression,
-          // The hatch tiles carry their own transparency; full layer
-          // opacity keeps the strokes crisp over the basemap.
-          'fill-opacity': 1
-        }
+        paint: buildOutlookFillPaint()
       },
       beforeId
     );
@@ -482,7 +497,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
         type: 'line',
         source: SOURCE_ID,
         paint: {
-          'line-color': outlineColorExpression,
+          'line-color': classColorExpression,
           'line-width': 1.1,
           'line-opacity': 0.9
         }
@@ -498,7 +513,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
           'Drought outlook key',
           OUTLOOK_LEGEND,
           // vocab-allow: names the CPC outlook (an upstream forecast product) and disclaims outcomes
-          'NOAA CPC Drought Outlook · hatched fills mark a FORECAST register; a shift in odds, not a forecast of outcomes'
+          'NOAA CPC Drought Outlook · a shift in odds, not a forecast of outcomes'
         )
     });
   } catch (err) {
@@ -558,7 +573,7 @@ export function cancelActivation(): void {
 
 /**
  * Abort in-flight work and remove the outlook layers, source, legend, and
- * time bar. The hatch images stay registered on the map (tiny, reusable).
+ * time bar.
  * Symmetric with `activate`; safe to call when never activated.
  */
 export function deactivate(map: maplibregl.Map): void {
@@ -587,34 +602,106 @@ const OUTLOOK_CLASS_COPY: Readonly<Record<string, string>> = {
   Removal: 'Existing drought is favored to end within the outlook period.'
 };
 
-function buildOutlookPopupHtml(props: GeoJsonProperties): string {
-  const p = props ?? {};
-  const cls = typeof p['outlook'] === 'string' ? p['outlook'] : '';
-  const issued = typeof p['fcst_date'] === 'string' ? humanIssueDate(p['fcst_date']) : '';
-  const target = typeof p['target'] === 'string' ? p['target'] : '';
-  const copy = OUTLOOK_CLASS_COPY[cls] ?? 'CPC drought outlook class.';
-  const title = cls === 'Persistence' ? 'Drought persists'
-    : cls === 'Development' ? 'Drought develops'
-    : cls === 'Improvement' ? 'Drought improves'
-    : cls === 'Removal' ? 'Drought removal likely'
-    : 'Drought outlook';
+/** Each drawn outlook class's legend colour key (OUTLOOK_LEGEND's pairs). */
+const OUTLOOK_CLASS_COLOR_KEY: Readonly<Record<string, string>> = {
+  Persistence: 'PERSISTS',
+  Development: 'DEVELOPS',
+  Improvement: 'IMPROVES',
+  Removal: 'REMOVAL'
+};
 
-  // vocab-allow: names the CPC outlook (an upstream forecast product) and disclaims outcomes
-  return `
-    <div class="popup-title">${escapeHtml(title)}</div>
-    <div class="popup-agency">NOAA CPC ${escapeHtml(rangeName(timeline.outlookRange))} Drought Outlook</div>
-    ${issued ? `<div class="popup-treaty-meta">Issued: ${escapeHtml(issued)}</div>` : ''}
-    ${target ? `<div class="popup-treaty-meta">Valid through: ${escapeHtml(target)}</div>` : ''}
-    <div class="popup-description">${escapeHtml(copy)} This is a forecast register: a shift in odds, not a forecast of outcomes.</div>
-    <div class="popup-links">
-      <a href="https://www.cpc.ncep.noaa.gov/products/expert_assessment/sdo_summary.php" target="_blank" rel="noopener">CPC Drought Outlook</a>
-      <a href="https://www.drought.gov/" target="_blank" rel="noopener">Drought.gov</a>
-    </div>
-  `;
+/** The frame's explanation for issuer time text DDM does not parse (PF1). */
+const SUPPLIED_TIME_EXPLANATION = 'As the issuer states it; DDM does not read it as a full date.';
+
+const OUTLOOK_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
+
+/** Present issuer text as supplied (PF1: its raw text kept, never read as a date). */
+function suppliedClock(text: string): ClockValue {
+  return { precision: 'supplied', text, explanation: SUPPLIED_TIME_EXPLANATION };
 }
 
 /**
- * Register the hatched fill's click target with the
+ * `fcst_date` ('MM/DD/YYYY') at date precision by pure string work, the
+ * calendar checked (month 1 to 12, the day within that month, leap years
+ * respected); anything else as supplied. Never `new Date()` on it.
+ */
+function issuedClock(fcstDate: string): ClockValue {
+  const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(fcstDate.trim());
+  if (!m) return suppliedClock(fcstDate);
+  const month = Number(m[1]);
+  const day = Number(m[2]);
+  const year = Number(m[3]);
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  if (days === undefined || day < 1 || day > days) return suppliedClock(fcstDate);
+  return { precision: 'date', date: `${m[3]}-${m[1]}-${m[2]}` };
+}
+
+/**
+ * `target`, the valid-through label as issued: month precision only for
+ * exactly "Mon YYYY" ('Jul 2026'); any other label ('September 30' names
+ * no year) as supplied, never given an invented year.
+ */
+function validThroughClock(target: string): ClockValue {
+  const m = /^([A-Z][a-z]{2}) (\d{4})$/.exec(target);
+  const index = m ? OUTLOOK_MONTHS.indexOf(m[1] as (typeof OUTLOOK_MONTHS)[number]) : -1;
+  if (!m || index < 0) return suppliedClock(target);
+  return { precision: 'month', month: `${m[2]}-${String(index + 1).padStart(2, '0')}` };
+}
+
+/**
+ * A present issuer field as text, or null (PF1): text or a finite number
+ * is read; a missing, null or blank value, or anything else (an array, an
+ * object, a boolean), is absent, never its String().
+ */
+function statedText(value: unknown): string | null {
+  const text = typeof value === 'string' ? value : typeof value === 'number' && Number.isFinite(value) ? String(value) : null;
+  return text === null || text.trim() === '' ? null : text;
+}
+
+/** The outlook polygon's popup model (D1 M25; the frame's surface head). */
+export function buildOutlookPopupModel(props: GeoJsonProperties, range: OutlookRange): IssuedModel {
+  const p = props ?? {};
+  const cls = typeof p['outlook'] === 'string' ? p['outlook'] : '';
+  const issued = statedText(p['fcst_date']);
+  const target = statedText(p['target']);
+  const copy = Object.hasOwn(OUTLOOK_CLASS_COPY, cls) ? OUTLOOK_CLASS_COPY[cls]! : 'CPC drought outlook class.';
+  const colorKey = Object.hasOwn(OUTLOOK_CLASS_COLOR_KEY, cls) ? OUTLOOK_CLASS_COLOR_KEY[cls]! : null;
+  const color = colorKey !== null && Object.hasOwn(DROUGHT_COLORS, colorKey) ? DROUGHT_COLORS[colorKey]! : null;
+  // The key's own words (OUTLOOK_LEGEND pairs each class colour with its label).
+  const title = OUTLOOK_LEGEND.find((entry) => entry.color === color)?.label ?? 'Drought outlook';
+  const clocks: [PopupClock, ...PopupClock[]] = [
+    issued === null
+      ? { kind: 'not-stated', label: 'Issued', reason: 'unavailable' }
+      : { kind: 'point', meaning: 'issued', label: 'Issued', at: issuedClock(issued) }
+  ];
+  if (target !== null) {
+    clocks.push({ kind: 'point', meaning: 'valid', label: 'Valid through', at: validThroughClock(target) });
+  }
+
+  return {
+    kind: 'surface',
+    title: `NOAA CPC ${rangeName(range)} Drought Outlook`,
+    issuer: { role: 'issued-by', name: 'NOAA Climate Prediction Center', productKey: 'drought' },
+    value: [
+      colorKey !== null && color !== null
+        ? { text: title, swatch: { table: 'DROUGHT_COLORS', classKey: colorKey, color } }
+        : { text: title }
+    ],
+    clocks,
+    source: {
+      link: { label: 'CPC Drought Outlook', href: 'https://www.cpc.ncep.noaa.gov/products/expert_assessment/sdo_summary.php' }
+    },
+    moreLinks: [{ label: 'Drought.gov', href: 'https://www.drought.gov/' }],
+    qualifications: [
+      // vocab-allow: names the CPC outlook (an upstream forecast product) and disclaims outcomes
+      `${copy} This is a forecast register: a shift in odds, not a forecast of outcomes.`
+    ]
+  };
+}
+
+/**
+ * Register the outlook fill's click target with the
  * InteractionCoordinator (one response per click; D-0.7.0-058 ruling 5;
  * condition surfaces rank last so they never blanket a boundary).
  */
@@ -628,8 +715,9 @@ export function bindPopups(map: maplibregl.Map): void {
         ? `Drought outlook: ${cls}`
         : 'Drought outlook';
     },
+    // The range drawn, not the one still loading: the clicked polygon is the drawn range's.
     respond: (feature) => ({
-      content: buildOutlookPopupHtml(feature.properties ?? {})
+      model: buildOutlookPopupModel(feature.properties ?? {}, renderedRange ?? timeline.outlookRange)
     })
   });
   map.on('mouseenter', FILL_LAYER_ID, () => {

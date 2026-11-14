@@ -1,6 +1,8 @@
 import type * as maplibregl from 'maplibre-gl';
 import {
   getBasemapMode,
+  isImageryUnavailable,
+  revertBasemapForFailure,
   setBasemapMode,
   onBasemapChange
 } from '../state/basemap-store';
@@ -11,7 +13,7 @@ import { showToast } from '../ui/overlay';
  * The basemap switcher (U4d, D-0.7.0-005 / D-0.7.0-031).
  *
  * One `IControl` button that flips recent satellite context on and off over
- * the subdued OpenStreetMap ground; deliberately NOT a style
+ * DDM's own base map; deliberately NOT a style
  * gallery (the corpus's product-lens guardrail). The control stacks with
  * the existing attribution and scale controls, carries real button
  * semantics (aria-pressed reflects the satellite state), and stays
@@ -27,24 +29,39 @@ import { showToast } from '../ui/overlay';
  * renders without the control being clicked.
  */
 
+let satelliteHeld = false;
+
+/**
+ * DR-105: Wildfire 3D never requests satellite imagery. The scene holds the
+ * imagery off while it is opening or open; the store keeps the visitor's
+ * choice (the button and the URL still say satellite), and releasing the
+ * hold brings the imagery back.
+ */
+export function holdSatellite(map: maplibregl.Map, held: boolean): void {
+  if (held === satelliteHeld) return;
+  satelliteHeld = held;
+  if (getBasemapMode() === 'satellite') void applyBasemapMode(map, 'satellite');
+}
+
 /**
  * Apply a basemap mode to the map. Lazy-imports the satellite module on
  * first use; idempotent per mode. On a chunk or source failure the mode
- * REVERTS to 'default' and says so (invariant 6, honest feedback): the
- * URL must never claim a satellite view that is not on screen.
+ * REVERTS to 'default' and says so (invariant 6, honest feedback): after a
+ * failed load the URL must not keep claiming satellite.
  */
 export async function applyBasemapMode(
   map: maplibregl.Map,
-  mode: BasemapMode
+  mode: BasemapMode,
+  announce = false
 ): Promise<void> {
   try {
     const { setSatelliteActive } = await import('./satellite');
-    await setSatelliteActive(map, mode === 'satellite');
+    await setSatelliteActive(map, mode === 'satellite' && !satelliteHeld, announce);
   } catch (err) {
     console.error('[basemap] satellite module failed to load:', err);
     if (mode === 'satellite') {
-      setBasemapMode('default');
-      showToast('Recent satellite imagery is unavailable. Default map restored.');
+      revertBasemapForFailure();
+      if (announce) showToast('Recent satellite imagery is unavailable. Default map restored.');
     }
   }
 }
@@ -52,14 +69,16 @@ export async function applyBasemapMode(
 /**
  * Record and apply one explicit basemap request. Callers use this only for a
  * visitor action, never while restoring or reconciling hazard state, so a
- * later manual choice remains authoritative.
+ * later manual choice remains authoritative. Only a SAT press announces: a
+ * mode's default that finds no imagery falls back quietly.
  */
 export function requestBasemapMode(
   map: maplibregl.Map,
-  mode: BasemapMode
+  mode: BasemapMode,
+  announce = false
 ): void {
   setBasemapMode(mode);
-  void applyBasemapMode(map, mode);
+  void applyBasemapMode(map, mode, announce);
 }
 
 /** The one-button basemap switcher control. */
@@ -74,10 +93,15 @@ export class BasemapSwitcherControl implements maplibregl.IControl {
 
     const btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'basemap-switcher-btn';
-    btn.setAttribute('aria-label', 'Satellite imagery');
+    // `map-cell` is the desktop column's labelled-cell anatomy (S30D D1 M9);
+    // the stylesheet applies it only while this node sits in slot 2, so the
+    // phone thumb-zone seat, the embed corner and the LAYERS studio header
+    // keep their own faces. The name leads with the visible word, so the
+    // word a sighted voice-control user reads is the word that operates it
+    // (WCAG 2.5.3; the design record's name table, section 2.3).
+    btn.className = 'basemap-switcher-btn map-cell';
+    btn.setAttribute('aria-label', 'SAT: satellite imagery');
     btn.setAttribute('aria-describedby', 'basemap-vintage');
-    btn.title = 'Toggle satellite imagery';
     // The inline currentColor glyph avoids an icon dependency. The legacy
     // desktop label remains available while the mobile control is icon-only.
     btn.innerHTML =
@@ -91,6 +115,13 @@ export class BasemapSwitcherControl implements maplibregl.IControl {
       const on = getBasemapMode() === 'satellite';
       btn.setAttribute('aria-pressed', on ? 'true' : 'false');
       btn.classList.toggle('active', on);
+      // The plain map after failed imagery is a fallback, not a choice: the
+      // control says so (the hidden chip it points to carries the detail).
+      const unavailable = isImageryUnavailable();
+      btn.toggleAttribute('data-imagery-unavailable', unavailable);
+      btn.title = unavailable
+        ? 'Satellite imagery is unavailable right now; press to try again'
+        : 'Toggle satellite imagery';
     };
     reflect();
     this.unsubscribe?.();
@@ -102,7 +133,7 @@ export class BasemapSwitcherControl implements maplibregl.IControl {
       // Store first (URL and button state update immediately), then the
       // map-side application; a failed chunk reverts the store inside
       // applyBasemapMode.
-      requestBasemapMode(map, next);
+      requestBasemapMode(map, next, true);
     });
 
     container.appendChild(btn);

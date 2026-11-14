@@ -3,12 +3,9 @@
  * change.
  *
  * Open-source design notes:
- *   - Basemap is the OpenStreetMap (OSM) standard raster, subdued via
- *     raster paint in `src/map/style.ts` so the drought layers dominate.
- *     OpenTopoMap is retained below as a pre-approved alternative.
- *   - Hydrography is queried live from OSM via the Overpass Application
- *     Programming Interface (API). No API key required; fair-use rate
- *     limits apply.
+ *   - The base map is DDM's own, baked from public government files and
+ *     Natural Earth into same-origin PMTiles (`src/map/style.ts`); the
+ *     Hydrography layer reads the same archive. No tile host is contacted.
  *   - Reference polygon layers (ecoregions, Tribal lands, Treaty areas)
  *     load from `public/data/` (Vite serves this directory at the site
  *     root, hence the leading slash).
@@ -17,8 +14,8 @@
  *     (WMS) endpoint. WMS is an Open Geospatial Consortium (OGC) open
  *     standard, so this is not a proprietary Environmental Systems Research
  *     Institute (ESRI) dependency.
- *   - United States Geological Survey (USGS) Water Services is open data,
- *     Cross-Origin Resource Sharing (CORS) enabled, JavaScript Object
+ *   - The United States Geological Survey (USGS) Water Data APIs are open
+ *     data, Cross-Origin Resource Sharing (CORS) enabled, JavaScript Object
  *     Notation (JSON).
  */
 
@@ -31,28 +28,15 @@ import { LANDSCAPE_SIGNATURE_LOCAL_URL } from './landscape-url';
 import { BASE_URL, BOOT_URLS } from './urls-boot';
 
 export const URLS = Object.freeze({
-  // ---------- Basemaps (raster tiles) ----------
-  // MapLibre GL JavaScript raster sources do not natively expand the `{s}`
-  // subdomain placeholder used by Leaflet templates. Pin a single subdomain
-  // (`a`) for the primary template; callers wanting round-robin can read
-  // the `basemapTopoVariants` array and rotate themselves. If a future
-  // migration moves to a hosted vector tile bundle, this comment can go.
-  basemapTopo: 'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
-  basemapTopoVariants: [
-    'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
-    'https://b.tile.opentopomap.org/{z}/{x}/{y}.png',
-    'https://c.tile.opentopomap.org/{z}/{x}/{y}.png'
-  ],
-
-  // OSM standard tiles: the active basemap, subdued via raster paint in
-  // `src/map/style.ts`. The bare hostname is the OSM tile policy's ONLY
-  // supported form (U4f, policy fetched live 2026-07-12): the legacy a/b/c
-  // sharding subdomains "may be slower or withdrawn without notice".
-  // Policy invariants: never append cache-busting query params to tile
-  // URLs, and never add a Referrer-Policy that strips the Referer from
-  // tile requests (the policy's web-traffic attribution branch).
-  // The literal lives in `urls-boot.ts` (the base style reads it at boot).
-  basemapOSM: BOOT_URLS.basemapOSM,
+  // ---------- Base map (DDM's own, from public files) ----------
+  // Same-origin PMTiles vector archives baked by scripts/build-base-tiles.mjs
+  // (DDM-P17-T12): North America to zoom 8, its highways in their own file,
+  // and the world to zoom 5. The Hydrography layer reads the North America
+  // archive's rivers and water bodies. The literals live in `urls-boot.ts`
+  // (the base style reads them at boot).
+  baseNaPmtiles: BOOT_URLS.baseNaPmtiles,
+  baseRoadsPmtiles: BOOT_URLS.baseRoadsPmtiles,
+  baseWorldPmtiles: BOOT_URLS.baseWorldPmtiles,
 
   // NOAA NESDIS merged GOES East and West GeoColor, the opt-in recent
   // satellite basemap. This is the rolling, time-enabled 24-hour archive,
@@ -63,24 +47,13 @@ export const URLS = Object.freeze({
   // defeats the service's otherwise ambiguous 12-hour tile cache. New frames
   // arrive every 10 or 15 minutes; the client refreshes metadata every 10
   // minutes while active. Coverage ends near 76.46 degrees north and south,
-  // so the subdued OpenStreetMap layer remains underneath.
+  // so DDM's own base map remains underneath.
   // Verified 2026-08-05: query and exportImage return HTTP 200 without
   // authentication, correctly reflect browser origins for CORS, and expose
   // objectid, name, start_time, and end_time. Direct browser access only; no
   // Worker proxy is involved.
   noaaMergedGeoColorImageServer:
     'https://satellitemaps.nesdis.noaa.gov/arcgis/rest/services/MERGEDGC_Last_24hr/ImageServer',
-
-  // ---------- Hydrography (live OSM via Overpass API) ----------
-  // Mirrors are tried in order with a 12s per-call timeout and 350ms
-  // backoff between failures. All must respond with `Access-Control-
-  // Allow-Origin: *`. Verified during the v0.1.1 polish pass; sizes
-  // and freshness can drift, so retest before reordering.
-  overpassMirrors: [
-    'https://overpass-api.de/api/interpreter',          // canonical, freshest
-    'https://overpass.kumi.systems/api/interpreter',    // independent operator
-    'https://overpass.openstreetmap.fr/api/interpreter' // replaces private.coffee
-  ],
 
   // ---------- Drought outlook (NOAA CPC, OGC WMS) ----------
   cpcDroughtWMS: 'https://mapservices.weather.noaa.gov/vector/services/outlooks/cpc_drought_outlk/MapServer/WMSServer',
@@ -102,49 +75,92 @@ export const URLS = Object.freeze({
   // Content-Type application/json, one feature returned for a PNW point, and a
   // browser fetch from the app origin succeeds (Access-Control-Allow-Origin: *
   // confirmed by live in-page fetch, not just by header inspection).
+  // Re-verified 2026-11-06 for the ENSO Weeks ahead map layers
+  // (src/layers/cpc-seasonal-read.ts): each layer's national `where=1=1`
+  // GeoJSON query with `maxAllowableOffset=0.05` echoed
+  // `Access-Control-Allow-Origin: https://atniclimate.github.io` and measured
+  // 96,432 (6-10 temperature), 97,911 (6-10 precipitation), 95,887 (8-14
+  // temperature) and 96,228 (8-14 precipitation) bytes gzip.
   cpc610OutlookMapServer:
     'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_6_10_day_outlk/MapServer',
   cpc814OutlookMapServer:
     'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_8_14_day_outlk/MapServer',
 
-  // ---------- USGS Water Services Instantaneous Values (open data, CORS-OK) ----------
-  // United States Geological Survey (USGS) Water Services, Instantaneous
-  // Values (IV). Two query shapes share this base URL:
-  //   - Single-site value fetch (existing use): `${usgsIV}?format=json
-  //     &sites=<siteCode>&parameterCd=<codes>&siteStatus=active`.
-  //   - Viewport DISCOVERY (unit A2 slice 2): `${usgsIV}?format=json
-  //     &bBox=<west,south,east,north>&parameterCd=00060,00065
-  //     &siteStatus=active` (no `sites`). With no period, the service
-  //     defaults to mode=LATEST (one instantaneous point per
-  //     site-parameter pair), which is what discovery needs.
-  // Response is WaterML JSON; the site list is at value.timeSeries[]:
-  //   .sourceInfo.siteName                              site name
-  //   .sourceInfo.siteCode[0].value                     USGS site code
-  //   .sourceInfo.geoLocation.geogLocation.latitude     decimal degrees (EPSG:4326)
-  //   .sourceInfo.geoLocation.geogLocation.longitude    decimal degrees
-  //   .variable.variableCode[0].value                   parameter code (00060, 00065)
-  //   .variable.unit.unitCode                           unit (ft3/s, ft)
-  //   .values[0].value[0].value                         latest reading (string; parse float)
-  //   .values[0].value[0].dateTime                      ISO 8601, station-local offset
-  // A gage reporting multiple parameters emits multiple timeSeries sharing
-  // one siteCode; group by `sourceInfo.siteCode[0].value` before applying
-  // the 50-nearest cap, or a station double-counts.
-  // CAVEAT (load-bearing): the bBox size limit varies by latitude (an
-  // equal-area cap, not a flat degree cap): roughly
-  // width_deg * cos(latitude) * height_deg <= 25. A box that exceeds it
-  // returns HTTP 400 with a `text/html` body (do not JSON-parse the error).
-  // A low-zoom viewport can exceed it, so the consumer must clamp the query
-  // bBox from the viewport center latitude, or fall back to "zoom in to
-  // load". CAVEAT: `siteStatus=active` does not guarantee a current reading
-  // (some active sites were months stale in testing); read `dateTime` per
-  // series and treat anything past a telemetry window (for example 24
-  // hours) as stale, not live.
-  // Verified 2026-07-06 (ddm-source-verifier): HTTP 200, Content-Type
-  // application/json, Access-Control-Allow-Origin: * (genuine wildcard,
-  // confirmed with an unrelated test origin, not a reflection). Direct
-  // fetch; no Worker proxy needed (host is not on the allow-list and does
-  // not need to be).
-  usgsIV: 'https://waterservices.usgs.gov/nwis/iv/',
+  // ---------- CPC seasonal temperature outlook (NOAA, ArcGIS MapServer) ----------
+  // The Climate Prediction Center (CPC) seasonal temperature outlook,
+  // DDM-P7-T07 (DR-075 option a), hosted on the same NOAA mapservices cloud
+  // host as `cpc610OutlookMapServer` / `cpc814OutlookMapServer`. 13 lead
+  // layers (layer 0 = "Lead 1"); a point query against layer 0
+  // (`/0/query?...&geometry=<lon>,<lat>&geometryType=esriGeometryPoint
+  // &inSR=4326&f=geojson`) returns one polygon feature carrying `cat`
+  // ("Above" / "Below" / "Normal" / "EC"), `prob` (a percentage), `valid_seas`
+  // (the issuer's own season label, for example "SON 2026") and `fcst_date`
+  // (the issuance date, epoch ms). The season-ahead heat cell of the impact
+  // briefing reads Lead 1 for the outlook claim.
+  // Verified 2026-09-09 (STEP 0, ddm-forecast-wirer): `/0?f=pjson` returns
+  // HTTP 200, layer name "Lead 1", geometryType esriGeometryPolygon, fields
+  // objectid, fcst_date (esriFieldTypeDate), valid_seas (esriFieldTypeString,
+  // no coded domain), prob (esriFieldTypeDouble), cat (esriFieldTypeString,
+  // no coded domain), idp_ingestdate, idp_filedate, idp_source, shape; no
+  // region-name attribute. A live point query with an `Origin` header echoed
+  // `Access-Control-Allow-Origin` back to that origin (browser fetch from the
+  // app origin succeeds), and returned `{"cat":"Above","prob":50,
+  // "valid_seas":"SON 2026","fcst_date":1787184000000}` for a Pacific
+  // Northwest point.
+  cpcSeasonalTempOutlookMapServer:
+    'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_sea_temp_outlk/MapServer',
+
+  // ---------- CPC seasonal precipitation outlook (NOAA, ArcGIS MapServer) ----------
+  // The temperature service's sibling ("Seasonal Precipitation Outlooks"), the
+  // same 13 lead layers and field set; layer 0 is "Lead 1". Both draw as the
+  // ENSO Season ahead outlook layers (src/layers/cpc-seasonal-read.ts reads
+  // each service's layer 0 nationally). Verified 2026-11-05: `/0?f=json` names
+  // the fields objectid, fcst_date (alias "Forecast Date"), valid_seas (alias
+  // "Valid Season"), prob, cat, idp_source, idp_filedate, idp_ingestdate,
+  // maxRecordCount 2000, and a cat,prob uniqueValue renderer of 17 classes; a
+  // national `where=1=1` GeoJSON query with `maxAllowableOffset=0.05` echoed
+  // `Access-Control-Allow-Origin: https://atniclimate.github.io` and measured
+  // 96,953 bytes gzip (precipitation) and 95,212 (temperature), 18 features each.
+  cpcSeasonalPrecipOutlookMapServer:
+    'https://mapservices.weather.noaa.gov/vector/rest/services/outlooks/cpc_sea_precip_outlk/MapServer',
+
+  // ---------- USGS Water Data APIs (open data, CORS-OK, no API key) ----------
+  // United States Geological Survey (USGS) Water Data APIs, OGC API Features.
+  // They replace the Water Services Instantaneous Values service, which USGS
+  // slows from 2026-11-16 and ends on 2027-02-22. Three query shapes share
+  // this base (built in src/util/usgs.ts and src/config/station-registry.ts):
+  //   - One gauge's 7-day series (the popup's latest values and sparkline,
+  //     the sidebar value): `collections/continuous/items?f=json
+  //     &monitoring_location_id=USGS-<site>&parameter_code=00060,00065
+  //     &time=P7D&limit=5000&skipGeometry=true&properties=time_series_id,
+  //     parameter_code,time,value,unit_of_measure,qualifier`.
+  //   - Viewport DISCOVERY: `collections/latest-continuous/items?f=json
+  //     &bbox=<west,south,east,north>&parameter_code=00060,00065
+  //     &time=P183D&limit=2000&properties=monitoring_location_id,
+  //     parameter_code,time,value,unit_of_measure,qualifier`; with no time
+  //     window it also returns series that ended years ago.
+  //   - Site names, which value rows do not carry, only for sites not yet
+  //     named this session: `collections/monitoring-locations/items?f=json
+  //     &id=USGS-<a>,USGS-<b>&properties=monitoring_location_name
+  //     &skipGeometry=true&limit=<count + 1>`. A page as long as its limit
+  //     always links a next page, which for this id list is empty.
+  // Response: a GeoJSON FeatureCollection with ONE FEATURE PER OBSERVATION,
+  // in no guaranteed order: properties.monitoring_location_id
+  // ('USGS-14103000'), parameter_code, time (UTC, +00:00), value (a string,
+  // or null for no reading), unit_of_measure ('ft^3/s' where the legacy said
+  // 'ft3/s'; 'ft'), qualifier (null or a list such as ["ESTIMATED"]);
+  // geometry coordinates are [longitude, latitude].
+  // CAVEATS (load-bearing): the id needs its `USGS-` prefix (a bare number
+  // answers HTTP 200 with zero features); the default page is 10 rows, the
+  // maximum 50,000, and a further page is the answer's own links[] entry
+  // with rel "next"; error bodies are JSON. NO API KEY, EVER: a keyless
+  // address may make 50 requests an hour, so every read is frugal and a 429
+  // pauses them (src/util/usgs.ts).
+  // Verified 2026-11-06 (UTC) with Origin https://atniclimate.github.io:
+  // Access-Control-Allow-Origin: * on 200, 400, 403 and 404; the three
+  // shapes above answered 200 with it at 05:39 UTC. Direct fetch; no Worker
+  // route.
+  usgsWaterData: 'https://api.waterdata.usgs.gov/ogcapi/v1/',
   // STREAMFLOW PERCENTILES, recorded as verified NOT wired (2026-09-01).
   // Nothing here is fetched today; this note exists so the next plan does not
   // reach for a decommissioned service.
@@ -152,20 +168,12 @@ export const URLS = Object.freeze({
   //     ?id=romap3` now 301-redirects to
   //     `waterdata.usgs.gov/blog/wdfn-stats-delivery/`, which states that
   //     WaterWatch and Water Quality Watch were expected to be decommissioned
-  //     by the end of 2025. The app never used it (it reads Instantaneous
-  //     Values above directly), so nothing is broken; any older plan or note
-  //     naming WaterWatch percentiles is stale.
-  //   - The live percentile path is the NWIS Statistics Service, on the same
-  //     `waterservices.usgs.gov` host this entry already trusts:
-  //     `.../nwis/stat/?format=rdb&sites=<siteCode>&statReportType=daily
-  //     &statTypeCd=p10,p25,p50,p75,p90&parameterCd=00060`. Verified HTTP 200,
-  //     Content-Type text/plain (RDB, not JSON: a tab-delimited body with
-  //     `#` comment lines and a two-row header, so it needs its own parser),
-  //     Access-Control-Allow-Origin: * (genuine wildcard). Day-of-year
-  //     statistics, so a reading's percentile is a comparison against that
-  //     calendar day's record, not against the year.
-  //   - The newer OGC API at `api.waterdata.usgs.gov/ogcapi/v0/collections`
-  //     is also wildcard-CORS and returns JSON; verified HTTP 200.
+  //     by the end of 2025. The app never used it, so nothing is broken; any
+  //     older plan or note naming WaterWatch percentiles is stale.
+  //   - The percentile path verified then was the NWIS Statistics Service
+  //     (RDB, day-of-year statistics) on the legacy Water Services host that
+  //     USGS is retiring; its successor is the statistics of the Water Data
+  //     APIs above, not yet verified here.
 
   // ---------- NRCS AWDB REST (SNOTEL / SCAN station data) ----------
   // Natural Resources Conservation Service Air-Water Database REST service.
@@ -412,6 +420,20 @@ export const URLS = Object.freeze({
   nwsWwaMapServer:
     'https://mapservices.weather.noaa.gov/eventdriven/rest/services/WWA/watch_warn_adv/MapServer/1',
 
+  // NOAA NHC and CPHC Tropical Weather MapServer (ENSO block B3; admission
+  // planning/2026-09-25-desktop-pass/admissions/noaa-tropical-cyclones.md).
+  // Fifteen storm slots AT1-5, EP1-5, CP1-5 at base = 4 + 26n; per slot the
+  // tropical cyclones layer queries Forecast Points (base+2), Forecast Track
+  // (base+3), Forecast Cone (base+4) and Watch-Warning (base+5) as
+  // `${nhcTropicalMapServer}/<id>/query?where=1%3D1&outFields=<fields>&returnGeometry=true&outSR=4326&f=geojson`.
+  // Probed 2026-10-13 09:26 to 09:28 UTC with Origin https://atniclimate.github.io:
+  // HTTP 200, application/geo+json, Access-Control-Allow-Origin reflected the
+  // origin with Vary: Origin; errors arrive as HTTP 200 envelopes;
+  // maxRecordCount 2000; not time enabled (current issuance only). Direct
+  // browser fetch; no Worker route is needed.
+  nhcTropicalMapServer:
+    'https://mapservices.weather.noaa.gov/tropical/rest/services/tropical/NHC_tropical_weather/MapServer',
+
   // ---------- NOAA Storm Prediction Center (SPC) Fire Weather Outlook ------
   // The SPC Fire Weather Outlooks MapServer, same NOAA mapservices cloud host
   // as `nwsWwaMapServer`. Layer 1 ("Day 1 Outlook") and layer 4 ("Day 2
@@ -574,7 +596,7 @@ export const URLS = Object.freeze({
   // ---------- CPC drought outlook, vector form (0.5.0b outlook register) ----------
   // The same cpc_drought_outlk service the raster `cpcDroughtWMS` above
   // renders, but the ArcGIS REST vector layers, so the outlook register can
-  // draw hatched fills client-side with the issued date and valid-through
+  // draw class fills client-side with the issued date and valid-through
   // target read from attributes. Layer 1 = Monthly Drought Outlook (US +
   // Puerto Rico), layer 4 = Seasonal Drought Outlook (US + Puerto Rico);
   // island-territory layers are siblings. Consumer appends
@@ -691,6 +713,36 @@ export const URLS = Object.freeze({
   // Anti-scrape note: the ArcGIS REST /query path, not the TIGERweb viewer.
   censusAiannhMapServer:
     'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/AIANNHA/MapServer',
+
+  // ---------- US Census Bureau TIGERweb Transportation (live) ----------
+  // Local roads with street names inside Tribal areas from zoom 12
+  // (src/layers/tribal-streets.ts, started by the Tribal Lands layer). The
+  // consumer appends `/8/query?...&geometry=<bbox>&geometryType=
+  // esriGeometryEnvelope&inSR=4326&outFields=NAME,MTFCC&f=geojson`. Layer 8 "Local
+  // Roads" (MTFCC S1400), maxRecordCount 100000. Verified 2026-11-12: HTTP 200,
+  // application/geo+json, Access-Control-Allow-Origin echoes
+  // https://atniclimate.github.io; a zoom 12 view of Toppenish returned 1,436
+  // streets, 361 KB, in 1.1 s. Direct fetch, no proxy.
+  tigerwebTransportation:
+    'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Transportation/MapServer',
+  // Community names inside Tribal areas (owner decision 4, 2026-11-12): the
+  // TIGERweb Census Designated Places layer (5), read live with the streets,
+  // names and internal points only. Verified 2026-11-12: HTTP 200,
+  // Access-Control-Allow-Origin echoes https://atniclimate.github.io.
+  tigerwebPlaces:
+    'https://tigerweb.geo.census.gov/arcgis/rest/services/TIGERweb/Places_CouSub_ConCity_SubMCD/MapServer',
+  // Named streams (6, Flowline - Large Scale) and lakes (12, Waterbody - Large
+  // Scale) inside Tribal areas from the USGS National Hydrography Dataset,
+  // read live with the streets. Verified 2026-11-12: HTTP 200,
+  // Access-Control-Allow-Origin *; a Toppenish view returned 335 named
+  // flowlines, 106 KB. Direct fetch, no proxy.
+  usgsNhdMapServer: 'https://hydro.nationalmap.gov/arcgis/rest/services/nhd/MapServer',
+  // Public and protected lands for the Public Lands layer: USGS PAD-US 4.1,
+  // manager type (USGS Gap Analysis Project; public domain). Verified
+  // 2026-11-12: HTTP 200, Access-Control-Allow-Origin *; a zoom 10 view of the
+  // Wenatchee country returned 136 areas, 1.3 MB, in 1.5 s. Direct fetch.
+  padusManagerType:
+    'https://services.arcgis.com/v01gqwM5QqNysAAi/arcgis/rest/services/Manager_Type_PADUS/FeatureServer/0',
 
   // ---------- BIA Tribal Leaders Directory (headquarters points, live) ----------
   // Administrative-headquarters POINT layer (not a boundary), proposed to give
@@ -822,13 +874,30 @@ export const URLS = Object.freeze({
   // Precipitation Index (SPI) is available at several accumulation windows; the
   // product slug encodes the index and window, for example
   // `ce-ACIS_NRCC_NN-spi-90d`. The full tile template is
-  // `${nidisGriddedTileRoot}/<slug>/{z}/{x}/{y}.png`. Tiles exist to zoom 6
-  // (the source maxzoom); MapLibre overzooms above that. The color scale is
-  // baked into the tiles (no per-feature properties, so no popups); the
-  // authoritative legend lives on drought.gov.
+  // `${nidisGriddedTileRoot}/<slug>/{z}/{x}/{y}.png`. The zoom ceiling is the
+  // product's own published `tilezmax`, which the layer reads from
+  // `<slug>/info.json`; MapLibre overzooms above it. (drought.gov's Data
+  // Download prose says "Tiles are currently created for zoom levels of 1-5",
+  // which every `info.json` on this bucket contradicts; the data is the
+  // authority.) The color scale is baked into the tiles (no per-feature
+  // properties, so no popups); the authoritative legend lives on drought.gov.
   // Verified 2026-05-30 (live in-page fetch from the app origin): HTTP 200,
   // Content-Type image/png, Access-Control-Allow-Origin: * for the SPI 30, 60,
   // 90, 180, and 365 day windows.
+  //
+  // COVERAGE: contiguous United States only. The wired products belong to the
+  // ACIS "Grid 1" foundational dataset, whose drought.gov page carries the
+  // field "Data Coverage: Contiguous U.S." and describes it as covering "the
+  // contiguous United States from January 1, 1950 to the present"
+  // (https://www.drought.gov/data-maps-tools/gridded-climate-datasets-applied-climate-information-system-acis-nrcc-interpolated),
+  // and whose Data Download row gives Coverage and Resolution as "ConUS 4km".
+  // Every wired window's own `info.json` agrees: `"bbox":
+  // "-128.8,24.4,-66.0,50.3"` on all five, re-verified live 2026-09-03. That
+  // box excludes Alaska, Hawaii, Puerto Rico and the Pacific territories, so
+  // the catalog row and the legend both state the limit. The US Drought
+  // Monitor surface DOES cover Alaska, Hawaii and the territories, so the two
+  // drought surfaces do not agree about where the app has data, and saying so
+  // is the honest resolution.
   //
   // SPEI and EDDI (corrected twice on 2026-09-01). The earlier note guessed
   // the slugs `spei` and `eddi` under the ACIS prefix and, when those 404ed,
@@ -847,7 +916,9 @@ export const URLS = Object.freeze({
   // carrying its valid date and true tilezmax; since 2026-09-02 the gridded
   // layer reads it on activation and on window change and shows the valid
   // date in its legend (spi-365d was 62 days old on 2026-09-01, unnoticed
-  // before that). Only SPI windows are wired today; see
+  // before that, and still carried date 2026-07-01 on 2026-09-03). Only SPI
+  // windows are wired today, and whether the selector grows is an open
+  // product question rather than a limit of the source; see
   // planning/2026-09-01-deep-dive reports 10, 12, and 14.
   nidisGriddedTileRoot:
     'https://storage.googleapis.com/noaa-nidis-drought-gov-data/current-conditions/tile/v1',
@@ -872,7 +943,6 @@ export const URLS = Object.freeze({
   // both locally and on Pages; that was a latent bug (the empty-placeholder
   // layers surfaced as `error` instead of `no-data`). BASE_URL ends with a
   // slash, so the path segment must not start with one.
-  ecoregionsLocal: BASE_URL + 'data/ecoregions-pnw.geojson',
   // EPA Omernik Level III and Level IV ecoregion polygons for the PNW, baked
   // into a PMTiles vector bundle by scripts/build-ecoregion-tiles.mjs
   // (`npm run build:ecoregion-tiles`) from the EPA Region 10 shapefiles. Two
@@ -880,10 +950,12 @@ export const URLS = Object.freeze({
   // the pmtiles protocol (HTTP Range Requests, so only the header, directory,
   // and visible tiles download). The simplification tolerance, source vintage,
   // and retrieval date are baked into the archive attribution so the overlay
-  // never implies precision the source does not carry. The empty
-  // `ecoregions-pnw.geojson` above is the legacy placeholder, retained until the
-  // ecoregion layer module consumes this bundle.
+  // never implies precision the source does not carry.
   ecoregionsPmtilesLocal: BASE_URL + 'data/ecoregions-pnw.pmtiles',
+  // National forest boundaries (USDA Forest Service; public, data.gov lists
+  // CC BY 4.0), baked into their own archive by scripts/build-base-tiles.mjs
+  // for the National Forests layer.
+  forestsPmtiles: BASE_URL + 'data/ddm-forests-2026-11.pmtiles',
   // The PNW hillshade raster-dem archive (U4g, D-0.7.0-012/-029): terrarium
   // PNG tiles, 512 px, z0-8, whole-meter quantized, baked by
   // Built from the USGS 3DEP ImageServer (public domain; vintage and
@@ -899,20 +971,36 @@ export const URLS = Object.freeze({
   // bounded header probe, so normal static deployments remain self-contained.
   hillshadePmtilesFallback:
     'https://atniclimate.github.io/dynamic-drought-module/data/hillshade-dem-pnw.pmtiles',
-  // The PNW LANDFIRE fuel-model drape for the desktop 3D Fire mode: LF2024
-  // Scott and Burgan 40 Fire Behavior Fuel Models (FBFM40), CONUS, rendered
-  // server-side by the LANDFIRE ImageServer's own class colors and baked to
-  // PNG PMTiles by scripts/build-fuels-tiles.mjs (`npm run build:fuels-tiles`;
-  // U.S. Public Domain, USGS-produced; vintage, retrieval date, and the
-  // reduced-resolution disclosure are recorded in the archive attribution).
-  // Loaded only while the 3D Fire mode is active, via the pmtiles protocol's
-  // ranged reads, exactly like the hillshade archive above.
-  // RETIRED FROM THE SCENE 2026-08-19 (owner direction): the fuel-model
-  // drape was replaced by the hazard drape below, and the 25.7 MB archive
-  // was removed from the working tree so it stops riding every deploy.
-  // The builder and this path stay so the layer can be restored as an
-  // opt-in without re-deriving anything; git history holds the archive.
-  fuelsFbfm40PmtilesLocal: BASE_URL + 'data/fuels-fbfm40-pnw.pmtiles',
+  // The DEEP terrain archive for the 3D Fire scene (DR-079, owner ruling
+  // 2026-09-10): the same USGS 3D Elevation Program box as the bundled
+  // archive above, baked to zoom 10 (about 53 m per pixel at 46N) instead of
+  // zoom 8 (about 212 m). Only the DEPTH differs: FIRE3D_TERRAIN_COVERAGE's
+  // bounds describe both archives, but its maxZoom (8) and the constant
+  // coverage sentence describe the BUNDLED one only. The 3D scene formats
+  // its own sentence from the header of whichever archive resolved
+  // (DR-083; src/map/fire3d.ts, `Fire3DStatus.terrainMaxZoom`), so a scene
+  // reading this archive says zoom 10 and never claims zoom 8.
+  //
+  // Why it is not bundled: 435,700,035 bytes. GitHub Pages caps a published
+  // site at 1 GB and blocks any file over 100 MiB, and Git LFS is not usable
+  // with Pages, so no GitHub plan reaches it. It is served from a Cloudflare
+  // R2 bucket through the `ddm-terrain` Worker (workers/terrain/), which does
+  // nothing but return byte ranges with CORS and keeps no logs.
+  //
+  // Why depending on it is SAFE even before it is published: the scene probes
+  // this archive's header first and falls back to the bundled zoom 8 copy,
+  // which stays shipped, so an unreachable deep archive costs one bounded
+  // probe and the flat-map guarantee is untouched. That fallback path was
+  // exercised in both directions against a live scene on 2026-09-10 (the
+  // MapLibre terrain source swaps at runtime with no page errors).
+  //
+  // The measurement that justified it, taken in the running scene through
+  // queryTerrainElevation: the bundled archive reads the Mount Jefferson
+  // summit 931 m low and this one reads it 50 m low, while both read the Bend
+  // valley floor within 20 m. A coarse elevation model does not lower a
+  // landscape, it flattens it, and the mountain is what it removes.
+  terrainPmtilesDeep:
+    'https://ddm-terrain.atniclimate.workers.dev/pnw-z10-2026-09-10.pmtiles',
   // The PNW Wildfire Hazard Potential drape for the desktop 3D Fire mode:
   // the USDA Forest Service Rocky Mountain Research Station's 2023 WHP
   // classification, rendered server-side in the issuer's own class colors
@@ -932,18 +1020,14 @@ export const URLS = Object.freeze({
   // carries the mandatory currency caveat. Loaded only while the 3D Fire
   // mode is active.
   powerLinesPmtilesLocal: BASE_URL + 'data/power-lines-pnw.pmtiles',
-  // Central Oregon building footprints for the desktop 3D Fire mode:
-  // Overture Maps Foundation buildings theme (ODbL; fuses OpenStreetMap,
-  // Microsoft, Esri, and Google open building sets), extracted by
-  // scripts/extract-overture-buildings.py and baked by
-  // scripts/build-structures-tiles.mjs (`npm run build:structures-tiles`).
-  // The committed default covers the central_oregon region framing only
-  // (a full-PNW bake was PROJECTED at roughly 240 MB for z14-only tiles,
-  // about 380 MB at the shipped z13-14 scheme, from the measured
-  // per-building rate, and rejected; the extract script's --bbox
-  // parameter is the deployer path for other regions).
-  // z13-14 vector tiles; loaded only while the 3D Fire mode is active.
-  structuresPmtilesLocal: BASE_URL + 'data/structures-central-oregon.pmtiles',
+  // Central Oregon building footprints for the desktop 3D Fire mode: USA
+  // Structures (Oak Ridge National Laboratory for the FEMA Geospatial
+  // Response Office), the 2023 edition published under CC0 (DR-126), clipped
+  // by scripts/extract-fema-structures.py and baked by
+  // scripts/build-structures-tiles.mjs; inputs and output pinned by SHA-256
+  // in scripts/data/structures-tiles-receipt.json. Outlines only, z13-14;
+  // loaded only while the 3D Fire mode is active.
+  structuresPmtilesLocal: BASE_URL + 'data/structures-central-oregon-2023.pmtiles',
   tribalLandsLocal: BASE_URL + 'data/tribal-lands.geojson',
   treatyAreasLocal: BASE_URL + 'data/treaty-areas.geojson',
   // United States state boundaries, baked from the Census Bureau cartographic
@@ -984,7 +1068,7 @@ export const URLS = Object.freeze({
   // temperature (SST) anomaly, daily, ~1 km. The ENSO ocean surface: the
   // equatorial warm/cool tongue rendered as map tiles. MapLibre raster tile
   // template; the GIBS path order is {z}/{y}/{x} (TileMatrix/TileRow/TileCol),
-  // the REVERSE of the OSM z/x/y convention; MapLibre substitutes tokens by
+  // the REVERSE of the usual web tile z/x/y order; MapLibre substitutes tokens by
   // name so the template below is correct as written.
   // Verified 2026-07-06 (ddm-source-verifier): HTTP 200, Content-Type
   // image/png, Access-Control-Allow-Origin: * (genuine wildcard, confirmed
@@ -1163,6 +1247,29 @@ export const URLS = Object.freeze({
   // product). NOT yet wired.
   usgsQuickdriWeeklyWms:
     'https://dmsdata.cr.usgs.gov/geoserver/quickdri_quickdri_conus_week_data/wms',
+
+  // ---------- Wildfire 3D dryness ground (DDM-P9-T13; admissions star-vhi, usgs-relative-greenness) ----------
+  // NOAA NESDIS STAR VIIRS 500 m Vegetation Health Index map tiles (j01,
+  // NOAA-20), wildcard CORS on 200; a missing week or Z=8 answers 500 with
+  // no CORS header, so the two cannot be told apart. {week} is yyyy0WW,
+  // weeks 1 to 52 only; tiles z0 to z7 only. Cache-Control private,
+  // max-age=0 with no validator, and STAR rewrites back-weeks after
+  // publishing: never cache a week in the app (owner direction 2026-10-09).
+  starVhiJ01TileTemplate:
+    'https://www.star.nesdis.noaa.gov/smcd/emb/vci/VH/image_mapTile.php?type=/j01_500m_VHI/{week}&Z={z}&X={x}&Y={y}',
+  // STAR's land-cover tiles, which the same ground reads beside each of the
+  // tiles above, are NOT a key here: starLandCoverTileTemplate lives in
+  // src/config/dryness-ground.ts (DRYNESS_GROUND_URLS), because this
+  // catalog's chunk rides every feature's first activation and two rows of
+  // scripts/check-activation-budget.mjs had no room for one more entry
+  // (measured 2026-10-11: +29 B gzip; heatrisk-days had 12 B, the North
+  // American Drought Monitor 23 B). The upstream probe reads that file too.
+  // USGS EROS eVIIRS weekly Relative Greenness WMS, layer rg_conus_week_data,
+  // the automatic fallback ground. TIME labels the week's START Monday and
+  // must match a capabilities value exactly (an off-list TIME answers a 200
+  // ServiceException); bbox -128.54 to -65.37, 22.47 to 51.78 N, no Alaska.
+  usgsRgConusWeekWms:
+    'https://dmsdata.cr.usgs.gov/geoserver/firedanger_rg_conus_week_data/wms',
 
   // ---------- B4 transboundary slate (verified 2026-07-06; 0.7.0 wiring) ----------
   // Per the ratified B4 scope these are VERIFIED, NOT WIRED; region-config

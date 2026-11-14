@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test';
+import { test, expect, type Page } from './offline-test';
 
 import { gotoApp, urlLayers, waitForLayerSettled } from './helpers';
 import {
@@ -28,7 +28,7 @@ test.beforeEach(async ({ page }) => {
 test.describe('mobile map-information disclosure (390x844)', () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test('the circular control opens a non-modal region without changing URL state and Escape returns focus', async ({
+  test('the edge-column control opens a non-modal region without changing URL state and Escape returns focus', async ({
     page
   }) => {
     await gotoApp(page);
@@ -37,6 +37,8 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     const panel = page.locator('#map-info-panel');
     const canvasContainer = page.locator('#map .maplibregl-canvas-container');
     const bottomDock = page.locator('#map-bottom-dock');
+    const conditionIndicator = page.locator('#map-condition-indicator');
+    const mapKey = page.locator('#map-key');
     const originalUrl = page.url();
 
     // A focusable descendant proves the dock's inert contract independent of
@@ -55,7 +57,9 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     });
     const dockFocusProbe = page.locator('#map-info-dock-focus-probe');
     await expect(dockFocusProbe).toBeFocused();
-    await expect(bottomDock.locator('#map-key-expand')).toHaveCount(1);
+    await expect(page.locator('#map-key-expand')).toHaveCount(0);
+    await expect(conditionIndicator).toHaveCount(1);
+    await expect(mapKey).toHaveCount(1);
 
     await expect(button).toBeVisible();
     await expect(button).toHaveAttribute('aria-controls', 'map-info-panel');
@@ -65,8 +69,20 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     expect(box!.width).toBeGreaterThanOrEqual(44);
     expect(box!.height).toBeGreaterThanOrEqual(44);
     expect(Math.abs(box!.width - box!.height)).toBeLessThanOrEqual(1);
-    const radius = await button.evaluate((element) => getComputedStyle(element).borderRadius);
-    expect(radius === '50%' || Number.parseFloat(radius) >= box!.width / 2).toBe(true);
+    // A cell of the right-edge column, wearing the same face as its sibling Reset.
+    const edgeColumn = page.locator('#edge-column');
+    await expect(edgeColumn.locator('#map-info-btn')).toHaveCount(1);
+    const resetBox = await page.locator('#reset-btn').boundingBox();
+    expect(resetBox).not.toBeNull();
+    expect(Math.abs(box!.width - resetBox!.width)).toBeLessThanOrEqual(1);
+    const [radius, resetRadius] = await Promise.all([
+      button.evaluate((element) => getComputedStyle(element).borderRadius),
+      page.locator('#reset-btn').evaluate((element) => getComputedStyle(element).borderRadius)
+    ]);
+    expect(radius).toBe(resetRadius);
+    const columnBox = await edgeColumn.boundingBox();
+    expect(columnBox).not.toBeNull();
+    expect(Math.abs(box!.x + box!.width - (columnBox!.x + columnBox!.width))).toBeLessThanOrEqual(1);
 
     const rulers = page.locator('.maplibregl-ctrl-scale');
     await expect(rulers).toHaveCount(2);
@@ -78,14 +94,16 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     const rulerRight = Math.max(
       ...rulerBoxes.map((rulerBox) => rulerBox!.x + rulerBox!.width)
     );
-    const rulerTop = Math.min(...rulerBoxes.map((rulerBox) => rulerBox!.y));
-    const rulerBottom = Math.max(
-      ...rulerBoxes.map((rulerBox) => rulerBox!.y + rulerBox!.height)
-    );
+    // The button rides the right edge and no longer covers the scale and credit.
     expect(box!.x).toBeGreaterThanOrEqual(rulerRight);
-    expect(box!.x - rulerRight).toBeLessThanOrEqual(16);
-    expect(box!.y).toBeLessThan(rulerBottom);
-    expect(box!.y + box!.height).toBeGreaterThan(rulerTop);
+    const overlapsRuler = rulerBoxes.some(
+      (r) =>
+        box!.x < r!.x + r!.width &&
+        box!.x + box!.width > r!.x &&
+        box!.y < r!.y + r!.height &&
+        box!.y + box!.height > r!.y
+    );
+    expect(overlapsRuler).toBe(false);
     const rulerStyles = await rulers.evaluateAll((elements) =>
       elements.map((element) => {
         const style = getComputedStyle(element);
@@ -120,19 +138,19 @@ test.describe('mobile map-information disclosure (390x844)', () => {
 
     const stageBox = await page.locator('#map-container').boundingBox();
     const panelBox = await panel.boundingBox();
-    const footerBox = await page.locator('#mobile-footer-nav').boundingBox();
+    const railBox = await page.locator('#mobile-footer-nav').boundingBox();
     expect(stageBox).not.toBeNull();
     expect(panelBox).not.toBeNull();
-    expect(footerBox).not.toBeNull();
+    expect(railBox).not.toBeNull();
     const leftInset = panelBox!.x - stageBox!.x;
     const topInset = panelBox!.y - stageBox!.y;
     const rightInset = stageBox!.x + stageBox!.width - (panelBox!.x + panelBox!.width);
-    const footerGap = footerBox!.y - (panelBox!.y + panelBox!.height);
-    for (const inset of [leftInset, topInset, rightInset, footerGap]) {
+    const bottomInset = stageBox!.y + stageBox!.height - (panelBox!.y + panelBox!.height);
+    for (const inset of [leftInset, topInset, rightInset, bottomInset]) {
       expect(inset).toBeGreaterThanOrEqual(4);
       expect(inset).toBeLessThanOrEqual(16);
     }
-    expect(panelBox!.height).toBeGreaterThan((footerBox!.y - stageBox!.y) * 0.9);
+    expect(panelBox!.height).toBeGreaterThan(stageBox!.height * 0.9);
 
     const glass = await panel.evaluate((element) => {
       const root = getComputedStyle(document.documentElement);
@@ -145,8 +163,8 @@ test.describe('mobile map-information disclosure (390x844)', () => {
         borderRadius: style.borderRadius
       };
     });
-    expect(glass.richBlack.toLowerCase()).toBe('#004040');
-    expect(glass.backgroundColor).toBe('rgba(0, 64, 64, 0.3)');
+    expect(glass.richBlack.toLowerCase()).toBe('#010b13');
+    expect(glass.backgroundColor).toBe('rgba(1, 11, 19, 0.3)');
     expect(glass.borderRadius).toBe('4px');
 
     await page.evaluate(() => {
@@ -173,6 +191,8 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     await expect(button).toBeFocused();
     await expect(canvasContainer).not.toHaveAttribute('inert', '');
     await expect(bottomDock).not.toHaveAttribute('inert', '');
+    await expect(conditionIndicator).toHaveCount(1);
+    await expect(mapKey).toHaveCount(1);
     await expect.poll(() => page.url()).toBe(originalUrl);
     await page.evaluate(() => {
       document.getElementById('map-info-dock-focus-probe')?.focus();
@@ -209,9 +229,12 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     // The license credits (owner direction 2026-08-31): the panel is the
     // only credits surface, so the live per-source attribution strings,
     // links included, must render here.
+    // Value-only migration (S30D D1 M22, DR-162): the credits line is the
+    // pointer to the Acknowledgements. The base map is DDM's own public data
+    // since DDM-P17-T12, so no credit rides the map itself.
     const creditsLine = page.locator('#map-info-attribution');
-    await expect(creditsLine).toContainText('OpenStreetMap');
-    expect(await creditsLine.locator('a').count()).toBeGreaterThan(0);
+    await expect(creditsLine).toContainText('Acknowledgements');
+    expect(await creditsLine.locator('button[data-open-acknowledgements]').count()).toBeGreaterThan(0);
 
     // W2-D8: the panel opens with what it uniquely adds (the active view
     // and the basemap state), never a verbatim restatement of the on-map
@@ -240,24 +263,36 @@ test.describe('mobile map-information disclosure (390x844)', () => {
       await expect(control).toBeVisible();
     }
 
+    // One stacking context carries every control: the column sits above the panel.
     const stackOrder = await page.evaluate(() => {
       const z = (selector: string): number => {
         const element = document.querySelector<HTMLElement>(selector);
-        if (!element) return Number.NEGATIVE_INFINITY;
-        return Number.parseInt(getComputedStyle(element).zIndex, 10);
+        return element ? Number.parseInt(getComputedStyle(element).zIndex, 10) : Number.NaN;
       };
-      return {
-        panel: z('#map-info-panel'),
-        utility: z('.map-overlay-controls'),
-        hazards: z('#hazard-rail'),
-        satellite: z('.basemap-switcher-control'),
-        info: z('#map-info-btn')
-      };
+      return { panel: z('#map-info-panel'), column: z('#edge-column') };
     });
-    expect(stackOrder.utility).toBeGreaterThan(stackOrder.panel);
-    expect(stackOrder.hazards).toBeGreaterThan(stackOrder.panel);
-    expect(stackOrder.satellite).toBeGreaterThan(stackOrder.panel);
-    expect(stackOrder.info).toBeGreaterThan(stackOrder.panel);
+    expect(stackOrder.panel).toBeGreaterThan(0);
+    expect(stackOrder.column).toBeGreaterThan(stackOrder.panel);
+    // The topmost element at each control's centre is the control itself.
+    for (const selector of [
+      '#share-btn',
+      '#reset-btn',
+      '#hazard-rail button[data-preset="hazard-enso"]',
+      '#hazard-rail button[data-preset="hazard-fire"]',
+      '#hazard-rail button[data-preset="hazard-drought"]',
+      '#hazard-rail button[data-preset="hazard-heat"]',
+      '.basemap-switcher-btn',
+      '#map-info-btn'
+    ]) {
+      const topmost = await page.evaluate((sel) => {
+        const target = document.querySelector<HTMLElement>(sel);
+        if (!target) return false;
+        const r = target.getBoundingClientRect();
+        const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+        return !!hit && (hit === target || target.contains(hit));
+      }, selector);
+      expect(topmost, selector).toBe(true);
+    }
 
     // A click that would be intercepted by a fullscreen modal must remain
     // actionable. It flows through the normal preset controller, updates the
@@ -265,7 +300,7 @@ test.describe('mobile map-information disclosure (390x844)', () => {
     await ensoButton.click();
     await expect
       .poll(async () => [...(await urlLayers(page))].sort())
-      .toEqual(['aiannh', 'sst-anomaly']);
+      .toEqual(['aiannh', 'cpc-seasonal-precip', 'sst-anomaly']);
     await waitForLayerSettled(page, 'sst-anomaly');
     await expect(ensoButton).toHaveAttribute('aria-pressed', 'true');
     await expect(panel).toBeVisible();
@@ -330,9 +365,12 @@ test.describe('still-loading sources stay visible during live activation (W2-D6)
           body: JSON.stringify(fireFixture)
         })
     );
-    let releaseNifc: (() => void) | null = null;
+    // A typed holder, not a bare `let`: the assignment happens inside the
+    // Promise executor closure below, which TypeScript cannot see from the
+    // read site further down, and would otherwise narrow to `null`.
+    const nifc: { release: (() => void) | null } = { release: null };
     const nifcGate = new Promise<void>((resolve) => {
-      releaseNifc = resolve;
+      nifc.release = resolve;
     });
     await page.route(
       (url) => url.href.includes('WFIGS_Interagency_Perimeters_Current'),
@@ -355,6 +393,10 @@ test.describe('still-loading sources stay visible during live activation (W2-D6)
 
     // The Fire key renders the SPC scale AND names the still-loading NIFC
     // section as a placeholder row instead of omitting it (W2-D6).
+    const detailsToggle = page.locator('#map-key-details-toggle');
+    await expect(detailsToggle).toBeVisible();
+    await detailsToggle.click();
+    await expect(detailsToggle).toHaveAttribute('aria-expanded', 'true');
     const key = page.locator('#map-key');
     await expect(key.locator('[data-spc-fire-weather-key]')).toBeVisible();
     await expect(key.locator('[data-nifc-perimeter-key]')).toContainText(
@@ -377,7 +419,7 @@ test.describe('still-loading sources stay visible during live activation (W2-D6)
 
     // Release the held response: the placeholder resolves into the real
     // perimeter rows and the panel row leaves the loading state.
-    releaseNifc?.();
+    nifc.release?.();
     await expect(key.locator('[data-key-loading="nifc-fires"]')).toHaveCount(0, {
       timeout: 15_000
     });
@@ -401,7 +443,8 @@ test.describe('map information reaches the desktop and stays out of embeds', () 
 
     const button = page.locator('#map-info-btn');
     await expect(button).toBeVisible();
-    await expect(button).toHaveAttribute('aria-label', 'Map information');
+    // 2026-09-27, S30D D1 M9: the desktop seat shows the word Help, so its name leads with it (WCAG 2.5.3).
+    await expect(button).toHaveAttribute('aria-label', 'Help and map information');
     await expect(button).toHaveAttribute('aria-expanded', 'false');
     await expect(page.locator('#map-info-panel')).toBeHidden();
 

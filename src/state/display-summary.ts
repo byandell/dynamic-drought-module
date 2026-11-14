@@ -24,18 +24,21 @@
  *             distinct; no invented synonyms.
  *   zoom-in   excluded; "X appears after you zoom in".
  *
- * COVERAGE HONESTY: when the active framing carries a coverageNote and
- * the committed display includes ANY US-scoped display layer (a
- * condition surface, an event layer, or the stations; every
- * non-reference role), the caveat leads with that coverage caution
- * (the Mexico framing over the US Drought Monitor, or over the
- * events-only Wildfire display, must say the display does not cover
- * Mexico). The handoff section 2 and the framings config bind the note
- * to US-scoped display LAYERS; section 4's narrower literal word
- * "surface" is the drift, reconciled here per the coverage rule it
- * states ("ready over an out-of-coverage framing must not read as
- * unqualified coverage"). A globally-scoped layer (the Ocean
- * Temperature Anomaly) does not trigger the caution.
+ * COVERAGE HONESTY moved OFF this module 2026-09-10 (a DDM fix lane;
+ * owner: the minimap's popped-up coverage caption was noise, and the
+ * SAME sentence was rendering a second time in this module's own
+ * caveat, so it now has exactly one home). The rule it used to apply
+ * here still governs, just at the new site (`src/ui/map-key.ts`): when
+ * the active framing carries a coverageNote and the display includes
+ * ANY US-scoped display layer (a condition surface, an event layer, or
+ * the stations; every non-reference role), a viewer must be told the
+ * display does not cover the framing (the Mexico framing over the US
+ * Drought Monitor, or over the events-only Wildfire display, must say
+ * the display does not cover Mexico). A globally-scoped layer (the
+ * Ocean Temperature Anomaly) does not trigger the caution. This module
+ * still exports `isUsScopeCautionLayer` and `userFacingCoverageClause`
+ * so the key applies the identical rule and the identical user-facing
+ * text; see their doc comments below.
  *
  * The empty recipe (Extreme Heat at season-ahead) yields an honest
  * "no verified surface" primary, never a silently substituted surface.
@@ -46,7 +49,6 @@
  */
 
 import { CLUSTER_DISPLAY_NAMES } from '../config/clusters';
-import { FRAMINGS } from '../config/framings';
 import { LAYER_DEFS } from '../config/layers';
 import type { LayerDef } from '../config/layers';
 import { resolveStatusPillText } from '../ui/island/pill-text';
@@ -65,12 +67,28 @@ const SENTENCE_ROLE_ORDER: readonly LayerRole[] = [
 /**
  * Display layers for which the framing's generic US-scope caution does not
  * apply. The ocean anomaly is global; NADM is the tri-national continental
- * product. Every other exception needs an explicit coverage contract.
+ * product; the tropical cyclones cover the NHC and CPHC basins, which reach
+ * Mexico and the open ocean, and name those basins in their own key. Every
+ * other exception needs an explicit coverage contract.
  */
 const US_SCOPE_CAUTION_EXEMPT_KEYS: ReadonlySet<string> = new Set([
   'sst-anomaly',
-  'nadm-drought'
+  'nadm-drought',
+  'tropical-cyclones'
 ]);
+
+/**
+ * Whether a layer counts toward a framing's US-scope coverage caution: any
+ * non-reference role the exemption list above does not name. Exported so
+ * the on-map key (`src/ui/map-key.ts`), the sole renderer of the caution
+ * since 2026-09-10, applies the SAME rule against the registry's currently
+ * active keys that this module used to apply against the committed
+ * `intendedKeys`, so the two call sites can never rule differently on the
+ * same layer.
+ */
+export function isUsScopeCautionLayer(def: Pick<LayerDef, 'key' | 'role'>): boolean {
+  return def.role !== 'reference' && !US_SCOPE_CAUTION_EXEMPT_KEYS.has(def.key);
+}
 
 /**
  * Prose names for layers whose compact catalog labels lead with a bare
@@ -102,6 +120,16 @@ function listNames(defs: readonly LayerDef[]): string {
   return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`;
 }
 
+/**
+ * Whether the listed names take a plural verb: more than one layer, or one
+ * layer whose name is itself plural ("Monitoring stations", "Current Mapped
+ * Fire Perimeters (...)"). Every layer name whose head, before any
+ * parenthesis, ends in "s" is plural; no singular layer name ends in "s".
+ */
+function pluralNames(defs: readonly LayerDef[]): boolean {
+  return defs.length > 1 || (defs.length === 1 && /s$/.test(proseName(defs[0] as LayerDef).replace(/\s*\(.*$/, '')));
+}
+
 /** The Showing sentence body: "A", "A with B", "A with B, C, and D". */
 function showingNames(defs: readonly LayerDef[]): string {
   const names = defs.map(proseName);
@@ -111,34 +139,19 @@ function showingNames(defs: readonly LayerDef[]): string {
   return `${names[0]} with ${rest.slice(0, -1).join(', ')}, and ${rest[rest.length - 1]}`;
 }
 
-/**
- * A coverageNote clause that is authoring guidance addressed to the
- * implementation, not user-facing coverage truth: it names the shell
- * ("the shell must say so on this framing") or the status machinery
- * ("per-layer status stays honest here"). Only these are dropped.
+/*
+ * `userFacingCoverageClause` and its AUTHORING_CLAUSE_RE lived here until
+ * 2026-09-10. They split a framing's single `coverageNote` string on
+ * semicolons and dropped the clauses that matched an authoring-guidance
+ * pattern, which was the best available answer while the note WAS one
+ * string. Codex adversarial review finding 5 showed why that shape could not
+ * be made honest: the clauses inside a note describe the display, the
+ * minimap, and place selection, and those are true under different
+ * conditions, so no filter over one joined string can render the right
+ * subset. `FramingDef.coverage` now carries them as separate fields and
+ * `frameCoverageNote` in src/ui/map-key.ts gates each one; a regex that
+ * guessed at sentence boundaries has nothing left to do.
  */
-const AUTHORING_CLAUSE_RE = /\b(?:the shell|per-layer status)\b/;
-
-/**
- * The user-facing slice of a framing's coverageNote. The notes in
- * src/config/framings.ts are semicolon-joined clauses; SOME tails are
- * authoring guidance (Mexico, Hawaii, Boreal & Arctic) but others are
- * substantive coverage honesty a viewer needs (Alaska & Northwest:
- * "Yukon and British Columbia are outside US-scoped sources").
- * Truncating at the first semicolon silently dropped the substantive
- * kind, so instead each clause is kept unless it matches the narrow
- * authoring-guidance pattern above. The Mexico framing still yields
- * exactly the ruled sentence: "The current display layers do not cover
- * Mexico." Exported for the S4 minimap's coverage caption, so the two
- * surfaces render the same user-facing slice of the same note.
- */
-export function userFacingCoverageClause(note: string): string {
-  const clauses = note
-    .split(';')
-    .map((clause) => clause.trim())
-    .filter((clause) => clause.length > 0 && !AUTHORING_CLAUSE_RE.test(clause));
-  return clauses.join('; ').replace(/\.\s*$/, '');
-}
 
 /** Strip a trailing period so clauses join cleanly with semicolons. */
 function unterminated(clause: string): string {
@@ -185,23 +198,19 @@ export const deriveDisplaySummary: DeriveDisplaySummary = (input) => {
   }
 
   // The caveat: at most ONE string; clauses joined with semicolons,
-  // never a second status dashboard. Coverage honesty leads.
+  // never a second status dashboard. Coverage honesty no longer leads
+  // here: it rendered a second time (this caveat and the minimap's own
+  // caption said the same sentence at once), so it was relocated to the
+  // on-map key (src/ui/map-key.ts), the ONE site now, per the framings.ts
+  // and S4 handoff contract. `isUsScopeCautionLayer` above is exported
+  // so the key applies the identical exemption rule against its own
+  // active-layer set.
   const clauses: string[] = [];
-
-  const framingDef = input.framing !== null ? FRAMINGS[input.framing] : null;
-  const hasUsScopedDisplayLayer = intended.some(
-    (def) =>
-      def.role !== 'reference' && !US_SCOPE_CAUTION_EXEMPT_KEYS.has(def.key)
-  );
-  if (framingDef?.coverageNote !== undefined && hasUsScopedDisplayLayer) {
-    const coverage = userFacingCoverageClause(framingDef.coverageNote);
-    if (coverage.length > 0) clauses.push(coverage);
-  }
 
   const degraded = withStatus('degraded');
   if (degraded.length > 0) {
     clauses.push(
-      `${listNames(degraded)} ${degraded.length > 1 ? 'are' : 'is'} live with partial coverage`
+      `${listNames(degraded)} ${pluralNames(degraded) ? 'are' : 'is'} live with partial coverage`
     );
   }
 
@@ -213,7 +222,7 @@ export const deriveDisplaySummary: DeriveDisplaySummary = (input) => {
   const unavailable = withStatus('error');
   if (unavailable.length > 0) {
     clauses.push(
-      `${listNames(unavailable)} ${unavailable.length > 1 ? 'are' : 'is'} unavailable`
+      `${listNames(unavailable)} ${pluralNames(unavailable) ? 'are' : 'is'} unavailable`
     );
   }
 
@@ -229,7 +238,7 @@ export const deriveDisplaySummary: DeriveDisplaySummary = (input) => {
   const zoomGated = withStatus('zoom-in');
   if (zoomGated.length > 0) {
     clauses.push(
-      `${listNames(zoomGated)} ${zoomGated.length > 1 ? 'appear' : 'appears'} after you zoom in`
+      `${listNames(zoomGated)} ${pluralNames(zoomGated) ? 'appear' : 'appears'} after you zoom in`
     );
   }
 

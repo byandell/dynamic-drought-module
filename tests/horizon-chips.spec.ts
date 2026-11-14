@@ -1,0 +1,815 @@
+/**
+ * Honest horizon chips, and the acceptance sentence of DDM-P8-T03
+ * (`docs/ROADMAP.yaml:325`):
+ *
+ *   "A horizon a hazard cannot answer is absent or visibly disabled with its
+ *    reason, and every hazard surface states its time in one grammar with
+ *    its forecast register visually distinct from its observed register."
+ *
+ * This file covers all three clauses:
+ *
+ *   - "one grammar": the shell's horizon chips (`src/ui/island/shell.tsx`)
+ *     now read `HORIZON_CHROME` (`src/impact/horizon-chrome.ts`), the same
+ *     table the briefing panel headings already read, instead of the
+ *     retired `TEMPORAL_HORIZON_CHIP_LABELS`. No chip, and no other element
+ *     in the DOM, still shows the old "Weeks ahead" / "Season ahead" chip
+ *     wording.
+ *   - "absent or visibly disabled with its reason" (DDM-P8-T03, DR-017 a):
+ *     the shell's `horizonDisabledReason` (renamed from
+ *     `customHorizonDisabledReason`, which covered the CUSTOM-composition
+ *     case only) now also disables a chip bound to a committed cluster
+ *     whose recipe at that horizon is empty or repeats an earlier horizon's
+ *     (`horizonSurfaceSignature`, `src/state/timeline.ts`), reached through
+ *     `aria-disabled` plus `title` (the pre-existing custom-composition
+ *     pattern). A step-3 STOP RULE run found that an always-visible
+ *     `.shell-horizon-note` line collides with `.conditions-metric` at the
+ *     900x675 tablet band (`tests/interface-responsive.spec.ts`'s "tablet
+ *     band" describe), so that visible-text half is deferred pending an
+ *     `app.css` grant (DDM-P10-T04 territory); this clause is PARTIAL.
+ *   - "forecast register visually distinct from its observed register":
+ *     every rendered claim now carries exactly one `observed`/`outlook`
+ *     text tag beside its source line (`CLAIM_REGISTER_TAG`,
+ *     `src/impact/evidence.ts`), derived from the claim's own `evidence`
+ *     field, and no `CELL_ABSENCE` note carries one (an absence is
+ *     neither); and `#map-key`'s `data-register` (added this task) mirrors
+ *     `#time-bar`'s for the same surface, so the two never disagree.
+ *
+ * Fixture machinery adapted from `tests/enso-horizons.spec.ts`: the bundled
+ * ENSO snapshot, routed through `page.route`, with the other briefing lanes
+ * stubbed empty so this file depends on no live agency.
+ */
+import { expect, test, type Page } from './offline-test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+import { CLAIM_REGISTER_TAG, makeClaim } from '../src/impact/evidence';
+import { HORIZON_CHROME, SHELL_HAZARD_KEY, SHELL_HORIZON_KEY } from '../src/impact/horizon-chrome';
+import { CELL_ABSENCE, HAZARD_KEYS } from '../src/impact/matrix';
+import type { EvidenceClass } from '../src/impact/types';
+import { renderClaim } from '../src/ui/claim-render';
+import { HAZARD_CLUSTER_KEYS, HAZARD_CLUSTERS, TEMPORAL_HORIZON_KEYS } from '../src/config/clusters';
+import { stubCpcDroughtOutlook } from './cpc-outlook-fixtures';
+import { gotoApp, layerCheckbox, layerPill, PILL, search, stubHeatRiskCatalog, urlLayers, waitForLayerSettled } from './helpers';
+
+const SNAPSHOT_PATH = join(process.cwd(), 'public', 'data', 'enso-indices.json');
+
+interface Snapshot {
+  retrieved: string;
+  [key: string]: unknown;
+}
+
+function withWeekly(): Snapshot {
+  const parsed: unknown = JSON.parse(readFileSync(SNAPSHOT_PATH, 'utf8'));
+  if (
+    typeof parsed !== 'object' ||
+    parsed === null ||
+    typeof (parsed as { retrieved?: unknown }).retrieved !== 'string'
+  ) {
+    throw new Error('malformed bundled ENSO snapshot');
+  }
+  const snap = parsed as Snapshot;
+  if (snap.nino34Weekly === undefined) {
+    throw new Error(
+      'the bundled snapshot carries no nino34Weekly block; run npm run build:enso'
+    );
+  }
+  return snap;
+}
+
+async function openBriefing(
+  page: Page,
+  snapshot: Snapshot,
+  query = '?view=brief&layers=places&select=state:WA'
+): Promise<void> {
+  await page.route('**/data/enso-indices.json', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify(snapshot)
+    })
+  );
+  // The other briefing lanes are stubbed empty: fire cells with no lane
+  // declared for their horizon (fire nearTerm/longRange) settle to
+  // CELL_ABSENCE, which is exactly what the R4 check below needs. Heat
+  // longRange now has a lane (DDM-P7-T07); `gotoApp` stubs its endpoint with
+  // a default fixture, so that cell renders a claim, not an absence.
+  await page.route('**/USDM_current/FeatureServer/0/query?*', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+    })
+  );
+  await page.route('**/WFIGS_Interagency_Perimeters_Current/**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+    })
+  );
+  await page.route('https://api.weather.gov/alerts/active?*', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ features: [] })
+    })
+  );
+  await page.route('**/proxy?*', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: '[]' })
+  );
+  // DDM-P7-T05 F2: fetchHeatRiskClaims reads the NWS HeatRisk catalog
+  // independently of the map layer (DR-014 a), so this boot reaches it too.
+  await stubHeatRiskCatalog(page);
+  await gotoApp(page, query);
+}
+
+// ---------------------------------------------------------------------------
+// Shell chips: "one grammar"
+// ---------------------------------------------------------------------------
+
+test.describe('DDM-P8-T03: the shell horizon chips read HORIZON_CHROME', () => {
+  test('every shell chip title and subtitle equals HORIZON_CHROME, and no chip reads the retired wording', async ({
+    page
+  }) => {
+    await gotoApp(page, '?view=brief&layers=places');
+    for (const key of TEMPORAL_HORIZON_KEYS) {
+      const chrome = HORIZON_CHROME[SHELL_HORIZON_KEY[key]];
+      const btn = page.locator(`.shell-horizon-btn[data-horizon="${key}"]`);
+      const title = (await btn.locator('.shell-horizon-btn-title').innerText()).trim();
+      expect(title, `${key} chip title`).toBe(chrome.title);
+      // The subtitle left the chip's face (visual uniformity wave 1, D4): it is
+      // the chip's tooltip and accessible description. A disabled chip states
+      // its reason there instead (the custom-composition pattern).
+      await expect(btn.locator('.shell-horizon-btn-sub'), `${key} chip draws no sub-line`).toHaveCount(0);
+      if ((await btn.getAttribute('aria-disabled')) === 'true') {
+        expect((await btn.getAttribute('title'))?.trim(), `${key} disabled chip reason`).toBeTruthy();
+      } else {
+        await expect(btn, `${key} chip subtitle`).toHaveAccessibleDescription(chrome.subtitle);
+        await expect(btn, `${key} chip tooltip`).toHaveAttribute('title', chrome.subtitle);
+      }
+    }
+
+    // The retired chip wording must not survive anywhere in the DOM.
+    const stray = await page.evaluate(() =>
+      /\bWeeks ahead\b|\bSeason ahead\b/.test(document.body.textContent ?? '') // spec-impact: intended, asserts retired wording is absent
+    );
+    expect(stray, 'the retired chip wording still appears somewhere in the DOM').toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DDM-P2-T07: SHELL_HAZARD_KEY is a total bijection, cluster to briefing row
+// ---------------------------------------------------------------------------
+
+test.describe('DDM-P2-T07: SHELL_HAZARD_KEY maps every cluster to exactly one briefing row', () => {
+  test('every cluster key has a row, and that row is a real HazardKey', () => {
+    for (const cluster of HAZARD_CLUSTER_KEYS) {
+      const row = SHELL_HAZARD_KEY[cluster];
+      expect(row, `cluster "${cluster}" has no row in SHELL_HAZARD_KEY; add one`).not.toBeUndefined();
+      expect(
+        HAZARD_KEYS.includes(row),
+        `SHELL_HAZARD_KEY["${cluster}"] is "${row}", not a member of HAZARD_KEYS`
+      ).toBe(true);
+    }
+  });
+
+  test('every briefing row is the image of exactly one cluster: onto, and no two clusters collide', () => {
+    const rows = HAZARD_CLUSTER_KEYS.map((cluster) => SHELL_HAZARD_KEY[cluster]);
+    for (const hazard of HAZARD_KEYS) {
+      const matches = rows.filter((row) => row === hazard);
+      expect(
+        matches.length,
+        `briefing row "${hazard}" has ${matches.length} clusters mapped to it; it must have exactly one`
+      ).toBe(1);
+    }
+  });
+
+  test('HAZARD_CLUSTER_KEYS and HAZARD_KEYS are the same length', () => {
+    expect(
+      HAZARD_CLUSTER_KEYS.length,
+      'HAZARD_CLUSTER_KEYS and HAZARD_KEYS must be the same length for SHELL_HAZARD_KEY to be a bijection; a cluster has no row'
+    ).toBe(HAZARD_KEYS.length);
+    expect(
+      HAZARD_KEYS.length,
+      'HAZARD_CLUSTER_KEYS and HAZARD_KEYS must be the same length for SHELL_HAZARD_KEY to be a bijection; a row has no cluster'
+    ).toBe(HAZARD_CLUSTER_KEYS.length);
+  });
+
+  test('SHELL_HAZARD_KEY has no keys beyond HAZARD_CLUSTER_KEYS', () => {
+    const declaredKeys = Object.keys(SHELL_HAZARD_KEY);
+    for (const key of declaredKeys) {
+      expect(
+        (HAZARD_CLUSTER_KEYS as readonly string[]).includes(key),
+        `SHELL_HAZARD_KEY has an extra key "${key}" that is not in HAZARD_CLUSTER_KEYS; remove it`
+      ).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Claim register tags: "forecast register visually distinct from observed"
+// ---------------------------------------------------------------------------
+
+/** Every evidence class a claim in this app is built with as of this ruling
+ * (src/impact/evidence.ts: modeled and modeled-analysis are unused). */
+const USED_EVIDENCE: readonly EvidenceClass[] = [
+  'observed',
+  'analyzed',
+  'classified',
+  'derived',
+  'outlook'
+];
+
+function registerTagIn(html: string): string | null {
+  const m = html.match(/<span class="impact-claim-register">([^<]*)<\/span>/);
+  return m ? m[1]! : null;
+}
+
+test.describe('DDM-P8-T03: every rendered claim carries exactly one observed/outlook tag', () => {
+  test('R3: the literal ruling, evidence to tag', () => {
+    // "evidence 'outlook' renders \"outlook\"; 'analyzed' and 'derived'
+    // render \"observed\"." (R3, owner ruling 2026-09-07)
+    expect(CLAIM_REGISTER_TAG.outlook).toBe('outlook');
+    expect(CLAIM_REGISTER_TAG.analyzed).toBe('observed');
+    expect(CLAIM_REGISTER_TAG.derived).toBe('observed');
+    // The identity case R3 does not need to spell out, and this session's
+    // extension for 'classified' (not named in R3; same 'observation' tone
+    // EVIDENCE_PRESENTATION already gives it).
+    expect(CLAIM_REGISTER_TAG.observed).toBe('observed');
+    expect(CLAIM_REGISTER_TAG.classified).toBe('observed');
+  });
+
+  test('every used evidence class renders exactly one register tag, matching the ruling', () => {
+    for (const evidence of USED_EVIDENCE) {
+      const claim = makeClaim({
+        text: `A ${evidence} statement for the register-tag check.`,
+        source: 'Test source',
+        // Generic stand-in exercising the register-tag mapping across every
+        // evidence class, not one lane; `usdm` is an arbitrary valid catalog
+        // key (DDM-P14-T05 microtask 2).
+        product: 'usdm',
+        evidence,
+        dates: { retrieved: '2026-09-07' }
+      });
+      const html = renderClaim(claim);
+      const occurrences = html.split('impact-claim-register').length - 1;
+      expect(occurrences, `${evidence} claim tag count`).toBe(1);
+      expect(registerTagIn(html), `${evidence} claim tag text`).toBe(
+        CLAIM_REGISTER_TAG[evidence]
+      );
+    }
+  });
+
+  test('no register tag word contains "forecast"', () => {
+    for (const tag of Object.values(CLAIM_REGISTER_TAG)) {
+      expect(tag, `register tag "${tag}"`).not.toMatch(/forecast/i);
+    }
+  });
+
+  test('live in the browser: the ENSO row across all three horizons carries the ruled tags', async ({
+    page
+  }) => {
+    await openBriefing(page, withWeekly());
+
+    // current: the index-state read (derived -> observed) and the
+    // authority + monthly-companion reads (analyzed -> observed).
+    // Each ENSO cell's lane settles after boot-idle (the precedent at
+    // tests/enso-horizons.spec.ts, c8680ce): read a cell only once its pill
+    // has left loading, or the read races the lane.
+    const current = page.locator('.impact-hazard[data-horizon="current"][data-hazard="enso"]');
+    await expect(current.locator('.impact-hazard-pill')).not.toHaveText('loading');
+    const currentTags = await current.locator('.impact-claim-register').allInnerTexts();
+    expect(currentTags.length, 'enso current claim count').toBeGreaterThan(0);
+    for (const tag of currentTags) expect(tag.trim()).toBe('observed');
+
+    // nearTerm: the weekly Nino 3.4 observation (analyzed -> observed),
+    // exactly the DR-031 claim this ruling was made for.
+    const nearTerm = page.locator('.impact-hazard[data-horizon="nearTerm"][data-hazard="enso"]');
+    await expect(nearTerm.locator('.impact-hazard-pill')).not.toHaveText('loading');
+    const nearTermTags = await nearTerm.locator('.impact-claim-register').allInnerTexts();
+    expect(nearTermTags.length, 'enso nearTerm claim count').toBeGreaterThan(0);
+    for (const tag of nearTermTags) expect(tag.trim()).toBe('observed');
+
+    // longRange: the tendency claim (derived -> observed). The bundled
+    // fixture carries no `probabilities` block, so the CPC-odds claim
+    // (outlook -> outlook, the one place both tags would render side by
+    // side) does not activate here; 'outlook' is proven by the model-level
+    // test above instead, against every evidence class the app builds.
+    const longRange = page.locator('.impact-hazard[data-horizon="longRange"][data-hazard="enso"]');
+    await expect(longRange.locator('.impact-hazard-pill')).not.toHaveText('loading');
+    const longRangeTags = await longRange.locator('.impact-claim-register').allInnerTexts();
+    expect(longRangeTags.map((t) => t.trim())).toEqual(['observed']);
+
+    // Every claim carries exactly one tag: as many .impact-claim-register
+    // elements as .impact-claim elements, in each of the three cells.
+    for (const cell of [current, nearTerm, longRange]) {
+      const claimCount = await cell.locator('.impact-claim').count();
+      const tagCount = await cell.locator('.impact-claim-register').count();
+      expect(tagCount).toBe(claimCount);
+    }
+  });
+
+  test('R4: absence cells carry no tag', async ({ page }) => {
+    await openBriefing(page, withWeekly());
+
+    // Fire longRange has no lane declared for it (matrix.ts LANE_PLACEMENT),
+    // so with the other lanes stubbed empty it renders CELL_ABSENCE prose,
+    // never a claim. Two cells have left this list as their lanes were wired:
+    // heat longRange when DDM-P7-T07 wired the CPC seasonal temperature
+    // outlook lane (see tests/heat-h2-point-heat.spec.ts), and fire nearTerm
+    // when DDM-P7-T03 wired the SPC Day 1-8 Fire Weather Outlook lane, which
+    // gotoApp now stubs on every briefing boot (tests/helpers.ts
+    // stubSpcFireOutlook), so that cell renders a claim here (see
+    // tests/briefing-matrix.spec.ts). Fire longRange stays: NIFC publishes
+    // its seasonal outlook as a PDF only, so no lane can be declared for it.
+    const absenceCells: ReadonlyArray<readonly ['fire' | 'heat', 'nearTerm' | 'longRange']> = [
+      ['fire', 'longRange']
+    ];
+    for (const [hazard, horizon] of absenceCells) {
+      const cell = page.locator(
+        `.impact-hazard[data-horizon="${horizon}"][data-hazard="${hazard}"]`
+      );
+      await expect(cell.locator('.impact-horizon-note')).toHaveCount(1);
+      await expect(cell.locator('.impact-claim-register')).toHaveCount(0);
+      const noteText = (await cell.locator('.impact-horizon-note').innerText()).trim();
+      expect(noteText).toBe(CELL_ABSENCE[horizon][hazard]);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clause 1: every horizon chip either changes the map or says why not
+// ---------------------------------------------------------------------------
+
+const PNG_1PX = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  'base64'
+);
+/** One opaque #ed1e00 (Very High) pixel: Fuel risk shades only issuer class colours. */
+const WHP_PNG_1PX = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGN4K8fwHwAFEgILjNz/OgAAAABJRU5ErkJggg==',
+  'base64'
+);
+
+/** Empty, deterministic wildfire product fixtures so a wildfire cluster
+ * commit in this file depends on no live agency (the same pattern already
+ * used for the briefing's fire lane in `openBriefing` above), plus the WHP
+ * ImageServer `exportImage` tile behind the DDM proxy (season-ahead). */
+async function stubWildfireProducts(page: Page): Promise<void> {
+  await page.route(
+    (url) =>
+      url.href.includes('WFIGS_Interagency_Perimeters_Current') ||
+      url.href.includes('NOAA_Satellite_Smoke_Detection') ||
+      url.href.includes('/SPC_firewx/MapServer/1/query'),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+      })
+  );
+  await page.route('https://ddm-proxy.atniclimate.workers.dev/**', async (route) => {
+    const target = new URL(route.request().url()).searchParams.get('url') ?? '';
+    if (target.includes('/exportImage')) {
+      await route.fulfill({ status: 200, contentType: 'image/png', body: WHP_PNG_1PX });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: '[]' });
+  });
+}
+
+/** The two chips DR-017 a disables: heat season-ahead has an empty recipe,
+ * and heat weeks-ahead repeats current's signature (fact 1 of the step
+ * plan's ground-truth read). ENSO's weeks-ahead adds the CPC 8-14 day
+ * precipitation outlook (2026-11-06) and its season-ahead the CPC seasonal
+ * one (2026-11-05), each a map of its own. */
+const DISABLED_CHIPS: ReadonlySet<string> = new Set([
+  'heat:weeks-ahead',
+  'heat:season-ahead'
+]);
+const CLUSTER_KEYS = ['drought', 'wildfire', 'heat', 'enso'] as const;
+
+test.describe('DR-190: a mode switch and its shared link show the same horizon', () => {
+  for (const [destination, expectedHorizon, product] of [
+    ['heat', 'current', 'heatrisk'],
+    ['drought', 'current', 'nadm-drought']
+  ] as const) {
+    test(`Wildfire Long Range to ${destination} resolves before and after reload`, async ({ page }) => {
+      await stubWildfireProducts(page);
+      await stubHeatRiskCatalog(page);
+      await stubCpcDroughtOutlook(page);
+      await gotoApp(page, '?view=console&cluster=wildfire&horizon=season-ahead');
+      await expect(page.locator('.shell-horizon-btn[data-horizon="season-ahead"]'))
+        .toHaveAttribute('aria-pressed', 'true');
+      await waitForLayerSettled(page, 'usfs-whp');
+
+      await page.locator(`.shell-cluster-btn[data-cluster="${destination}"]`).click();
+      const expectedUrlHorizon = expectedHorizon === 'current' ? null : expectedHorizon;
+      await expect(page.locator(`.shell-horizon-btn[data-horizon="${expectedHorizon}"]`))
+        .toHaveAttribute('aria-pressed', 'true');
+      await expect.poll(() => new URL(page.url()).searchParams.get('horizon')).toBe(expectedUrlHorizon);
+      await expect(layerCheckbox(page, product)).toBeChecked();
+      await waitForLayerSettled(page, product);
+      await expect(page.locator('.shell-horizon-btn[aria-pressed="true"][aria-disabled="true"]'))
+        .toHaveCount(0);
+      const checked = await page.locator('#layer-toggles input[data-layer-key]:checked')
+        .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-layer-key')).sort());
+
+      await page.reload();
+      await expect(page.locator(`.shell-cluster-btn[data-cluster="${destination}"]`))
+        .toHaveAttribute('aria-pressed', 'true');
+      await expect(page.locator(`.shell-horizon-btn[data-horizon="${expectedHorizon}"]`))
+        .toHaveAttribute('aria-pressed', 'true');
+      await expect.poll(() => new URL(page.url()).searchParams.get('horizon')).toBe(expectedUrlHorizon);
+      await expect.poll(() => page.locator('#layer-toggles input[data-layer-key]:checked')
+        .evaluateAll((nodes) => nodes.map((node) => node.getAttribute('data-layer-key')).sort()))
+        .toEqual(checked);
+      await waitForLayerSettled(page, product);
+      await expect(page.locator('.shell-horizon-btn[aria-pressed="true"][aria-disabled="true"]'))
+        .toHaveCount(0);
+    });
+  }
+});
+
+test.describe('DDM-P8-T03 clause 1: every horizon chip either changes the map or says why not', () => {
+  test('a chip with no distinct map surface is aria-disabled with a reason', async ({
+    page
+  }) => {
+    await stubWildfireProducts(page);
+    // A bare boot, not `openBriefing`'s `layers=places`: a reference-role
+    // extra layer surviving a cluster click demotes the commit to
+    // 'custom' (src/state/cluster-service.ts applyCluster), which would
+    // test the CUSTOM branch of horizonDisabledReason instead of the one
+    // this describe is about.
+    await gotoApp(page);
+    for (const cluster of CLUSTER_KEYS) {
+      await page.locator(`.shell-cluster-btn[data-cluster="${cluster}"]`).click();
+      for (const key of TEMPORAL_HORIZON_KEYS) {
+        const btn = page.locator(`.shell-horizon-btn[data-horizon="${key}"]`);
+        const expectDisabled = DISABLED_CHIPS.has(`${cluster}:${key}`);
+        if (!expectDisabled) {
+          // Polled: the previous mode can leave this chip disabled for a frame after the click.
+          await expect(btn, `${cluster}:${key} should be enabled`).not.toHaveAttribute('aria-disabled');
+          continue;
+        }
+        await expect(btn, `${cluster}:${key} should be disabled`).toHaveAttribute(
+          'aria-disabled',
+          'true'
+        );
+        // DDM-P8-T03 step 3 stop rule: an always-visible
+        // `.shell-horizon-note` line was tried and reverted (it collided
+        // with `.conditions-metric` at the 900x675 tablet band,
+        // interface-responsive.spec.ts's "tablet band" describe); the
+        // reason still reaches a keyboard or screen-reader user through
+        // `title`, the pre-existing custom-composition pattern.
+        const title = (await btn.getAttribute('title'))?.trim();
+        expect(title, `${cluster}:${key} title`).toBeTruthy();
+      }
+    }
+  });
+
+  test('a disabled chip is a refusal, not a silent no-op', async ({ page }) => {
+    await stubHeatRiskCatalog(page);
+    await gotoApp(page, '?view=brief&layers=places');
+    await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
+    // The retained Places layer makes this a custom set. Finish both successful
+    // activations before attributing any later layer change to the refused press.
+    await expect(layerPill(page, 'heatrisk')).toHaveText(PILL.live);
+    await expect(layerCheckbox(page, 'heatrisk')).toBeChecked();
+    await expect.poll(async () => (await urlLayers(page)).has('heatrisk')).toBe(true);
+    // The default NWS fixture is a successful empty response.
+    await expect(layerPill(page, 'nws-alerts')).toHaveClass(/\bno-data\b/);
+    await expect(layerCheckbox(page, 'nws-alerts')).toBeChecked();
+    await expect.poll(async () => (await urlLayers(page)).has('nws-alerts')).toBe(true);
+    const season = page.locator('.shell-horizon-btn[data-horizon="season-ahead"]');
+    await expect(season).toHaveAttribute('aria-disabled', 'true');
+    const pressedBefore = await season.getAttribute('aria-pressed');
+    const layersBefore = await urlLayers(page);
+    // force: true because Playwright's actionability check refuses
+    // aria-disabled targets; the press reaching the handler and being
+    // refused is exactly what this asserts (the pattern at
+    // tests/s4-shell.spec.ts:433).
+    await season.click({ force: true });
+    expect(await season.getAttribute('aria-pressed')).toBe(pressedBefore);
+    expect(await search(page)).not.toContain('horizon=');
+    expect(await urlLayers(page)).toEqual(layersBefore);
+  });
+
+  test('keyboard: a disabled chip keeps its place in the tab order and refuses Enter and Space', async ({
+    page
+  }) => {
+    await gotoApp(page, '?view=brief&layers=places');
+    await page.locator('.shell-cluster-btn[data-cluster="enso"]').click();
+    const weeks = page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]');
+    await expect(weeks).toHaveAttribute('aria-disabled', 'true');
+    // Places demotes the ENSO press to a custom set, which keeps the held horizon
+    // (Current) instead of the entry horizon; the refused keys must not move it.
+    expect(await search(page)).not.toContain('horizon=');
+    await weeks.focus();
+    await expect(weeks).toBeFocused();
+    const pressedBefore = await weeks.getAttribute('aria-pressed');
+    await page.keyboard.press('Enter');
+    expect(await weeks.getAttribute('aria-pressed')).toBe(pressedBefore);
+    await expect(weeks).toBeFocused();
+    await page.keyboard.press('Space');
+    expect(await weeks.getAttribute('aria-pressed')).toBe(pressedBefore);
+    await expect(weeks).toBeFocused();
+    expect(await search(page)).not.toContain('horizon=');
+  });
+
+  test('the briefing does not drive chip state', async ({ page }) => {
+    // No `layers=places`: a reference-role extra surviving a cluster
+    // click would demote the commit to 'custom' and mask this clause
+    // (see the boot comment above).
+    await openBriefing(page, withWeekly(), '?view=brief&select=state:WA');
+    await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
+    // The season-ahead chip is disabled on the recipe alone; the briefing
+    // cell existing (DDM-P7-T07's claim) is asserted only for existence,
+    // never consulted as the reason.
+    const heatSeason = page.locator('.shell-horizon-btn[data-horizon="season-ahead"]');
+    await expect(heatSeason).toHaveAttribute('aria-disabled', 'true');
+    await expect(
+      page.locator('.impact-hazard[data-horizon="longRange"][data-hazard="heat"]')
+    ).toHaveCount(1);
+
+    // The converse: on Drought, weeks-ahead is a real recipe (the CPC
+    // monthly outlook) and stays enabled regardless of what the briefing
+    // renders for that cell.
+    await page.locator('.shell-cluster-btn[data-cluster="drought"]').click();
+    const droughtWeeks = page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]');
+    expect(await droughtWeeks.getAttribute('aria-disabled')).toBeNull();
+  });
+
+  // D1 M5 (2026-09-27; found-003, DDM-P10-T09): the census evidence says
+  // "clicking Wildfire again does nothing". A failed recipe layer now stays
+  // checked, so the committed hazard's button is the way to ask again, and
+  // pressing it must re-request the failed layer rather than skip a key
+  // whose box is already checked.
+  test('pressing the committed hazard again after a layer failure re-applies its recipe', async ({
+    page
+  }) => {
+    await stubWildfireProducts(page);
+    // The Day 1 outlook fails until the test lets the agency recover.
+    let recovered = false;
+    let spcRequests = 0;
+    await page.route(
+      (url) => url.href.includes('/SPC_firewx/MapServer/1/query'),
+      (route) => {
+        spcRequests += 1;
+        if (!recovered) {
+          return route.fulfill({ status: 503, contentType: 'text/plain', body: 'fixture outage' });
+        }
+        return route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: JSON.stringify({
+            type: 'FeatureCollection',
+            features: [
+              {
+                type: 'Feature',
+                properties: { dn: 8, valid: '202609081200', expire: '209912312359' },
+                geometry: {
+                  type: 'Polygon',
+                  coordinates: [
+                    [
+                      [-125, 42],
+                      [-116, 42],
+                      [-116, 49],
+                      [-125, 49],
+                      [-125, 42]
+                    ]
+                  ]
+                }
+              }
+            ]
+          })
+        });
+      }
+    );
+    await gotoApp(page, '?view=console&cluster=wildfire&horizon=weeks-ahead');
+    const wildfire = page.locator('.shell-cluster-btn[data-cluster="wildfire"]');
+    const spcPill = page.locator('[data-layer-status="spc-fire-weather"]');
+    const spcBox = page.locator('input[data-layer-key="spc-fire-weather"]');
+    await expect(spcPill).toHaveText(PILL.unavailable, { timeout: 25_000 });
+    await expect(spcBox).toBeChecked();
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'true');
+    const failedRequests = spcRequests;
+    expect(failedRequests).toBeGreaterThan(0);
+
+    recovered = true;
+    await wildfire.click();
+    await expect.poll(() => spcRequests).toBeGreaterThan(failedRequests);
+    await expect(spcPill).toHaveText(PILL.live, { timeout: 25_000 });
+    await expect(spcBox).toBeChecked();
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'true');
+    const params = new URLSearchParams(await search(page));
+    expect(params.get('cluster')).toBe('wildfire');
+    expect(params.get('horizon')).toBe('weeks-ahead');
+  });
+});
+
+/**
+ * D1 M6 (2026-09-27; found-009, DDM-P10-T09): a `cluster=`/`horizon=` deep
+ * link naming a horizon the mode cannot show (an empty recipe, or one whose
+ * signature repeats an earlier horizon's, `horizonSurfaceSignature` in
+ * src/state/timeline.ts) used to seed that horizon as committed anyway, so
+ * the shell pressed the very chip `horizonDisabledReason` disables: a chip
+ * reading `aria-pressed="true"` and `aria-disabled="true"` at once. The URL
+ * parser (src/state/url.ts's resolveHorizonForCluster) now boots such a link
+ * on Current Conditions, which every mode can show.
+ *
+ * Every mode and every horizon come from the tables (HAZARD_CLUSTER_KEYS,
+ * TEMPORAL_HORIZON_KEYS), and every product any of those boots can reach is
+ * answered locally: the wildfire products and the WHP tile behind the proxy,
+ * the ocean anomaly surface, the HeatRisk catalog and the WWA notices, and
+ * the CPC Drought Outlook.
+ */
+test.describe('D1 M6: no horizon chip is ever pressed and disabled at once', () => {
+  test('no horizon chip is ever both aria-pressed and aria-disabled over every HAZARD_CLUSTER_KEYS x horizon deep link', async ({
+    page
+  }) => {
+    const boots = HAZARD_CLUSTER_KEYS.length * TEMPORAL_HORIZON_KEYS.length;
+    test.setTimeout(60_000 + boots * 30_000);
+    await stubWildfireProducts(page);
+    await stubSstFixture(page);
+    await stubHeatRiskCatalog(page);
+    await page.route(
+      (url) => url.pathname.endsWith('/watch_warn_adv/MapServer/1/query'),
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+        })
+    );
+    await stubCpcDroughtOutlook(page);
+    for (const cluster of HAZARD_CLUSTER_KEYS) {
+      const token = HAZARD_CLUSTERS[cluster].urlToken;
+      for (const horizon of TEMPORAL_HORIZON_KEYS) {
+        const clusterQuery = token !== null ? `cluster=${token}&` : '';
+        const path = `?view=console&${clusterQuery}horizon=${horizon}`;
+        await gotoApp(page, path);
+        // Exactly one chip is pressed once the shell has rendered the boot
+        // snapshot; the sweep reads after that.
+        await expect(
+          page.locator('.shell-horizon-btn[aria-pressed="true"]'),
+          `${path}: one pressed horizon chip`
+        ).toHaveCount(1);
+        for (const key of TEMPORAL_HORIZON_KEYS) {
+          const btn = page.locator(`.shell-horizon-btn[data-horizon="${key}"]`);
+          const pressed = await btn.getAttribute('aria-pressed');
+          const disabled = await btn.getAttribute('aria-disabled');
+          expect(
+            pressed === 'true' && disabled === 'true',
+            `${path} left the ${key} chip both pressed and disabled`
+          ).toBe(false);
+        }
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clauses 2 and 3: one grammar, product-specific registers
+// ---------------------------------------------------------------------------
+
+/** The ENSO screen's surface: a one-week P1D window and blank tiles, the
+ * same stub tests/fire-heat-time-bar.spec.ts and tests/temporal-axis.spec.ts
+ * each carry their own copy of. */
+async function stubSstFixture(page: Page): Promise<void> {
+  await page.route(
+    (url) => url.href.includes('DescribeDomains'),
+    (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'text/xml',
+        body:
+          "<Domains xmlns:ows='http://www.opengis.net/ows/1.1'><DimensionDomain>" +
+          '<ows:Identifier>time</ows:Identifier>' +
+          '<Domain>2026-07-01/2026-07-07/P1D</Domain>' +
+          '<Size>1</Size></DimensionDomain></Domains>'
+      })
+  );
+  await page.route(
+    (url) => url.href.includes('GHRSST_L4_MUR') && url.pathname.endsWith('.png'),
+    (route) => route.fulfill({ status: 200, contentType: 'image/png', body: PNG_1PX })
+  );
+}
+
+test.describe('DDM-P8-T03 clauses 2 and 3: one grammar, product-specific registers', () => {
+  test.describe('at 390x844 (every hazard family shows a key there)', () => {
+    test.use({ viewport: { width: 390, height: 844 } });
+
+    test('each hazard key and its time bar state one register, and the outlook register is not the observed one', async ({
+      page
+    }) => {
+      await stubWildfireProducts(page);
+      // The heat step below reads the NWS HeatRisk catalog, which this case
+      // left live. That made an assertion about OUR register grammar depend
+      // on an agency's publication state: `extractFrames`
+      // (src/layers/heatrisk.ts) rejects a catalog with a duplicate
+      // `idp_validtime`, the layer then reports unavailable, no time bar
+      // installs, and `#time-bar` has no `data-register` to compare the key
+      // against. Observed 2026-09-09 (S21), when the live catalog served
+      // seven granules with only five distinct valid times and a two-day
+      // gap. Stubbed for the same reason `openBriefing` above already stubs
+      // it (DDM-P7-T05 F2): this case is about the key and the bar stating
+      // ONE register, never about whether NWS published cleanly today.
+      await stubHeatRiskCatalog(page);
+      // Wildfire current: NIFC perimeters, observed.
+      await gotoApp(page, '?cluster=wildfire');
+      let key = page.locator('#map-key');
+      let bar = page.locator('#time-bar');
+      await expect(key).toBeVisible();
+      await expect(bar).toHaveAttribute('data-register', 'observed');
+      await expect(key).toHaveAttribute('data-register', 'observed');
+
+      // Wildfire near term: the SPC fire-weather outlook, outlook register.
+      await gotoApp(page, '?cluster=wildfire&horizon=weeks-ahead');
+      key = page.locator('#map-key');
+      bar = page.locator('#time-bar');
+      await expect(key).toBeVisible();
+      await expect(bar).toHaveAttribute('data-register', 'outlook');
+      await expect(key).toHaveAttribute('data-register', 'outlook');
+
+      // Heat current: whichever register HeatRisk's active day declares
+      // (src/layers/heatrisk.ts switches per day); the key must mirror the
+      // bar, not claim a fixed value.
+      await gotoApp(page, '?cluster=heat');
+      key = page.locator('#map-key');
+      bar = page.locator('#time-bar');
+      await expect(key).toBeVisible();
+      const heatBarRegister = await bar.getAttribute('data-register');
+      expect(heatBarRegister).not.toBeNull();
+      await expect(key).toHaveAttribute('data-register', heatBarRegister!);
+
+      // ENSO: the GHRSST MUR daily field, observed at every horizon.
+      await gotoApp(page, '?cluster=enso');
+      key = page.locator('#map-key');
+      bar = page.locator('#time-bar');
+      await expect(key).toBeVisible();
+      await expect(bar).toHaveAttribute('data-register', 'observed');
+      await expect(key).toHaveAttribute('data-register', 'observed');
+    });
+
+    test('the Wildfire Hazard Potential key never claims an outlook register', async ({
+      page
+    }) => {
+      await stubWildfireProducts(page);
+      await gotoApp(page, '?cluster=wildfire&horizon=season-ahead');
+      const key = page.locator('#map-key');
+      const bar = page.locator('#time-bar');
+      await expect(bar).toHaveAttribute('data-register', 'observed');
+      await expect(key).toHaveAttribute('data-register', 'observed');
+      // The key's own accessible name carries the static-edition honesty
+      // disclaimer; since v0.7.7 Fuel risk is the white shade on every map,
+      // so it is the shade's qualification (src/config/whp-shade.ts
+      // WHP_SHADE_QUALIFICATION): the 2023 edition, static context, not
+      // current conditions or a forecast. The visible label stays
+      // 'Wildfire potential', never a dated claim.
+      await expect(key).toHaveAttribute('aria-label', /Wildfire Hazard Potential 2023/);
+      await expect(key).toHaveAttribute('aria-label', /Static context, not current conditions or a forecast\./);
+    });
+  });
+
+  test('the horizon grammar is one table across chip, stamp and briefing heading', async ({
+    page
+  }) => {
+    await stubSstFixture(page);
+    // FLIPPED BACK 2026-11-05: ENSO's Season ahead now shows the CPC
+    // seasonal precipitation outlook beside the SST, a map its Current does
+    // not show, so this deep link keeps its own horizon (an inbound link
+    // keeps its URL's horizon) and Long Range is pressed and enabled. The
+    // one-grammar intent is unchanged: the chip's static title, the stamp
+    // and the briefing heading read the same HORIZON_CHROME table, and the
+    // stamp still says what the SST surface is.
+    await gotoApp(
+      page,
+      '?view=console&cluster=enso&horizon=season-ahead&sst=2026-07-03'
+    );
+    const chipTitle = (
+      await page
+        .locator('.shell-horizon-btn[data-horizon="season-ahead"] .shell-horizon-btn-title')
+        .innerText()
+    ).trim();
+    expect(chipTitle).toBe(HORIZON_CHROME.longRange.title);
+    // The stamp says what the surface is (Current Conditions). The SST
+    // layer installs its stamp once the ImageServer domain answers; wait
+    // for it rather than reading a pre-boot placeholder.
+    const stampHorizonEl = page.locator('.time-bar-stamp-horizon');
+    // The rendered text is "<title> · <subtitle>" (stampHorizonText,
+    // src/ui/time-bar.ts), not the bare title; Jul 3 is not the newest of
+    // the stubbed days, so the shown day's own date stands for "now".
+    const expectedStampHorizon = `${HORIZON_CHROME.current.title} · Jul 3, 2026`;
+    await expect(stampHorizonEl).toHaveText(expectedStampHorizon, { timeout: 25_000 });
+    expect(expectedStampHorizon).not.toBe(chipTitle);
+    // The link's horizon holds: Long Range pressed and enabled, Current not.
+    await expect(
+      page.locator('.shell-horizon-btn[data-horizon="current"]')
+    ).toHaveAttribute('aria-pressed', 'false');
+    const seasonChip = page.locator('.shell-horizon-btn[data-horizon="season-ahead"]');
+    await expect(seasonChip).toHaveAttribute('aria-pressed', 'true');
+    expect(await seasonChip.getAttribute('aria-disabled')).toBeNull();
+    expect(new URLSearchParams(await search(page)).get('horizon')).toBe('season-ahead');
+  });
+});

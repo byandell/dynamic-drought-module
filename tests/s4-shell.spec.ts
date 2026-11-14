@@ -1,5 +1,18 @@
-import { test, expect } from '@playwright/test';
-import { gotoApp, layerCheckbox, search, urlLayers } from './helpers';
+import { continueLocalRoute } from './offline-test';
+import { test, expect } from './offline-test';
+import { stubCpcDroughtOutlook } from './cpc-outlook-fixtures';
+import { HAZARD_CLUSTER_KEYS, TEMPORAL_HORIZON_KEYS } from '../src/config/clusters';
+import { stubUsdmWeeks } from './usdm-fixtures';
+import { HORIZON_CHROME, SHELL_HORIZON_KEY } from '../src/impact/horizon-chrome';
+import {
+  gotoApp,
+  layerCheckbox,
+  layerPill,
+  search,
+  stubHeatRiskCatalog,
+  urlLayers,
+  waitForLayerSettled
+} from './helpers';
 
 /**
  * S4a: the main-screen shell boot state (the 2026-07-18 design record
@@ -13,6 +26,140 @@ import { gotoApp, layerCheckbox, search, urlLayers } from './helpers';
  */
 
 const CLUSTER_TITLES = ['Drought', 'Wildfire', 'Extreme Heat', 'ENSO'];
+
+for (const viewport of [{ width: 1440, height: 1000 }, { width: 958, height: 935 }, { width: 900, height: 675 }]) {
+  test(`upper navigation stays in place across hazard work and selection at ${viewport.width}x${viewport.height}`, async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize(viewport);
+    const empty = JSON.stringify({ type: 'FeatureCollection', features: [] });
+    const pixel = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+    const gates = new Map<string, { promise: Promise<void>; release: () => void }>();
+    for (const key of ['wildfire', 'heat', 'enso']) {
+      let release!: () => void;
+      const promise = new Promise<void>((resolve) => { release = resolve; });
+      gates.set(key, { promise, release });
+    }
+    let sstModuleRequests = 0;
+    await page.route(/\/assets\/sst-anomaly-[^/?]+\.js(?:\?|$)/, async (route) => {
+      // SST reports its latest surface ready before its date axis resolves.
+      // The layer controller's module load is the observable pending phase.
+      sstModuleRequests += 1;
+      await gates.get('enso')!.promise;
+      await continueLocalRoute(route);
+    });
+    await page.route((url) => url.href.includes('NOAA_Satellite_Smoke_Detection') ||
+      url.hostname === 'api.weather.gov' || url.pathname.endsWith('/WWA/watch_warn_adv/MapServer/1/query'),
+    (route) => route.fulfill({ status: 200, contentType: 'application/geo+json', body: empty }));
+    await page.route('**/WFIGS_Interagency_Perimeters_Current/**', async (route) => {
+      await gates.get('wildfire')!.promise;
+      await route.fulfill({ status: 200, contentType: 'application/geo+json', body: JSON.stringify({
+        type: 'FeatureCollection', features: [{
+          type: 'Feature',
+          properties: { attr_UniqueFireIdentifier: 'navigation-fixture', attr_IncidentName: 'Navigation Fixture', attr_IncidentTypeCategory: 'WF' },
+          geometry: { type: 'Polygon', coordinates: [[[-125, 42], [-116, 42], [-116, 49], [-125, 49], [-125, 42]]] }
+        }]
+      }) });
+    });
+    await stubHeatRiskCatalog(page);
+    await page.route((url) => url.pathname.endsWith('/NWS_HeatRisk/ImageServer'), async (route) => {
+      await gates.get('heat')!.promise;
+      await route.fallback();
+    });
+    await page.route((url) => url.href.includes('DescribeDomains'), async (route) => {
+      await gates.get('enso')!.promise;
+      await route.fulfill({
+        status: 200, contentType: 'text/xml',
+        body: "<Domains xmlns:ows='http://www.opengis.net/ows/1.1'><DimensionDomain>" +
+          '<ows:Identifier>time</ows:Identifier><Domain>2026-07-01/2026-07-07/P1D</Domain>' +
+          '<Size>1</Size></DimensionDomain></Domains>'
+      });
+    });
+    await page.route((url) => url.href.includes('GHRSST_L4_MUR') && url.pathname.endsWith('.png'),
+      async (route) => {
+        // Serve both latest and dated frames from the deterministic fixture.
+        await gates.get('enso')!.promise;
+        await route.fulfill({ status: 200, contentType: 'image/png', body: pixel });
+      });
+
+    await gotoApp(page);
+    const minimap = viewport.height < 700 ? '.shell-minimap-popover-wrap' : '.shell-minimap-map';
+    const selectors = ['#shell-panel', '.shell-view', '.shell-when', minimap,
+      '#shell-region-host', '#brief-search', '#layers-studio-entry-host'];
+    const readings: Array<{ phase: string; bounds: Array<{ selector: string; x: number; y: number; width: number; height: number }> }> = [];
+    const sample = async (phase: string): Promise<void> => {
+      // Read consecutive painted frames, including the held loading state,
+      // rather than treating a settled final rectangle as proof of stability.
+      for (let frame = 0; frame < 3; frame += 1) {
+        const bounds = await page.evaluate(async (items) => {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          return items.map((selector) => {
+            const element = document.querySelector(selector);
+            if (!element) throw new Error(`Missing navigation control: ${selector}`);
+            const { x, y, width, height } = element.getBoundingClientRect();
+            return { selector, x, y, width, height };
+          });
+        }, selectors);
+        readings.push({ phase: `${phase}, frame ${frame + 1}`, bounds });
+      }
+    };
+    try {
+      await sample('Drought settled');
+      for (const [key, source] of [['wildfire', 'nifc-fires'], ['heat', 'heatrisk'], ['enso', 'sst-anomaly']] as const) {
+        const button = page.locator(`.shell-cluster-btn[data-cluster="${key}"]`);
+        await button.click();
+        await expect(button).toHaveAttribute('aria-pressed', 'true');
+        if (key === 'enso') await expect.poll(() => sstModuleRequests).toBeGreaterThan(0);
+        await expect(button).toHaveAttribute('data-pending', 'true');
+        await sample(`${key} loading`);
+        gates.get(key)!.release();
+        await expect(button).toHaveAttribute('data-pending', 'false', { timeout: 25_000 });
+        await expect(layerPill(page, source)).toHaveText(/^live(?: \(partial\))?$/);
+        if (key === 'enso') {
+          // Value-only migration (found-014): the heading now leads with the
+          // pressed horizon chip's own HORIZON_CHROME title, so the stamp's
+          // own words follow it rather than standing alone. Entering ENSO
+          // commits its Season ahead (Long Range); the stamp is still the SST's.
+          await expect(page.locator('.shell-time-headline')).toHaveText(
+            'Long Range · Observed Jul 7, 2026'
+          );
+        }
+        await sample(`${key} settled`);
+      }
+      await page.locator('.shell-cluster-btn[data-cluster="drought"]').click();
+      await expect(page.locator('.shell-cluster-btn[data-cluster="drought"]')).toHaveAttribute('data-pending', 'false');
+      await page.locator('#brief-search [data-ddm-search]').fill('oregon');
+      await page.locator('#brief-search [data-search-kind="place"][data-search-id="OR"]').click();
+      await expect(page.locator('#brief-place-name')).toHaveText('Oregon');
+      // In a short window the pointer pick scrolls the honest-scroll Brief
+      // column to reach a result row beneath the sticky dock: the user's
+      // scroll, not a layout shift. While scrolled, every hazard button must
+      // stay on top (the sticky horizon row never covers the mode row).
+      const coveredHazards = await page.evaluate(() =>
+        [...document.querySelectorAll<HTMLElement>('.shell-cluster-btn')].flatMap((button) => {
+          const { x, y, width, height } = button.getBoundingClientRect();
+          const hit = document.elementFromPoint(x + width / 2, y + height / 2);
+          return hit && button.contains(hit) ? [] : [button.dataset.cluster ?? '?'];
+        }));
+      expect(coveredHazards, 'A scrolled Brief column must leave every hazard button on top').toEqual([]);
+      // Back at the column's top, the selected-place context must not have
+      // moved any upper control.
+      await page.evaluate(() => { document.querySelector('.sidebar-scroll')!.scrollTop = 0; });
+      await sample('Drought with Oregon selected');
+    } finally {
+      for (const gate of gates.values()) gate.release();
+    }
+
+    const baseline = readings[0]!.bounds;
+    const shifts = readings.flatMap(({ phase, bounds }) => bounds.flatMap((box, index) => {
+      const before = baseline[index]!;
+      return (['x', 'y', 'width', 'height'] as const).flatMap((dimension) =>
+        Math.abs(box[dimension] - before[dimension]) > 1
+          ? [{ phase, selector: box.selector, dimension, before: before[dimension], after: box[dimension] }]
+          : []);
+    }));
+    expect(shifts, 'Source work and selected-place context must not move upper navigation controls').toEqual([]);
+  });
+}
 
 test.describe('S4a desktop shell boot', () => {
   test('bare boot renders the four cluster buttons with Drought committed', async ({
@@ -86,17 +233,38 @@ test.describe('S4a desktop shell boot', () => {
     }
   });
 
-  test('the empty heat/season-ahead recipe yields the honest no-surface primary', async ({
+  test('DR-190: switching to Heat returns to Current while Long Range stays disabled with its reason', async ({
     page
   }) => {
-    await gotoApp(page);
+    // DR-190 supersedes the in-session empty recipe: mode switches now
+    // resolve the destination horizon exactly as found-009's deep links do.
+    await stubCpcDroughtOutlook(page);
+    await stubHeatRiskCatalog(page);
+    await gotoApp(page, '?view=console');
+    const season = page.locator('.shell-horizon-btn[data-horizon="season-ahead"]');
+    await season.click();
+    await expect(season).toHaveAttribute('aria-pressed', 'true');
+    await waitForLayerSettled(page, 'drought');
     await page.locator('.shell-cluster-btn[data-cluster="heat"]').click();
-    await page.locator('.shell-horizon-btn[data-horizon="season-ahead"]').click();
     await expect(
-      page.locator('.shell-horizon-btn[data-horizon="season-ahead"]')
+      page.locator('.shell-cluster-btn[data-cluster="heat"]')
     ).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.locator('#shell-summary-primary')).toHaveText(
-      'No verified Extreme Heat surface is available at this horizon; showing reference layers only.'
+    await expect(season).toHaveAttribute('aria-pressed', 'false');
+    await expect(page.locator('.shell-horizon-btn[data-horizon="current"]'))
+      .toHaveAttribute('aria-pressed', 'true');
+    await expect.poll(() => new URL(page.url()).searchParams.get('horizon')).toBeNull();
+    await expect(layerCheckbox(page, 'heatrisk')).toBeChecked();
+    await expect(layerPill(page, 'heatrisk')).toHaveClass(/\bready\b/);
+    await expect(page.locator('#shell-summary-primary')).toContainText('HeatRisk');
+    await expect(season).toHaveAttribute('aria-disabled', 'true');
+    // DDM-P8-T03 step 3 stop rule: the always-visible `.shell-horizon-note`
+    // line was reverted (interface-responsive.spec.ts's 900x675 tablet
+    // band went red on the collision it introduced); the reason still
+    // reaches every consumer through `title`, the same pattern the
+    // custom-composition case above already uses.
+    await expect(season).toHaveAttribute(
+      'title',
+      'Long Range is off for Extreme Heat: no verified map source for this time horizon exists yet, so none is shown rather than a guess.'
     );
   });
 
@@ -128,7 +296,7 @@ test.describe('S4a desktop shell boot', () => {
     ).toHaveAttribute('aria-pressed', 'true');
   });
 
-  test('the pre-S4 surfaces stay staged: the console door lives, Quick views stays hidden in Brief', async ({
+  test('the pre-S4 surfaces stay staged: the console door lives', async ({
     page
   }) => {
     await gotoApp(page);
@@ -138,11 +306,6 @@ test.describe('S4a desktop shell boot', () => {
     // successor; the design record's "mode-switch cleanup" does not
     // sanction retiring desktop console itself.
     await expect(page.locator('.view-switch [data-view="console"]')).toBeVisible();
-    // Quick views is hidden on the desktop Brief launch pad (as since
-    // E1; the shell's cluster buttons carry the view question there)
-    // but remains the shipped surface of console and the mobile sheet.
-    await expect(page.locator('#panel-quick-views')).toBeHidden();
-    await expect(page.locator('#panel-quick-views')).toBeAttached();
   });
 
   test('desktop Brief seats the same controls in the ruled shell order and restores them for console and collapse', async ({
@@ -156,27 +319,34 @@ test.describe('S4a desktop shell boot', () => {
         children.findIndex((child) => child.matches(selector));
       return [
         '.shell-view',
-        '#shell-conditions-summary',
+        '.shell-when',
         '.shell-minimap-map',
         '.shell-minimap-popover-wrap',
         '#shell-region-host',
-        '#shell-refine-host',
-        '.shell-when',
-        '#shell-share-host'
+        '#shell-refine-host'
       ].map(indexOf);
     });
     expect(shellOrder).toEqual([...shellOrder].sort((a, b) => a - b));
     expect(shellOrder.every((index) => index >= 0)).toBe(true);
+    // The ENSO buttons sit above the mode-sized details so those never move them.
+    await expect(page.locator('#brief-display + #enso-flow-controls + #shell-details-panel')).toHaveCount(1);
+    await expect(page.locator('#shell-details-island > #shell-conditions-summary')).toHaveCount(1);
+    await expect(page.locator('#shell-panel #shell-conditions-summary')).toHaveCount(0);
 
-    for (const id of ['conditions-strip', 'legend-panel', 'panel-region', 'share-btn', 'brief-head']) {
+    for (const id of ['conditions-strip', 'panel-region', 'share-btn', 'brief-head']) {
       await expect(page.locator(`#${id}`)).toHaveCount(1);
     }
     await expect(page.locator('#conditions-strip-dock > #conditions-strip')).toHaveCount(1);
-    await expect(page.locator('#sidebar-key-host > #legend-panel')).toHaveCount(1);
     await expect(page.locator('#shell-region-host > #panel-region')).toHaveCount(1);
-    await expect(page.locator('#shell-share-host > #share-btn')).toHaveCount(1);
+    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
+    // Conditions in view is parked unseen in the floating window, and the Key
+    // chip carries its lead reading (owner 2026-11-13, one box); the bottom
+    // Layer legends is gone (item 13).
+    await expect(page.locator('#map-condition-indicator #conditions-strip')).toHaveCount(1);
+    await expect(page.locator('#legend-panel')).toBeHidden();
+    await expect(page.locator('#brief-head-lede')).toHaveCount(0);
     await expect(page.locator('#shell-refine-host > #brief-head')).toHaveCount(1);
-    await expect(page.locator('#shell-conditions-heading')).toHaveText('Conditions in view');
+    await expect(page.locator('#shell-conditions-heading')).toHaveText('Display summary');
     await expect(page.locator('#conditions-strip-dock .conditions-title')).toBeHidden();
 
     // Existing behavior rides the moved nodes: region navigation still owns
@@ -189,16 +359,15 @@ test.describe('S4a desktop shell boot', () => {
 
     await page.locator('.view-switch [data-view="console"]').click();
     await expect(page.locator('#conditions-strip-home + #conditions-strip')).toHaveCount(1);
-    await expect(page.locator('#legend-panel-home + #legend-panel')).toHaveCount(1);
+    await expect(page.locator('#legend-panel')).toBeVisible();
     await expect(page.locator('#panel-region-home + #panel-region')).toHaveCount(1);
-    await expect(page.locator('#share-btn-home + #share-btn')).toHaveCount(1);
     await expect(page.locator('#brief-head-home + #brief-head')).toHaveCount(1);
     await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
 
     await page.locator('.view-switch [data-view="brief"]').click();
     await page.locator('#sidebar-collapse').click();
-    await expect(page.locator('#conditions-strip-home + #conditions-strip')).toHaveCount(1);
-    await expect(page.locator('#legend-panel-home + #legend-panel')).toHaveCount(1);
+    // The map seat stays while the sidebar is collapsed; the column seats return home.
+    await expect(page.locator('#conditions-strip-dock > #conditions-strip')).toHaveCount(1);
     await expect(page.locator('#panel-region-home + #panel-region')).toHaveCount(1);
     await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
     await expect(page.locator('#brief-head-home + #brief-head')).toHaveCount(1);
@@ -232,7 +401,7 @@ test.describe('S4 temporal register coherence (DG-080 review blocker 1)', () => 
     ]
   };
 
-  async function routeCpcOutlook(page: import('@playwright/test').Page): Promise<void> {
+  async function routeCpcOutlook(page: import('./offline-test').Page): Promise<void> {
     await page.route(
       (url) => url.href.includes('cpc_drought_outlk/MapServer'),
       (route) =>
@@ -300,10 +469,9 @@ test.describe('S4 temporal register coherence (DG-080 review blocker 1)', () => 
       page.locator('.shell-cluster-btn[data-cluster="drought"]')
     ).toHaveAttribute('aria-pressed', 'true');
     await page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]').click();
-    // The monthly register renders (the More time door's description
-    // names the product register the surface installed).
-    await expect(page.locator('#shell-time-more')).toHaveAttribute(
-      'title',
+    // The monthly register renders (the stamp detail names the product
+    // register the surface installed).
+    await expect(page.locator('#time-bar .time-bar-stamp-detail')).toContainText(
       /Monthly Drought Outlook/,
       { timeout: 45_000 }
     );
@@ -315,8 +483,7 @@ test.describe('S4 temporal register coherence (DG-080 review blocker 1)', () => 
     await expect(
       page.locator('.shell-horizon-btn[data-horizon="season-ahead"]')
     ).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.locator('#shell-time-more')).toHaveAttribute(
-      'title',
+    await expect(page.locator('#time-bar .time-bar-stamp-detail')).toContainText(
       /Seasonal Drought Outlook/,
       { timeout: 45_000 }
     );
@@ -325,6 +492,112 @@ test.describe('S4 temporal register coherence (DG-080 review blocker 1)', () => 
         window.location.search.includes('horizon=season-ahead') &&
         !window.location.search.includes('outlook=monthly')
     );
+  });
+
+  test('a horizon switch to a longer outlook headline does not shift the shell layout (fix-lane Defect 1)', async ({
+    page
+  }) => {
+    // NADM's 'Consensus month ...' stamp is short and single-line; the CPC
+    // outlook's 'Issued ... . through ...' stamp is markedly longer and,
+    // pre-fix, wrapped the headline to a second line with no reserved
+    // height, pushing every control below it down. app.css's
+    // .shell-time-headline now reserves a fixed two-line box, so this
+    // switch must not move the regional navigation seated after it. Since
+    // owner 2026-11-13 the line is Console-only at the column foot, so in
+    // Brief it is attached but not drawn; the case still guards Brief
+    // against any shift should the line reappear.
+    await routeCpcOutlook(page);
+    await gotoApp(page);
+
+    const headline = page.locator('.shell-time-headline');
+    await expect(headline).toBeAttached();
+    await expect(headline).toContainText('Consensus month');
+
+    const navigation = page.locator('#shell-minimap-heading');
+    const before = await navigation.boundingBox();
+    expect(before).not.toBeNull();
+
+    await page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]').click();
+    await expect(headline).toContainText('Issued', { timeout: 45_000 });
+    await expect(headline).toContainText('through Jul 2026');
+
+    const after = await navigation.boundingBox();
+    expect(after).not.toBeNull();
+    expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
+  });
+
+  // S30D D1 M13 (found-010, found-017; DDM-P8-T07): a STRENGTHENED
+  // assertion over the case above, not an edit to make a test pass. The
+  // case above reads only #shell-minimap-heading at the suite's default
+  // viewport; this extension adds Share in the map column's slot 4 (it
+  // stays there in Brief, owner 2026-10-19) at the four desktop widths
+  // the design record's acceptance names, where --sidebar-w is the
+  // unclamped 340px constant (app.css:394-398's tablet clamp band ends at
+  // 1024px, below every width here). Red only if either element moves;
+  // green on base counts as the acceptance's own measurement, named so in
+  // the report.
+  for (const viewport of [
+    { width: 1280, height: 720 },
+    { width: 1440, height: 900 },
+    { width: 1920, height: 1080 },
+    { width: 2560, height: 1440 }
+  ]) {
+    test(`a horizon switch to a longer outlook headline moves neither #shell-minimap-heading nor Share in the map column by more than 1 px at ${viewport.width}x${viewport.height} (found-010, found-017)`, async ({
+      page
+    }) => {
+      await page.setViewportSize(viewport);
+      await routeCpcOutlook(page);
+      await gotoApp(page);
+
+      // Attached, not drawn: Brief carries no date line (owner 2026-11-13).
+      const headline = page.locator('.shell-time-headline');
+      await expect(headline).toBeAttached();
+      await expect(headline).toContainText('Consensus month');
+
+      const navigation = page.locator('#shell-minimap-heading');
+      const shareHost = page.locator('.map-overlay-controls > #share-btn');
+      const navBefore = await navigation.boundingBox();
+      const shareBefore = await shareHost.boundingBox();
+      expect(navBefore).not.toBeNull();
+      expect(shareBefore).not.toBeNull();
+
+      await page.locator('.shell-horizon-btn[data-horizon="weeks-ahead"]').click();
+      await expect(headline).toContainText('Issued', { timeout: 45_000 });
+      await expect(headline).toContainText('through Jul 2026');
+
+      const navAfter = await navigation.boundingBox();
+      const shareAfter = await shareHost.boundingBox();
+      expect(navAfter).not.toBeNull();
+      expect(shareAfter).not.toBeNull();
+      expect(Math.abs(navAfter!.y - navBefore!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(shareAfter!.y - shareBefore!.y)).toBeLessThanOrEqual(1);
+      expect(Math.abs(shareAfter!.x - shareBefore!.x)).toBeLessThanOrEqual(1);
+    });
+  }
+
+  test('the time card heading names the pressed horizon chip in HORIZON_CHROME\'s own words at every Drought horizon (found-014)', async ({
+    page
+  }) => {
+    await routeCpcOutlook(page);
+    await gotoApp(page);
+
+    // found-014: the heading is not a literal per-surface guess; it is
+    // read straight from HORIZON_CHROME for whichever chip is pressed, at
+    // every enabled horizon this cluster offers (TEMPORAL_HORIZON_KEYS,
+    // never a hard-coded list, DR-113).
+    for (const key of TEMPORAL_HORIZON_KEYS) {
+      const chip = page.locator(`.shell-horizon-btn[data-horizon="${key}"]`);
+      if ((await chip.getAttribute('aria-disabled')) === 'true') continue;
+      await chip.click();
+      await expect(chip).toHaveAttribute('aria-pressed', 'true', { timeout: 45_000 });
+      const chrome = HORIZON_CHROME[SHELL_HORIZON_KEY[key]];
+      await expect(page.locator('.shell-time-headline-horizon')).toHaveText(chrome.title, {
+        timeout: 45_000
+      });
+      await expect(page.locator('#shell-time')).toHaveAttribute('data-has-spec', 'true', {
+        timeout: 45_000
+      });
+    }
   });
 });
 
@@ -364,7 +637,7 @@ test.describe('S4 r2: custom-composition horizon honesty and the failed range sw
    * Monthly layer, MapServer/4 the Seasonal (RANGE_LAYER_INDEX in
    * src/layers/drought.ts). */
   async function routeCpcPerRange(
-    page: import('@playwright/test').Page,
+    page: import('./offline-test').Page,
     seasonal: 'ok' | 'fail',
     onSeasonalAttempt?: () => void
   ): Promise<void> {
@@ -405,13 +678,18 @@ test.describe('S4 r2: custom-composition horizon honesty and the failed range sw
     // re-resolve a custom set, so Weeks/Season ahead must disable with
     // an honest reason instead of pressing a chip for a time the map
     // does not show.
+    await stubUsdmWeeks(page);
     await gotoApp(
       page,
       '?view=brief&layers=hillshade,aiannh,bia-reservations,states,usdm,places'
     );
-    await expect(page.locator('.shell-cluster-btn')).toHaveCount(4);
+    await waitForLayerSettled(page, 'usdm');
+    await expect(page.locator('[data-layer-status="usdm"]')).toHaveClass(/\bready\b/);
+    await expect(layerCheckbox(page, 'usdm')).toBeChecked();
+    expect(await urlLayers(page)).toContain('usdm');
+    await expect(page.locator('.shell-cluster-btn')).toHaveCount(HAZARD_CLUSTER_KEYS.length);
     // Custom: no cluster button claims pressed.
-    for (const key of ['drought', 'wildfire', 'heat', 'enso']) {
+    for (const key of HAZARD_CLUSTER_KEYS) {
       await expect(
         page.locator(`.shell-cluster-btn[data-cluster="${key}"]`)
       ).toHaveAttribute('aria-pressed', 'false');
@@ -459,8 +737,7 @@ test.describe('S4 r2: custom-composition horizon honesty and the failed range sw
     expect(await season.getAttribute('aria-disabled')).toBeNull();
     await season.click();
     await expect(season).toHaveAttribute('aria-pressed', 'true');
-    await expect(page.locator('#shell-time-more')).toHaveAttribute(
-      'title',
+    await expect(page.locator('#time-bar .time-bar-stamp-detail')).toContainText(
       /Seasonal Drought Outlook/,
       { timeout: 45_000 }
     );
@@ -512,8 +789,7 @@ test.describe('S4 r2: custom-composition horizon honesty and the failed range sw
     // truth: these dates come from the rendered features)...
     await expect(page.locator('.shell-time-headline')).toContainText(MONTHLY_TARGET);
     await expect(page.locator('.shell-time-headline')).not.toContainText(SEASONAL_TARGET);
-    await expect(page.locator('#shell-time-more')).toHaveAttribute(
-      'title',
+    await expect(page.locator('#time-bar .time-bar-stamp-detail')).toContainText(
       /Monthly Drought Outlook/
     );
     // ...the status is the displayed range's honest 'live', not a
@@ -594,8 +870,17 @@ test.describe('S4 r3: an initial-load horizon supersession stays owned (DG-080 r
 
     // The activation promise followed the replacement (the latest-owner
     // settle), so the controller observed the terminal error and its
-    // cleanup ran: the checkbox clears...
-    await expect(layerCheckbox(page, 'drought')).not.toBeChecked({ timeout: 30_000 });
+    // cleanup ran. FLIPPED 2026-09-27 (D1 M5, found-003; the director's
+    // Tier 1 scope: a failed RECIPE layer of the COMMITTED cluster keeps
+    // its checkbox, so the committed view never demotes to a custom set).
+    // The Season chip committed Drought, and `drought` is its season-ahead
+    // recipe, so the checkbox now STAYS checked, the layer stays in the
+    // Drought `layers=` claim, and the Drought button stays pressed; the
+    // registry cleanup (no registration, no time-bar spec, no summary
+    // claim) still runs. The title's "checkbox ... and URL claim all
+    // withdraw" predates M5; it is kept because the sleep inventory keys
+    // this test's wait by its exact title. The checkbox stays...
+    await expect(layerCheckbox(page, 'drought')).toBeChecked({ timeout: 30_000 });
     // ...the pill carries the honest terminal error, not a live claim...
     await expect
       .poll(async () => {
@@ -604,29 +889,33 @@ test.describe('S4 r3: an initial-load horizon supersession stays owned (DG-080 r
         return cls.split(/\s+/).includes('error');
       })
       .toBe(true);
-    // ...the URL claim is withdrawn: the failed surface leaves layers=
-    // and the outlook token carries no residue...
+    // ...the committed Drought claim keeps the failed surface in layers=
+    // (FLIPPED, D1 M5: it read "withdrawn") and the outlook token carries
+    // no residue...
     await page.waitForFunction(() => {
       const raw = new URLSearchParams(window.location.search).get('layers');
-      return raw !== null && !raw.split(',').includes('drought');
+      return raw !== null && raw.split(',').includes('drought');
     });
-    expect((await urlLayers(page)).has('drought')).toBe(false);
+    expect((await urlLayers(page)).has('drought')).toBe(true);
     expect(await search(page)).not.toContain('outlook=');
-    // ...no cluster button claims the failed display...
+    // ...the committed hazard stays pressed (FLIPPED, D1 M5: it read
+    // "no cluster button claims the failed display")...
     await expect(
       page.locator('.shell-cluster-btn[data-cluster="drought"]')
-    ).toHaveAttribute('aria-pressed', 'false');
+    ).toHaveAttribute('aria-pressed', 'true');
     // ...and no empty Drought surface remains registered: no time-bar
     // spec installed, no summary claim.
     await expect(page.locator('#shell-time')).toHaveAttribute('data-has-spec', 'false');
     await expect(page.locator('#shell-summary-primary')).not.toContainText('Drought Outlook');
 
     // Release the held, aborted first request LAST: a late stale
-    // response must not resurrect the withdrawn surface.
+    // response must not resurrect the failed surface (no time-bar spec),
+    // and the committed claim stays as it was (FLIPPED, D1 M5: the
+    // checkbox and the layers= entry stay).
     for (const release of heldMonthly.splice(0, heldMonthly.length)) release();
     await page.waitForTimeout(500);
-    await expect(layerCheckbox(page, 'drought')).not.toBeChecked();
-    expect((await urlLayers(page)).has('drought')).toBe(false);
+    await expect(layerCheckbox(page, 'drought')).toBeChecked();
+    expect((await urlLayers(page)).has('drought')).toBe(true);
     await expect(page.locator('#shell-time')).toHaveAttribute('data-has-spec', 'false');
   });
 });
@@ -649,7 +938,10 @@ test.describe('S4a mobile shape (390x844)', () => {
     await expect(page.locator('#conditions-strip-home + #conditions-strip')).toHaveCount(1);
     await expect(page.locator('#panel-region-home + #panel-region')).toHaveCount(1);
     await expect(page.locator('#brief-head-home + #brief-head')).toHaveCount(1);
-    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
+    // The phone shell seats Share in the right-edge column's utility group
+    // (src/ui/edge-column.ts); the same node moves, it is not cloned.
+    await expect(page.locator('#edge-column #edge-body-utility > #share-btn')).toHaveCount(1);
+    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(0);
   });
 });
 
@@ -719,6 +1011,7 @@ test.describe('S4 r4: off intent during activation reaches the abort path (DG-08
     // studio id is the unambiguous handle (the shared data-layer-key
     // locator matches both the panel and the studio input once open).
     await page.locator('#layers-studio-entry').click();
+    await expect.poll(() => new URL(page.url()).searchParams.get('studio')).toBe('layers');
     const studioDrought = page.locator('#studio-layer-toggle-drought');
     await expect(studioDrought).toBeVisible();
     await expect(studioDrought).toBeChecked();
@@ -727,8 +1020,12 @@ test.describe('S4 r4: off intent during activation reaches the abort path (DG-08
     // 10 seconds is comfortably under the 20-second budget the pre-fix path
     // would have had to exhaust first, and comfortably over any honest
     // teardown cost.
+    // The studio's condition surfaces are one radio group; a press on the
+    // chosen one turns it off through controller.deactivate (catalog.tsx
+    // onSinglePress). uncheck() cannot drive a radio.
+    await expect(studioDrought).toHaveAttribute('type', 'radio');
     const offAt = Date.now();
-    await studioDrought.uncheck();
+    await studioDrought.click();
 
     // THE assertion: the in-flight request is actually aborted, and well
     // inside the 20-second header budget the pre-seam path had to exhaust
@@ -760,5 +1057,399 @@ test.describe('S4 r4: off intent during activation reaches the abort path (DG-08
     await expect(studioDrought).not.toBeChecked();
     expect((await urlLayers(page)).has('drought')).toBe(false);
     await expect(page.locator('#shell-time')).toHaveAttribute('data-has-spec', 'false');
+  });
+});
+
+// D1 M8 imports. Import declarations are hoisted, so appending them beside the
+// describe that uses them keeps the cases above byte-identical (append only).
+import type { Page } from './offline-test';
+import { REGIONS, regionToMapLibreBounds } from '../src/config/regions';
+import type { RegionKey } from '../src/config/regions';
+
+test.describe('M8: the refit on a sidebar toggle (found-029, DDM-P10-T07)', () => {
+  // Collapsing or expanding the desktop column changes only the canvas WIDTH
+  // at this size, so a bare resize keeps the vertical span and the centre,
+  // while a refit changes the zoom and with it the vertical span.
+  test.use({ viewport: { width: 1280, height: 720 } });
+
+  interface Bounds {
+    readonly west: number;
+    readonly south: number;
+    readonly east: number;
+    readonly north: number;
+  }
+
+  // The production build has no map handle: the camera is read from the
+  // inline minimap canvas's `data-bounds` = west,south,east,north rounded to
+  // 4 decimals (src/ui/island/minimap.tsx; no rectangle is drawn). It keeps
+  // updating on the map's moveend while the collapsed sidebar hides it.
+  const FOOTPRINT = '.shell-minimap-map .shell-minimap-canvas';
+  // Equality with the fresh-boot oracle, per edge, in degrees: about 0.1 CSS
+  // px at the Washington State fit, far under the roughly 0.2 degree the
+  // Washington refit moves each latitude edge.
+  const ORACLE_TOLERANCE_DEG = 0.001;
+  // No-refit proofs: the Mercator vertical span of data-bounds is fixed by
+  // the canvas height and the zoom alone (a pan moves it by nothing), so a
+  // bare width resize holds it and a refit moves it. The smallest refit here
+  // (Washington State, zoom 6.28 on the 940 px open canvas to 6.43 on the
+  // 1280 px closed one) moves it by about 11 percent; the tolerance is 0.2
+  // percent.
+  const SPAN_TOLERANCE = 0.002;
+  const CENTRE_TOLERANCE_DEG = 0.001;
+  // The settle floor: the handler's 220 ms delay plus the longest refit
+  // flight in these cases (under 200 ms by MapLibre's flyTo arithmetic),
+  // with margin. It only decides WHEN reading may start; the proof is the
+  // assertion on the settled value, which must also hold for two reads.
+  const SETTLE_FLOOR_MS = 900;
+  const parseBounds = (raw: string): Bounds => {
+    const [west, south, east, north] = raw.split(',').map(Number);
+    if (
+      west === undefined || south === undefined || east === undefined || north === undefined ||
+      ![west, south, east, north].every(Number.isFinite)
+    ) {
+      throw new Error(`data-bounds is not west,south,east,north: ${raw}`);
+    }
+    return { west, south, east, north };
+  };
+
+  const mercatorY = (lat: number): number =>
+    Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360));
+  const verticalSpan = (bounds: Bounds): number =>
+    mercatorY(bounds.north) - mercatorY(bounds.south);
+  const spanChange = (after: Bounds, before: Bounds): number =>
+    Math.abs(verticalSpan(after) - verticalSpan(before)) / verticalSpan(before);
+  const centre = (bounds: Bounds): { lng: number; lat: number } => ({
+    lng: (bounds.west + bounds.east) / 2,
+    lat: (bounds.south + bounds.north) / 2
+  });
+
+  const pageNow = (page: Page): Promise<number> => page.evaluate(() => performance.now());
+
+  /** Poll until the footprint reads the same value twice in a row, no earlier
+   * than SETTLE_FLOOR_MS after `since` (page clock). With `oracle`, the two
+   * equal reads must also be the oracle's camera (ORACLE_TOLERANCE_DEG per
+   * edge): the refit's flight is driven by the map's render loop, so on a
+   * slow runner two reads 250 ms apart can match BEFORE a frame has moved the
+   * camera (s4-shell M8, GitHub run 37235148587: west -126.6329 against
+   * -126.0567, flaky once). Waiting for the fact the case asserts, not for
+   * the camera to stop, is the same assertion retried; a camera that never
+   * reaches the oracle still ends in `expectSameCamera` naming the edge, with
+   * the last stable read. */
+  async function settledBounds(page: Page, since: number, oracle?: Bounds): Promise<Bounds> {
+    const reads: { previous: string | null; settled: string | null; lastStable: string | null } = {
+      previous: null,
+      settled: null,
+      lastStable: null
+    };
+    const atOracle =(raw: string): boolean => {
+      if (oracle === undefined) return true;
+      const read = parseBounds(raw);
+      return (['west', 'south', 'east', 'north'] as const).every(
+        (edge) => Math.abs(read[edge] - oracle[edge]) <= ORACLE_TOLERANCE_DEG
+      );
+    };
+    try {
+      await expect
+        .poll(
+          async () => {
+            const [now, raw] = await page.evaluate(
+              (selector) =>
+                [
+                  performance.now(),
+                  document.querySelector(selector)?.getAttribute('data-bounds') ?? null
+                ] as const,
+              FOOTPRINT
+            );
+            const stable = raw !== null && raw === reads.previous && now - since >= SETTLE_FLOOR_MS;
+            reads.previous = raw;
+            if (stable) reads.lastStable = raw;
+            if (stable && atOracle(raw)) {
+              reads.settled = raw;
+              return true;
+            }
+            return false;
+          },
+          { intervals: [250], timeout: 15_000, message: 'the viewport footprint settles' }
+        )
+        .toBe(true);
+    } catch (error) {
+      // Never reached the oracle: hand the caller the last stable read so its
+      // `expectSameCamera` fails naming the edge and both values.
+      if (oracle === undefined || reads.lastStable === null) throw error;
+      return parseBounds(reads.lastStable);
+    }
+    return parseBounds(reads.settled!);
+  }
+
+  async function boot(page: Page, query: string): Promise<Bounds> {
+    await gotoApp(page, query);
+    await expect(page.locator(FOOTPRINT)).toHaveAttribute('data-bounds', /\S/);
+    return settledBounds(page, 0);
+  }
+
+  async function toggleSidebar(
+    page: Page,
+    to: 'closed' | 'open',
+    oracle?: Bounds
+  ): Promise<Bounds> {
+    const since = await pageNow(page);
+    await page.locator(to === 'closed' ? '#sidebar-collapse' : '#sidebar-expand').click();
+    if (to === 'closed') {
+      await expect(page.locator('#app')).toHaveClass(/\bsidebar-collapsed\b/);
+    } else {
+      await expect(page.locator('#app')).not.toHaveClass(/\bsidebar-collapsed\b/);
+    }
+    return settledBounds(page, since, oracle);
+  }
+
+  function expectSameCamera(actual: Bounds, oracle: Bounds, label: string): void {
+    for (const edge of ['west', 'south', 'east', 'north'] as const) {
+      expect(
+        Math.abs(actual[edge] - oracle[edge]),
+        `${label}: ${edge} ${actual[edge]} against the fresh boot's ${oracle[edge]}`
+      ).toBeLessThanOrEqual(ORACLE_TOLERANCE_DEG);
+    }
+  }
+
+  function regionBox(key: RegionKey): Bounds {
+    const region = REGIONS[key];
+    const [west, south, east, north] = regionToMapLibreBounds(region);
+    const pad = region.padding;
+    return { west: west - pad, south: south - pad, east: east + pad, north: north + pad };
+  }
+
+  function expectInside(inner: Bounds, outer: Bounds, label: string): void {
+    expect(inner.west, `${label}: west edge inside`).toBeGreaterThanOrEqual(outer.west);
+    expect(inner.east, `${label}: east edge inside`).toBeLessThanOrEqual(outer.east);
+    expect(inner.south, `${label}: south edge inside`).toBeGreaterThanOrEqual(outer.south);
+    expect(inner.north, `${label}: north edge inside`).toBeLessThanOrEqual(outer.north);
+  }
+
+  async function mapPoint(page: Page): Promise<{ x: number; y: number }> {
+    const box = await page.locator('#map canvas.maplibregl-canvas').boundingBox();
+    if (!box) throw new Error('the map canvas has no box');
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  }
+
+  async function drag(page: Page, from: { x: number; y: number }, dx: number, dy: number): Promise<void> {
+    await page.mouse.move(from.x, from.y);
+    await page.mouse.down();
+    await page.mouse.move(from.x + dx, from.y + dy, { steps: 6 });
+    await page.mouse.up();
+  }
+
+  test('opening or closing the sidebar keeps the committed region inside the remaining map area', async ({
+    page
+  }) => {
+    test.setTimeout(180_000);
+    for (const key of ['washington_state', 'national'] as const) {
+      const box = regionBox(key);
+      const openOracle = await boot(page, `?region=${key}`);
+      const closedOracle = await boot(page, `?region=${key}&sidebar=closed`);
+
+      // From a closed boot: expanding narrows the canvas. Before M8 the
+      // resize kept the closed zoom, so the region's west and east edges fell
+      // outside the remaining map area.
+      const expanded = await toggleSidebar(page, 'open', openOracle);
+      expectSameCamera(expanded, openOracle, `${key}: expand from a closed boot`);
+      expectInside(box, expanded, `${key}: expand from a closed boot`);
+      const collapsedAgain = await toggleSidebar(page, 'closed', closedOracle);
+      expectSameCamera(collapsedAgain, closedOracle, `${key}: collapse after the expand`);
+      expectInside(box, collapsedAgain, `${key}: collapse after the expand`);
+
+      // From an open boot: collapsing widens the canvas; the refit fills the
+      // wider area exactly as a closed boot frames it.
+      await boot(page, `?region=${key}`);
+      const collapsed = await toggleSidebar(page, 'closed', closedOracle);
+      expectSameCamera(collapsed, closedOracle, `${key}: collapse from an open boot`);
+      expectInside(box, collapsed, `${key}: collapse from an open boot`);
+      const reopened = await toggleSidebar(page, 'open', openOracle);
+      expectSameCamera(reopened, openOracle, `${key}: expand after the collapse`);
+      expectInside(box, reopened, `${key}: expand after the collapse`);
+    }
+  });
+
+  test('toggle refits committed framing without URL or briefing side effects', async ({ page }) => {
+    test.setTimeout(240_000);
+    const withoutSidebar = async (): Promise<string[]> => {
+      const params = new URLSearchParams(await search(page));
+      params.delete('sidebar');
+      return [...params.entries()].map(([name, value]) => `${name}=${value}`).sort();
+    };
+    const sidebarTokens = async (): Promise<string[]> =>
+      new URLSearchParams(await search(page)).getAll('sidebar');
+    const panelState = (): Promise<string> =>
+      page.evaluate(() => {
+        const panel = document.getElementById('impact-panel');
+        if (!panel) return 'absent';
+        return `${panel.hidden ? 'hidden' : 'shown'}/${panel.classList.contains('open') ? 'open' : 'closed'}`;
+      });
+
+    for (const query of ['?region=national', '?region=washington_state', '?framing=all', '?framing=arid-west']) {
+      const closedOracle = await boot(page, `${query}&sidebar=closed`);
+      const openOracle = await boot(page, query);
+      const keysBefore = await withoutSidebar();
+      const panelBefore = await panelState();
+      expect(await sidebarTokens(), `${query}: an open boot carries no sidebar=`).toEqual([]);
+
+      // The oracle makes the settle wait for the camera the case asserts, as
+      // the :1278 case does (GitHub run 37282168792, S30D B3 CI3: on a slow
+      // runner two equal reads came before the refit's flight landed, west
+      // -124.6708 against -125.094; the same assertion below still decides).
+      const collapsed = await toggleSidebar(page, 'closed', closedOracle);
+      expect(await withoutSidebar(), `${query}: collapse writes nothing but sidebar=`).toEqual(keysBefore);
+      expect(await sidebarTokens(), `${query}: collapse writes sidebar=closed`).toEqual(['closed']);
+      expect(await panelState(), `${query}: collapse leaves the briefing alone`).toBe(panelBefore);
+      expectSameCamera(collapsed, closedOracle, `${query}: collapse`);
+
+      const expanded = await toggleSidebar(page, 'open', openOracle);
+      expect(await withoutSidebar(), `${query}: expand writes nothing but sidebar=`).toEqual(keysBefore);
+      expect(await sidebarTokens(), `${query}: expand drops sidebar=`).toEqual([]);
+      expect(await panelState(), `${query}: expand leaves the briefing alone`).toBe(panelBefore);
+      expectSameCamera(expanded, openOracle, `${query}: expand`);
+    }
+  });
+
+  test('a panned camera keeps its visible centre across a sidebar toggle', async ({ page }) => {
+    await boot(page, '?region=washington_state');
+    const dragSince = await pageNow(page);
+    await drag(page, await mapPoint(page), -180, -90);
+    const panned = await settledBounds(page, dragSince);
+
+    const collapsed = await toggleSidebar(page, 'closed');
+    expect(
+      Math.abs(centre(collapsed).lng - centre(panned).lng),
+      'the panned centre longitude holds'
+    ).toBeLessThanOrEqual(CENTRE_TOLERANCE_DEG);
+    expect(
+      Math.abs(centre(collapsed).lat - centre(panned).lat),
+      'the panned centre latitude holds'
+    ).toBeLessThanOrEqual(CENTRE_TOLERANCE_DEG);
+    expect(spanChange(collapsed, panned), 'no refit: the vertical span holds').toBeLessThanOrEqual(
+      SPAN_TOLERANCE
+    );
+  });
+
+  test('a pan during the transition cancels refit', async ({ page }) => {
+    const before = await boot(page, '?region=washington_state');
+    const point = await mapPoint(page);
+    // found-133 and found-101: the case used to bound the time between the
+    // collapse click and the first dragging move at 180 ms of the 220 ms
+    // refit delay, counted across Playwright round trips. A slow runner spent
+    // 235 to 246 ms there and the bound could not tell a late drag from a
+    // broken cancellation. The 220 ms refit timer (src/ui/sidebar.ts,
+    // resizeAfterSidebarToggle) is now held, by this page only, from the
+    // click until the case releases it: the drag therefore begins inside the
+    // refit's delay by construction on any runner, with no bound to miss.
+    // Three facts keep it honest: the click armed exactly one 220 ms timer
+    // and it had not run; real (trusted) dragging moves reached the page and
+    // moved the camera before the release; and the timer, once released,
+    // decides exactly as it would have (the refit fires or is cancelled by
+    // the app's own cameraStateUnchanged check, which the case asserts).
+    await page.evaluate(() => {
+      const w = window as unknown as {
+        __refitHold: {
+          armed: boolean;
+          held: Array<() => void>;
+          fired: number;
+          trustedDragMoves: number;
+          release: () => void;
+        };
+      };
+      const realSetTimeout = window.setTimeout.bind(window);
+      const hold = {
+        armed: false,
+        held: [] as Array<() => void>,
+        fired: 0,
+        trustedDragMoves: 0,
+        release: (): void => {
+          const run = hold.held.splice(0);
+          for (const callback of run) {
+            hold.fired += 1;
+            callback();
+          }
+        }
+      };
+      w.__refitHold = hold;
+      window.addEventListener(
+        'mousemove',
+        (event: MouseEvent) => {
+          if (event.isTrusted && event.buttons !== 0) hold.trustedDragMoves += 1;
+        },
+        true
+      );
+      window.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+        if (hold.armed && timeout === 220 && typeof handler === 'function') {
+          hold.held.push(() => (handler as (...a: unknown[]) => void)(...args));
+          return -hold.held.length;
+        }
+        return realSetTimeout(handler, timeout, ...args);
+      }) as typeof window.setTimeout;
+      hold.armed = true;
+    });
+    await page.locator('#sidebar-collapse').click();
+    await expect(page.locator('#app')).toHaveClass(/\bsidebar-collapsed\b/);
+    const armed = await page.evaluate(() => {
+      const hold = (window as unknown as { __refitHold: { armed: boolean; held: unknown[] } }).__refitHold;
+      hold.armed = false;
+      return hold.held.length;
+    });
+    expect(armed, 'the collapse click armed exactly one 220 ms refit timer, held and not yet run').toBe(1);
+
+    const readBounds = (): Promise<string> =>
+      page.evaluate((selector) => document.querySelector(selector)?.getAttribute('data-bounds') ?? '', FOOTPRINT);
+    const dragStart = await readBounds();
+    await drag(page, point, -160, 80);
+    await expect
+      .poll(
+        () => readBounds(),
+        { message: 'the real drag moved the camera while the refit timer was still held', timeout: 15_000 }
+      )
+      .not.toBe(dragStart);
+    const mid = await page.evaluate(() => {
+      const hold = (
+        window as unknown as { __refitHold: { held: unknown[]; fired: number; trustedDragMoves: number } }
+      ).__refitHold;
+      return { held: hold.held.length, fired: hold.fired, trustedDragMoves: hold.trustedDragMoves };
+    });
+    expect(mid.trustedDragMoves, 'real dragging mouse moves reached the page').toBeGreaterThan(0);
+    expect(mid, 'the refit timer was still held when the drag moved the camera').toMatchObject({
+      held: 1,
+      fired: 0
+    });
+
+    const since = await pageNow(page);
+    await page.evaluate(() => (window as unknown as { __refitHold: { release: () => void } }).__refitHold.release());
+
+    const after = await settledBounds(page, since);
+    expect(spanChange(after, before), 'no refit: the vertical span keeps the pre-toggle zoom').toBeLessThanOrEqual(
+      SPAN_TOLERANCE
+    );
+  });
+
+  test('a pitched camera keeps its live camera across a sidebar toggle', async ({ page }) => {
+    test.setTimeout(120_000);
+    const flat = await boot(page, '?region=washington_state');
+    const canvas = page.locator('#map canvas.maplibregl-canvas');
+    await canvas.focus();
+    const pitchSince = await pageNow(page);
+    await page.keyboard.press('Shift+ArrowUp');
+    await page.keyboard.press('Shift+ArrowUp');
+    const pitched = await settledBounds(page, pitchSince);
+    // The pitch landed: a tilted view reaches further north on screen.
+    expect(spanChange(pitched, flat), 'the keyboard pitch changed the view').toBeGreaterThan(SPAN_TOLERANCE);
+
+    const collapsed = await toggleSidebar(page, 'closed');
+    expect(spanChange(collapsed, pitched), 'no refit: the pitched vertical span holds').toBeLessThanOrEqual(
+      SPAN_TOLERANCE
+    );
+
+    // Reduced motion changes only HOW a flat committed camera refits (a jump),
+    // never WHETHER it does.
+    await page.emulateMedia({ reducedMotion: 'reduce' });
+    const closedOracle = await boot(page, '?region=washington_state&sidebar=closed');
+    await boot(page, '?region=washington_state');
+    const jumped = await toggleSidebar(page, 'closed');
+    expectSameCamera(jumped, closedOracle, 'reduced motion: collapse');
   });
 });

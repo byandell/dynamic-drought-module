@@ -43,9 +43,6 @@ const BAKE_MAX_ZOOM = 9; // measured; the committed depth is chosen by size belo
 const TILE_SIZE = 512;
 /**
  * Stay in the hillshade archive's proven same-origin hosting envelope.
- * This MUST equal the enforced dataAssets maxBytes for
- * data/fuels-fbfm40-pnw.pmtiles in scripts/check-activation-budget.mjs, or
- * a rebake could pass here and fail the gate (or vice versa).
  */
 const SIZE_BUDGET_BYTES = 30_000_000;
 /** The canary-proven depth; emitting shallower would ship an archive whose
@@ -192,10 +189,7 @@ async function main() {
   const archive = result.archives.get(fit.zoom);
   if (!archive) throw new Error(`no archive emitted for max zoom ${fit.zoom}`);
 
-  await writeFile(OUT_PATH, archive);
-  console.log(`  wrote ${OUT_PATH} (${archive.length.toLocaleString()} bytes)`);
-
-  // Validate: read the archive back through the runtime pmtiles reader.
+  // Validate before writing: read the archive back through the runtime pmtiles reader.
   const source = {
     getKey: () => 'build',
     getBytes: async (offset, length) => {
@@ -209,6 +203,8 @@ async function main() {
   const sampleZ = Math.min(7, fit.zoom);
   const sample = await reader.getZxy(sampleZ, lonToTileX(-122.7, sampleZ), latToTileY(44.0, sampleZ));
   if (!sample) throw new Error('validation failed: sample tile did not decode');
+  await writeFile(OUT_PATH, archive);
+  console.log(`  wrote ${OUT_PATH} (${archive.length.toLocaleString()} bytes)`);
   console.log('\nvalidation:');
   console.log(`  header zooms ${header.minZoom}..${header.maxZoom}, tileType ${header.tileType}`);
   console.log(`  sample tile z${sampleZ} decoded: ${sample.data.byteLength} bytes`);

@@ -2,16 +2,13 @@
  * The S4 main-screen shell island (the S4 design record sections 2-3;
  * D-0.7.0-042/052/074; ADR 0002: new UI surfaces are Preact islands).
  *
- * The left panel is a LAUNCH PAD, not a dashboard: one control per
- * decision, in the ruled order VIEW (which hazard) -> CONDITIONS IN VIEW
- * (the honest S3 DisplaySummary plus live metrics) -> CURRENT REGION ->
- * MAP CONTEXT (the S4b minimap) -> WHEN (the compact temporal row; detail
- * behind the S4c "More time" popover) -> SHARE -> REFINE. Depth lives in
- * the studios; the doors to them stay where E1 put them
- * (src/ui/view-shell.ts renders the capability-gated
- * PLACE/LAYERS pair against the real studio-route API, including the
- * embed link-out form, so this island deliberately does NOT duplicate
- * that surface).
+ * Shared desktop order: hazard, time horizon, regional navigation, and place
+ * search. Variable view details follow Place, Layers, and Tribal Nations.
+ * Share stays in the map column's slot 4 in every view. The
+ * active condition readout is one line under the map's Key chip in Brief and
+ * below the hazard buttons in Console; source details stay available
+ * through the map key and the Impact Briefing.
+ * Place and Layers studios keep their existing route and restoration logic.
  *
  * The four cluster buttons render COMMITTED truth, never optimistic
  * click state: aria-pressed mirrors the CommittedShellSnapshot's
@@ -44,10 +41,11 @@ import { useEffect, useLayoutEffect, useRef } from 'preact/hooks';
 import {
   HAZARD_CLUSTERS,
   HAZARD_CLUSTER_KEYS,
-  TEMPORAL_HORIZON_CHIP_LABELS,
   TEMPORAL_HORIZON_KEYS
 } from '../../config/clusters';
 import type { HazardClusterKey, TemporalHorizonKey } from '../../config/clusters';
+import { HORIZON_CHROME, SHELL_HORIZON_KEY } from '../../impact/horizon-chrome';
+import { clusterHorizonReason } from '../horizon-reason';
 import type { FramingSelection } from '../../config/framings';
 import { getLayerDef } from '../../config/layers';
 import {
@@ -59,6 +57,15 @@ import {
 } from '../../state/cluster-service';
 import type { CommittedShellSnapshot } from '../../state/cluster-service';
 import { requestBasemapMode } from '../../map/basemap-switcher';
+import { defaultBasemapFor } from '../../state/basemap-store';
+import { takeEnsoCamera } from '../../map/enso-camera';
+import { restoreCameraState } from '../../map/camera-fit';
+import {
+  backToMap,
+  getStudioRoute,
+  studioOwnsScreen
+} from '../../state/studio-route';
+import { setPlaceReturnDisplayCommand } from '../../state/place-return';
 import { onTimeBarSpecChange } from '../time-bar';
 import { Fire3DControl } from './fire3d-control';
 import { Minimap } from './minimap';
@@ -69,29 +76,23 @@ const DESKTOP_SHELL_QUERY = '(min-width: 721px)';
 
 const SHELL_REHOST_SEATS = [
   {
+    // Parked unseen in the floating window's dock; the Key chip carries its lead reading (owner 2026-11-13).
     nodeId: 'conditions-strip',
     homeId: 'conditions-strip-home',
-    hostId: 'conditions-strip-dock'
-  },
-  {
-    nodeId: 'legend-panel',
-    homeId: 'legend-panel-home',
-    hostId: 'sidebar-key-host'
+    hostId: 'conditions-strip-dock',
+    onMap: true
   },
   {
     nodeId: 'panel-region',
     homeId: 'panel-region-home',
-    hostId: 'shell-region-host'
-  },
-  {
-    nodeId: 'share-btn',
-    homeId: 'share-btn-home',
-    hostId: 'shell-share-host'
+    hostId: 'shell-region-host',
+    onMap: false
   },
   {
     nodeId: 'brief-head',
     homeId: 'brief-head-home',
-    hostId: 'shell-refine-host'
+    hostId: 'shell-refine-host',
+    onMap: false
   }
 ] as const;
 
@@ -99,6 +100,7 @@ interface ShellRehostSeat {
   readonly node: HTMLElement;
   readonly home: HTMLElement;
   readonly host: HTMLElement;
+  readonly onMap: boolean;
 }
 
 function shellRehostSeats(): readonly ShellRehostSeat[] | null {
@@ -108,17 +110,18 @@ function shellRehostSeats(): readonly ShellRehostSeat[] | null {
     const home = document.getElementById(ids.homeId);
     const host = document.getElementById(ids.hostId);
     if (!node || !home || !host) return null;
-    seats.push({ node, home, host });
+    seats.push({ node, home, host, onMap: ids.onMap });
   }
   return seats;
 }
 
 /**
- * Seat the existing region, share, and Brief-head nodes inside the ordered
- * desktop Brief shell, and its condition readout plus legend in the fixed
- * sidebar dock. No surface is cloned or rewired: moving each node preserves
+ * Seat the existing region and Brief-head nodes inside the ordered
+ * desktop Brief shell, and park its condition readout, unseen, in the
+ * floating window's dock, where it keeps computing the Key chip's lead
+ * reading. No surface is cloned or rewired: moving each node preserves
  * its island root, controls, listeners, and live state. Every ineligible
- * presentation returns all five nodes to static HTML homes.
+ * presentation returns all three nodes to static HTML homes.
  */
 function useDesktopBriefRehost(): void {
   useLayoutEffect(() => {
@@ -163,17 +166,17 @@ function useDesktopBriefRehost(): void {
         seats.some(({ node }) => node.contains(lastRehostFocus))
           ? lastRehostFocus
           : null);
-      const useShell =
+      const briefShell =
         seats.every(({ node, home, host }) =>
           node.isConnected && home.isConnected && host.isConnected
         ) &&
         widthQuery.matches &&
         app.classList.contains('view-brief') &&
-        !app.classList.contains('embed') &&
-        !app.classList.contains('sidebar-collapsed');
+        !app.classList.contains('embed');
+      const useShell = briefShell && !app.classList.contains('sidebar-collapsed');
 
-      for (const { node, home, host } of seats) {
-        if (useShell) {
+      for (const { node, home, host, onMap } of seats) {
+        if (onMap ? briefShell : useShell) {
           if (node.parentElement !== host) host.appendChild(node);
         } else if (
           node.parentElement !== home.parentElement ||
@@ -223,57 +226,67 @@ function isPending(snap: CommittedShellSnapshot): boolean {
 }
 
 /**
- * The honest reason a horizon chip is disabled for a CUSTOM composition,
- * or null when the chip is honestly applicable (DG-080 r2 finding 1).
+ * The honest reason a horizon chip is disabled, or null when the chip is
+ * honestly applicable (DR-017 a). Two independent cases:
  *
- * A custom set has no recipe, so a horizon switch cannot re-resolve the
- * displayed layers; committing the register alone would press a chip
- * for a time the map does not show (the two review counterexamples:
- * custom plus the US Drought Monitor with Weeks ahead clicked, and
- * custom plus the Seasonal outlook with Current clicked). The ONE
- * honest exception is flipping BETWEEN the two outlook horizons while
- * the CPC Drought Outlook surface is part of the custom display: that
- * mounted surface follows the outlook register itself and re-renders
- * the register the chip claims. The committed chip stays enabled (an
- * idempotent no-op press, and the honest pressed state).
+ * CUSTOM composition (DG-080 r2 finding 1, unchanged): a custom set has
+ * no recipe, so a horizon switch cannot re-resolve the displayed layers;
+ * committing the register alone would press a chip for a time the map
+ * does not show (the two review counterexamples: custom plus the US
+ * Drought Monitor with Weeks ahead clicked, and custom plus the Seasonal
+ * outlook with Current clicked). The ONE honest exception is flipping
+ * BETWEEN the two outlook horizons while the CPC Drought Outlook surface
+ * is part of the custom display: that mounted surface follows the
+ * outlook register itself and re-renders the register the chip claims.
+ * The committed chip stays enabled (an idempotent no-op press, and the
+ * honest pressed state).
+ *
+ * A COMMITTED cluster (DDM-P8-T03): `clusterHorizonReason`
+ * (src/ui/horizon-reason.ts), from the recipe's capability signature only;
+ * no import of `matrix.ts`, `hydrate.ts` or any claim module may appear in
+ * this file either.
  */
-function customHorizonDisabledReason(
+function horizonDisabledReason(
   snap: CommittedShellSnapshot,
   key: TemporalHorizonKey
 ): string | null {
-  if (snap.cluster !== 'custom') return null;
-  if (key === snap.horizon) return null;
-  const outlookDisplayed = snap.intendedKeys.has('drought');
-  if (outlookDisplayed && key !== 'current') return null;
-  return (
-    'Not available for this custom layer set: applying this time horizon ' +
-    'would change which layers are displayed, and a custom set keeps the ' +
-    'layers you chose. Pick a hazard view to change the time horizon.'
-  );
+  if (snap.cluster === 'custom') {
+    if (key === snap.horizon) return null;
+    const outlookDisplayed = snap.intendedKeys.has('drought');
+    if (outlookDisplayed && key !== 'current') return null;
+    return (
+      'Not available for this custom layer set: applying this time horizon ' +
+      'would change which layers are displayed, and a custom set keeps the ' +
+      'layers you chose. Pick a hazard view to change the time horizon.'
+    );
+  }
+  return clusterHorizonReason(snap.cluster, key);
 }
 
 interface ShellProps {
   readonly map: maplibregl.Map;
   readonly snap: ReadonlySignal<CommittedShellSnapshot>;
   readonly framing: ReadonlySignal<FramingSelection>;
-  readonly specTick: ReadonlySignal<number>;
+  readonly onMinimapNoteChange: (note: string) => void;
 }
 
 /**
  * The compact-band framing door and its popover (the 600-699px height
- * band's only "where" control). Carries the same popover discipline as
- * the More time detail: focus moves in on open, restores to the door on
- * close, and the light-dismissing pointer gesture is consumed rather
- * than clicking through to the map.
+ * band's only "where" control). Carries the shared popover discipline:
+ * focus moves in on open, restores to the door on close, and the
+ * light-dismissing pointer gesture is consumed rather than clicking
+ * through to the map.
  */
 function MinimapPopover({
   map,
   framing,
-  metricContext
+  metricContext,
+  horizon
 }: {
   readonly map: maplibregl.Map;
   readonly framing: ReadonlySignal<FramingSelection>;
-  readonly metricContext: CommittedShellSnapshot['cluster'];
+  readonly metricContext: HazardClusterKey;
+  readonly horizon: CommittedShellSnapshot['horizon'];
 }) {
   const doorRef = useRef<HTMLButtonElement>(null);
   const popRef = useRef<HTMLDivElement>(null);
@@ -308,22 +321,95 @@ function MinimapPopover({
           framing={framing}
           idPrefix="shell-minimap-pop"
           metricContext={metricContext}
+          horizon={horizon}
         />
       </div>
     </div>
   );
 }
 
-function Shell({ map, snap, framing, specTick }: ShellProps) {
+function Shell({ map, snap, framing, onMinimapNoteChange }: ShellProps) {
   useDesktopBriefRehost();
+
+  // The sticky horizon row sits under the sticky mode row, so it needs that
+  // row's live height (font load, touch floor, text zoom); the column's
+  // scroll padding needs both, so they sit on the scroller.
+  const shellRef = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const shell = shellRef.current;
+    const view = shell?.querySelector<HTMLElement>('.shell-view');
+    const when = shell?.querySelector<HTMLElement>('.shell-when');
+    if (!shell || !view || !when || typeof ResizeObserver !== 'function') return;
+    const scroller = shell.closest<HTMLElement>('.sidebar-scroll') ?? shell;
+    const observer = new ResizeObserver(() => {
+      scroller.style.setProperty('--shell-view-h', `${view.offsetHeight}px`);
+      scroller.style.setProperty('--shell-when-h', `${when.offsetHeight}px`);
+    });
+    observer.observe(view);
+    observer.observe(when);
+    return () => observer.disconnect();
+  }, []);
 
   const snapshot = snap.value;
   const pending = isPending(snapshot);
 
+  /**
+   * Run a display command that the Place studio would otherwise reverse
+   * (Codex adversarial review 2026-09-10, finding 6).
+   *
+   * The sidebar became reachable from inside a studio on 2026-09-10, which
+   * was an accessibility fix: the narrowed inert scope means a keyboard or
+   * screen-reader user can finally reach these controls while a studio is
+   * open. Making a control FOCUSABLE, though, does not make its command
+   * compatible with the state machine underneath it. The Place studio
+   * captures the display on entry and reasserts that capture on every intent
+   * change (`enforceCleanIntent`, src/state/display-snapshot.ts), then
+   * restores it again on exit. A cluster or horizon requested from the
+   * exposed sidebar was therefore stripped within a microtask and then
+   * overwritten a second time on the way out: an apparently operative choice
+   * that did not survive, which is worse than one that was never offered.
+   *
+   * The fix is to sequence, not to suppress. The command is deferred behind
+   * the studio's OWN exit, using the ruled restore-then-act ordering the
+   * selected-exit briefing hand-off already uses (run by the island's
+   * unmount cleanup AFTER `restoreDisplaySnapshot`). So clicking Wildfire
+   * from inside Place studio leaves the studio and lands on Wildfire, which
+   * is what the control says it does. Nothing about the snapshot contract
+   * changes: the studio still captures on entry and still restores on exit,
+   * and the new display is applied after that restore rather than in a race
+   * with it.
+   *
+   * The command has its OWN hand-off slot (`setPlaceReturnDisplayCommand`,
+   * src/state/place-return.ts), not the briefing's. The first cut wrote it
+   * through `setPlaceReturnBriefing`, the single slot the studio uses for
+   * the briefing of its selected place, so a hazard click after a selection
+   * silently dropped the promised briefing (/code-review, 2026-09-10). Both
+   * now survive: the exit runs the display command, then opens the briefing.
+   *
+   * Only the PLACE studio needs this. The Layers studio is the layer editor;
+   * edits there are meant to persist and it captures no snapshot to reassert.
+   */
+  const runDisplayCommand = (apply: () => void): void => {
+    if (studioOwnsScreen() && getStudioRoute() === 'place') {
+      setPlaceReturnDisplayCommand(apply);
+      backToMap();
+      return;
+    }
+    apply();
+  };
+
   const chooseCluster = (key: HazardClusterKey): void => {
-    requestCluster(key);
-    const preferredBasemap = HAZARD_CLUSTERS[key].preferredBasemap;
-    if (preferredBasemap) requestBasemapMode(map, preferredBasemap);
+    runDisplayCommand(() => {
+      requestCluster(key);
+      // Every switch applies the new mode's default; a SAT press does not outlive its mode.
+      requestBasemapMode(map, defaultBasemapFor(key));
+      // Leaving ENSO from a custom composition: the store already said drought, so
+      // the cluster subscriber saw no change; the held camera is restored here.
+      if (key !== 'enso') {
+        const heldCamera = takeEnsoCamera();
+        if (heldCamera) restoreCameraState(map, heldCamera);
+      }
+    });
   };
 
   const chooseHorizon = (key: TemporalHorizonKey): void => {
@@ -331,11 +417,11 @@ function Shell({ map, snap, framing, specTick }: ShellProps) {
     // commit (it re-resolves an explicit cluster once via its own
     // timeline subscription, applies the derived boot case itself, and
     // lets a 'custom' display keep its set).
-    requestHorizon(key);
+    runDisplayCommand(() => requestHorizon(key));
   };
 
   return (
-    <div class="shell">
+    <div class="shell" ref={shellRef}>
       <div class="shell-view" role="group" aria-label="Hazard view">
         {HAZARD_CLUSTER_KEYS.map((key) => {
           const def = HAZARD_CLUSTERS[key];
@@ -366,51 +452,23 @@ function Shell({ map, snap, framing, specTick }: ShellProps) {
         })}
       </div>
 
-      <Fire3DControl cluster={snapshot.cluster} />
-
-      <section
-        class="shell-summary"
-        id="shell-conditions-summary"
-        aria-labelledby="shell-conditions-heading"
-      >
-        <h2 class="panel-title sr-only" id="shell-conditions-heading">Conditions in view</h2>
-        <p class="shell-summary-primary sr-only" id="shell-summary-primary">
-          {snapshot.summary.primary}
-        </p>
-        {/* The live region stays PERSISTENTLY rendered and visible; only
-            its text swaps. A region that is unhidden in the same render
-            that sets its text is unreliably announced across screen
-            readers (NVDA/Firefox drop it), so hidden/display toggling is
-            deliberately avoided; an empty paragraph renders nothing. */}
-        <p
-          class="shell-summary-caveat"
-          id="shell-summary-caveat"
-          aria-live="polite"
-        >
-          {snapshot.summary.caveat ?? ''}
-        </p>
-      </section>
-
-      <div class="shell-minimap-map">
-        <Minimap
-          map={map}
-          framing={framing}
-          idPrefix="shell-minimap"
-          metricContext={snapshot.selectedHazard}
-        />
-      </div>
-      <MinimapPopover
-        map={map}
-        framing={framing}
-        metricContext={snapshot.selectedHazard}
-      />
-      <div class="shell-rehost" id="shell-region-host" />
-      <div class="shell-rehost shell-search-host" id="shell-refine-host" />
-
       <div class="shell-when" role="group" aria-label="Time horizon">
         <div class="shell-horizons">
           {TEMPORAL_HORIZON_KEYS.map((key) => {
-            const disabledReason = customHorizonDisabledReason(snapshot, key);
+            // DDM-P8-T03 step 3 STOP RULE: a visible `.shell-horizon-note`
+            // per disabled chip was tried and reverted (interface-
+            // responsive.spec.ts's tablet band at 900x675 landscape went
+            // red: "button.shell-horizon-btn over button.conditions-metric",
+            // a real control collision, not a flaky measurement). The
+            // reason still reaches every consumer honestly through
+            // `aria-disabled` plus `title` (unchanged, WCAG-valid, and the
+            // pattern this shell already used for the custom-composition
+            // case); only the always-visible prose line is deferred. See
+            // "Owner decisions" in this task's report: the visible-text
+            // half of DR-017 a needs an `app.css` grant (DDM-P10-T04
+            // territory), and this clause lands partial until then.
+            const disabledReason = horizonDisabledReason(snapshot, key);
+            const chrome = HORIZON_CHROME[SHELL_HORIZON_KEY[key]];
             return (
               <button
                 type="button"
@@ -419,23 +477,79 @@ function Shell({ map, snap, framing, specTick }: ShellProps) {
                 data-horizon={key}
                 aria-pressed={snapshot.horizon === key}
                 aria-disabled={disabledReason !== null ? 'true' : undefined}
-                title={disabledReason ?? undefined}
+                // The sub-line ("now", "days to weeks") left the face (visual
+                // uniformity wave 1, D4): it is the tooltip and the accessible
+                // description. A disabled chip states its reason there instead;
+                // the briefing's horizon headings carry the sub-line always.
+                title={disabledReason ?? chrome.subtitle}
                 onClick={() => {
                   if (disabledReason === null) chooseHorizon(key);
                 }}
               >
-                {TEMPORAL_HORIZON_CHIP_LABELS[key]}
+                <span class="shell-horizon-btn-title">{chrome.title}</span>
               </button>
             );
           })}
         </div>
-        <TimeCompact specTick={specTick} />
       </div>
 
-      <div class="shell-rehost shell-share-host" id="shell-share-host" />
-
+      <div class="shell-minimap-map">
+        <Minimap
+          map={map}
+          framing={framing}
+          idPrefix="shell-minimap"
+          metricContext={snapshot.selectedHazard}
+          horizon={snapshot.horizon}
+          onNoteChange={onMinimapNoteChange}
+        />
+      </div>
+      <MinimapPopover
+        map={map}
+        framing={framing}
+        metricContext={snapshot.selectedHazard}
+        horizon={snapshot.horizon}
+      />
+      <div class="shell-rehost" id="shell-region-host" />
+      <div class="shell-rehost shell-search-host" id="shell-refine-host" />
     </div>
   );
+}
+
+/** Variable claims and optional controls do not displace shared navigation. */
+function ShellDetails({ map, snap, framingNote }: {
+  readonly map: maplibregl.Map;
+  readonly snap: ReadonlySignal<CommittedShellSnapshot>;
+  readonly framingNote: ReadonlySignal<string>;
+}) {
+  const snapshot = snap.value;
+  return (
+    <>
+      <Fire3DControl cluster={snapshot.cluster} map={map} />
+      <section class="shell-summary" id="shell-conditions-summary" aria-labelledby="shell-conditions-heading">
+        {/* The strip owns the "Conditions in view" region; this one names what is displayed. */}
+        <h2 class="panel-title sr-only" id="shell-conditions-heading">Display summary</h2>
+        <p class="shell-summary-primary sr-only" id="shell-summary-primary">{snapshot.summary.primary}</p>
+        {/* Keep the live regions mounted as their text changes. */}
+        <p class="shell-summary-caveat" id="shell-summary-caveat" aria-live="polite">
+          {snapshot.summary.caveat ?? ''}
+        </p>
+      </section>
+      <p class="sr-only" id="shell-framing-note" aria-live="polite">{framingNote.value}</p>
+      {/* The disabled chips' reasons ride each chip's title; their visible text reads in Technical information. */}
+    </>
+  );
+}
+
+/**
+ * The date line at the very foot of the column (owner 2026-11-13): drawn in
+ * Console only by CSS, so Brief keeps it mounted for text and attributes.
+ * A wrapper so this root subscribes to the committed snapshot.
+ */
+function ShellTimeFoot({ snap, specTick }: {
+  readonly snap: ReadonlySignal<CommittedShellSnapshot>;
+  readonly specTick: ReadonlySignal<number>;
+}) {
+  return <TimeCompact specTick={specTick} pressedHorizon={snap.value.horizon} />;
 }
 
 /**
@@ -462,8 +576,14 @@ export function mountShell(host: HTMLElement, map: maplibregl.Map): void {
     specTick.value = specTick.value + 1;
   });
 
+  const framingNote = signal('');
+  const onMinimapNoteChange = (note: string): void => { framingNote.value = note; };
   render(
-    <Shell map={map} snap={snap} framing={framing} specTick={specTick} />,
+    <Shell map={map} snap={snap} framing={framing} onMinimapNoteChange={onMinimapNoteChange} />,
     host
   );
+  const detailsHost = document.getElementById('shell-details-island');
+  if (detailsHost) render(<ShellDetails map={map} snap={snap} framingNote={framingNote} />, detailsHost);
+  const timeHost = document.getElementById('shell-time-island');
+  if (timeHost) render(<ShellTimeFoot snap={snap} specTick={specTick} />, timeHost);
 }

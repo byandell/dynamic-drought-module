@@ -43,18 +43,23 @@ import { readCurrentWorkerRevision, readWorkerRevision } from './lib/worker-revi
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const URLS_PATH = join(__dirname, '..', 'src', 'config', 'urls.ts');
 /** The catalog's boot slice (DR-008a, 2026-09-03): the literals the eager
- * boot graph reads (the OpenStreetMap tile template among them) live here and
- * are re-exported by urls.ts under their old keys, so extraction must read
- * both files or the basemap probe silently disappears. */
+ * boot graph reads live here and are re-exported by urls.ts under their old
+ * keys, so extraction must read both files or a boot probe silently disappears. */
 const URLS_BOOT_PATH = join(__dirname, '..', 'src', 'config', 'urls-boot.ts');
+/** The Wildfire 3D ground's NOAA STAR land-cover tile template (2026-10-11):
+ * kept beside the ground's own config so the catalog chunk does not grow,
+ * written in the catalog's `key: 'https...'` form so it is extracted and
+ * probed here like any catalog key (runtime tier by default). */
+const DRYNESS_GROUND_URLS_PATH = join(__dirname, '..', 'src', 'config', 'dryness-ground.ts');
 
-/** The catalog and its boot slice as one extraction source. */
+/** The catalog, its boot slice and the ground's one address as one extraction source. */
 async function readUrlsSource() {
-  const [catalog, boot] = await Promise.all([
+  const [catalog, boot, ground] = await Promise.all([
     readFile(URLS_PATH, 'utf8'),
     readFile(URLS_BOOT_PATH, 'utf8'),
+    readFile(DRYNESS_GROUND_URLS_PATH, 'utf8'),
   ]);
-  return `${catalog}\n${boot}`;
+  return `${catalog}\n${boot}\n${ground}`;
 }
 
 const TIMEOUT_MS = 15_000;
@@ -70,7 +75,6 @@ export const DRIFT_TIERS = Object.freeze({
  * New keys default to runtime: a maintainer must explicitly lower an endpoint
  * to candidate or build-only status instead of silently losing protection. */
 export const CANDIDATE_SOURCE_KEYS = new Set([
-  'basemapTopo',
   'cpcDroughtWMS',
   'biaTribalLeadersDirectory',
   'waEcologyCededLands',
@@ -212,13 +216,19 @@ const TEMPLATE_SUBSTITUTIONS = [
   // GIBS WMTS accepts the literal keyword 'default' in the TIME position
   // (the most recent granule). Without this the timed template 400s on the
   // literal token and the monitor cries wolf (verified 2026-07-09).
-  ['{TIME}', 'default']
+  ['{TIME}', 'default'],
+  // NOAA STAR's weekly tiles answer 500 for an unpublished week, and the newest
+  // week lags by days: probe a week that is long published (200 with ACAO *
+  // on 2026-10-11). Liveness of the endpoint, not of the current week.
+  ['{week}', '2026040']
 ];
 
 /** Keys whose bare root answers 4xx by design; probed with the consumer's
  * real form (or the documented health check) so a healthy service reads ok
  * and a FAIL means genuine drift, not a probe artifact. */
 const PROBE_SUFFIXES = new Map([
+  // The Wildfire 3D ground's fallback: the capabilities read the runtime makes first.
+  ['usgsRgConusWeekWms', '?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetCapabilities'],
   // ESRI service roots: ?f=json is the canonical liveness form.
   ['nifcRawsFeatureServer', '?f=json'],
   ['cpcWeeklySstAnomalyMapServer', '?f=json'],
@@ -259,7 +269,7 @@ const PROBE_SUFFIXES = new Map([
       '&resultRecordCount=4&f=json'
   ],
   // Parameterized APIs: a bare root 400s by design; probe a minimal real call.
-  ['usgsIV', '?format=json&sites=01646500&parameterCd=00060&siteStatus=all'],
+  ['usgsWaterData', 'collections/latest-continuous/items?f=json&monitoring_location_id=USGS-01646500&parameter_code=00060&limit=2'],
   ['nrcsAwdbRest', '?stationTriplets=679:WA:SNTL&elements=WTEQ&duration=DAILY&beginDate=2026-01-01&endDate=2026-01-02'],
   ['usdmDataServices', USDM_DSCI_PROBE_PATH],
   // Tile ROOT with the template living in the consumer; probe one real tile.
@@ -429,6 +439,18 @@ const CONTENT_TRIPWIRES = new Map([
     }
   ],
   [
+    'landscapeNlcdPinnedTime',
+    (body, response) => {
+      const type = response.headers.get('content-type') ?? '';
+      const rasterType = /^(?:image\/(?:tiff|geotiff)|application\/(?:octet-stream|geotiff))(?:;|$)/i.test(type);
+      const tiffHeader = ['II*\0', 'MM\0*', 'II+\0', 'MM\0+'].some((header) => body.startsWith(header));
+      if (!rasterType || !tiffHeader) {
+        return 'pinned Annual NLCD TIME=2024-01-01 did not return TIFF bytes (an HTTP 200 OGC exception is not coverage)';
+      }
+      return null;
+    }
+  ],
+  [
     'landscapeNlcdCollection',
     (body) => {
       const coverage =
@@ -493,7 +515,7 @@ export function extractUrls(source) {
  * src/ui/island/place-studio.tsx; the USDM `DM` and NIFC identity fields in
  * src/impact/sources.ts; the WBD template in src/state/watershed-geometry.ts
  * (same as place-catalog's). NOT covered: the CPC 6-10 and 8-14 day point
- * query in src/impact/sources.ts passes `cat,prob` as a function argument
+ * query in src/impact/cpc-extended.ts passes `cat,prob` as a function argument
  * the extractor does not see, and the WBD HUC code field is a template
  * token reported as unchecked.
  */
@@ -506,8 +528,16 @@ export const ARCGIS_FIELD_PROBES = Object.freeze([
   // place-catalog.ts watershedQueryUrl: layers 1 (huc2) and 2 (huc4).
   { key: 'wbdMapServer', file: 'src/config/place-catalog.ts', layer: '/1' },
   { key: 'wbdMapServer', file: 'src/config/place-catalog.ts', layer: '/2' },
+  { key: 'wbdMapServer', file: 'src/impact/water-supply.ts', layer: '/4' },
   { key: 'nifcFires', file: 'src/layers/nifc-fires.ts', layer: '', constName: 'NIFC_OUT_FIELDS' },
   { key: 'censusAiannhMapServer', file: 'src/layers/aiannh.ts', layer: '/47' },
+  // The detail inside Tribal areas: TIGERweb Local Roads, USGS NHD named streams
+  // and lakes, and Census Designated Places.
+  { key: 'tigerwebTransportation', file: 'src/layers/tribal-streets.ts', layer: '/8', constName: 'STREET_OUT_FIELDS' },
+  { key: 'usgsNhdMapServer', file: 'src/layers/tribal-streets.ts', layer: '/6', constName: 'STREAM_OUT_FIELDS' },
+  { key: 'usgsNhdMapServer', file: 'src/layers/tribal-streets.ts', layer: '/12', constName: 'WATERBODY_OUT_FIELDS' },
+  { key: 'tigerwebPlaces', file: 'src/layers/tribal-streets.ts', layer: '/5', constName: 'COMMUNITY_OUT_FIELDS' },
+  { key: 'padusManagerType', file: 'src/layers/public-lands.ts', layer: '', constName: 'PUBLIC_LANDS_OUT_FIELDS' },
   { key: 'biaLarFeatureServer', file: 'src/layers/bia-reservations.ts', layer: '' },
   // RANGE_LAYER_INDEX in drought.ts: monthly 1, seasonal 4.
   { key: 'cpcDroughtOutlookVectorMapServer', file: 'src/layers/drought.ts', layer: '/1' },
@@ -515,9 +545,28 @@ export const ARCGIS_FIELD_PROBES = Object.freeze([
   { key: 'nwsHeatRisk', file: 'src/layers/heatrisk.ts', layer: '' },
   { key: 'noaaHmsSmokeFeatureServer', file: 'src/layers/hms-smoke.ts', layer: '' },
   { key: 'nwsWwaMapServer', file: 'src/layers/nws-alerts.ts', layer: '' },
+  // ENSO B3: the EP5 slot's layers stand for all fifteen slots, which share
+  // the same three field constants (points, track and cone, watch-warning).
+  { key: 'nhcTropicalMapServer', file: 'src/layers/tropical-read.ts', layer: '/240', constName: 'POINT_OUT_FIELDS' },
+  { key: 'nhcTropicalMapServer', file: 'src/layers/tropical-read.ts', layer: '/242', constName: 'LINE_OUT_FIELDS' },
+  { key: 'nhcTropicalMapServer', file: 'src/layers/tropical-read.ts', layer: '/243', constName: 'WW_OUT_FIELDS' },
   { key: 'eiaPowerPlantsFeatureLayer', file: 'src/layers/power-3d.ts', layer: '', constName: 'PLANTS_OUT_FIELDS' },
   // DAY1_LAYER_ID in spc-fire-weather.ts.
   { key: 'spcFireWeatherOutlookMapServer', file: 'src/layers/spc-fire-weather.ts', layer: '/1' },
+  // The ENSO outlook map layers. The reader sends one list per family (a
+  // ternary): the seasonal Lead 1 (REST layer 0 of each service) and the 6-10
+  // and 8-14 day layers (each service: 0 temperature, 1 precipitation).
+  { key: 'cpcSeasonalPrecipOutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/0', pick: (fields) => fields.includes('valid_seas') },
+  { key: 'cpcSeasonalTempOutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/0', pick: (fields) => fields.includes('valid_seas') },
+  { key: 'cpc610OutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/0', pick: (fields) => fields.includes('start_date') },
+  { key: 'cpc610OutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/1', pick: (fields) => fields.includes('start_date') },
+  { key: 'cpc814OutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/0', pick: (fields) => fields.includes('start_date') },
+  { key: 'cpc814OutlookMapServer', file: 'src/layers/cpc-seasonal-read.ts', layer: '/1', pick: (fields) => fields.includes('start_date') },
+  // F6 (S20 fix round, DDM-P7-T03): the Days 3-8 probabilistic field set
+  // (SPC_PROBABILISTIC_OUT_FIELDS in src/impact/sources.ts), one row for
+  // layer 8 (Day 3) standing for all six probabilistic layers, which share
+  // this same constant (see OUT_FIELDS_SENDERS_COVERED_ELSEWHERE above).
+  { key: 'spcFireWeatherOutlookMapServer', file: 'src/impact/sources.ts', layer: '/8', constName: 'SPC_PROBABILISTIC_OUT_FIELDS' },
   { key: 'usdmFeatureServer', file: 'src/layers/usdm.ts', layer: '', constName: 'CURRENT_OUT_FIELDS' },
   { key: 'usdmArchiveFeatureServer', file: 'src/layers/usdm.ts', layer: '', constName: 'ARCHIVE_OUT_FIELDS' },
   { key: 'bcDroughtLevelsFeatureServer', file: 'src/layers/bc-drought.ts', layer: '' },
@@ -539,12 +588,17 @@ export const ARCGIS_FIELD_PROBES = Object.freeze([
  */
 export const OUT_FIELDS_SENDERS_COVERED_ELSEWHERE = Object.freeze({
   'src/config/urls.ts': 'documentation comments only; no query is built here',
+  'src/util/bcws-perimeter-read.ts':
+    'dormant: reached only from src/layers/bcws-fires.ts, which no shipped module imports, so no build carries it and nothing contacts the Province (checked 2026-10-08 for release 0.7.1); BC read limits are undecided, add its probe row only with that ruling',
   'src/state/display-snapshot.ts': 'extracted list (BIA LARID) is a subset of the biaLarFeatureServer row today; not probed on its own',
-  'src/ui/search-controller.ts': 'extracted list is the same five BIA fields as the biaLarFeatureServer row today; not probed on its own',
+  'src/ui/search-controller.ts':
+    'the BIA fields are the same five as the biaLarFeatureServer row, and the Census AIANNH layer 47 fields are byte-identical to the censusAiannhMapServer row (src/layers/aiannh.ts); not probed on its own',
   'src/state/watershed-geometry.ts':
     'NOT extracted (the template is a positional argument to geometryParams); byte-identical to the place-catalog template today',
   'src/impact/sources.ts':
-    'NOT extracted (positional arguments to esriPointQuery and esriEnvelopeQuery): USDM DM and the NIFC identity fields are subsets of their rows today; the CPC 6-10 and 8-14 day point query (cat,prob) has no row',
+    'NOT extracted (positional arguments to esriPointQuery and esriEnvelopeQuery): USDM DM and the NIFC identity fields are subsets of their rows today; the CPC 6-10 and 8-14 day point query (cat,prob) now lives in src/impact/cpc-extended.ts and has no row. F6 (S20 fix round, DDM-P7-T03): seven new SPC Day 1-8 Fire Weather Outlook layer queries added here. Layer 4 (Day 2 categorical: dn,valid,expire) has no probe row of its own (its field list is byte-identical to the spcFireWeatherOutlookMapServer/1 row already probed via src/layers/spc-fire-weather.ts, just a separate declaration). Layers 8, 11, 14, 17, 20, 23 (Days 3-8 probabilistic: dn,label,label2,valid,expire,issue) share one field constant (SPC_PROBABILISTIC_OUT_FIELDS); layer 8 alone is now extracted and probed live below (fields:spcFireWeatherOutlookMapServer/8), and a drift in that shared constant is caught once for all six.',
+  'src/ui/heatrisk-sequence.ts':
+    "the briefing's independent HeatRisk catalog read (DDM-P7-T05) queries the same nwsHeatRisk catalog with the same outFields (name, idp_validtime) as src/layers/heatrisk.ts, whose probe row covers the fields; the two parsers are kept identical by cross-reference comments",
 });
 
 const OUT_FIELDS_RE =
@@ -637,6 +691,42 @@ export function checkFieldSchema(expected, bodyText) {
   return { miss: null, note: `${expected.length}/${expected.length} requested fields present` };
 }
 
+/** Judge a WWA layer `?f=json` body against the product names the alert reader asks for:
+ * each must be a value of the service renderer's own list, or a rename drops it silently. */
+export function checkProductNames(expected, bodyText) {
+  let json;
+  try {
+    json = JSON.parse(bodyText);
+  } catch {
+    return { miss: 'layer body is not JSON', note: '' };
+  }
+  if (json && json.error) {
+    return { miss: `ArcGIS error ${json.error.code ?? '?'} ${json.error.message ?? ''}`.trim(), note: '' };
+  }
+  const values = json?.drawingInfo?.renderer?.uniqueValueInfos;
+  if (!Array.isArray(values)) return { miss: 'layer body has no renderer value list', note: '' };
+  const served = new Set(values.map((info) => info?.value));
+  const missing = expected.filter((name) => !served.has(name));
+  if (missing.length > 0) return { miss: `products not in the renderer: ${missing.join(', ')}`, note: '' };
+  return { miss: null, note: `${expected.length}/${expected.length} requested products in the renderer` };
+}
+
+/** The pre-2025 names the heat set still asks for on purpose (Hazard Simplification renamed
+ * Excessive Heat to Extreme Heat; src/config/palette.ts): the renderer no longer lists them. */
+export const RETIRED_ALERT_PRODUCTS = Object.freeze(['Excessive Heat Warning', 'Excessive Heat Watch']);
+
+/** One probe of every product name any mode's alert set asks for (HazardClusterDef.alerts),
+ * read from the mode table itself; a missing WWA key is a disarmed probe and throws. */
+export async function buildProductProbeEntry(urlEntries) {
+  const base = urlEntries.find((e) => e.key === 'nwsWwaMapServer');
+  if (!base) throw new Error('product probe: nwsWwaMapServer is not an extracted urls.ts entry; the probe is disarmed');
+  const { HAZARD_CLUSTERS } = await import('../src/config/clusters.ts');
+  const productsExpected = [...new Set(Object.values(HAZARD_CLUSTERS).flatMap((def) => def.alerts?.events ?? []))]
+    .filter((name) => !RETIRED_ALERT_PRODUCTS.includes(name));
+  if (productsExpected.length === 0) throw new Error('product probe: no mode names alert products; the probe is disarmed');
+  return { key: 'products:nwsWwaMapServer', url: `${base.url}?f=json`, tier: DRIFT_TIERS.RUNTIME, productsExpected };
+}
+
 async function fieldListsForProbe(probe, root) {
   const file = join(root, probe.file);
   const source = await readFile(file, 'utf8');
@@ -704,7 +794,7 @@ function probeUrl(entry) {
   return url;
 }
 
-async function check(entry) {
+export async function check(entry) {
   const url = probeUrl(entry);
   const tier = entry.tier ?? sourceTierForKey(entry.key);
   const controller = new AbortController();
@@ -742,6 +832,10 @@ async function check(entry) {
       if (fieldNote && entry.fieldsDynamic?.length) {
         fieldNote += `; template token${entry.fieldsDynamic.length === 1 ? '' : 's'} ${entry.fieldsDynamic.map((t) => '${' + t + '}').join(', ')} not checked`;
       }
+    } else if (entry.productsExpected && resp.status < 400) {
+      const result = checkProductNames(entry.productsExpected, await resp.text());
+      tripwireMiss = result.miss;
+      fieldNote = result.note;
     }
     const ok = resp.status < 400 && !corsInvalid && tripwireMiss === null;
     const detail =
@@ -978,6 +1072,8 @@ async function main() {
     // Field-schema rows for every ArcGIS outFields list the runtime sends;
     // an unresolvable row throws (a disarmed probe must fail loudly).
     entries.push(...(await buildFieldProbeEntries(entries)));
+    // The alert products every mode asks for, against the WWA renderer's own names.
+    entries.push(await buildProductProbeEntry(entries));
   }
   entries.push(...LANDSCAPE_PROBES);
 

@@ -1,0 +1,362 @@
+/**
+ * The briefing matrix: four hazard rows by three horizon columns (DR-012 b).
+ *
+ * The briefing used to be three horizon sections holding one undifferentiated
+ * list of claims, so a drought issuer's status pill spoke for a wildfire
+ * sentence beside it and one failed source made the whole horizon read
+ * partial. This module makes the twelve cells explicit: each cell owns its
+ * claims, its status, and its note, and nothing in a cell comes from a lane
+ * that was not declared for it.
+ *
+ * Two tables carry the whole arrangement:
+ *
+ *   LANE_PLACEMENT   which hazard rows and which horizon columns each source
+ *                    family feeds. A source that answers for two hazards
+ *                    (the NWS active-alerts query answers for fire and for
+ *                    heat) declares both; a source that answers across
+ *                    horizons (the ENSO snapshot) declares both horizons and
+ *                    its claims name their own.
+ *   CELL_ABSENCE     what a cell says when it has nothing to show and no
+ *                    failing source explained why. Every cell has one, so a
+ *                    cell can never render blank.
+ *
+ * The module is pure: no DOM, no fetches, no application state. `hydrate.ts`
+ * settles lanes and calls `applyMatrix` after each one.
+ */
+
+import { HAZARD_CLUSTER_KEYS } from '../config/clusters';
+import type { BriefingSourceKey } from '../config/source-capability';
+import { SHELL_HAZARD_KEY } from './horizon-chrome';
+import type {
+  HazardCell,
+  HazardKey,
+  Horizon,
+  HorizonKey,
+  HorizonStatus,
+  SourcedClaim
+} from './types';
+
+/** The hazard rows in display order: one per mode, in the mode table's order (DR-113). */
+export const HAZARD_KEYS: readonly HazardKey[] = HAZARD_CLUSTER_KEYS.map((key) => SHELL_HAZARD_KEY[key]);
+
+/** The horizon columns in display order. */
+export const HORIZON_KEYS: readonly HorizonKey[] = [
+  'current',
+  'nearTerm',
+  'longRange'
+];
+
+/**
+ * The row labels. Deliberately the plainest possible names for the four
+ * hazards the module already speaks in; the briefing's door names and any
+ * per-screen title are a separate, open question (DR-013) and are not
+ * settled here.
+ */
+export const HAZARD_LABELS: Readonly<Record<HazardKey, string>> = {
+  drought: 'Drought',
+  fire: 'Fire',
+  heat: 'Heat',
+  enso: 'ENSO'
+};
+
+/**
+ * Every source family that feeds the matrix. Point heat is not here: it is
+ * its own briefing lane with its own section, describing the selected
+ * coordinate rather than a hazard row.
+ */
+export type MatrixLaneKey = Exclude<BriefingSourceKey, 'pointHeat'>;
+
+export interface MatrixLanePlacement {
+  /** The hazard rows this lane may fill. */
+  readonly hazards: readonly HazardKey[];
+  /** The horizon columns this lane may fill. */
+  readonly horizons: readonly HorizonKey[];
+}
+
+/**
+ * Which cells each lane is responsible for. This table IS the matrix: a cell
+ * with no lane here renders its `CELL_ABSENCE` state, and a lane can never
+ * write into a cell it does not name.
+ */
+export const LANE_PLACEMENT: Readonly<
+  Record<MatrixLaneKey, MatrixLanePlacement>
+> = {
+  usdm: { hazards: ['drought'], horizons: ['current'] },
+  dsci: { hazards: ['drought'], horizons: ['current'] },
+  nifc: { hazards: ['fire'], horizons: ['current'] },
+  // One query, two hazards: the fire-weather claim carries hazards ['fire'],
+  // the extreme-heat claim carries ['heat'], and the claim reporting neither
+  // in effect speaks for both rows, so it keeps the lane's own pair.
+  nwsAlerts: { hazards: ['fire', 'heat'], horizons: ['current'] },
+  heatRisk: { hazards: ['heat'], horizons: ['nearTerm'] },
+  nwsForecast: { hazards: ['heat'], horizons: ['nearTerm'] },
+  cpcExtended: { hazards: ['drought'], horizons: ['nearTerm'] },
+  // One snapshot, three clocks: the observed index state is a current read, the
+  // weekly Nino 3.4 trajectory is a near-term one (DR-031 a), and the seasonal
+  // tendency is a long-range one, so its claims name their own horizon rather
+  // than all landing under the season. The near-term cell activates only when
+  // the snapshot carries the weekly block and the read has not gone stale;
+  // otherwise no claim is tagged nearTerm, the cell settles empty, and it
+  // renders its CELL_ABSENCE prose exactly as before.
+  enso: { hazards: ['enso'], horizons: ['current', 'nearTerm', 'longRange'] },
+  waterSupply: { hazards: ['drought'], horizons: ['longRange'] },
+  cpcSeasonal: { hazards: ['drought'], horizons: ['longRange'] },
+  // DDM-P7-T07 (DR-075 option a): the NOAA CPC seasonal TEMPERATURE outlook,
+  // read live at Lead 1. A distinct lane from `cpcSeasonal` above, which is
+  // the cited CPC Seasonal DROUGHT Outlook prose and feeds the drought row.
+  cpcSeasonalTemp: { hazards: ['heat'], horizons: ['longRange'] },
+  // DDM-P7-T03 (DR-022 a): the NOAA SPC Day 1-8 Fire Weather Outlook, read
+  // live at the selected point. The season-ahead fire half of DR-022 a (the
+  // NIFC National Wildland Significant Fire Potential Outlook) has no
+  // machine-readable endpoint (verify-spc-nifc.md, S20) and so declares no
+  // lane here; the long-range fire cell keeps its CELL_ABSENCE prose, now
+  // naming that product's PDF-only posture rather than "not wired".
+  spcFireOutlook: { hazards: ['fire'], horizons: ['nearTerm'] }
+};
+
+/** Every lane key, in a stable order. */
+export const MATRIX_LANE_KEYS: readonly MatrixLaneKey[] = [
+  'usdm',
+  'dsci',
+  'nifc',
+  'nwsAlerts',
+  'heatRisk',
+  'nwsForecast',
+  'cpcExtended',
+  'enso',
+  'waterSupply',
+  'cpcSeasonal',
+  'cpcSeasonalTemp',
+  'spcFireOutlook'
+];
+
+/**
+ * What each cell says when it holds no claim and no source failure explained
+ * the absence. One of these describes a product this briefing will never read
+ * from here and names why (the long-range fire cell, DR-022 a: the NIFC
+ * National Wildland Significant Fire Potential Outlook is PDF-only, per
+ * verify-spc-nifc.md, S20); the rest name the product that had nothing to
+ * report for this selection, including the near-term fire cell now that
+ * DDM-P7-T03 (DR-022 a) has wired its live SPC Day 1-8 read (this fallback
+ * fires only if that lane ever settles with zero claims and no note of its
+ * own, which its own composition avoids in the ordinary case) and the
+ * season-ahead heat cell now that DDM-P7-T07 (DR-075 option a) has wired its
+ * live read. None of them is a claim about conditions, and none is a blank.
+ */
+export const CELL_ABSENCE: Readonly<
+  Record<HorizonKey, Readonly<Record<HazardKey, string>>>
+> = {
+  current: {
+    drought: 'No U.S. Drought Monitor read is available for this selection.',
+    fire: 'No NIFC current mapped fire perimeter read is available for this selection.',
+    // vocab-allow: names the upstream NWS active alerts product
+    heat: 'No NWS active alerts read is available for this selection.',
+    enso: 'No NOAA CPC ENSO index read is available for this selection.'
+  },
+  nearTerm: {
+    drought:
+      'No NOAA CPC extended-range outlook is available for this selection.',
+    fire:
+      'No NOAA SPC Day 1-8 Fire Weather Outlook read is available for this selection.',
+    heat: 'No near-term heat read is available for this selection.',
+    enso:
+      'No weekly Nino 3.4 observation is available for this selection: the briefing reads the CPC weekly Nino-region file here, and it is absent from the current snapshot or too old to report.'
+  },
+  longRange: {
+    drought: 'No long-range drought outlook is available for this selection.',
+    // DDM-P7-T03 (DR-022 a; verify-spc-nifc.md, S20): NIFC publishes this
+    // outlook as a PDF only, with no ArcGIS, GeoJSON, KML or shapefile
+    // distribution on any NIFC or GACC host, so this cell reads unavailable
+    // naming the product rather than scraping the PDF or its map images.
+    // Verbatim from the science verdict (science-verdict.md section 5). F9
+    // (S20 fix round): round 1 appended "Read the issuer: <bare url>" to
+    // this sentence, but `HazardCell.note` has no link mechanism
+    // (`src/ui/impact-panel-runtime.ts` renders it as escaped plain text),
+    // so a 62-character unclickable URL is not the cell's "existing link
+    // form"; removed. The owner ask for a `noteUrl` on `HazardCell` is
+    // recorded in the report's Owner decisions.
+    fire:
+      'The National Wildland Significant Fire Potential Outlook (NIFC/NICC Predictive Services; also called the National Monthly and Seasonal Significant Fire Potential Outlook by the GACCs) is published as a PDF only and is not read here.',
+    heat: 'No NOAA CPC seasonal temperature outlook read is available for this selection.',
+    enso: 'No ENSO seasonal tendency is shown for this selection.'
+  }
+};
+
+/** The settled outcome of one lane, structurally a `SourceResult`. */
+export interface MatrixLaneResult {
+  readonly claims: readonly SourcedClaim[];
+  readonly ok: boolean;
+  readonly note?: string;
+  /** An `ok` lane that answered only in part (`SourceResult.partial`): its
+   * claims stand, and the cells it feeds read live (partial), never live. */
+  readonly partial?: boolean;
+}
+
+/** The lanes settled so far, keyed by lane. An absent key is still in flight. */
+export type MatrixLaneResults = ReadonlyMap<MatrixLaneKey, MatrixLaneResult>;
+
+/** Build the four empty cells of one horizon, all waiting on their lanes. */
+export function createHorizonCells(
+  horizon: HorizonKey
+): Record<HazardKey, HazardCell> {
+  const cells = {} as Record<HazardKey, HazardCell>;
+  for (const hazard of HAZARD_KEYS) {
+    const lanes = lanesForCell(horizon, hazard);
+    cells[hazard] = {
+      hazard,
+      horizon,
+      label: HAZARD_LABELS[hazard],
+      claims: [],
+      // A cell no lane feeds never loads, so it says what it is missing from
+      // the first paint rather than spinning for a source that will not come.
+      status: lanes.length > 0 ? 'loading' : 'unavailable',
+      ...(lanes.length > 0 ? {} : { note: CELL_ABSENCE[horizon][hazard] })
+    };
+  }
+  return cells;
+}
+
+/** Put every cell of one horizon into the same explicit state. */
+export function markHorizonCells(
+  horizon: Horizon,
+  status: HorizonStatus,
+  note: string
+): void {
+  for (const hazard of HAZARD_KEYS) {
+    const cell = horizon.cells[hazard];
+    cell.claims = [];
+    cell.status = status;
+    cell.note = note;
+  }
+  horizon.claims = [];
+  horizon.status = status;
+}
+
+/** The lanes declared for one cell. */
+export function lanesForCell(
+  horizon: HorizonKey,
+  hazard: HazardKey
+): readonly MatrixLaneKey[] {
+  return MATRIX_LANE_KEYS.filter((key) => {
+    const placement = LANE_PLACEMENT[key];
+    return (
+      placement.horizons.includes(horizon) && placement.hazards.includes(hazard)
+    );
+  });
+}
+
+/** Whether one claim from `lane` belongs in the cell at (horizon, hazard). */
+function claimBelongs(
+  claim: SourcedClaim,
+  lane: MatrixLaneKey,
+  horizon: HorizonKey,
+  hazard: HazardKey
+): boolean {
+  const placement = LANE_PLACEMENT[lane];
+  const claimHorizon = claim.horizon ?? placement.horizons[0];
+  const claimHazards = claim.hazards ?? placement.hazards;
+  return claimHorizon === horizon && claimHazards.includes(hazard);
+}
+
+/**
+ * Recompute one cell from the lanes declared for it. Idempotent: it reads the
+ * settled results and writes the whole cell, so a later publish cannot leave
+ * a stale claim or a stale note behind.
+ */
+export function fillCell(cell: HazardCell, results: MatrixLaneResults): void {
+  const lanes = lanesForCell(cell.horizon, cell.hazard);
+  const claims: SourcedClaim[] = [];
+  const notes: string[] = [];
+  let settled = 0;
+  let answered = 0;
+  let incomplete = false;
+
+  for (const lane of lanes) {
+    const result = results.get(lane);
+    if (!result) continue;
+    settled += 1;
+    if (result.ok) {
+      answered += 1;
+      // A lane that answered only in part (one CPC window, some SPC days)
+      // keeps its claims and brings its own note: the read did not establish
+      // everything it asked for, so the cell must not read live (plan rule
+      // 6's "live (partial)"; S30D P3-TRUTH).
+      if (result.partial === true) {
+        incomplete = true;
+        if (result.note) notes.push(result.note);
+      }
+      for (const claim of result.claims) {
+        if (claimBelongs(claim, lane, cell.horizon, cell.hazard)) {
+          claims.push(claim);
+        }
+      }
+    } else if (result.note) {
+      notes.push(result.note);
+    }
+  }
+
+  cell.claims = claims;
+  const pending = lanes.length - settled;
+  if (lanes.length === 0) {
+    cell.status = 'unavailable';
+  } else if (pending > 0) {
+    // A lane is still in flight, so the cell has not settled: what is already
+    // in hand reads live (partial), and an empty cell keeps loading rather
+    // than announcing an absence that may yet fill.
+    cell.status = claims.length > 0 ? 'partial' : 'loading';
+  } else if (claims.length === 0) {
+    // Every lane settled and the cell has nothing to say. That is an honest
+    // absence, never a live cell with an empty body.
+    cell.status = 'unavailable';
+  } else if (answered === lanes.length && !incomplete) {
+    cell.status = 'ready';
+  } else {
+    cell.status = 'partial';
+  }
+
+  const note = notes.length > 0 ? notes.join(' ') : null;
+  if (note !== null) {
+    cell.note = note;
+  } else if (cell.status === 'unavailable') {
+    // S30D P3-TRUTH (repair round 2): the absence sentence states established
+    // emptiness, so a cell whose reads were incomplete (a lane that answered
+    // `partial` with nothing to state, and no note of its own) never says it.
+    // It states no sentence: the empty note also keeps the renderer's own
+    // fallback ("No source answered ...") off it, which would be false, since
+    // that lane answered. The wording for this case is the owner's to give.
+    cell.note = incomplete ? '' : CELL_ABSENCE[cell.horizon][cell.hazard];
+  } else {
+    delete cell.note;
+  }
+}
+
+/** Fold four cell statuses into the horizon's own summary status. */
+function horizonStatus(cells: readonly HazardCell[]): HorizonStatus {
+  const every = (status: HorizonStatus): boolean =>
+    cells.every((cell) => cell.status === status);
+  if (every('loading')) return 'loading';
+  if (every('ready')) return 'ready';
+  if (every('unavailable')) return 'unavailable';
+  return 'partial';
+}
+
+/**
+ * Recompute all twelve cells from the lanes settled so far, and refresh each
+ * horizon's flattened claim list and summary status.
+ *
+ * The horizon's status is a summary of its four cells and carries no issuer
+ * and no validity date of its own; every issuer and every clock stays on the
+ * claim that owns it.
+ */
+export function applyMatrix(
+  horizons: Record<HorizonKey, Horizon>,
+  results: MatrixLaneResults
+): void {
+  for (const horizonKey of HORIZON_KEYS) {
+    const horizon = horizons[horizonKey];
+    const cells = HAZARD_KEYS.map((hazard) => horizon.cells[hazard]);
+    for (const cell of cells) fillCell(cell, results);
+    horizon.claims = cells.flatMap((cell) => cell.claims);
+    horizon.status = horizonStatus(cells);
+  }
+}

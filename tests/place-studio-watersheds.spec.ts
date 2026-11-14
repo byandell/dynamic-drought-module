@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 import type * as maplibregl from 'maplibre-gl';
 import type { MultiPolygon, Polygon } from 'geojson';
 
@@ -150,6 +150,9 @@ async function stubWatersheds(
   });
 }
 
+/** The Watersheds group's rows: a search lists every place type (visual uniformity D11), and "Yakima" also names two ecoregions. */
+const WATERSHED_OPTION = '#place-list-panel [data-place-group="watershed"] .place-studio-option';
+
 async function openWatersheds(page: Page): Promise<void> {
   await gotoApp(page, '?view=brief&layers=places&studio=place');
   await page.locator('#place-type-watershed').click();
@@ -177,7 +180,7 @@ test.describe('PS-WATER provider and studio wiring', () => {
     }
 
     await page.locator('#place-studio-search').fill('Yakima');
-    await page.locator('#place-list-panel .place-studio-option').click();
+    await page.locator(WATERSHED_OPTION).click();
     await expect(
       page.locator('#place-brief-narrative .place-studio-selection-kind')
     ).toHaveText('Watershed (USGS Watershed Boundary Dataset)');
@@ -250,7 +253,7 @@ test.describe('PS-WATER provider and studio wiring', () => {
       const url = new URL(request.url());
       return url.searchParams.get('where') === "huc4='1703'";
     });
-    await page.locator('#place-list-panel .place-studio-option').click();
+    await page.locator(WATERSHED_OPTION).click();
     await pendingYakima;
 
     await page.locator('#place-studio-search').fill('Pacific Northwest');
@@ -300,12 +303,19 @@ test('the ephemeral emphasis surface shows, updates, and clears areal geometry',
   expect(sources.has('place-studio-boundary')).toBe(true);
   expect(layers.get('place-studio-boundary-fill')).toMatchObject({
     type: 'fill',
-    paint: { 'fill-opacity': 0.1 }
+    paint: { 'fill-opacity': 0.1, 'fill-color': '#FFFFFF' }
   });
   expect(layers.get('place-studio-boundary-line')).toMatchObject({
     type: 'line',
-    paint: { 'line-width': 2 }
+    paint: { 'line-width': 2, 'line-color': '#FFFFFF', 'line-dasharray': [2, 2] }
   });
+  expect(layers.get('place-studio-boundary-casing')).toMatchObject({
+    type: 'line',
+    paint: { 'line-width': 4, 'line-color': '#010B13' }
+  });
+  expect([...layers.keys()]).toEqual([
+    'place-studio-boundary-fill', 'place-studio-boundary-casing', 'place-studio-boundary-line'
+  ]);
 
   showStudioBoundary(map, PACIFIC_NORTHWEST);
   expect(latestData).toMatchObject({
@@ -317,4 +327,10 @@ test('the ephemeral emphasis surface shows, updates, and clears areal geometry',
   expect(sources.has('place-studio-boundary')).toBe(false);
   expect(layers.has('place-studio-boundary-fill')).toBe(false);
   expect(layers.has('place-studio-boundary-line')).toBe(false);
+  expect(layers.has('place-studio-boundary-casing')).toBe(false);
+  showStudioBoundary(map, YAKIMA);
+  expect(layers.size).toBe(3);
+  expect(layers.get('place-studio-boundary-line')).toMatchObject({ paint: { 'line-dasharray': [2, 2] } });
+  clearStudioBoundary(map);
+  expect(layers.size).toBe(0);
 });

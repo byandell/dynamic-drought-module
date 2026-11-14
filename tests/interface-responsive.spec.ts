@@ -1,7 +1,10 @@
-import { expect, test, type Locator, type Page } from '@playwright/test';
+import { expect, test, type Locator, type Page } from './offline-test';
 
-import { SST_ANOMALY_SCALE } from '../src/config/palette';
 import { gotoApp } from './helpers';
+import { HAZARD_CLUSTER_KEYS } from '../src/config/clusters';
+import { FRAMING_KEYS } from '../src/config/framings';
+import { routeAllTribalFixtures } from './tribal-fixtures';
+import { installMinimapAnalysisStubs } from './minimap-fixtures';
 
 interface Rect {
   readonly left: number;
@@ -89,18 +92,30 @@ async function stubWildfireMapProducts(page: Page): Promise<void> {
   );
 }
 
+async function openMapKey(page: Page): Promise<void> {
+  // One box (owner 2026-11-13): the Key toggle carries the reading and is the only door.
+  const toggle = page.locator('#map-key-details-toggle');
+  if (await toggle.isVisible() && await toggle.getAttribute('aria-expanded') === 'false') {
+    await toggle.click();
+  }
+}
+
 async function expectMobileKeyClearance(
   page: Page,
   contentSelector: string
 ): Promise<void> {
   const key = page.locator('#map-key');
-  const controls = page.locator('.map-overlay-controls');
+  const controls = page.locator('#edge-column');
+  await openMapKey(page);
   await expect(key).toBeVisible();
   await expect(key.locator(contentSelector).first()).toBeVisible();
   await expect(controls).toBeVisible();
+  await expect(page.locator('.map-overlay-controls')).toBeHidden();
+  await expect(controls.locator('#edge-body-utility > #share-btn')).toBeVisible();
 
-  // Utilities now own an independent right column at the same safe-area top.
-  // The key reserves that column horizontally instead of pushing it down.
+  // The utilities ride the phone's right-edge column at the same safe-area
+  // top, and the key reserves --edge-column-w horizontally instead of being
+  // pushed down.
   await expect
     .poll(async () => {
       const [keyBox, controlsBox] = await Promise.all([rect(key), rect(controls)]);
@@ -149,7 +164,7 @@ test.describe('the exact desktop and mobile boundary', () => {
     const shareHandle = await share.elementHandle();
     expect(shareHandle).not.toBeNull();
     await expect(page.locator('#shell-panel')).toBeVisible();
-    await expect(page.locator('#shell-share-host > #share-btn')).toHaveCount(1);
+    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
     await expect(app).not.toHaveAttribute('data-sheet-detent', /.+/);
     await expect
       .poll(() =>
@@ -165,7 +180,9 @@ test.describe('the exact desktop and mobile boundary', () => {
 
     await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
     await expect(page.locator('#shell-panel')).toBeHidden();
-    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
+    // The phone shell seats the same node in the right-edge column.
+    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(0);
+    await expect(page.locator('#edge-column #edge-body-utility > #share-btn')).toHaveCount(1);
     await expect(share).toBeFocused();
     expect(
       await shareHandle!.evaluate(
@@ -184,7 +201,7 @@ test.describe('the exact desktop and mobile boundary', () => {
 
     await page.setViewportSize({ width: 721, height: 844 });
     await expect(app).not.toHaveAttribute('data-sheet-detent', /.+/);
-    await expect(page.locator('#shell-share-host > #share-btn')).toHaveCount(1);
+    await expect(page.locator('.map-overlay-controls > #share-btn')).toHaveCount(1);
     await expect(share).toBeFocused();
     expect(
       await shareHandle!.evaluate(
@@ -206,7 +223,7 @@ test.describe('the exact desktop and mobile boundary', () => {
     await page.setViewportSize({ width: 720, height: 844 });
     await gotoApp(page);
     await page.locator('#mobile-footer-nav button[data-tab="place"]').click();
-    await expect(page.locator('#app')).toHaveAttribute('data-sheet-detent', 'half');
+    await expect(page.locator('#app')).toHaveAttribute('data-sheet-detent', 'full');
 
     const entry = page.locator('#sheet-place-studio-entry');
     await entry.scrollIntoViewIfNeeded();
@@ -225,7 +242,7 @@ test.describe('the exact desktop and mobile boundary', () => {
 test.describe('mobile key growth at 390x844', () => {
   test.use({ viewport: { width: 390, height: 844 } });
 
-  test('the phone shell keeps the drought key; the desktop shell defers to the sidebar legend (W2-D2)', async ({
+  test('the drought key opens from the indicator and remains readable across the desktop breakpoint', async ({
     page
   }) => {
     await gotoApp(page);
@@ -233,16 +250,19 @@ test.describe('mobile key growth at 390x844', () => {
     // surface earns its on-map key exactly like Fire and Heat, seated by
     // the same measured-height machinery.
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key).toBeVisible();
     await expect(key).toHaveAttribute('data-key-family', 'drought');
     await expect(key.locator('.map-key-label')).toHaveText('North America drought');
     await expectMobileKeyClearance(page, '.map-key-item');
 
-    // The desktop shell keeps the established suppression: the sidebar
-    // legend is the drought reference there and the on-map key would
-    // restate it.
+    // An explicitly opened key remains open when the viewport grows.
+    // The desktop Key chip, titled by the drought reading (one box), tracks it too.
     await page.setViewportSize({ width: 1280, height: 800 });
-    await expect(key).toBeHidden();
+    await expect(key).toBeVisible();
+    const toggle = page.locator('#map-key-details-toggle');
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(toggle).toHaveAttribute('aria-label', /^(D\d|No polygon)[^.]* in view\. (Reading is stale\. )?Close /);
     await expect
       .poll(() =>
         page
@@ -260,6 +280,7 @@ test.describe('mobile key growth at 390x844', () => {
     await stubWildfireMapProducts(page);
     await gotoApp(page, '?cluster=wildfire&horizon=weeks-ahead');
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key.locator('[data-spc-fire-weather-key]')).toBeVisible();
     await expect(key.locator('[data-nifc-perimeter-key]')).toBeVisible();
     await expect(key).toHaveAttribute('data-key-family', 'fire');
@@ -279,7 +300,7 @@ test.describe('mobile key growth at 390x844', () => {
       };
     });
     expect(chrome.radius).toBe('4px');
-    expect(chrome.background).toBe('rgba(0, 64, 64, 0.3)');
+    expect(chrome.background).toBe('rgba(1, 11, 19, 0.3)');
     expect(chrome.backdrop).toContain('blur(15px)');
 
     for (const section of [
@@ -300,7 +321,7 @@ test.describe('mobile key growth at 390x844', () => {
         );
       }
     }
-    await expect(page.locator('#map-key-expand')).toBeHidden();
+    await expect(page.locator('#map-key-expand')).toHaveCount(0);
   });
 
   test('both source-calculated scale controls render as transparent dynamic rulers', async ({
@@ -354,13 +375,25 @@ test.describe('mobile key growth at 390x844', () => {
       .not.toEqual(before);
   });
 
-  test('the Fire disclosure appears only for real overflow and expands within the map stage', async ({
+  test('the opened Fire key scrolls within the map and closes through its one indicator', async ({
     page
   }) => {
     await stubWildfireMapProducts(page);
     await gotoApp(page, '?cluster=wildfire&horizon=weeks-ahead');
     const key = page.locator('#map-key');
-    const expander = page.locator('#map-key-expand');
+    const content = page.locator('#map-key-content');
+    await expect(content).toBeHidden();
+    await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-expanded', 'false');
+    // Visual uniformity wave 1, D8 (2026-11-13): the map's title names the
+    // mode with the word on its button, in that word's own case at every
+    // width; the product ('Fire', buildFireKey) keeps the drawer's own title
+    // line and the toggle's accessible name. Before: asserted 'Fire',
+    // drawn in capitals by the phone rule.
+    const toggle = page.locator('#map-key-details-toggle');
+    await expect(toggle).toHaveText('Wildfire');
+    await expect(toggle).toHaveCSS('text-transform', 'none');
+    await expect(toggle).toHaveAccessibleName('Open Wildfire, Fire details and key');
+    await openMapKey(page);
     await expect(key.locator('[data-nifc-perimeter-key]')).toBeVisible();
     // Wait for the READY key: during activation the sections render W2-D6
     // loading placeholders, and the ready re-render replaces the content
@@ -369,7 +402,7 @@ test.describe('mobile key growth at 390x844', () => {
     await expect(
       key.locator('[data-nifc-perimeter-key] .map-key-item')
     ).toHaveCount(3);
-    await expect(expander).toBeHidden();
+    await expect(page.locator('#map-key-expand')).toHaveCount(0);
 
     await key.locator('[data-nifc-perimeter-key]').evaluate((section) => {
       for (let index = 0; index < 12; index += 1) {
@@ -380,28 +413,29 @@ test.describe('mobile key growth at 390x844', () => {
       }
     });
 
-    await expect(expander).toBeVisible();
-    await expect(expander).toHaveAttribute('aria-expanded', 'false');
-    await expect(key).toHaveAttribute('role', 'group');
-    await expander.focus();
-    await expander.press('Enter');
-    await expect(expander).toHaveAttribute('aria-expanded', 'true');
-    await expect(key).toHaveAttribute('data-key-expanded', 'true');
+    await expect.poll(() => content.evaluate((element) => element.scrollHeight > element.clientHeight)).toBe(true);
+    await content.focus();
+    await content.press('End');
+    await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
 
-    const [keyBox, footerBox] = await Promise.all([
+    const [keyBox, mapBox] = await Promise.all([
       rect(key),
-      rect(page.locator('#mobile-footer-nav'))
+      rect(page.locator('#map'))
     ]);
-    expect(keyBox.bottom).toBeLessThanOrEqual(footerBox.top);
+    expect(keyBox.bottom).toBeLessThanOrEqual(mapBox.bottom - 8);
+
+    await page.locator('#map-key-details-toggle').click();
+    await expect(content).toBeHidden();
+    await expect(page.locator('#map-key-details-toggle')).toHaveAttribute('aria-expanded', 'false');
 
     await page.locator('#hazard-rail button[data-preset="hazard-drought"]').click();
+    await openMapKey(page);
     await expect(key).toBeVisible();
     await expect(key.locator('.map-key-label')).toHaveText(
       'North America drought'
     );
     await expect(key).toHaveAttribute('data-key-family', 'drought');
-    await expect(expander).toHaveAttribute('aria-expanded', 'false');
-    await expect(expander).toBeHidden();
+    await expect(page.locator('#map-key-expand')).toHaveCount(0);
   });
 });
 
@@ -433,28 +467,61 @@ async function stubSstAnomaly(page: Page): Promise<void> {
   );
 }
 
-/** Assert the one shared SST scale renders in the on-map key (W2-D1). */
+// Independent ordered GIBS v1.3 literals, warm-to-cool; no production-table import.
+const SST_ISSUER_COLORS = [
+  '#800000', '#88000f', '#9a002c', '#ab0048', '#bf0068', '#d30085',
+  '#de007d', '#e60067', '#ec004a', '#f3002d', '#f90113', '#fe0900',
+  '#ff2100', '#ff3d00', '#ff5900', '#ff7100', '#ff8200', '#ff9100',
+  '#ff9d00', '#ffaa00', '#ffb601', '#ffc209', '#ffd025', '#ffde43',
+  '#ffea5e', '#fff679', '#f9f88d', '#eded98', '#e2e2a2', '#d5d5ac',
+  '#cacab7', '#c2cab8', '#bfd0b6', '#bfdbb0', '#bfe8a9', '#bff4a3',
+  '#bdfe9e', '#b1ff98', '#a4ff91', '#97ff8b', '#88ff84', '#76ff8c',
+  '#60ff9e', '#47ffb6', '#2fffce', '#18fce5', '#03f8fa', '#00e3ff',
+  '#00caff', '#00aeff', '#0094ff', '#087cfb', '#2264f1', '#414be6',
+  '#6031dc', '#7f1ad1', '#9109cc', '#9600ca', '#8900cf', '#7f00d3',
+  '#7400d6', '#6b00db'
+];
+async function expectSstSourceRamp(root: Locator): Promise<void> {
+  const ramp = root.locator('.sst-anomaly-ramp');
+  await expect(ramp).toBeVisible();
+  const swatches = ramp.locator('[data-sst-color]');
+  await expect(swatches).toHaveCount(62);
+  const actual = await swatches.evaluateAll(elements => elements.map(element =>
+    [element.getAttribute('data-sst-color'), getComputedStyle(element).backgroundColor]));
+  const expected = SST_ISSUER_COLORS.map((color, index) => [
+    String(62 - index), `rgb(${parseInt(color.slice(1, 3), 16)}, ${parseInt(color.slice(3, 5), 16)}, ${parseInt(color.slice(5, 7), 16)})`
+  ]);
+  expect(actual).toEqual(expected);
+  await expect(ramp.locator('[data-sst-color="0"]')).toHaveCount(0);
+  await expect(root.locator('.sst-anomaly-orientation > span')).toHaveText(
+    ['Warmer than usual', 'Near usual', 'Cooler than usual']);
+  const wordsFit = await root.locator('.sst-anomaly-orientation > span').evaluateAll(elements => elements.every(element => {
+    const box = element.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    return element.scrollWidth <= element.clientWidth + 1 &&
+      element.scrollHeight <= element.clientHeight + 1 &&
+      [...range.getClientRects()].every(rect => rect.left >= box.left - 1 &&
+        rect.right <= box.right + 1 && rect.top >= box.top - 1 && rect.bottom <= box.bottom + 1);
+  }));
+  expect(wordsFit, 'All three orientation phrases fit their actual text boxes').toBe(true);
+  const fit = await ramp.evaluate(element => {
+    const box = element.getBoundingClientRect();
+    const cells = [...element.children].map(child => child.getBoundingClientRect());
+    return { width: box.width, overflow: element.scrollWidth - element.clientWidth,
+      cellsInside: cells.every(cell => cell.width > 0 && cell.left >= box.left && cell.right <= box.right + 0.1) };
+  });
+  expect(fit.width).toBeGreaterThan(0);
+  expect(fit.overflow).toBeLessThanOrEqual(1);
+  expect(fit.cellsInside).toBe(true);
+}
+
+/** Assert source colors independently while retaining the existing key contract. */
 async function expectSstKeyContent(
-  page: Page,
   root: ReturnType<Page['locator']>
 ): Promise<void> {
   await expect(root.locator('.map-key-label')).toHaveText('Ocean temperature');
-  const swatches = root.locator('[data-sst-anomaly-key] .map-key-item');
-  await expect(swatches).toHaveCount(SST_ANOMALY_SCALE.length);
-  for (let index = 0; index < SST_ANOMALY_SCALE.length; index += 1) {
-    const entry = SST_ANOMALY_SCALE[index]!;
-    await expect(swatches.nth(index)).toContainText(entry.label);
-    const rendered = await swatches
-      .nth(index)
-      .locator('.map-key-swatch')
-      .evaluate((element) => getComputedStyle(element).backgroundColor);
-    const hex = entry.color.replace('#', '');
-    const rgb = `rgb(${parseInt(hex.slice(0, 2), 16)}, ${parseInt(
-      hex.slice(2, 4),
-      16
-    )}, ${parseInt(hex.slice(4, 6), 16)})`;
-    expect(rendered, `${entry.label} swatch color`).toBe(rgb);
-  }
+  await expectSstSourceRamp(root.locator('[data-sst-anomaly-key]'));
   await expect(root.locator('[data-sst-attribution]')).toHaveText(
     'NASA GIBS GHRSST MUR'
   );
@@ -467,6 +534,19 @@ async function expectSstKeyContent(
 }
 
 test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
+  test('the actual SST sidebar and map key render the complete source ramp', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await stubSstAnomaly(page);
+    await gotoApp(page, '?view=console&layers=sst-anomaly,aiannh');
+    const sidebar = page.locator('.legend-section[data-legend="sst-anomaly"]');
+    await expect(sidebar).toBeVisible();
+    await expect(sidebar.locator('.legend-section-title')).toHaveText('Ocean temperature anomaly');
+    await expect(sidebar.locator('.legend-note')).toHaveText(
+      'NASA GHRSST MUR daily anomaly · the dashed box is Nino 3.4, the region the ENSO index measures');
+    await expectSstSourceRamp(sidebar);
+    await openMapKey(page);
+    await expectSstKeyContent(page.locator('#map-key'));
+  });
   test('the phone quick view renders the SST anomaly key like Fire and Heat', async ({
     page
   }) => {
@@ -475,8 +555,9 @@ test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
     await gotoApp(page, '?layers=sst-anomaly,aiannh');
 
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key).toBeVisible();
-    await expectSstKeyContent(page, key);
+    await expectSstKeyContent(key);
     await expectMobileKeyClearance(page, '[data-sst-anomaly-key]');
   });
 
@@ -488,8 +569,9 @@ test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
     await gotoApp(page, '?embed=true&layers=sst-anomaly');
 
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key).toBeVisible();
-    await expectSstKeyContent(page, key);
+    await expectSstKeyContent(key);
     const keyBox = await rect(key);
     expect(keyBox.left).toBeGreaterThanOrEqual(0);
     expect(keyBox.right).toBeLessThanOrEqual(200);
@@ -506,8 +588,9 @@ test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
     await stubSstAnomaly(page);
     await gotoApp(page, '?embed=true&layers=sst-anomaly');
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key).toBeVisible();
-    await expectSstKeyContent(page, key);
+    await expectSstKeyContent(key);
   });
 
   test('the desktop shell renders the SST anomaly key in the control column', async ({
@@ -517,8 +600,9 @@ test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
     await stubSstAnomaly(page);
     await gotoApp(page, '?layers=sst-anomaly,aiannh');
     const key = page.locator('#map-key');
+    await openMapKey(page);
     await expect(key).toBeVisible();
-    await expectSstKeyContent(page, key);
+    await expectSstKeyContent(key);
   });
 });
 
@@ -534,7 +618,7 @@ test.describe('the ENSO ocean key reaches every surface (W2-D1)', () => {
  * the embed were designed around the old seats and keep them.
  */
 test.describe('the 2026-08-19 map chrome seats', () => {
-  test('the desktop column holds the satellite control and the key, and the corner reads badge, attribution, question mark', async ({
+  test('the desktop column holds the satellite control, help and the key, and the preview badge stays clear of help', async ({
     page
   }) => {
     await page.setViewportSize({ width: 1280, height: 800 });
@@ -552,41 +636,56 @@ test.describe('the 2026-08-19 map chrome seats', () => {
     expect(satellite.top).toBeGreaterThanOrEqual(reset.bottom - 1);
     expect(Math.abs(satellite.right - reset.right)).toBeLessThanOrEqual(2);
 
-    // The corner holds the question mark alone (owner direction
-    // 2026-08-31: the attribution circle is gone and its credits render
-    // inside the question-mark panel); the preview badge sits bottom
-    // center. No overlap.
+    // Help sits under SAT in the same column since D1 M9 (2026-09-27;
+    // interface-chrome section 2.2, slot 3; it left the bottom-right corner,
+    // which the old wording here described). Its credits still render inside
+    // its panel (owner direction 2026-08-31); the preview badge sits clear
+    // of the scale bars since D1 M10 (found-019), no longer bottom centre.
+    // No overlap.
     const info = await rect(page.locator('.map-info-btn'));
+    expect(info.top).toBeGreaterThanOrEqual(satellite.bottom - 1);
+    expect(Math.abs(info.right - reset.right)).toBeLessThanOrEqual(2);
+    // The column's top band, never the old bottom-right corner (800 / 3).
+    expect(info.bottom).toBeLessThan(800 / 3);
     const badge = await rect(page.locator('.test-preview-badge'));
     await expect(page.locator('.map-info-btn')).toBeVisible();
-    const viewport = page.viewportSize();
-    if (!viewport) throw new Error('viewport size is unavailable');
-    const badgeCenter = (badge.left + badge.right) / 2;
-    expect(Math.abs(badgeCenter - viewport.width / 2)).toBeLessThanOrEqual(2);
+    // Value-only migration (S30D D1 M10, found-019): the badge no longer
+    // centres on the viewport (that put it over the scale bar between
+    // about 721px and 985px of map width); it now sits clear of the scale
+    // bars' own extent instead (app.css ":5984-6010"; the full contract is
+    // "the preview badge and the scale bar (found-019)" below). Before:
+    // asserted the badge centred within 2px of viewport.width / 2. After:
+    // asserts it clears the scale bar's right edge by the required 8px.
+    const scale = page.locator('.maplibregl-ctrl-bottom-left .maplibregl-ctrl-scale').first();
+    await expect(scale).toBeVisible();
+    const scaleRect = await rect(scale);
+    expect(badge.left, 'the badge sits right of the scale bars, not centred').toBeGreaterThanOrEqual(
+      scaleRect.right + 8 - 1
+    );
     expect(badge.right).toBeLessThanOrEqual(info.left);
     expect(intersects(badge, info)).toBe(false);
     expect(info.bottom).toBeLessThanOrEqual(800);
 
-    // The license disclosure is still one click away and still says who
-    // owns the base map. Burying it to make room for app chrome would be a
-    // license problem, not a layout preference.
+    // The credits disclosure is still one click away: the credits line points
+    // to the Acknowledgements (S30D D1 M22, DR-162).
     await page.locator('#map-info-btn').click();
-    await expect(page.locator('#map-info-attribution')).toContainText(
-      'OpenStreetMap'
-    );
+    await expect(page.locator('#map-info-attribution')).toContainText('Acknowledgements');
     await page.keyboard.press('Escape');
   });
 
-  test('a phone keeps the dock key seat and the thumb-zone satellite control', async ({
+  test('a phone keeps the dock key seat and seats the satellite control in the column view tools', async ({
     page
   }) => {
     await page.setViewportSize({ width: 390, height: 844 });
     await gotoApp(page, '');
 
     await expect(page.locator('.map-dock-foot > #map-key')).toHaveCount(1);
+    // The phone sprint moved SAT from MapLibre's corner into the right-edge
+    // column's view tools (map-chrome-seats.spec.ts holds the full contract).
+    await expect(page.locator('#edge-body-view > .basemap-switcher-control')).toHaveCount(1);
     await expect(
       page.locator('.maplibregl-ctrl-bottom-right .basemap-switcher-control')
-    ).toHaveCount(1);
+    ).toHaveCount(0);
     await expect(page.locator('#map-key-overlay-host > #map-key')).toHaveCount(0);
   });
 
@@ -626,7 +725,9 @@ test.describe('short landscape coarse-pointer shell', () => {
       '.shell-cluster-btn',
       '.shell-horizon-btn',
       '#shell-minimap-door',
-      '#shell-share-host > #share-btn'
+      // Its first option, All of North America, replaced the minimap's All tile.
+      '#region-select',
+      '.map-overlay-controls > #share-btn'
     ]) {
       const target = page.locator(selector).first();
       const targetBox = await rect(target);
@@ -636,15 +737,15 @@ test.describe('short landscape coarse-pointer shell', () => {
     const minimapDoor = page.locator('#shell-minimap-door');
     await minimapDoor.scrollIntoViewIfNeeded();
     await minimapDoor.click();
-    const allAreas = page.locator('#shell-minimap-popover .shell-minimap-all');
-    await expect(allAreas).toBeVisible();
-    const allAreasBox = await rect(allAreas);
-    expect(allAreasBox.width).toBeGreaterThanOrEqual(44);
-    expect(allAreasBox.height).toBeGreaterThanOrEqual(44);
+    await expect(page.locator('#shell-minimap-popover')).toBeVisible();
+    await expect(page.locator('#shell-minimap-popover .shell-minimap-all')).toHaveCount(0);
+    await expect(
+      page.locator('#shell-minimap-popover [role="radiogroup"] [role="radio"]')
+    ).toHaveCount(FRAMING_KEYS.length);
 
     for (const selector of [
       '.shell-cluster-btn',
-      '#shell-share-host > #share-btn',
+      '.map-overlay-controls > #share-btn',
       '#shell-minimap-popover .shell-minimap-mainland'
     ]) {
       const duration = await page
@@ -655,6 +756,146 @@ test.describe('short landscape coarse-pointer shell', () => {
     }
 
     await expectNoHorizontalOverflow(page, 844);
+  });
+});
+
+test.describe('desktop Tribal Nations action in the visible column (1440x900)', () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  // Visual uniformity wave 1, D5 (2026-11-13): the selected count left the
+  // display for the action's accessible name, so the line under the button is
+  // the fault line and draws nothing while both agencies answer. The column's
+  // foot dock is gone (owner items 11 and 13), so the column's own foot bounds it.
+  test('at rest, in every hazard mode, the action ends at least 8px above the column foot and its fault line is empty', async ({
+    page
+  }) => {
+    await gotoApp(page);
+    const scroller = page.locator('.sidebar-scroll');
+    const action = page.locator('#tribal-nations-brief-action');
+    const fault = page.locator('#tribal-nations-brief-action ~ .tribal-nations-health');
+
+    for (const key of HAZARD_CLUSTER_KEYS) {
+      const chip = page.locator(`.shell-cluster-btn[data-cluster="${key}"]`);
+      await chip.click();
+      await expect(chip).toHaveAttribute('aria-pressed', 'true');
+      await expect(action).toBeVisible();
+      await expect(fault).toHaveText('');
+      await expect(fault).toBeHidden();
+      await expect
+        .poll(
+          async () => {
+            await scroller.evaluate((element) => {
+              element.scrollTop = 0;
+            });
+            const [columnBox, actionBox] = await Promise.all([rect(scroller), rect(action)]);
+            return columnBox.bottom - actionBox.bottom;
+          },
+          { message: `${key}: the Tribal Nations action runs past the column foot` }
+        )
+        .toBeGreaterThanOrEqual(8);
+    }
+  });
+});
+
+test.describe('an embed meets the touch floor', () => {
+  test.use({ viewport: { width: 390, height: 700 } });
+
+  test('the sidebar expander and the map information button are at least 44 pixels square', async ({ page }) => {
+    await gotoApp(page, '?embed=true');
+    for (const selector of ['#sidebar-expand', '#map-info-btn']) {
+      const target = page.locator(selector);
+      await expect(target).toBeVisible();
+      const box = await rect(target);
+      expect(box.width, `${selector} is narrower than the touch floor`).toBeGreaterThanOrEqual(44);
+      expect(box.height, `${selector} is shorter than the touch floor`).toBeGreaterThanOrEqual(44);
+    }
+  });
+});
+
+test.describe('the horizon row stays inside the sidebar', () => {
+  for (const [width, height] of [[768, 1024], [1440, 900]] as const) {
+    test(`every horizon button ends inside its row at ${width}x${height}`, async ({ page }) => {
+      await page.setViewportSize({ width, height });
+      await gotoApp(page);
+      const row = page.locator('.shell-horizons');
+      await expect(row).toBeVisible();
+      const rowBox = await rect(row);
+      const buttons = await page.locator('.shell-horizon-btn').all();
+      expect(buttons.length).toBeGreaterThan(0);
+      for (const button of buttons) {
+        const box = await rect(button);
+        expect(box.right, 'a horizon button runs past its row').toBeLessThanOrEqual(rowBox.right + 0.5);
+        expect(box.left).toBeGreaterThanOrEqual(rowBox.left - 0.5);
+      }
+    });
+  }
+});
+
+test.describe('desktop Brief region band', () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test('at region=national the region panel leaves no empty band where the hidden briefing door was', async ({
+    page
+  }) => {
+    // A bare boot resolves to the national default and Brief mode (DR-109,
+    // 60c3a66), where the region panel is rehosted inside the desktop shell
+    // and its briefing door has no anchor to show (D1 M4, found-024). The
+    // repair (D1 M4 repair) keeps the row occupied by a plain-text
+    // alternate rather than collapsing it: this must be RED against the
+    // original pre-M4 code (an empty reserved band, no statement anywhere)
+    // because #region-briefing-note would not exist there at all.
+    await gotoApp(page);
+    const panel = page.locator('#shell-region-host > #panel-region');
+    await expect(panel).toBeVisible();
+    await expect(page.locator('#region-briefing-btn')).toBeHidden();
+    const note = page.locator('#shell-region-host #region-briefing-note');
+    await expect(note).toBeVisible();
+    await expect(note).toHaveText('Pick a place to open its briefing.');
+
+    // The statement's own box must sit inside the second row with no blank
+    // gap above or below it beyond the row's own 8px gap token (measured,
+    // not assumed): top gap is select-bottom to note-top, bottom gap is
+    // note-bottom to panel-bottom (panel padding is zeroed by .shell-rehost
+    // while seated here, so panel-bottom is the row's own edge).
+    const selectBox = await rect(page.locator('#shell-region-host #region-select'));
+    const noteBox = await rect(note);
+    const panelBox = await rect(panel);
+    expect(
+      noteBox.top - selectBox.bottom,
+      'a blank gap sits above the statement beyond the row gap token'
+    ).toBeLessThanOrEqual(9);
+    expect(
+      panelBox.bottom - noteBox.bottom,
+      'a blank gap sits below the statement inside the reserved row'
+    ).toBeLessThanOrEqual(1);
+  });
+
+  test('the region row keeps its height when a place selection shows the door', async ({
+    page
+  }) => {
+    // Red on the collapse design (D1 M4): collapsing the second row to 0px
+    // when the door is hidden, then expanding it once a place selection
+    // shows the door, moves every fixed-position control below it,
+    // including #brief-search, which the 2026-09-13 stable-position rule
+    // pins in place across selection changes.
+    // Measured in the sidebar column's content coordinates: the States row
+    // now follows the Tribal group, and clicking it may scroll the column
+    // to clear the sticky Brief dock. That scroll is not a layout move.
+    const searchContentTop = (): Promise<number> =>
+      page.locator('#brief-search').evaluate((element) => {
+        const scroller = element.closest('.sidebar-scroll');
+        return element.getBoundingClientRect().top + (scroller?.scrollTop ?? 0);
+      });
+    await gotoApp(page);
+    const searchTopBefore = await searchContentTop();
+    await page.locator('#brief-search [data-ddm-search]').fill('oregon');
+    await page.locator('#brief-search [data-search-kind="place"][data-search-id="OR"]').click();
+    await expect(page.locator('#region-briefing-btn')).toBeVisible();
+    const searchTopAfter = await searchContentTop();
+    expect(
+      Math.abs(searchTopAfter - searchTopBefore),
+      '#brief-search moved when the region row gained the visible door'
+    ).toBeLessThanOrEqual(1);
   });
 });
 
@@ -670,6 +911,7 @@ for (const width of [400, 200]) {
     await expect(app).toHaveClass(/\bembed\b/);
     await expect(app).not.toHaveAttribute('data-sheet-detent', /.+/);
     await expect(page.locator('#mobile-footer-nav')).toBeHidden();
+    await openMapKey(page);
     await expect(page.locator('#map-key [data-spc-fire-weather-key]')).toBeVisible();
     await expect(page.locator('#map-key [data-nifc-perimeter-key]')).toBeVisible();
 
@@ -696,3 +938,1039 @@ for (const width of [400, 200]) {
     await expectNoHorizontalOverflow(page, width);
   });
 }
+
+/**
+ * THE TABLET BAND, 721 to 1024 pixels (DDM-P10-T01; ROADMAP gate DDM-D02;
+ * owner ruling DR-036 a, 2026-09-02: "Real third band 721 to 1024 px, fluid
+ * sidebar, 44 px touch floor. Tablet is touch-first").
+ *
+ * The task's acceptance sentence is asserted literally: "At 721, 768, 820,
+ * 900, and 1024 pixels in both orientations no control overlaps another, the
+ * dock keeps a usable width, and every interactive target meets the
+ * coarse-pointer minimum." Five widths times two orientations is ten
+ * viewports and three conditions each.
+ *
+ * Orientation is read as the aspect of the viewport at that width, because
+ * the acceptance fixes the WIDTH and asks for both orientations: portrait is
+ * 4:3 taller than wide, landscape is 3:4 wider than tall. The landscape rows
+ * are the harder half (721x541 sits under the 600px height that keeps the
+ * inline minimap, and 768x576 is a real small-tablet frame).
+ *
+ * "Usable width" carries no number in the acceptance, so the two concrete
+ * failures named in DR-036's own question are what it means here:
+ *
+ *   "the bottom dock computes to zero width between 721 and 804px with the
+ *    briefing open, and the impact panel overlaps the sidebar below 780px"
+ *
+ * Both were pinned here until the owner's ruling of 2026-11-13: the briefing
+ * now covers the map as a studio does, the whole viewport in this band, so
+ * neither collision can arise and the case pins that cover instead.
+ *
+ * WHAT COUNTS AS AN INTERACTIVE TARGET. A tap at the element's own centre
+ * has to land on the element. That excludes three classes of node that are
+ * in the DOM but are not targets: the sidebar's controls inside an embed
+ * (the column is zero wide and clips them), anything under the open briefing
+ * (it is `aria-modal`, so its cover is correct modal behavior and not a
+ * collision), and anything scrolled out of the viewport. Two exemptions
+ * follow WCAG 2.5.5 and 2.5.8 rather than waiving them: a link whose
+ * computed display is `inline` keeps the line box of the sentence it sits
+ * in, and a layer checkbox is measured at its `label` row, which is its real
+ * activation target.
+ */
+const TABLET_BAND_WIDTHS = [721, 768, 820, 900, 1024] as const;
+const TOUCH_FLOOR = 44;
+
+interface Target extends Rect {
+  readonly sel: string;
+  readonly label: string;
+  /** The pressable area, which is the box unless a rule widened it. */
+  readonly hitWidth: number;
+  readonly hitHeight: number;
+  /**
+   * The PAINTED area (DDM-P10-T05): the box intersected with the viewport
+   * and with every ancestor that clips on that axis. This is the only
+   * rectangle the collision audit may compare. The raw box above stays for
+   * the touch floor, which asks what a finger presses, not what is drawn.
+   */
+  readonly effective: Rect;
+}
+
+/**
+ * Two rectangles that share painted pixels. Kept as its own predicate so a
+ * collision can never silently fall back to the raw box.
+ */
+function paintedOverlap(a: Target, b: Target): boolean {
+  return intersects(a.effective, b.effective);
+}
+
+/**
+ * Every interactive element a finger can actually reach, with its measured
+ * box. Runs entirely in the page so one round trip covers a whole survey.
+ *
+ * DDM-P10-T05, the geometry defect behind three red gates: this survey used
+ * to prove reachability at the box CENTRE via elementFromPoint and then keep
+ * the FULL box. A control row whose centre sits one pixel above the
+ * sidebar's scroll fold was admitted with its unpainted tail intact, and
+ * that phantom tail was then reported as colliding with the fixed bottom
+ * dock, a sibling outside the scroller. Which row lands at the fold is a
+ * matter of timing, which is the whole intermittency. The survey now also
+ * records the effective rectangle, clipped by every overflow ancestor, and
+ * drops a control whose painted area is empty.
+ */
+async function reachableTargets(page: Page): Promise<Target[]> {
+  return page.evaluate(() => {
+    const selector =
+      'button, a[href], input, select, summary, [role="button"], [role="tab"], [tabindex]:not([tabindex="-1"])';
+    const found: {
+      sel: string;
+      label: string;
+      left: number;
+      top: number;
+      right: number;
+      bottom: number;
+      width: number;
+      height: number;
+      hitWidth: number;
+      hitHeight: number;
+      effective: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+    }[] = [];
+    const clips = (value: string): boolean =>
+      value === 'auto' || value === 'scroll' || value === 'hidden' || value === 'clip';
+    /** The box clipped by the viewport and by each clipping ancestor. */
+    const effectiveRect = (
+      element: HTMLElement,
+      box: DOMRect
+    ): { left: number; top: number; right: number; bottom: number } => {
+      let left = Math.max(box.left, 0);
+      let top = Math.max(box.top, 0);
+      let right = Math.min(box.right, window.innerWidth);
+      let bottom = Math.min(box.bottom, window.innerHeight);
+      for (let a = element.parentElement; a && a !== document.body; a = a.parentElement) {
+        const s = getComputedStyle(a);
+        const r = a.getBoundingClientRect();
+        if (clips(s.overflowX)) {
+          left = Math.max(left, r.left);
+          right = Math.min(right, r.right);
+        }
+        if (clips(s.overflowY)) {
+          top = Math.max(top, r.top);
+          bottom = Math.min(bottom, r.bottom);
+        }
+      }
+      return { left, top, right, bottom };
+    };
+    for (const node of Array.from(document.querySelectorAll(selector))) {
+      let element = node as HTMLElement;
+      const initial = getComputedStyle(element);
+      if (element.tagName === 'A' && initial.display === 'inline') continue;
+      if (element.tagName === 'INPUT' && (element as HTMLInputElement).type === 'checkbox') {
+        const label = element.closest('label');
+        if (label) element = label as HTMLElement;
+      }
+      const style = getComputedStyle(element);
+      if (style.visibility === 'hidden' || style.display === 'none') continue;
+      const box = element.getBoundingClientRect();
+      if (box.width === 0 || box.height === 0) continue;
+      const centreX = box.left + box.width / 2;
+      const centreY = box.top + box.height / 2;
+      if (
+        centreX < 0 ||
+        centreY < 0 ||
+        centreX >= window.innerWidth ||
+        centreY >= window.innerHeight
+      ) {
+        continue;
+      }
+      const atCentre = document.elementFromPoint(centreX, centreY);
+      if (!atCentre) continue;
+      if (!(atCentre === element || element.contains(atCentre) || atCentre.contains(element))) {
+        continue;
+      }
+      const id = element.id ? `#${element.id}` : '';
+      const classes =
+        typeof element.className === 'string' && element.className.trim()
+          ? `.${element.className.trim().split(/\s+/).slice(0, 2).join('.')}`
+          : '';
+      // The hit area is the box. The minimap Pacific and Atlantic zones
+      // (2026-10-19) are reachable again, but their box centres fall on the
+      // Hawaii inset or on land, so the centre check above skips them.
+      const hitWidth = box.width;
+      const hitHeight = box.height;
+      const eff = effectiveRect(element, box);
+      // Nothing of it is painted: reachable by centre, but no pixels to
+      // collide with and none to press. It is not a target.
+      if (eff.right <= eff.left || eff.bottom <= eff.top) continue;
+      found.push({
+        sel: `${element.tagName.toLowerCase()}${id}${classes}`,
+        label: (element.getAttribute('aria-label') ?? element.textContent ?? '').trim().slice(0, 40),
+        left: Number(box.left.toFixed(1)),
+        top: Number(box.top.toFixed(1)),
+        right: Number(box.right.toFixed(1)),
+        bottom: Number(box.bottom.toFixed(1)),
+        width: Number(box.width.toFixed(1)),
+        height: Number(box.height.toFixed(1)),
+        hitWidth: Number(hitWidth.toFixed(1)),
+        hitHeight: Number(hitHeight.toFixed(1)),
+        effective: {
+          left: Number(eff.left.toFixed(1)),
+          top: Number(eff.top.toFixed(1)),
+          right: Number(eff.right.toFixed(1)),
+          bottom: Number(eff.bottom.toFixed(1)),
+          width: Number((eff.right - eff.left).toFixed(1)),
+          height: Number((eff.bottom - eff.top).toFixed(1))
+        }
+      });
+    }
+    return found;
+  });
+}
+
+/**
+ * Wait for a layout the audit can trust (DDM-P10-T05): the local faces load
+ * with `font-display: swap`, so a survey taken before `document.fonts.ready`
+ * measures fallback metrics, and a row can be mid-transition. Two
+ * consecutive frames with an unchanged control survey is the settle point.
+ */
+async function settledLayout(page: Page): Promise<void> {
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+    const sample = (): string =>
+      Array.from(document.querySelectorAll('button, summary, a[href]'))
+        .map((e) => {
+          const r = e.getBoundingClientRect();
+          return `${r.left | 0},${r.top | 0},${r.right | 0},${r.bottom | 0}`;
+        })
+        .join(';');
+    const frame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
+    let previous = sample();
+    for (let i = 0; i < 30; i += 1) {
+      await frame();
+      await frame();
+      const next = sample();
+      if (next === previous) return;
+      previous = next;
+    }
+  });
+}
+
+/**
+ * What a collision red has to say to be diagnosed from its own output
+ * (DDM-P10-T05 acceptance): the scroller's client box and scroll offset,
+ * the fold this audit is really about, and the strip's tile count and tones.
+ */
+async function layoutDiagnostics(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const scroller = document.querySelector('.sidebar-scroll');
+    const r = scroller?.getBoundingClientRect();
+    const tiles = Array.from(document.querySelectorAll('.conditions-metric')).map(
+      (t) => t.getAttribute('data-tone') ?? '?'
+    );
+    return [
+      r
+        ? `sidebar-scroll ${r.left | 0},${r.top | 0},${r.right | 0},${r.bottom | 0} scrollTop=${(scroller as HTMLElement).scrollTop}`
+        : 'sidebar-scroll: absent',
+      `tiles=${tiles.length} [${tiles.join(',')}]`,
+      `fonts=${document.fonts.status}`
+    ].join(' | ');
+  });
+}
+
+function undersizedTargets(targets: readonly Target[]): string[] {
+  return targets
+    .filter((target) => target.hitWidth < TOUCH_FLOOR || target.hitHeight < TOUCH_FLOOR)
+    .map((target) => `${target.sel} ${target.hitWidth}x${target.hitHeight} "${target.label}"`);
+}
+
+/**
+ * Pairs of reachable targets whose PAINTED areas cross, ignoring nesting.
+ * Compares effective rectangles only (DDM-P10-T05); each clash prints both
+ * the raw and the effective boxes so a red explains itself.
+ */
+function collidingTargets(targets: readonly Target[]): string[] {
+  const clashes: string[] = [];
+  const raw = (t: Target): string => `raw ${t.left},${t.top},${t.right},${t.bottom}`;
+  const eff = (t: Target): string =>
+    `eff ${t.effective.left},${t.effective.top},${t.effective.right},${t.effective.bottom}`;
+  for (let i = 0; i < targets.length; i += 1) {
+    for (let j = i + 1; j < targets.length; j += 1) {
+      const a = targets[i] as Target;
+      const b = targets[j] as Target;
+      if (!paintedOverlap(a, b)) continue;
+      const ae = a.effective;
+      const be = b.effective;
+      const nested =
+        (ae.left <= be.left && ae.right >= be.right && ae.top <= be.top && ae.bottom >= be.bottom) ||
+        (be.left <= ae.left && be.right >= ae.right && be.top <= ae.top && be.bottom >= ae.bottom);
+      if (nested) continue;
+      clashes.push(`${a.sel} [${raw(a)}; ${eff(a)}] over ${b.sel} [${raw(b)}; ${eff(b)}]`);
+    }
+  }
+  return clashes;
+}
+
+// ---------------------------------------------------------------------------
+// DDM-P10-T05 fixtures: the audit's reading, proved in both directions on a
+// controlled DOM. Without the true-positive control a filter that quietly
+// dropped inconvenient controls would make every tablet case green.
+// ---------------------------------------------------------------------------
+
+test.describe('collision audit geometry (DDM-P10-T05)', () => {
+  // These fixtures never boot the application: each paints a synthetic
+  // document and nothing in it makes a request. The suite-wide boundary and
+  // minimap stubs are installed anyway, because
+  // tests/boundary-boot-inventory.test.mjs holds every navigation outside
+  // gotoApp to the same fail-closed contract, and a fixture that one day
+  // framed the app would otherwise reach a live service unnoticed.
+  test.beforeEach(async ({ page }) => {
+    await routeAllTribalFixtures(page);
+    await installMinimapAnalysisStubs(page);
+  });
+
+  const shell = (body: string): string =>
+    `<!doctype html><style>
+      body{margin:0}
+      .col{display:flex;flex-direction:column;height:200px;width:300px;overflow:hidden}
+      .scroll{flex:1 1 auto;min-height:0;overflow-y:auto}
+      .dock{flex:0 0 auto;height:60px}
+      button{display:block;width:120px;height:44px;margin:0;padding:0;border:0}
+    </style>${body}`;
+
+  test('a control whose raw box crosses an overflow clip does not collide with the dock', async ({
+    page
+  }) => {
+    // The scroller is 140px tall; the second button's raw box runs from 114
+    // to 158, so its centre (136) is still inside the scroller while its
+    // lower 18px are clipped. The dock button starts at 140. Raw boxes
+    // overlap by 18px; painted pixels never do.
+    await page.setContent(
+      shell(`<div class="col">
+        <div class="scroll" id="s">
+          <div style="height:70px"></div>
+          <button id="row1">above</button>
+          <button id="row2">at the fold</button>
+          <div style="height:200px"></div>
+        </div>
+        <div class="dock"><button id="dockbtn">dock</button></div>
+      </div>`)
+    );
+    await page.evaluate(() => {
+      (document.getElementById('s') as HTMLElement).scrollTop = 0;
+    });
+    const targets = await reachableTargets(page);
+    const row2 = targets.find((t) => t.sel.includes('#row2'));
+    const dock = targets.find((t) => t.sel.includes('#dockbtn'));
+    expect(row2, 'the fold row is still reachable at its centre').toBeTruthy();
+    expect(dock).toBeTruthy();
+    expect(
+      intersects(row2 as Target, dock as Target),
+      'the RAW boxes do overlap, which is the false positive the old audit reported'
+    ).toBe(true);
+    expect(collidingTargets(targets), 'clipped pixels are not a collision').toEqual([]);
+    expect(
+      undersizedTargets(targets),
+      'the touch floor still sees the full 44px hit area'
+    ).toEqual([]);
+  });
+
+  test('a deliberately painted overlap still fails', async ({ page }) => {
+    // A PARTIAL overlap, 20x14px at the corner, with both centres clear: a
+    // control whose centre is covered is not reachable and never was, so a
+    // total overlap would prove nothing about the collision check.
+    await page.setContent(
+      shell(`<div style="position:relative;width:300px;height:200px">
+        <button id="under" style="position:absolute;left:0;top:0">under</button>
+        <button id="over" style="position:absolute;left:100px;top:30px">over</button>
+      </div>`)
+    );
+    const clashes = collidingTargets(await reachableTargets(page));
+    expect(clashes, 'a real overlap is reported').toHaveLength(1);
+    expect(clashes[0]).toContain('#under');
+    expect(clashes[0]).toContain('#over');
+    expect(clashes[0], 'the report carries both rectangles').toMatch(/raw .*; eff /);
+  });
+
+  test('a control clipped entirely out of view is not a target at all', async ({ page }) => {
+    await page.setContent(
+      shell(`<div class="col">
+        <div class="scroll" id="s">
+          <div style="height:400px"></div>
+          <button id="hidden">below the fold</button>
+        </div>
+        <div class="dock"><button id="dockbtn">dock</button></div>
+      </div>`)
+    );
+    const targets = await reachableTargets(page);
+    expect(targets.some((t) => t.sel.includes('#hidden'))).toBe(false);
+    expect(targets.some((t) => t.sel.includes('#dockbtn'))).toBe(true);
+  });
+});
+
+/** Settle the briefing's slide-in before any geometry is read. */
+async function settledBriefing(page: Page): Promise<void> {
+  await expect(page.locator('#impact-panel')).toBeVisible({ timeout: 15_000 });
+  await expect
+    .poll(() =>
+      page.locator('#impact-panel').evaluate((element) => getComputedStyle(element).transform)
+    )
+    .toBe('matrix(1, 0, 0, 1, 0, 0)');
+}
+
+for (const bandWidth of TABLET_BAND_WIDTHS) {
+  for (const orientation of ['portrait', 'landscape'] as const) {
+    const bandHeight = Math.round(
+      orientation === 'portrait' ? (bandWidth * 4) / 3 : (bandWidth * 3) / 4
+    );
+
+    test.describe(`tablet band ${bandWidth}x${bandHeight} ${orientation}`, () => {
+      test.use({ viewport: { width: bandWidth, height: bandHeight }, hasTouch: true });
+
+      test('the briefing covers the shell and every target keeps the touch floor', async ({
+        page
+      }) => {
+        await gotoApp(page, '?select=state:WA');
+        expect(
+          await page.evaluate(() => window.matchMedia('(pointer: coarse)').matches),
+          'the band is verified with a coarse pointer'
+        ).toBe(true);
+        await settledBriefing(page);
+
+        // The briefing covers the map as a studio does (owner, 2026-11-13).
+        // Below 1025px the studio box is the whole viewport, so the old
+        // drawer's collisions with the sidebar (DR-036 failure B) and the
+        // bottom dock (failure A) cannot arise: nothing sits beside it.
+        const panel = await rect(page.locator('#impact-panel'));
+        expect(Math.abs(panel.left), 'the briefing starts at the left edge').toBeLessThanOrEqual(1);
+        expect(Math.abs(panel.right - bandWidth), 'the briefing reaches the right edge').toBeLessThanOrEqual(1);
+        expect(Math.abs(panel.top), 'the briefing starts at the top edge').toBeLessThanOrEqual(1);
+        await expect(page.locator('#impact-panel .impact-panel-close')).toHaveText('Back to map');
+
+        await settledLayout(page);
+        expect(
+          undersizedTargets(await reachableTargets(page)),
+          'targets below the touch floor with the briefing open'
+        ).toEqual([]);
+        await expectNoHorizontalOverflow(page, bandWidth);
+
+        // The same conditions with the briefing closed, where nothing is
+        // modal and every control on the shell is reachable at once.
+        await page.keyboard.press('Escape');
+        await expect(page.locator('#impact-panel')).toBeHidden({ timeout: 5_000 });
+
+        // DDM-P10-T05: sample only a settled layout, and compare painted
+        // rectangles. The 900x675 horizon-button red and the 820x1093
+        // studio-door red were both this audit reading a clipped tail at the
+        // scroller/dock fold, never a product overlap.
+        await settledLayout(page);
+        const shellTargets = await reachableTargets(page);
+        expect(
+          undersizedTargets(shellTargets),
+          'targets below the touch floor with no briefing open'
+        ).toEqual([]);
+        expect(
+          collidingTargets(shellTargets),
+          `two reachable controls overlap (${await layoutDiagnostics(page)})`
+        ).toEqual([]);
+        await expectNoHorizontalOverflow(page, bandWidth);
+      });
+    });
+  }
+}
+
+test.describe('the tablet band inside an iframe', () => {
+  test.use({ viewport: { width: 820, height: 615 }, hasTouch: true });
+
+  test('an 820x615 embed keeps the touch floor with no sidebar to fall back on', async ({
+    page
+  }) => {
+    await gotoApp(page, '?embed=true&cluster=wildfire');
+    await expect(page.locator('#app')).toHaveClass(/\bembed\b/);
+    const targets = await reachableTargets(page);
+    expect(undersizedTargets(targets), 'embed targets below the touch floor').toEqual([]);
+    expect(collidingTargets(targets), 'two reachable embed controls overlap').toEqual([]);
+    await expectNoHorizontalOverflow(page, 820);
+  });
+});
+
+test.describe('the tablet band sidebar is fluid, not a 340px constant', () => {
+  test('the column tracks the viewport across the band and desktop is unchanged', async ({
+    page
+  }) => {
+    // One boot, resized: the sidebar width is pure CSS, so a re-boot per
+    // width would buy nothing and cost five map builds.
+    await gotoApp(page);
+    const sidebarWidthAt = async (viewport: number): Promise<number> => {
+      await page.setViewportSize({ width: viewport, height: 900 });
+      return (await rect(page.locator('.sidebar'))).width;
+    };
+
+    const at721 = await sidebarWidthAt(721);
+    const at820 = await sidebarWidthAt(820);
+    const at1024 = await sidebarWidthAt(1024);
+    const at1280 = await sidebarWidthAt(1280);
+
+    // The sidebar floor of the band block in src/styles/app.css.
+    expect(at721).toBeGreaterThanOrEqual(300);
+    // Fluid: the column is strictly wider as the viewport grows inside the
+    // band. This is the clause a fixed --sidebar-w fails.
+    expect(at820).toBeGreaterThan(at721);
+    expect(at1024).toBeGreaterThan(at820);
+    // Never past the desktop constant, and desktop itself is untouched.
+    expect(at1024).toBeLessThanOrEqual(340);
+    expect(at1280).toBe(340);
+    // At the bottom of the band the map is still the larger half.
+    expect(721 - at721).toBeGreaterThan(at721);
+  });
+});
+
+/**
+ * A place tap on a short coarse-pointer desktop in Brief opens the place's
+ * briefing (owner, 2026-11-13: "clicking on a place should open the impact
+ * briefing drawer").
+ *
+ * This viewport (1280x600 with a coarse pointer) is the one the Codex
+ * adversarial review of 2026-09-10 (finding 4) named for the panel-foot card,
+ * whose frozen head could collapse the body that carried the caveat and the
+ * source links. A place response no longer reaches that card: in Brief the
+ * briefing is the answer at every width, so the card's geometry is no longer
+ * a place path, and the case now pins the route at the same viewport, where a
+ * touch-capable desktop is still not the phone's sheet.
+ */
+test.describe('short desktop coarse-pointer Brief place tap', () => {
+  test.use({
+    viewport: { width: 1280, height: 600 },
+    hasTouch: true
+  });
+
+  test('a place tap opens the briefing, never the panel-foot card or a popup', async ({
+    page
+  }) => {
+    // The Washington framing puts Washington under the map's centre (DR-109).
+    await gotoApp(page, '?view=brief&region=washington_state&layers=states');
+    expect(
+      await page.evaluate(() => window.matchMedia('(pointer: coarse)').matches)
+    ).toBe(true);
+    // The desktop shell, not the phone's sheet.
+    await expect(page.locator('#app')).not.toHaveAttribute('data-sheet-detent');
+
+    const box = await page.locator('#map').boundingBox();
+    if (!box) throw new Error('map container has no box');
+    const panel = page.locator('#impact-panel');
+    await expect(async () => {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await expect(panel).toBeVisible({ timeout: 1500 });
+    }).toPass({ timeout: 20_000 });
+
+    await expect(page.locator('#impact-panel-title')).toHaveText('Washington');
+    await expect(page.locator('.maplibregl-popup')).toHaveCount(0);
+    await expect(page.locator('#panel-response .coordinated-response')).toHaveCount(0);
+    await expect(page.locator('[data-ddm-impact-trigger]')).toHaveCount(0);
+  });
+});
+
+/**
+ * S30D D1 M10 (register found-019; task DDM-P10-T11; design record
+ * interface-chrome-popups-text.md section 2.2's clearance list): the
+ * preview badge sits right of the scale bars' maximum extent plus 8px,
+ * never intersecting the scale bar.
+ *
+ * Predicted red on the pre-M10 tree: at 960x540 the badge (position:
+ * fixed, left: 50%, transform: translateX(-50%), centred on the whole
+ * viewport including the sidebar) intersects the scale bar, which sits at
+ * the map container's own left edge.
+ */
+test.describe('the preview badge and the scale bar (found-019)', () => {
+  const WIDTHS = [960, 1280, 1440, 1920, 2560] as const;
+  const HEIGHTS: Readonly<Record<number, number>> = {
+    960: 540,
+    1280: 720,
+    1440: 900,
+    1920: 1080,
+    2560: 1440
+  };
+
+  test('the preview badge never intersects the scale bar from 960x540 to 2560x1440', async ({ page }) => {
+    for (const width of WIDTHS) {
+      const height = HEIGHTS[width]!;
+      await page.setViewportSize({ width, height });
+      await gotoApp(page);
+      const badge = page.locator('.test-preview-badge');
+      const scale = page.locator('.maplibregl-ctrl-bottom-left .maplibregl-ctrl-scale').first();
+      await expect(badge).toBeVisible();
+      await expect(scale).toBeVisible();
+      const badgeRect = await rect(badge);
+      const scaleRect = await rect(scale);
+      expect(
+        intersects(badgeRect, scaleRect),
+        `${width}x${height}: badge ${JSON.stringify(badgeRect)} vs scale ${JSON.stringify(scaleRect)}`
+      ).toBe(false);
+      expect(badgeRect.left, `${width}x${height}: badge left is at least 8px past the scale bar's right edge`).toBeGreaterThanOrEqual(
+        scaleRect.right + 8 - 1
+      );
+    }
+  });
+
+  test('the preview badge stays clear of the scale bar with the sidebar collapsed too', async ({ page }) => {
+    await page.setViewportSize({ width: 960, height: 540 });
+    await gotoApp(page);
+    await page.locator('#sidebar-collapse').click();
+    await expect(page.locator('#app')).toHaveClass(/sidebar-collapsed/);
+    const badge = page.locator('.test-preview-badge');
+    const scale = page.locator('.maplibregl-ctrl-bottom-left .maplibregl-ctrl-scale').first();
+    const badgeRect = await rect(badge);
+    const scaleRect = await rect(scale);
+    expect(intersects(badgeRect, scaleRect)).toBe(false);
+  });
+});
+
+/**
+ * S30D D1 M29 (register found-020; task DDM-P17-T07; WCAG 2.2 SC 2.5.8
+ * Target Size (Minimum)): the fine-pointer floor for the DESKTOP shell,
+ * 24 x 24 CSS px, at 1280 to 2560 wide. This is a SEPARATE contract from
+ * the tablet band above: those cases run with `hasTouch` and a coarse
+ * pointer, and their 44px floor (`--touch-target`, DR-153) is unchanged
+ * here. These cases run with the suite's default fine pointer (no
+ * `hasTouch`), which is what a mouse-driven desktop actually is.
+ *
+ * Collector: NOT `reachableTargets` above. That collector is reused for
+ * its reachability idea (visible, non-zero box, centre-hit-tests to the
+ * element) but deliberately keeps a disabled control in view, because the
+ * tablet touch floor is about occupied space a thumb lands on regardless
+ * of state. DDM-P17-T07's acceptance says "every ENABLED... control", so
+ * a disabled control (native `disabled` or `aria-disabled="true"`) is
+ * filtered out here instead, and the selector list is the brief's own
+ * (no `[role="tab"]`, which `reachableTargets` added for the horizon
+ * chips). A second, narrower collector is the honest way to keep both
+ * contracts legible rather than overloading one function with a flag.
+ *
+ * One SC 2.5.8 exception is recognized, computed rather than asserted:
+ *  - Inline: "The target is in a sentence or block of text." Narrowed in
+ *    M29 repair round 2 (director's measurement against the ratified
+ *    acceptance): an `<a>` whose computed `display` is the browser
+ *    default `inline` is exempt ONLY when its parent also carries real
+ *    running text outside the link itself (a sibling node whose trimmed
+ *    text content contains a run of two or more letters), which is the
+ *    computable stand-in for "in a sentence." The sidebar footer's
+ *    repository link (`.sidebar-footer a`) is `display: inline` but its
+ *    only siblings are a middle-dot separator and the version stamp
+ *    (`#footer-version`, no letter run), so it fails this test and is a
+ *    real finding, exactly as the ratified acceptance names it
+ *    ("the footer repository link 200x15").
+ *
+ * The Spacing exception ("the target offset is at least 24 CSS pixels to
+ * every adjacent target") was REMOVED in M29 repair round 2: the ratified
+ * acceptance for DDM-P17-T07 names controls that only clear the floor
+ * because Spacing excused them (Brief/Console at 43.4x17/64.8x17 with
+ * centres 56px apart; the quick-view chips at 21.3px tall, 30px row
+ * pitch) as "today's failures," so this census's floor is the target's
+ * own box, never a spacing-derived excuse. `circleIntersectsBox` went
+ * with it (`git diff` confirms nothing else called it).
+ *
+ * A checkbox or radio `<input>` counts by its associated `<label>`'s box
+ * (`input.labels[0]`, falling back to an ancestor `<label>`) when that
+ * label clears the floor: the label is what a mouse actually lands on to
+ * activate the control (native forms-association semantics; e.g. the
+ * layer toggles measured 295x40 to 295x65 by their label rows).
+ *
+ * Coverage: the collector used to read only what the current scroll
+ * position already had inside the viewport, so a control further down
+ * the scrolling sidebar was never measured at all (silently absent from
+ * `found`, never a finding). For every candidate under the floor (after
+ * any label substitution above), `pointerTargets` now calls
+ * `scrollIntoView({ block: 'center', inline: 'nearest' })` on it before
+ * the reachability (`elementFromPoint`) read, and re-reads its box after
+ * the scroll, so a genuinely undersized control cannot hide below the
+ * fold. A control that already clears the floor is never scrolled: it
+ * cannot be a finding either way, and scrolling it would only disturb
+ * the page for no measurement gain.
+ *
+ * Equivalent (a same-function larger control elsewhere) and
+ * Essential/User agent control are NOT invoked: neither applies to any
+ * element this shell authors.
+ *
+ * Case shape (M29 repair round 1, register found-020): the first cut
+ * boots the app once per (width, view, cluster) combination -- 4 widths x
+ * 2 views x every rendered cluster, plus the collapsed-sidebar case, about
+ * 33 full `gotoApp` boots in one 60s test -- and the gate could not finish
+ * even one boot's worth of assertions at 2560x1440 before the default
+ * test timeout landed mid-`gotoApp` (`I:/claude-temp/ddm-s30d/gates/m29-wt.log`).
+ * Restructured here into one test per (width, view): `gotoApp` runs ONCE
+ * for that case's default cluster, then the remaining clusters are
+ * reached by clicking `.shell-cluster-btn[data-cluster]` in place (never
+ * a second `gotoApp`), which is strictly cheaper than a reboot per
+ * cluster and lets each case report on its own rather than share one
+ * shared 60s clock across all of them.
+ */
+interface PointerTarget {
+  readonly sel: string;
+  readonly label: string;
+  readonly left: number;
+  readonly top: number;
+  readonly width: number;
+  readonly height: number;
+  readonly cx: number;
+  readonly cy: number;
+}
+
+const POINTER_FLOOR = 24;
+
+/** Every visible, ENABLED, reachable interactive element, scoped to the
+ * sidebar and the DDM-authored map chrome. MapLibre's own furniture
+ * (zoom, geolocate, attribution, its native scale bar) is excluded: it
+ * is library-rendered chrome this module never restyles, and every
+ * control DDM authors lives outside a `maplibregl-ctrl-*` container, so
+ * the exclusion drops nothing DDM owns. */
+async function pointerTargets(page: Page): Promise<PointerTarget[]> {
+  return page.evaluate((floor) => {
+    const selector =
+      'button, a[href], input, select, summary, [role="button"], [tabindex]:not([tabindex="-1"])';
+    const found: {
+      sel: string;
+      label: string;
+      left: number;
+      top: number;
+      width: number;
+      height: number;
+      cx: number;
+      cy: number;
+    }[] = [];
+    for (const node of Array.from(document.querySelectorAll(selector))) {
+      const element = node as HTMLElement;
+      if (element.closest('[class*="maplibregl-ctrl"]')) continue;
+      const style = getComputedStyle(element);
+      if (style.visibility === 'hidden' || style.display === 'none') continue;
+      // SC 2.5.8 Inline exception, narrowed (M29 repair round 2): exempt
+      // only when the parent also carries real running text outside the
+      // link (a sibling node with a two-or-more-letter run), the
+      // computable stand-in for "in a sentence." A separator and a
+      // version stamp do not qualify: see the module doc comment.
+      if (element.tagName === 'A' && style.display === 'inline') {
+        const parent = element.parentElement;
+        const hasRunningText = parent
+          ? Array.from(parent.childNodes).some((sibling) => {
+              if (sibling === element) return false;
+              return /[A-Za-z]{2,}/.test((sibling.textContent ?? '').trim());
+            })
+          : false;
+        if (hasRunningText) continue;
+      }
+      // "Enabled" per the acceptance text, unlike the tablet collector.
+      if ((element as HTMLButtonElement).disabled) continue;
+      if (element.getAttribute('aria-disabled') === 'true') continue;
+
+      // A checkbox/radio counts by its label's box: the label is the real
+      // activation target (native forms-association), so an undersized
+      // input with a floor-clearing label is not a finding.
+      let target = element;
+      if (
+        element.tagName === 'INPUT' &&
+        (element as HTMLInputElement).labels &&
+        ((element as HTMLInputElement).type === 'checkbox' ||
+          (element as HTMLInputElement).type === 'radio')
+      ) {
+        const inputBox = element.getBoundingClientRect();
+        if (inputBox.width < floor || inputBox.height < floor) {
+          const label =
+            (element as HTMLInputElement).labels?.[0] ??
+            (element.closest('label') as HTMLElement | null);
+          if (label) {
+            const labelBox = label.getBoundingClientRect();
+            if (labelBox.width >= floor && labelBox.height >= floor) target = label;
+          }
+        }
+      }
+
+      let box = target.getBoundingClientRect();
+      if (box.width === 0 || box.height === 0) continue;
+      // Coverage: a candidate under the floor is scrolled into view before
+      // its reachability read, so a control further down the scrolling
+      // sidebar cannot hide below the fold. A control that already clears
+      // the floor is left exactly where it is: it cannot be a finding.
+      if (box.width < floor || box.height < floor) {
+        target.scrollIntoView({ block: 'center', inline: 'nearest' });
+        box = target.getBoundingClientRect();
+      }
+      const cx = box.left + box.width / 2;
+      const cy = box.top + box.height / 2;
+      if (cx < 0 || cy < 0 || cx >= window.innerWidth || cy >= window.innerHeight) continue;
+      const atCentre = document.elementFromPoint(cx, cy);
+      if (!atCentre) continue;
+      if (!(atCentre === target || target.contains(atCentre) || atCentre.contains(target))) {
+        continue;
+      }
+      const id = element.id ? `#${element.id}` : '';
+      const classes =
+        typeof element.className === 'string' && element.className.trim()
+          ? `.${element.className.trim().split(/\s+/).slice(0, 2).join('.')}`
+          : '';
+      found.push({
+        sel: `${element.tagName.toLowerCase()}${id}${classes}`,
+        label: (element.getAttribute('aria-label') ?? element.textContent ?? '').trim().slice(0, 40),
+        left: Number(box.left.toFixed(1)),
+        top: Number(box.top.toFixed(1)),
+        width: Number(box.width.toFixed(1)),
+        height: Number(box.height.toFixed(1)),
+        cx: Number(cx.toFixed(1)),
+        cy: Number(cy.toFixed(1))
+      });
+    }
+    return found;
+  }, POINTER_FLOOR);
+}
+
+function meetsFloor(target: PointerTarget): boolean {
+  return target.width >= POINTER_FLOOR && target.height >= POINTER_FLOOR;
+}
+
+function undersizedPointerTargets(targets: readonly PointerTarget[]): string[] {
+  return targets
+    .filter((target) => !meetsFloor(target))
+    .map((target) => `${target.sel} ${target.width}x${target.height} "${target.label}"`);
+}
+
+const POINTER_CENSUS_WIDTHS: Readonly<Record<number, number>> = {
+  1280: 720,
+  1440: 900,
+  1920: 1080,
+  2560: 1440
+};
+
+/** Click every cluster the boot did not already commit, in place (never a
+ * second `gotoApp`), waiting each time for the same settle signal
+ * `tests/s4-shell.spec.ts` waits for after a cluster press: the button's
+ * own `aria-pressed`, then its `data-pending` seam dropping to `false`
+ * (the 45s ceiling matches the one that file already uses for a real
+ * layer settle, e.g. `tests/s4-shell.spec.ts:115`), then a settled paint.
+ * Collects and labels the failures for every cluster, including the one
+ * already committed at boot. */
+async function censusEveryCluster(
+  page: Page,
+  width: number,
+  height: number,
+  view: 'brief' | 'console'
+): Promise<string[]> {
+  const clusters = await page.evaluate(() =>
+    Array.from(document.querySelectorAll('.shell-cluster-btn[data-cluster]'))
+      .map((el) => ({
+        key: el.getAttribute('data-cluster'),
+        pressed: el.getAttribute('aria-pressed') === 'true'
+      }))
+      .filter((entry): entry is { key: string; pressed: boolean } => Boolean(entry.key))
+  );
+  expect(
+    clusters.length,
+    'DR-113: at least one hazard mode must be enumerable from the rendered switch'
+  ).toBeGreaterThan(0);
+
+  const failures: string[] = [];
+  for (const { key, pressed } of clusters) {
+    if (!pressed) {
+      // Click only the one mode being measured; SAT and every other
+      // control on the shell stay untouched.
+      const button = page.locator(`.shell-cluster-btn[data-cluster="${key}"]`);
+      await button.click();
+      await expect(button).toHaveAttribute('aria-pressed', 'true');
+      await expect(button).toHaveAttribute('data-pending', 'false', { timeout: 45_000 });
+      await settledLayout(page);
+    }
+    const targets = await pointerTargets(page);
+    for (const failure of undersizedPointerTargets(targets)) {
+      failures.push(`${width}x${height} view=${view} cluster=${key}: ${failure}`);
+    }
+  }
+  return failures;
+}
+
+for (const width of Object.keys(POINTER_CENSUS_WIDTHS).map(Number)) {
+  const height = POINTER_CENSUS_WIDTHS[width]!;
+  for (const view of ['brief', 'console'] as const) {
+    test.describe(`desktop pointer-target floor ${width}x${height} view=${view} (DDM-P17-T07, found-020)`, () => {
+      test.use({ viewport: { width, height } });
+
+      // 2560x1440 is the named-slowest boot in the gate log
+      // (I:/claude-temp/ddm-s30d/gates/m29-wt.log): the old 33-boot census
+      // exhausted its shared 60s clock inside a boot at this width. This
+      // case still does one boot plus up to three in-place cluster
+      // switches; each of the four steps is bounded by the 45s
+      // data-pending settle ceiling this suite already uses for a mode
+      // swap (see `censusEveryCluster` above), so 4 x 45_000ms = 180_000ms
+      // is the derived worst-case budget, not a round guess. The other
+      // three widths keep the framework default (60_000ms): they are
+      // cheaper (smaller canvas) and this shape (1 boot + <=3 in-place
+      // switches) is lighter than the sibling multi-boot describes
+      // elsewhere in this file that already pass at 60s.
+      if (width === 2560) {
+        test.setTimeout(180_000);
+      }
+
+      test('every enabled sidebar and chrome control is at least 24 x 24 CSS px', async ({
+        page
+      }) => {
+        await gotoApp(page, `?view=${view}`);
+        await expect(page.locator('.sidebar')).toBeVisible();
+        await settledLayout(page);
+
+        const failures = await censusEveryCluster(page, width, height, view);
+
+        expect(
+          failures,
+          `pointer targets under 24x24 CSS px with no SC 2.5.8 exception:\n${failures.join('\n')}`
+        ).toEqual([]);
+      });
+    });
+  }
+}
+
+test.describe('desktop pointer-target floor, sidebar collapsed 1440x900 (DDM-P17-T07, found-020)', () => {
+  test.use({ viewport: { width: 1440, height: 900 } });
+
+  test('every enabled sidebar and chrome control is at least 24 x 24 CSS px', async ({ page }) => {
+    // The brief's own extra case: the collapsed rail, not the cluster walk.
+    await gotoApp(page, '?view=console');
+    await page.locator('#sidebar-collapse').click();
+    await expect(page.locator('#app')).toHaveClass(/sidebar-collapsed/);
+    await settledLayout(page);
+    const collapsedTargets = await pointerTargets(page);
+    const failures = undersizedPointerTargets(collapsedTargets).map(
+      (failure) => `1440x900 sidebar collapsed: ${failure}`
+    );
+
+    expect(
+      failures,
+      `pointer targets under 24x24 CSS px with no SC 2.5.8 exception:\n${failures.join('\n')}`
+    ).toEqual([]);
+  });
+});
+
+test.describe("DDM's own base map: no OpenStreetMap in any mode (DDM-P17-T12)", () => {
+  test.use({ viewport: { width: 1280, height: 720 } });
+
+  test('no mode or basemap state asks OpenStreetMap, Overpass or OpenTopoMap, and the ground reads its own archive', async ({
+    page
+  }) => {
+    const thirdParty: string[] = [];
+    let baseReads = 0;
+    page.on('request', (request) => {
+      const url = request.url();
+      if (/openstreetmap\.org|overpass|opentopomap/i.test(url)) thirdParty.push(url);
+      if (url.includes('/data/ddm-base-')) baseReads++;
+    });
+    for (const basemap of ['default', 'satellite']) {
+      await gotoApp(page, `?view=brief&basemap=${basemap}`);
+      await settledLayout(page);
+      for (const key of HAZARD_CLUSTER_KEYS) {
+        await page.locator(`.shell-cluster-btn[data-cluster="${key}"]`).click();
+        await settledLayout(page);
+      }
+    }
+    expect(thirdParty).toEqual([]);
+    expect(baseReads).toBeGreaterThan(0);
+    // The base map is public data: no credit rides the map (the Acknowledgements carry it).
+    await expect(page.locator('#map-osm-credit')).toHaveCount(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// found-021 (S30D D1 M27): on desktop each map-information source row shows
+// its name, detail and state as separate cells whose rectangles never touch;
+// at 390x844 the phone rows keep their stacked cards.
+// ---------------------------------------------------------------------------
+
+interface SourceRowReading {
+  readonly text: string;
+  readonly cells: readonly { readonly tag: string; readonly box: Rect }[];
+}
+
+/** Every source row's cells, read in ONE evaluate after the panel settles. */
+async function readSourceRows(page: Page): Promise<SourceRowReading[]> {
+  return page.evaluate(() =>
+    Array.from(document.querySelectorAll('#map-info-sources > li')).map((li) => ({
+      text: (li.textContent ?? '').replace(/\s+/g, ' ').trim(),
+      cells: Array.from(li.children).map((child) => {
+        const r = child.getBoundingClientRect();
+        return {
+          tag: child.className ? `${child.tagName.toLowerCase()}.${child.className}` : child.tagName.toLowerCase(),
+          box: { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height }
+        };
+      })
+    }))
+  );
+}
+
+/** Closed rectangles: a shared edge counts as touching. */
+function touches(a: Rect, b: Rect): boolean {
+  return !(a.right < b.left || b.right < a.left || a.bottom < b.top || b.bottom < a.top);
+}
+
+test.describe('map-information source rows (found-021)', () => {
+  for (const viewport of [
+    { width: 1280, height: 720 },
+    { width: 1440, height: 900 },
+    { width: 2560, height: 1440 }
+  ]) {
+    test(`map-information source rows show name, detail and state as separate non-touching cells on desktop at ${viewport.width}x${viewport.height}`, async ({
+      page
+    }) => {
+      await page.setViewportSize(viewport);
+      await gotoApp(page, '?view=console');
+      await page.locator('#map-info-btn').click();
+      await expect(page.locator('#map-info-panel')).toBeVisible();
+      await expect(page.locator('#map-info-sources > li').first()).toBeVisible();
+      await settledLayout(page);
+
+      const rows = await readSourceRows(page);
+      expect(rows.length, 'the drawer lists its sources').toBeGreaterThan(0);
+      const touching: string[] = [];
+      for (const row of rows) {
+        expect(row.cells.length, `"${row.text}" has a name and a detail`).toBeGreaterThanOrEqual(2);
+        for (let i = 0; i < row.cells.length; i += 1) {
+          for (let j = i + 1; j < row.cells.length; j += 1) {
+            const a = row.cells[i]!;
+            const b = row.cells[j]!;
+            if (touches(a.box, b.box)) {
+              touching.push(
+                `"${row.text}": ${a.tag} ${a.box.left.toFixed(0)}..${a.box.right.toFixed(0)} x ${a.box.top.toFixed(0)}..${a.box.bottom.toFixed(0)} touches ` +
+                  `${b.tag} ${b.box.left.toFixed(0)}..${b.box.right.toFixed(0)} x ${b.box.top.toFixed(0)}..${b.box.bottom.toFixed(0)}`
+              );
+            }
+          }
+        }
+      }
+      expect(touching, touching.join('\n')).toEqual([]);
+    });
+  }
+
+  test('at 390x844 the source rows keep the phone cards: every cell on its own line, left edges shared', async ({
+    page
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await gotoApp(page);
+    await page.getByRole('button', { name: 'Map information' }).click();
+    await expect(page.locator('#map-info-panel')).toBeVisible();
+    await expect(page.locator('#map-info-sources > li').first()).toBeVisible();
+    await settledLayout(page);
+
+    const phone = await page.evaluate(() => {
+      const li = document.querySelector('#map-info-sources > li');
+      if (!li) return null;
+      const style = getComputedStyle(li);
+      return {
+        display: style.display,
+        rowGap: style.rowGap,
+        padding: style.padding,
+        columns: style.gridTemplateColumns.trim().split(/\s+/).length
+      };
+    });
+    // The phone block (app.css, max-width: 720px): a one-column grid card,
+    // 2 px between lines, 9 px by 10 px of padding.
+    expect(phone).toEqual({ display: 'grid', rowGap: '2px', padding: '9px 10px', columns: 1 });
+    const rows = await readSourceRows(page);
+    for (const row of rows) {
+      for (let i = 1; i < row.cells.length; i += 1) {
+        const above = row.cells[i - 1]!.box;
+        const cell = row.cells[i]!.box;
+        expect(cell.top, `"${row.text}": cell ${i} sits under the one before it`).toBeGreaterThanOrEqual(above.bottom - 0.5);
+        expect(Math.abs(cell.left - above.left), `"${row.text}": cell ${i} shares the left edge`).toBeLessThanOrEqual(0.5);
+      }
+    }
+  });
+});

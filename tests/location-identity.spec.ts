@@ -1,7 +1,8 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './offline-test';
 import type * as maplibregl from 'maplibre-gl';
 
 import { resolveLocationIdentity } from '../src/state/location-identity';
+import { invalidateSharedJsonRequest, US_STATES_SHARED_KEY } from '../src/util/fetch';
 
 const STATE_FILL = 'us-states-fill';
 const TRIBAL_FILL = 'tribal-lands-fill';
@@ -50,7 +51,7 @@ function identityMap(layerFeatures: SyntheticLayerFeatures): maplibregl.Map {
 
 async function containingTribal(
   layerFeatures: SyntheticLayerFeatures
-): Promise<{ name: string; source: string } | null> {
+): Promise<{ name: string; source: string; biaLandArea?: string } | null> {
   const identity = await resolveLocationIdentity(
     identityMap(layerFeatures),
     { lng: -120.5, lat: 47.2 },
@@ -74,7 +75,7 @@ test('the subtype-aware identity matrix covers legal AIANNH, statistical AIANNH,
   const cases: ReadonlyArray<{
     readonly label: string;
     readonly layers: SyntheticLayerFeatures;
-    readonly expected: { readonly name: string; readonly source: string } | null;
+    readonly expected: { readonly name: string; readonly source: string; readonly biaLandArea?: string } | null;
   }> = [
     {
       label: 'legal AIANNH only',
@@ -97,7 +98,8 @@ test('the subtype-aware identity matrix covers legal AIANNH, statistical AIANNH,
         [BIA_FILL]: bia,
         [AIANNH_FILL]: [statisticalAiannh, legalAiannh]
       },
-      expected: { name: 'Synthetic Census Legal Area', source: 'aiannh' }
+      // R5-37: the BIA land area rides along so the door can name the Nation.
+      expected: { name: 'Synthetic Census Legal Area', source: 'aiannh', biaLandArea: 'Synthetic BIA LAR Area' }
     },
     {
       label: 'BIA outranks a statistical AIANNH area',
@@ -126,4 +128,83 @@ test('the subtype-aware identity matrix covers legal AIANNH, statistical AIANNH,
       identityCase.label
     ).toEqual(identityCase.expected);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The bundled-states fallback (no rendered states layer): a superseded click
+// must not cancel a live one, and one failure must not last the session.
+// ---------------------------------------------------------------------------
+
+const BUNDLED_STATES = JSON.stringify({
+  type: 'FeatureCollection',
+  features: [
+    {
+      type: 'Feature',
+      properties: { STUSPS: 'WA', NAME: 'Washington' },
+      geometry: {
+        type: 'Polygon',
+        coordinates: [[[-125, 45.5], [-116.9, 45.5], [-116.9, 49], [-125, 49], [-125, 45.5]]]
+      }
+    }
+  ]
+});
+
+/** A map with no rendered layers, so the state comes from the bundled file. */
+const noLayersMap = identityMap({ [STATE_FILL]: [] });
+const SEATTLE = { lng: -122.3, lat: 47.6 };
+
+/** Answer the bundled file after `delayMs`, honouring the request's abort. */
+function bundledStatesFetch(delayMs: number): typeof fetch {
+  return (async (_input: unknown, init?: RequestInit) => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, delayMs);
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        reject(init.signal?.reason);
+      }, { once: true });
+    });
+    return new Response(BUNDLED_STATES, { status: 200 });
+  }) as typeof fetch;
+}
+
+test.describe.serial('bundled-states fallback', () => {
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  test.beforeEach(() => {
+    invalidateSharedJsonRequest(US_STATES_SHARED_KEY);
+    console.warn = () => {};
+  });
+  test.afterEach(() => {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+    invalidateSharedJsonRequest(US_STATES_SHARED_KEY);
+  });
+
+  test('one transient failure is retried on the next click', async () => {
+    let calls = 0;
+    const answer = bundledStatesFetch(0);
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls += 1;
+      if (calls === 1) throw new TypeError('network down');
+      return answer(input, init);
+    }) as typeof fetch;
+
+    const first = await resolveLocationIdentity(noLayersMap, SEATTLE, new AbortController().signal);
+    expect(first.state).toBeNull();
+    const second = await resolveLocationIdentity(noLayersMap, SEATTLE, new AbortController().signal);
+    expect(second.state).toEqual({ code: 'WA', name: 'Washington' });
+    expect(calls).toBe(2);
+  });
+
+  test('a superseded first click does not take the state from the live second click', async () => {
+    globalThis.fetch = bundledStatesFetch(200);
+    const a = new AbortController();
+    const first = resolveLocationIdentity(noLayersMap, { lng: -120.5, lat: 47.4 }, a.signal).catch(
+      () => null
+    );
+    const second = resolveLocationIdentity(noLayersMap, SEATTLE, new AbortController().signal);
+    setTimeout(() => a.abort(), 50);
+    await first;
+    expect((await second).state).toEqual({ code: 'WA', name: 'Washington' });
+  });
 });

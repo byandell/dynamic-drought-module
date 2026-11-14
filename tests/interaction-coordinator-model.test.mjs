@@ -1,0 +1,1313 @@
+import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { registerHooks } from 'node:module';
+import test from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+/**
+ * S30D P1-FRAME (2026-10-04): the InteractionCoordinator is the popup frame's
+ * one caller. This drives src/map/interaction-coordinator.ts itself, through
+ * the one map click handler it binds (tests/interaction-coordinator-collect
+ * .test.mjs is the precedent), with targets that answer a MODEL:
+ *
+ *   - the coordinator hands the popup path exactly `serializePopupFrame(model)`;
+ *   - a response carrying both `content` and `model`, or neither, is a builder
+ *     bug, declined like a null answer (the next hit answers);
+ *   - a model the frame refuses throws its PopupFrameError (as a builder's own
+ *     serializer call did), before any selection or emphasis is written;
+ *   - a commit that lands before the frame chunk has resolved waits, and a
+ *     later commit, a dismissal, a studio route change, a reset, the mobile
+ *     Brief sheet taking over, the map's removal or an adopted station
+ *     popup's close wins: the stale commit never paints, never writes
+ *     selection or emphasis, never opens the briefing;
+ *   - a model the frame refuses AFTER the wait is reported once on the
+ *     console and dismisses, never an unhandled rejection; that catch covers
+ *     the serialization only, never the rendering after it;
+ *   - Escape during the wait retires the waiting commit, and the handler the
+ *     wait installs is gone when the wait ends, however it ends;
+ *   - the mobile Brief sheet route needs no frame, so it never waits.
+ *
+ * The resolve hook maps `maplibre-gl` to a recording Popup, and the impact
+ * panel facade, the mobile sheet and the studio route to recording stubs;
+ * every other import is the real module, the frame included (its dynamic
+ * import resolves to the real src/ui/popup-frame.ts). The DOM is a minimal
+ * fake: `raw.innerHTML` is recorded (the string the coordinator renders),
+ * never parsed, so a framed string takes the unframed fallback here; the
+ * framed regions get their proof in tests/coordinator-frame-model.spec.ts.
+ * The fake does what the DOM does where the coordinator relies on it (a
+ * `textContent` setter, listener binding, appendChild refusing a non-node),
+ * so a case reds at its own assertion rather than inside the fake; a click
+ * that throws is returned by `tryClick` and asserted clean last. The mobile
+ * sheet becoming active WITHOUT a view-mode change (a resize) is proved in
+ * the browser, against the real sheet, not by flipping this stub.
+ *
+ * A COLD commit is made by `resetInteractionCoordinatorForTest`, which forgets
+ * the loaded frame: the next registration warms it again, and the cached
+ * module resolves a few microtasks later, after the synchronous click.
+ */
+
+const STUBS = {
+  'maplibre-gl': [
+    'export class Popup {',
+    '  constructor(options) { this.options = options; this.closers = []; this.removed = false; globalThis.__ddmPopups.push(this); }',
+    '  setLngLat() { return this; }',
+    '  setDOMContent(node) { this.content = node; return this; }',
+    '  addTo() { return this; }',
+    '  on(type, fn) { if (type === "close") this.closers.push(fn); return this; }',
+    '  remove() { this.removed = true; const closers = this.closers; this.closers = []; for (const fn of closers) fn(); return this; }',
+    '  getElement() { return null; }',
+    '}'
+  ].join('\n'),
+  impactPanel: [
+    'export function openImpactPanel(context) { globalThis.__ddmPanelOpens.push(context); }',
+    'export function nextBriefingIntent() { return 1; }',
+    'export function isCurrentBriefingIntent(intent) { return intent === 1; }',
+    'export function openTechnicalInformation(opener) { globalThis.__ddmTechnicalOpens.push(opener); }'
+  ].join('\n'),
+  // The region briefing's opener (the door on a popup that is not about a place): recorded, never fetched.
+  deepLink: 'export function openStateBriefing(_map, state, opts) { globalThis.__ddmStateBriefings.push({ state, fit: opts.fit, current: opts.guard() }); }',
+  // The tap's place (the late door's subject): a case names it; otherwise it throws, as the real resolver does on this fake map (no `project`).
+  locationIdentity:
+    'export async function resolveLocationIdentity() { if (!globalThis.__ddmIdentity) throw new Error("no identity"); return globalThis.__ddmIdentity; }',
+  mobileSheet: 'export function isSheetActive() { return globalThis.__ddmSheetActive === true; }',
+  studioRoute:
+    'export function studioOwnsScreen() { return false; } export function onStudioRouteChange(fn) { globalThis.__ddmStudioListeners.push(fn); return () => {}; }',
+  // The committed mode and horizon: a case publishes a new snapshot through `publishSnapshot`.
+  clusterService:
+    'export function getCommittedSnapshot() { return globalThis.__ddmSnapshot; } export function onCommittedSnapshotChange(fn) { globalThis.__ddmSnapshotListeners.push(fn); return () => {}; }'
+};
+
+const stubUrl = (source) => `data:text/javascript,${encodeURIComponent(source)}`;
+
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    const fromTs = typeof context.parentURL === 'string' && context.parentURL.endsWith('.ts');
+    if (specifier === 'maplibre-gl' && fromTs) return { url: stubUrl(STUBS['maplibre-gl']), shortCircuit: true };
+    if (fromTs && /\/ui\/impact-panel$/.test(specifier)) return { url: stubUrl(STUBS.impactPanel), shortCircuit: true };
+    if (fromTs && /\/state\/deep-link$/.test(specifier)) return { url: stubUrl(STUBS.deepLink), shortCircuit: true };
+    if (fromTs && /\/state\/location-identity$/.test(specifier)) return { url: stubUrl(STUBS.locationIdentity), shortCircuit: true };
+    if (fromTs && /\/ui\/mobile-sheet$/.test(specifier)) return { url: stubUrl(STUBS.mobileSheet), shortCircuit: true };
+    if (fromTs && /\/state\/studio-route$/.test(specifier)) return { url: stubUrl(STUBS.studioRoute), shortCircuit: true };
+    if (fromTs && /\/state\/cluster-service$/.test(specifier)) return { url: stubUrl(STUBS.clusterService), shortCircuit: true };
+    if (specifier.startsWith('.') && !/\.[a-z]+$/i.test(specifier) && fromTs) {
+      const candidate = new URL(`${specifier}.ts`, context.parentURL);
+      if (existsSync(fileURLToPath(candidate))) return nextResolve(`${specifier}.ts`, context);
+    }
+    return nextResolve(specifier, context);
+  }
+});
+
+globalThis.window = { matchMedia: () => ({ matches: false }) };
+globalThis.__ddmPopups = [];
+globalThis.__ddmPanelOpens = [];
+globalThis.__ddmStateBriefings = [];
+globalThis.__ddmTechnicalOpens = [];
+globalThis.__ddmStudioListeners = [];
+globalThis.__ddmSheetActive = false;
+globalThis.__ddmSnapshot = { selectedHazard: 'drought', cluster: 'drought', horizon: 'current' };
+globalThis.__ddmSnapshotListeners = [];
+/** Publish a committed snapshot as the cluster service does: every listener, in the same turn. */
+function publishSnapshot(snapshot) {
+  globalThis.__ddmSnapshot = snapshot;
+  for (const fn of globalThis.__ddmSnapshotListeners) fn();
+}
+/** Every string the coordinator set as `innerHTML`, in order: what it rendered. */
+const rendered = [];
+
+class FakeNode {
+  constructor(nodeType) {
+    this.nodeType = nodeType;
+    this.parentNode = null;
+    this.childNodes = [];
+  }
+  get textContent() {
+    return this.childNodes.map((n) => n.textContent).join('');
+  }
+  /** As the DOM does: the children are replaced by one text node (none for ''). */
+  set textContent(value) {
+    for (const child of this.childNodes) child.parentNode = null;
+    this.childNodes = [];
+    const text = String(value ?? '');
+    if (text === '') return;
+    const node = new FakeText(text);
+    node.parentNode = this;
+    this.childNodes.push(node);
+  }
+  get firstChild() {
+    return this.childNodes[0] ?? null;
+  }
+  contains(node) {
+    return node === this || this.childNodes.some((child) => child.contains(node));
+  }
+  get isConnected() {
+    return this === document.body || this.parentNode?.isConnected === true;
+  }
+  remove() {
+    if (!this.parentNode) return;
+    const siblings = this.parentNode.childNodes;
+    siblings.splice(siblings.indexOf(this), 1);
+    this.parentNode = null;
+  }
+}
+class FakeText extends FakeNode {
+  constructor(data) {
+    super(3);
+    this.data = data;
+  }
+  get textContent() {
+    return this.data;
+  }
+}
+class FakeElement extends FakeNode {
+  constructor() {
+    super(1);
+    this.attrs = new Map();
+    const classes = new Set();
+    this.classList = { add: (...names) => names.forEach((c) => classes.add(c)), contains: (c) => classes.has(c) };
+  }
+  set innerHTML(value) {
+    rendered.push(value);
+  }
+  get children() {
+    return this.childNodes.filter((n) => n.nodeType === 1);
+  }
+  get childElementCount() {
+    return this.children.length;
+  }
+  get firstElementChild() {
+    return this.children[0] ?? null;
+  }
+  appendChild(node) {
+    // The DOM's own refusal of a non-node (an answer whose content is absent).
+    if (!(node instanceof FakeNode)) {
+      throw new TypeError("Failed to execute 'appendChild' on 'Node': parameter 1 is not of type 'Node'.");
+    }
+    node.remove();
+    node.parentNode = this;
+    this.childNodes.push(node);
+    return node;
+  }
+  setAttribute(k, v) {
+    this.attrs.set(k, String(v));
+  }
+  getAttribute(k) {
+    return this.attrs.has(k) ? this.attrs.get(k) : null;
+  }
+  removeAttribute(k) {
+    this.attrs.delete(k);
+  }
+  matches() {
+    return false;
+  }
+  querySelector() {
+    return null;
+  }
+  getClientRects() {
+    return this.isConnected ? [{}] : [];
+  }
+  focus() {
+    if (!this.isConnected || document.activeElement === this) return;
+    const previous = document.activeElement;
+    document.activeElement = this;
+    for (const fn of documentListeners.get('focusout') ?? []) fn({ target: previous, relatedTarget: this });
+    for (const fn of documentListeners.get('focusin') ?? []) fn({ target: this, relatedTarget: previous });
+  }
+  // The disclosure's buttons and the briefing door bind clicks; nothing here dispatches one.
+  addEventListener() {}
+  removeEventListener() {}
+}
+const mapContainer = new FakeElement();
+/** The document's listeners by event type, as the DOM keeps them (P1-FRAME repair round 2: Escape). */
+const documentListeners = new Map();
+globalThis.Node = FakeNode;
+globalThis.HTMLElement = FakeElement;
+globalThis.document = {
+  body: new FakeElement(),
+  activeElement: null,
+  documentElement: { dataset: {} },
+  getElementById: (id) => (id === 'map-container' ? mapContainer : null),
+  createElement: () => new FakeElement(),
+  addEventListener(type, fn) {
+    documentListeners.set(type, [...(documentListeners.get(type) ?? []), fn]);
+  },
+  removeEventListener(type, fn) {
+    documentListeners.set(type, (documentListeners.get(type) ?? []).filter((f) => f !== fn));
+  }
+};
+const keydownListeners = () => (documentListeners.get('keydown') ?? []).length;
+/** A key press reaching the document: every keydown listener, in order; reports whether any swallowed it. */
+function press(key) {
+  const swallowed = [];
+  const event = {
+    key,
+    preventDefault: () => swallowed.push('preventDefault'),
+    stopPropagation: () => swallowed.push('stopPropagation'),
+    stopImmediatePropagation: () => swallowed.push('stopImmediatePropagation')
+  };
+  for (const fn of [...(documentListeners.get('keydown') ?? [])]) fn(event);
+  return swallowed;
+}
+
+const coordinator = await import('../src/map/interaction-coordinator.ts');
+const FRAME_URL = new URL('../src/ui/popup-frame.ts', import.meta.url).href;
+const { serializePopupFrame } = await import(FRAME_URL);
+const { getPlaceSelection, setPlaceSelection } = await import('../src/state/place-selection.ts');
+const { setCurrentRegion } = await import('../src/state/region-store.ts');
+const { clearEmphasis, getEmphasisTargets } = await import('../src/state/place-emphasis.ts');
+const { setViewMode } = await import('../src/state/view-mode.ts');
+const { getTypedPlace, setTypedPlace } = await import('../src/state/typed-place.ts');
+// The popup's lifecycle is the Console's: in Brief a place-bearing click opens the briefing at every
+// width (owner, 2026-11-13). The cases about Brief set it themselves and hand the Console back.
+setViewMode('console');
+
+/** The frame import has resolved and every continuation queued on it has run. */
+async function settle() {
+  await import(FRAME_URL);
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+const MODEL = {
+  kind: 'surface',
+  title: 'Fixture Node Surface',
+  issuer: { role: 'issued-by', name: 'Fixture issuer', productKey: 'usdm' },
+  value: [{ text: 'Fixture value' }],
+  clocks: [{ kind: 'point', meaning: 'map-date', label: 'Fixture map date', at: { precision: 'date', date: '2026-09-29' } }],
+  source: { link: { label: 'Fixture source', href: 'https://droughtmonitor.unl.edu/' } }
+};
+const SECOND_MODEL = { ...MODEL, title: 'Fixture Node Second Surface' };
+/** A model the frame refuses (a blank title is a caller bug, PopupFrameError). */
+const REFUSED_MODEL = { ...MODEL, title: ' ' };
+
+const context = (title) => ({
+  kind: 'bia-reservation',
+  title,
+  properties: null,
+  lngLat: { lng: -120, lat: 47 },
+  regionKey: 'washington_state',
+  containing: { state: null, basis: 'none' }
+});
+
+const F = (layer, name) => ({ layer: { id: layer }, source: layer, properties: { name } });
+
+/**
+ * A fresh coordinator (the frame forgotten, so the first commit after the
+ * registration is COLD unless the caller settles first) with one target per
+ * entry of `layers`, each answering from its queue (the last answer repeats).
+ */
+function harness(layers, { warm = false } = {}) {
+  coordinator.resetInteractionCoordinatorForTest();
+  setPlaceSelection(null);
+  clearEmphasis({ getSource: () => undefined });
+  globalThis.__ddmPopups.length = 0;
+  globalThis.__ddmPanelOpens.length = 0;
+  globalThis.__ddmStudioListeners.length = 0;
+  globalThis.__ddmSnapshotListeners.length = 0;
+  globalThis.__ddmSnapshot = { selectedHazard: 'drought', cluster: 'drought', horizon: 'current' };
+  globalThis.__ddmSheetActive = false;
+  rendered.length = 0;
+  // A popup an earlier case left open keeps its own Escape handler; a fresh
+  // harness starts with none, so a case sees only the handlers it caused.
+  documentListeners.clear();
+  document.body.textContent = '';
+  document.activeElement = document.body;
+  const canvas = document.body.appendChild(new FakeElement());
+  const calls = [];
+  /** Every map event handler the coordinator bound, by type (MapLibre's `map.on`). */
+  const handlers = new Map();
+  const map = {
+    getCanvas: () => canvas,
+    on(type, handler) {
+      handlers.set(type, [...(handlers.get(type) ?? []), handler]);
+    },
+    getLayer: (id) => (id in layers ? { id } : undefined),
+    getSource: () => undefined,
+    queryRenderedFeatures: () => Object.keys(layers).map((id) => F(id, id))
+  };
+  const kinds = ['reservation-boundary', 'tribal-lands'];
+  for (const [index, [id, queue]] of Object.entries(layers).entries()) {
+    let n = 0;
+    coordinator.registerClickTarget({
+      kind: kinds[index] ?? 'condition-surface',
+      layerIds: [id],
+      label: () => id,
+      respond() {
+        calls.push(id);
+        const answer = queue[Math.min(n, queue.length - 1)];
+        n += 1;
+        return answer;
+      }
+    });
+  }
+  coordinator.initInteractionCoordinator(map);
+  assert.equal(handlers.get('click')?.length, 1, 'the coordinator bound one map click handler');
+  const click = () => handlers.get('click')[0]({ point: { x: 10, y: 10 }, lngLat: { lng: -120, lat: 47 } });
+  /**
+   * A click whose throw is RETURNED, not raised, so a case asserts its
+   * intended outcome first and the clean click last (on a coordinator that
+   * cannot take a model, the DOM's own appendChild refusal is the throw).
+   */
+  const tryClick = () => {
+    try {
+      click();
+      return null;
+    } catch (err) {
+      return err;
+    }
+  };
+  /** Fire a map event the way MapLibre's `fire` does: every bound handler, in order. */
+  const fire = (type) => {
+    for (const handler of handlers.get(type) ?? []) handler({ type });
+  };
+  return { calls, click, tryClick, fire, map, canvas, ready: warm ? settle() : Promise.resolve() };
+}
+
+/** An external popup can open before its frame chunk supplies any DOM. */
+function stationPopup() {
+  let element = null;
+  const closers = [];
+  return {
+    removes: 0,
+    once(type, fn) {
+      if (type === 'close') closers.push(fn);
+      return this;
+    },
+    getElement: () => element,
+    paintElement() {
+      element = document.body.appendChild(new FakeElement());
+      return element.appendChild(new FakeElement());
+    },
+    remove() {
+      this.removes++;
+      if (element?.contains(document.activeElement)) {
+        const previous = document.activeElement;
+        document.activeElement = document.body;
+        for (const fn of documentListeners.get('focusout') ?? []) fn({ target: previous, relatedTarget: null });
+      }
+      element?.remove();
+      element = null;
+      for (const fn of closers.splice(0)) fn();
+      return this;
+    }
+  };
+}
+
+/** A controlled DOM shape for the real serializer's already-validated frame.
+ * This supplies regions and focusable controls, not an HTML parser or a layout
+ * claim. The browser frame cases still own markup parsing and popup geometry.
+ */
+async function withAdoptedFrameDom(run) {
+  const createElement = document.createElement;
+  const frames = [];
+  document.createElement = () => {
+    const holder = new FakeElement();
+    Object.defineProperty(holder, 'innerHTML', { set(value) {
+      rendered.push(value);
+      assert.match(value, /^<article[^>]*data-popup-frame/);
+      const root = new FakeElement();
+      root.matches = (selector) => selector === '[data-popup-frame]';
+      const head = root.appendChild(new FakeElement());
+      head.matches = (selector) => selector === '[data-popup-region=head]';
+      const body = root.appendChild(new FakeElement());
+      body.matches = (selector) => selector === '[data-popup-region=body]';
+      const controls = [head.appendChild(new FakeElement()), body.appendChild(new FakeElement())];
+      root.querySelectorAll = () => controls;
+      root.querySelector = () => controls[0];
+      root.replaceWith = (replacement) => {
+        const parent = root.parentNode;
+        const at = parent.childNodes.indexOf(root);
+        parent.childNodes[at] = replacement;
+        replacement.parentNode = parent;
+        root.parentNode = null;
+        if (root.contains(document.activeElement)) document.activeElement = document.body;
+      };
+      holder.appendChild(root);
+      frames.push({ root, head, body, controls });
+    } });
+    return holder;
+  };
+  try { await run(frames); }
+  finally { document.createElement = createElement; }
+}
+
+function framedStationPopup() {
+  const popup = stationPopup();
+  popup.setContentCalls = 0;
+  popup.classes = new Set();
+  popup.setDOMContent = (root) => {
+    popup.setContentCalls++;
+    const content = popup.paintElement();
+    content.appendChild(root);
+    popup.getElement().querySelector = (selector) => selector === '.maplibregl-popup-content > [data-popup-frame]'
+      ? content.firstElementChild : null;
+    return popup;
+  };
+  popup.addClassName = (name) => { popup.classes.add(name); return popup; };
+  return popup;
+}
+
+test('an adopted cold frame waits, then decorates and mounts exactly once', async () => {
+  const { map } = harness({});
+  const popup = framedStationPopup();
+  const mounted = [];
+  await withAdoptedFrameDom(async (frames) => {
+    coordinator.adoptExternalResponse(popup, map, document.body).paint(MODEL, (root) => mounted.push(root));
+    assert.equal(popup.getElement(), null, 'no DOM before the lazy frame resolves');
+    assert.deepEqual(mounted, []);
+    await settle();
+    assert.equal(frames.length, 1);
+    assert.deepEqual(mounted, [frames[0].root]);
+    assert.equal(popup.setContentCalls, 1);
+    assert.equal(frames[0].root.classList.contains('coordinated-response'), true);
+    assert.equal(frames[0].head.classList.contains('coordinated-response-head'), true);
+    assert.equal(frames[0].body.classList.contains('coordinated-response-body'), true);
+    assert.deepEqual([...popup.classes], ['ddm-coordinated-popup', 'ddm-popup-framed']);
+    assert.equal(popup.getElement().getAttribute('data-ddm-external-response'), '');
+  });
+  popup.remove();
+});
+
+test('a replaced cold adoption never paints or mounts after its frame resolves', async () => {
+  const { map } = harness({});
+  const old = framedStationPopup();
+  const current = framedStationPopup();
+  const mounted = [];
+  await withAdoptedFrameDom(async (frames) => {
+    const retired = coordinator.adoptExternalResponse(old, map, document.body);
+    retired.paint(MODEL, () => mounted.push('old'));
+    coordinator.adoptExternalResponse(current, map, document.body).paint(SECOND_MODEL, () => mounted.push('current'));
+    await settle();
+    retired.paint(MODEL, () => mounted.push('late-old'));
+    assert.equal(old.removes, 1);
+    assert.equal(old.setContentCalls, 0);
+    assert.equal(frames.length, 1);
+    assert.deepEqual(rendered, [serializePopupFrame(SECOND_MODEL)]);
+    assert.deepEqual(mounted, ['current']);
+  });
+  current.remove();
+});
+
+test('adopted hydration replaces the root, retains control-index focus and mounts each new frame once', async () => {
+  const { map, ready } = harness({ warmup: [{ model: MODEL }] }, { warm: true });
+  await ready;
+  const popup = framedStationPopup();
+  const mounted = [];
+  await withAdoptedFrameDom(async (frames) => {
+    const response = coordinator.adoptExternalResponse(popup, map, document.body);
+    response.paint(MODEL, (root) => mounted.push(root));
+    assert.equal(frames.length, 1, 'warm paint remains synchronous');
+    frames[0].controls[1].focus();
+    response.paint(SECOND_MODEL, (root) => mounted.push(root));
+    assert.equal(frames.length, 2);
+    assert.equal(popup.setContentCalls, 1, 'hydration replaces only the existing frame root');
+    assert.equal(frames[0].root.isConnected, false);
+    assert.equal(frames[1].root.isConnected, true);
+    assert.equal(document.activeElement, frames[1].controls[1]);
+    assert.deepEqual(mounted, frames.map((frame) => frame.root));
+    assert.equal(popup.getElement().getAttribute('data-ddm-external-response'), '');
+  });
+  popup.remove();
+});
+
+test('an adopted warm model refusal throws before DOM or mount work', async () => {
+  const { map, ready } = harness({ warmup: [{ model: MODEL }] }, { warm: true });
+  await ready;
+  const popup = framedStationPopup();
+  const mounted = [];
+  await withAdoptedFrameDom(async (frames) => {
+    const response = coordinator.adoptExternalResponse(popup, map, document.body);
+    assert.throws(() => response.paint(REFUSED_MODEL, (root) => mounted.push(root)), { name: 'PopupFrameError' });
+    assert.deepEqual(frames, []);
+    assert.deepEqual(mounted, []);
+    assert.equal(popup.setContentCalls, 0);
+  });
+  popup.remove();
+});
+
+test('Escape closes an adopted station before its lazy frame paints and retires the late paint', async () => {
+  const { map } = harness({});
+  const marker = document.body.appendChild(new FakeElement());
+  marker.focus();
+  const station = stationPopup();
+  const response = coordinator.adoptExternalResponse(station, map, marker);
+  response.paint(MODEL);
+  assert.deepEqual(rendered, [], 'the frame is still pending');
+  assert.deepEqual(press('Escape'), [], 'Escape is not swallowed');
+  assert.equal(station.removes, 1, 'Escape closes the adopted popup once');
+  await settle();
+  assert.deepEqual(rendered, [], 'the retired adoption never serializes or paints');
+  assert.equal(keydownListeners(), 0, 'no Escape handler outlives the popup');
+  assert.equal(document.activeElement, marker, 'focus never left the marker while the frame was pending');
+});
+
+test('an adopted station tracks focus after a late first paint, returns it on Escape, and binds once on each reopen', () => {
+  const { map } = harness({});
+  const marker = document.body.appendChild(new FakeElement());
+  const station = stationPopup();
+  for (let opened = 1; opened <= 2; opened++) {
+    marker.focus();
+    coordinator.adoptExternalResponse(station, map, marker);
+    station.paintElement().focus();
+    assert.deepEqual(press('Enter'), [], 'other keys do not close the popup');
+    assert.equal(station.removes, opened - 1);
+    assert.equal(keydownListeners(), 1, 'one Escape listener for the open popup');
+    press('Escape');
+    assert.equal(station.removes, opened, 'one close per Escape');
+    assert.equal(document.activeElement, marker, 'focus returns to the station marker');
+    assert.equal(keydownListeners(), 0);
+    assert.equal((documentListeners.get('focusin') ?? []).length, 0);
+    assert.equal((documentListeners.get('focusout') ?? []).length, 0);
+  }
+});
+
+test('adopted popup dismissal keeps focus that left for another control, and falls back to the canvas when its marker is gone', () => {
+  const { map, canvas } = harness({});
+  const marker = document.body.appendChild(new FakeElement());
+  const other = document.body.appendChild(new FakeElement());
+  const station = stationPopup();
+  marker.focus();
+  coordinator.adoptExternalResponse(station, map, marker);
+  station.paintElement().focus();
+  other.focus();
+  press('Escape');
+  assert.equal(station.removes, 1);
+  assert.equal(document.activeElement, other, 'a deliberate move outside the popup is preserved');
+
+  marker.focus();
+  coordinator.adoptExternalResponse(station, map, marker);
+  station.paintElement().focus();
+  marker.remove();
+  press('Escape');
+  assert.equal(station.removes, 2);
+  assert.equal(document.activeElement, canvas, 'a disconnected station cannot receive focus');
+  assert.equal(keydownListeners(), 0);
+});
+
+test('replacing an adopted popup with a normal response removes its keyboard listeners', async () => {
+  const { map, tryClick, ready } = harness({ surface: [{ model: MODEL }] }, { warm: true });
+  await ready;
+  const marker = document.body.appendChild(new FakeElement());
+  const station = stationPopup();
+  marker.focus();
+  coordinator.adoptExternalResponse(station, map, marker);
+  assert.equal(keydownListeners(), 1);
+  assert.equal(tryClick(), null);
+  assert.equal(station.removes, 1, 'the normal response replaces the station');
+  assert.equal(keydownListeners(), 1, 'only the replacement response listens');
+  press('Escape');
+  assert.equal(globalThis.__ddmPopups[0].removed, true);
+  assert.equal(station.removes, 1, 'the retired station is not closed a second time');
+  assert.equal(keydownListeners(), 0);
+});
+
+test('a list-opened station returns focus to its visible initiator or the canvas when it is hidden or removed', () => {
+  const { map, canvas } = harness({});
+  const item = document.body.appendChild(new FakeElement());
+  const station = stationPopup();
+  for (const state of ['visible', 'hidden', 'removed']) {
+    coordinator.adoptExternalResponse(station, map, item);
+    station.paintElement().focus();
+    if (state === 'hidden') item.getClientRects = () => [];
+    if (state === 'removed') item.remove();
+    press('Escape');
+    const expected = state === 'visible' ? item : canvas;
+    assert.ok(document.activeElement === expected, `${state}: use the first available return target`);
+    assert.equal(keydownListeners(), 0);
+  }
+});
+
+test('a model answer hands the popup path exactly the frame serialization', async () => {
+  const { tryClick, ready } = harness({ surface: [{ model: MODEL }] }, { warm: true });
+  await ready;
+  const thrown = tryClick();
+  assert.deepEqual(rendered, [serializePopupFrame(MODEL)], 'the warm commit rendered the serializer output, synchronously');
+  assert.equal(globalThis.__ddmPopups.length, 1, 'one popup');
+  assert.equal(thrown, null, 'the click threw nothing');
+});
+
+test('a response with both content and model, or with neither, is declined and the next hit answers', async () => {
+  for (const [name, invalid] of [
+    ['both', { content: 'fixture both', model: MODEL }],
+    ['neither', { popupOptions: {} }]
+  ]) {
+    const { calls, tryClick, ready } = harness({ first: [invalid], next: [{ content: 'fixture next' }] }, { warm: true });
+    await ready;
+    const thrown = tryClick();
+    assert.deepEqual(calls, ['first', 'next'], `${name}: the invalid answer fell through to the next hit`);
+    assert.deepEqual(rendered, ['fixture next'], `${name}: only the next hit rendered`);
+    assert.equal(thrown, null, `${name}: the click threw nothing`);
+  }
+});
+
+test('a door on a popup that is not about a place opens the selected place, else the region briefing, and leaves the selection alone', async () => {
+  const model = { ...MODEL, kind: 'event', actions: [{ kind: 'briefing', place: 'Fixture Place' }] };
+  // The fake DOM parses no markup: the door is found when the rendered string carries it, and its click handler is kept.
+  const querySelector = FakeElement.prototype.querySelector;
+  const doors = [];
+  FakeElement.prototype.querySelector = function (selector) {
+    if (selector !== '[data-ddm-impact-trigger]' || !rendered.at(-1)?.includes('data-ddm-impact-trigger')) return null;
+    const door = new FakeElement();
+    door.addEventListener = (type, fn) => {
+      if (type === 'click') doors.push(fn);
+    };
+    return door;
+  };
+  globalThis.__ddmStateBriefings.length = 0;
+  try {
+    const { click, ready } = harness({ storm: [{ model }] }, { warm: true });
+    await ready;
+
+    const selected = { label: 'Fixture Place', context: context('Fixture Place') };
+    setPlaceSelection(selected);
+    click();
+    assert.equal(doors.length, 1, 'the frame door was wired');
+    doors[0]();
+    assert.deepEqual(globalThis.__ddmPanelOpens, [selected.context], 'the door opened the selected place');
+    assert.equal(globalThis.__ddmPopups.at(-1).removed, true, 'the door dismissed its popup');
+    assert.equal(getPlaceSelection(), selected, 'the popup closing left the selection alone');
+
+    setPlaceSelection(null);
+    setCurrentRegion('washington_state');
+    click();
+    assert.equal(doors.length, 2, 'the frame door was wired again');
+    doors[1]();
+    assert.deepEqual(globalThis.__ddmStateBriefings, [{ state: 'WA', fit: false, current: true }], 'the door opened the region briefing, camera untouched');
+    assert.equal(globalThis.__ddmPanelOpens.length, 1, 'no second place briefing');
+    assert.equal(globalThis.__ddmPopups.at(-1).removed, true, 'the door dismissed its popup');
+  } finally {
+    FakeElement.prototype.querySelector = querySelector;
+    setPlaceSelection(null);
+    setCurrentRegion('national');
+  }
+});
+
+test('the door of a popup with nothing to brief opens the panel at Technical information and hands focus back to the map', async () => {
+  const model = { ...MODEL, kind: 'event', actions: [{ kind: 'technical' }] };
+  // As above: the door is found when the rendered string carries the technical door, and its click handler is kept.
+  const querySelector = FakeElement.prototype.querySelector;
+  const doors = [];
+  FakeElement.prototype.querySelector = function (selector) {
+    if (selector !== '[data-ddm-impact-trigger]' || !rendered.at(-1)?.includes('data-ddm-technical-door')) return null;
+    const door = new FakeElement();
+    door.matches = (s) => s === '[data-ddm-technical-door]';
+    door.addEventListener = (type, fn) => {
+      if (type === 'click') doors.push(fn);
+    };
+    return door;
+  };
+  globalThis.__ddmTechnicalOpens.length = 0;
+  globalThis.__ddmStateBriefings.length = 0;
+  try {
+    const { click, ready, canvas } = harness({ storm: [{ model }] }, { warm: true });
+    await ready;
+    setCurrentRegion('national');
+    click();
+    assert.equal(doors.length, 1, 'the frame door was wired');
+    doors[0]();
+    assert.deepEqual(globalThis.__ddmTechnicalOpens, [canvas], 'the door opened Technical information, focus returning to the map');
+    assert.equal(globalThis.__ddmPanelOpens.length, 0, 'no place briefing');
+    assert.deepEqual(globalThis.__ddmStateBriefings, [], 'no region briefing');
+    assert.equal(globalThis.__ddmPopups.at(-1).removed, true, 'the door dismissed its popup');
+  } finally {
+    FakeElement.prototype.querySelector = querySelector;
+    setCurrentRegion('national');
+  }
+});
+
+test('a technical door gives way to the place door when the tap resolves a state', async () => {
+  const model = { ...MODEL, kind: 'event', actions: [{ kind: 'technical' }] };
+  // The frame's technical door sits in the head; the late door's markup becomes one button the fake can hold.
+  const querySelector = FakeElement.prototype.querySelector;
+  const createElement = document.createElement;
+  class FakeButton extends FakeElement {}
+  globalThis.HTMLButtonElement = FakeButton;
+  const technical = new FakeElement();
+  technical.matches = (s) => s === '[data-ddm-technical-door]';
+  FakeElement.prototype.querySelector = function (selector) {
+    if (!rendered.some((html) => html.includes('data-ddm-technical-door'))) return null;
+    if (selector === '[data-ddm-impact-trigger]' && !technical.parentNode) this.children[0]?.appendChild(technical);
+    if (selector === '[data-ddm-impact-trigger]') return technical;
+    if (selector === '[data-ddm-technical-door]') return technical.parentNode === this ? technical : null;
+    return null;
+  };
+  document.createElement = () => {
+    const element = new FakeElement();
+    Object.defineProperty(element, 'innerHTML', {
+      set(html) {
+        rendered.push(html);
+        if (!html.startsWith('<button')) return;
+        const button = new FakeButton();
+        button.html = html;
+        element.appendChild(button);
+      }
+    });
+    return element;
+  };
+  globalThis.__ddmIdentity = { state: { code: 'FL', name: 'Florida' }, containingTribal: null };
+  try {
+    const { click, ready } = harness({ storm: [{ model }] }, { warm: true });
+    await ready;
+    setCurrentRegion('national');
+    click();
+    // MapLibre puts the popup in the page; this stub does not.
+    document.body.appendChild(globalThis.__ddmPopups.at(-1).content);
+    const head = technical.parentNode;
+    assert.ok(head, 'the frame painted its technical door');
+    for (let i = 0; i < 20 && head.children.includes(technical); i += 1) await new Promise((resolve) => setImmediate(resolve));
+    const doors = head.children.filter((child) => child === technical || child instanceof FakeButton);
+    assert.equal(doors.length, 1, 'the popup carries one door');
+    assert.match(doors[0].html ?? '', /Open the Impact Briefing for Florida/, 'the door names the state the tap resolved');
+  } finally {
+    FakeElement.prototype.querySelector = querySelector;
+    document.createElement = createElement;
+    delete globalThis.HTMLButtonElement;
+    delete globalThis.__ddmIdentity;
+    setCurrentRegion('national');
+  }
+});
+
+// The look at 4237781, R1-3: the late door over a BIA reservation named the
+// land area (LARNAME) where a click on the reservation names the Nation.
+test('the late door over a BIA reservation names the Nation as a click on the reservation does, the land area beside it', async () => {
+  const model = { ...MODEL, kind: 'surface' };
+  const createElement = document.createElement;
+  const fetch = globalThis.fetch;
+  class FakeButton extends FakeElement {
+    addEventListener(type, fn) {
+      if (type === 'click') this.onclick = fn;
+    }
+  }
+  globalThis.HTMLButtonElement = FakeButton;
+  const buttons = [];
+  document.createElement = () => {
+    const element = new FakeElement();
+    Object.defineProperty(element, 'innerHTML', {
+      set(html) {
+        rendered.push(html);
+        if (!html.startsWith('<button')) return;
+        const button = new FakeButton();
+        button.html = html;
+        buttons.push(button);
+        element.appendChild(button);
+      }
+    });
+    return element;
+  };
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ areas: [{ larName: 'Fixture Trusted Area', displayName: 'Fixture Trusted Nation', provenance: 'safe-match' }] }), {
+      headers: { 'content-type': 'application/json' }
+    });
+  globalThis.__ddmIdentity = { state: null, containingTribal: { source: 'bia-reservation', name: 'Fixture Trusted Area' } };
+  try {
+    const { click, ready } = harness({ drought: [{ model }] }, { warm: true });
+    await ready;
+    click();
+    // MapLibre puts the popup in the page; this stub does not.
+    document.body.appendChild(globalThis.__ddmPopups.at(-1).content);
+    for (let i = 0; i < 50 && buttons.length === 0; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(buttons.length, 1, 'the late door was added');
+    assert.match(buttons[0].html, /Fixture Trusted Nation/, 'the door names the Nation');
+    buttons[0].onclick();
+    const opened = globalThis.__ddmPanelOpens.at(-1);
+    assert.equal(opened.title, 'Fixture Trusted Nation', 'the briefing is titled by the Nation');
+    assert.equal(opened.areaLabel, 'Land area: Fixture Trusted Area', 'the land area beside the source');
+    assert.equal(opened.kind, 'bia-reservation');
+  } finally {
+    document.createElement = createElement;
+    globalThis.fetch = fetch;
+    delete globalThis.HTMLButtonElement;
+    delete globalThis.__ddmIdentity;
+  }
+});
+
+// Round 5, R5-37: with both Tribal layers on, the late door over a legal Census
+// area named it by its Census name where a click on the BIA land area under it
+// names the Nation. The legal Census area keeps its rank (D-0.8.0-052); the door
+// takes the gated Nation name, the Census area beside the source.
+test('the late door over a legal Census area with a BIA land area under it names the Nation, the Census area beside it', async () => {
+  const model = { ...MODEL, kind: 'surface' };
+  const createElement = document.createElement;
+  const fetch = globalThis.fetch;
+  class FakeButton extends FakeElement {
+    addEventListener(type, fn) {
+      if (type === 'click') this.onclick = fn;
+    }
+  }
+  globalThis.HTMLButtonElement = FakeButton;
+  const buttons = [];
+  document.createElement = () => {
+    const element = new FakeElement();
+    Object.defineProperty(element, 'innerHTML', {
+      set(html) {
+        rendered.push(html);
+        if (!html.startsWith('<button')) return;
+        const button = new FakeButton();
+        button.html = html;
+        buttons.push(button);
+        element.appendChild(button);
+      }
+    });
+    return element;
+  };
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ areas: [{ larName: 'Fixture Trusted Area', displayName: 'Fixture Trusted Nation', provenance: 'safe-match' }], censusAreas: [] }), {
+      headers: { 'content-type': 'application/json' }
+    });
+  globalThis.__ddmIdentity = {
+    state: null,
+    containingTribal: { source: 'aiannh', name: 'Fixture Census Reservation', biaLandArea: 'Fixture Trusted Area' }
+  };
+  try {
+    const { click, ready } = harness({ drought: [{ model }] }, { warm: true });
+    await ready;
+    click();
+    // MapLibre puts the popup in the page; this stub does not.
+    document.body.appendChild(globalThis.__ddmPopups.at(-1).content);
+    for (let i = 0; i < 50 && buttons.length === 0; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(buttons.length, 1, 'the late door was added');
+    assert.match(buttons[0].html, /Fixture Trusted Nation/, 'the door names the Nation');
+    buttons[0].onclick();
+    const opened = globalThis.__ddmPanelOpens.at(-1);
+    assert.equal(opened.title, 'Fixture Trusted Nation', 'the briefing is titled by the Nation');
+    assert.equal(opened.areaLabel, 'Census area: Fixture Census Reservation', 'the Census area beside the source');
+    assert.equal(opened.kind, 'aiannh', 'the legal Census area keeps its kind');
+  } finally {
+    document.createElement = createElement;
+    globalThis.fetch = fetch;
+    delete globalThis.HTMLButtonElement;
+    delete globalThis.__ddmIdentity;
+  }
+});
+
+// The look at 4237781, R1-4: one Escape aimed at another control also closed the map popup.
+test('Escape another control used, or one inside a nested surface, leaves the map popup open', async () => {
+  const { click, ready } = harness({ surface: [{ model: MODEL }] }, { warm: true });
+  await ready;
+  click();
+  const popup = globalThis.__ddmPopups.at(-1);
+  const escape = (event) => {
+    for (const fn of [...(documentListeners.get('keydown') ?? [])]) fn({ key: 'Escape', ...event });
+  };
+  escape({ defaultPrevented: true });
+  assert.equal(popup.removed, false, 'the search box clearing its query is not a dismissal');
+  const inside = new FakeElement();
+  inside.closest = (selectors) => (selectors.split(', ').includes('#map-info-panel') ? inside : null);
+  escape({ defaultPrevented: false, target: inside });
+  assert.equal(popup.removed, false, 'Escape inside the map-information panel is that panel\'s');
+  const outside = new FakeElement();
+  outside.closest = () => null;
+  escape({ defaultPrevented: false, target: outside });
+  assert.equal(popup.removed, true, 'Escape elsewhere still closes the popup');
+});
+
+test('a model the frame refuses throws its PopupFrameError before any selection or emphasis is written', async () => {
+  const { click, ready } = harness(
+    { refused: [{ model: REFUSED_MODEL, selection: context('Refused'), emphasis: [{ source: 'refused', id: 1 }] }] },
+    { warm: true }
+  );
+  await ready;
+  assert.throws(click, (err) => err?.name === 'PopupFrameError', 'the caller bug surfaces, as a builder serializer call did');
+  assert.deepEqual(rendered, [], 'nothing rendered');
+  assert.equal(getPlaceSelection(), null, 'the refused place answer wrote no selection');
+  assert.deepEqual(getEmphasisTargets(), [], 'the refused place answer wrote no emphasis');
+});
+
+test('a cold commit writes nothing until the frame resolves, then paints once with its selection', async () => {
+  const selection = context('Cold');
+  const { tryClick } = harness({ place: [{ model: MODEL, selection, emphasis: [{ source: 'place', id: 7 }] }] });
+  const thrown = tryClick();
+  assert.deepEqual(rendered, [], 'nothing rendered before the frame resolved');
+  assert.equal(getPlaceSelection(), null, 'no selection before the wait ends');
+  assert.deepEqual(getEmphasisTargets(), [], 'no emphasis before the wait ends');
+  await settle();
+  assert.deepEqual(rendered, [serializePopupFrame(MODEL)], 'painted once after the wait');
+  assert.equal(getPlaceSelection()?.context, selection, 'the selection was written after the wait');
+  assert.deepEqual(getEmphasisTargets(), [{ source: 'place', id: 7 }]);
+  assert.equal(thrown, null, 'the click threw nothing');
+});
+
+const STALE = { model: MODEL, selection: context('Stale'), emphasis: [{ source: 'stale', id: 1 }] };
+
+for (const [name, supersede, expectRendered] of [
+  ['a dismissal', () => coordinator.dismissResponse(), []],
+  ['a studio route change', () => globalThis.__ddmStudioListeners.forEach((fn) => fn('place')), []],
+  ['a reset', () => coordinator.resetInteractionCoordinatorForTest(), []]
+]) {
+  test(`${name} during the wait wins: the stale commit never paints nor writes selection or emphasis`, async () => {
+    const { tryClick } = harness({ place: [STALE] });
+    const thrown = tryClick();
+    supersede();
+    await settle();
+    assert.deepEqual(rendered, expectRendered);
+    assert.equal(globalThis.__ddmPopups.length, 0, 'no popup');
+    assert.equal(getPlaceSelection(), null, 'the superseded commit wrote no selection');
+    assert.deepEqual(getEmphasisTargets(), [], 'the superseded commit wrote no emphasis');
+    assert.equal(thrown, null, 'the click threw nothing');
+  });
+}
+
+test('a later commit during the wait wins: only it paints, and only its selection and emphasis are written', async () => {
+  const later = context('Later');
+  const { tryClick } = harness({ place: [STALE, { model: SECOND_MODEL, selection: later, emphasis: [{ source: 'later', id: 2 }] }] });
+  const thrown = [tryClick(), tryClick()];
+  await settle();
+  assert.deepEqual(rendered, [serializePopupFrame(SECOND_MODEL)], 'the later commit painted once; the stale one never');
+  assert.equal(globalThis.__ddmPopups.length, 1);
+  assert.equal(getPlaceSelection()?.context, later);
+  assert.deepEqual(getEmphasisTargets(), [{ source: 'later', id: 2 }]);
+  assert.deepEqual(thrown, [null, null], 'neither click threw');
+});
+
+test('a later click whose builder throws still retires the waiting commit', async () => {
+  let n = 0;
+  const { click, tryClick } = harness({ place: [STALE] });
+  // Swap the target for one whose second answer throws (a builder bug); the
+  // reset keeps the harness map's click handler bound.
+  coordinator.resetInteractionCoordinatorForTest();
+  coordinator.registerClickTarget({
+    kind: 'reservation-boundary',
+    layerIds: ['place'],
+    label: () => 'place',
+    respond() {
+      n += 1;
+      if (n > 1) throw new Error('fixture builder bug');
+      return STALE;
+    }
+  });
+  const thrown = tryClick();
+  assert.throws(click, /fixture builder bug/);
+  await settle();
+  assert.deepEqual(rendered, [], 'the waiting commit never painted');
+  assert.equal(getPlaceSelection(), null, 'the waiting commit wrote no selection');
+  assert.deepEqual(getEmphasisTargets(), [], 'the waiting commit wrote no emphasis');
+  assert.equal(thrown, null, 'the first click threw nothing');
+});
+
+test('the mobile Brief sheet taking over during the wait wins: the stale commit neither paints nor opens the briefing', async () => {
+  setViewMode('console');
+  try {
+    const { tryClick } = harness({ place: [STALE] });
+    const thrown = tryClick();
+    globalThis.__ddmSheetActive = true;
+    setViewMode('brief');
+    await settle();
+    assert.deepEqual(rendered, []);
+    assert.deepEqual(globalThis.__ddmPanelOpens, [], 'the stale commit never opened the briefing');
+    assert.equal(getPlaceSelection(), null, 'the stale commit wrote no selection');
+    assert.equal(thrown, null, 'the click threw nothing');
+  } finally {
+    setViewMode('console');
+    globalThis.__ddmSheetActive = false;
+  }
+});
+
+test('the mobile Brief sheet route needs no frame: a cold place-bearing model answer opens the briefing at once', () => {
+  const selection = context('Sheet');
+  const { click } = harness({ place: [{ model: MODEL, selection, emphasis: [] }] });
+  setViewMode('brief');
+  globalThis.__ddmSheetActive = true;
+  try {
+    click();
+    assert.deepEqual(globalThis.__ddmPanelOpens, [selection], 'the sheet took the response synchronously');
+    assert.deepEqual(rendered, [], 'no popup markup was rendered');
+    assert.equal(getPlaceSelection()?.context, selection);
+  } finally {
+    setViewMode('console');
+    globalThis.__ddmSheetActive = false;
+  }
+});
+
+test('in Brief on a desktop a place-bearing click opens its briefing at once; an embed and the Console keep the popup', async () => {
+  const getElementById = globalThis.document.getElementById;
+  try {
+    setViewMode('brief');
+    const desk = context('Desk');
+    harness({ place: [{ model: MODEL, selection: desk, emphasis: [] }] }).click();
+    assert.deepEqual(globalThis.__ddmPanelOpens, [desk], 'no sheet, and still the briefing');
+    assert.deepEqual(rendered, [], 'no popup markup was rendered');
+    assert.equal(getPlaceSelection()?.context, desk);
+
+    globalThis.__ddmPanelOpens.length = 0;
+    globalThis.document.getElementById = (id) =>
+      id === 'app' ? { classList: { contains: (c) => c === 'embed' } } : getElementById(id);
+    harness({ place: [{ model: MODEL, selection: context('Embedded'), emphasis: [] }] }).click();
+    await settle();
+    assert.deepEqual(globalThis.__ddmPanelOpens, [], 'an embed without its sheet keeps its popup');
+    assert.equal(rendered.length, 1);
+
+    globalThis.document.getElementById = getElementById;
+    setViewMode('console');
+    harness({ place: [{ model: MODEL, selection: context('Console'), emphasis: [] }] }).click();
+    await settle();
+    assert.deepEqual(globalThis.__ddmPanelOpens, [], 'the Console keeps its popup');
+    assert.equal(rendered.length, 1, 'each harness starts its own record');
+  } finally {
+    globalThis.document.getElementById = getElementById;
+    setViewMode('console');
+  }
+});
+
+// S30D P1-FRAME repair round 1 (2026-10-04): the two lifecycle routes the
+// Codex diff review found open, and the adopted station popup's close.
+
+test('removing the map during the wait retires the commit even with no popup on screen', async () => {
+  const { tryClick, fire } = harness({ place: [STALE] });
+  const presented = [];
+  coordinator.setResponseSink({
+    present: (response) => {
+      presented.push(response);
+      return true;
+    },
+    dismiss() {}
+  });
+  const thrown = tryClick();
+  // MapLibre's Map#remove fires 'remove' once torn down; no popup exists yet,
+  // so no popup close can retire the waiting commit for it.
+  fire('remove');
+  await settle();
+  assert.deepEqual(rendered, [], 'the commit waiting when the map was removed never rendered');
+  assert.equal(presented.length, 0, 'nothing reached the sink after the map was removed');
+  assert.equal(globalThis.__ddmPopups.length, 0, 'no popup');
+  assert.equal(getPlaceSelection(), null, 'no selection written after the map was removed');
+  assert.deepEqual(getEmphasisTargets(), [], 'no emphasis written after the map was removed');
+  assert.equal(thrown, null, 'the click threw nothing');
+});
+
+test('closing an adopted station popup during the wait retires the commit', async () => {
+  const { tryClick, map } = harness({ place: [STALE] });
+  const closers = [];
+  // The shape adoptExternalResponse reads; MapLibre's close control calls
+  // remove(), which fires the popup's 'close'.
+  const station = {
+    once(type, fn) {
+      if (type === 'close') closers.push(fn);
+      return station;
+    },
+    getElement: () => null,
+    remove() {
+      for (const fn of closers.splice(0)) fn();
+      return station;
+    }
+  };
+  coordinator.adoptExternalResponse(station, map, document.body);
+  const thrown = tryClick();
+  station.remove();
+  await settle();
+  assert.deepEqual(rendered, [], 'the commit waiting when the station popup closed never rendered');
+  assert.equal(globalThis.__ddmPopups.length, 0, 'no popup');
+  assert.equal(getPlaceSelection(), null, 'no selection');
+  assert.deepEqual(getEmphasisTargets(), [], 'no emphasis');
+  assert.equal(thrown, null, 'the click threw nothing');
+});
+
+test('a model the frame refuses after the wait is reported once and dismisses, writes nothing, and the next click paints', async () => {
+  const reported = [];
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  const consoleError = console.error;
+  process.on('unhandledRejection', onUnhandled);
+  console.error = (...args) => reported.push(args);
+  try {
+    const { tryClick } = harness({
+      place: [
+        { content: 'fixture open' },
+        { model: REFUSED_MODEL, selection: context('Refused'), emphasis: [{ source: 'refused', id: 1 }] },
+        { model: MODEL }
+      ]
+    });
+    // Legacy content needs no frame: it paints at once, cold or warm.
+    const thrown = [tryClick()];
+    assert.equal(globalThis.__ddmPopups.length, 1, 'the open response painted');
+    // The refused model, cold: it waits for the frame, which then refuses it.
+    thrown.push(tryClick());
+    await settle();
+    assert.deepEqual(unhandled, [], 'the refusal after the wait is no unhandled rejection');
+    assert.equal(reported.length, 1, 'the refusal after the wait is reported once');
+    assert.equal(reported[0]?.[0], '[coordinator] the popup frame could not paint this response:');
+    assert.equal(reported[0]?.[1]?.name, 'PopupFrameError', 'the report carries the frame error');
+    assert.equal(globalThis.__ddmPopups[0].removed, true, 'the open response was dismissed (no stale response)');
+    assert.equal(getPlaceSelection(), null, 'the refused place answer wrote no selection');
+    assert.deepEqual(getEmphasisTargets(), [], 'the refused place answer wrote no emphasis');
+    // No pending record survives: the next click, now warm, paints at once.
+    thrown.push(tryClick());
+    assert.deepEqual(rendered, ['fixture open', serializePopupFrame(MODEL)], 'the next click painted');
+    assert.deepEqual(thrown, [null, null, null], 'no click threw');
+  } finally {
+    console.error = consoleError;
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+// S30D P1-FRAME repair round 2 (2026-10-04): the reviewer's confirmation,
+// items 7 and 5.
+
+test('Escape during the wait retires the waiting commit, swallows nothing, and its handler is gone once the wait ends', async () => {
+  // Nothing is on screen: a person clicked, sees nothing yet, presses Escape.
+  const { tryClick } = harness({ place: [STALE] });
+  const thrown = [tryClick()];
+  const swallowed = press('Escape');
+  await settle();
+  assert.deepEqual(rendered, [], 'Escape during the wait retired the commit before it could paint');
+  assert.equal(globalThis.__ddmPopups.length, 0, 'no popup');
+  assert.equal(getPlaceSelection(), null, 'the retired commit wrote no selection');
+  assert.deepEqual(getEmphasisTargets(), [], 'the retired commit wrote no emphasis');
+  assert.deepEqual(swallowed, [], 'the Escape was not swallowed: another surface still sees it');
+  assert.equal(keydownListeners(), 0, 'the wait\'s Escape handler was removed when the wait ended');
+
+  // A wait that ends by painting removes its handler too, and another key
+  // during the wait retires nothing.
+  const second = harness({ place: [STALE] });
+  thrown.push(second.tryClick());
+  assert.equal(keydownListeners(), 1, 'a waiting commit listens for Escape');
+  assert.deepEqual(press('Enter'), [], 'another key is not swallowed');
+  await settle();
+  assert.deepEqual(rendered, [serializePopupFrame(MODEL)], 'another key during the wait retired nothing');
+  assert.equal(keydownListeners(), 1, 'only the painted response\'s own Escape handler remains');
+
+  // A wait whose commit was retired by another route removes its handler
+  // too, and an Escape meanwhile, with nothing pending, is not swallowed.
+  const third = harness({ place: [STALE] });
+  thrown.push(third.tryClick());
+  coordinator.dismissResponse();
+  assert.deepEqual(press('Escape'), [], 'with nothing pending, the Escape is not swallowed');
+  await settle();
+  assert.deepEqual(rendered, [], 'the dismissed commit never painted');
+  assert.equal(keydownListeners(), 0, 'a retired wait\'s Escape handler was removed when the wait ended');
+  assert.deepEqual(thrown, [null, null, null], 'no click threw');
+});
+
+test('after the wait, the refusal catch covers serialization only: a sink callback that commits a newer response and then throws leaves the newer response alone', async () => {
+  const reported = [];
+  const consoleError = console.error;
+  console.error = (...args) => reported.push(args);
+  // The sink's own throw escapes the continuation, as it escapes a warm
+  // click to its caller; it is captured here so the runner does not fail
+  // the file on it, and restored after.
+  const runnerHandlers = process.listeners('unhandledRejection');
+  process.removeAllListeners('unhandledRejection');
+  const escaped = [];
+  const onUnhandled = (reason) => escaped.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const { click, tryClick } = harness({ place: [STALE, { model: SECOND_MODEL }] });
+    const sinkError = new Error('fixture sink failed after committing a newer response');
+    let presented = 0;
+    coordinator.setResponseSink({
+      present() {
+        presented += 1;
+        // Synchronous re-entry: a newer (non-place, warm) commit paints its
+        // popup, then the sink fails.
+        click();
+        throw sinkError;
+      },
+      dismiss() {}
+    });
+    const thrown = tryClick();
+    await settle();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(presented, 1, 'the older place commit reached the sink after its wait');
+    assert.equal(globalThis.__ddmPopups.length, 1, 'the newer commit painted one popup');
+    assert.equal(globalThis.__ddmPopups[0].removed, false, 'the older wait\'s failure cleanup left the newer response on screen');
+    assert.deepEqual(reported, [], 'a downstream throw is not reported as the frame failing to paint');
+    assert.deepEqual(escaped, [sinkError], 'the sink\'s own error surfaces unchanged');
+    assert.equal(thrown, null, 'the click threw nothing');
+  } finally {
+    console.error = consoleError;
+    process.off('unhandledRejection', onUnhandled);
+    for (const handler of runnerHandlers) process.on('unhandledRejection', handler);
+  }
+});
+
+// The look at 6748f25, D3: Escape closed a station popup but not the
+// selection response at the foot of the side panel (the installed sink).
+test('Escape dismisses a response the panel-foot sink presents, unless another control used it, and its handler goes with the response', async () => {
+  const selection = context('Sink Place');
+  const { click, ready } = harness({ place: [{ model: MODEL, selection, emphasis: [] }] }, { warm: true });
+  await ready;
+  let dismissed = 0;
+  coordinator.setResponseSink({ present: () => true, dismiss: () => { dismissed += 1; } });
+  click();
+  assert.equal(globalThis.__ddmPopups.length, 0, 'the sink took the response, no popup');
+  assert.equal(getPlaceSelection()?.context, selection);
+  assert.equal(keydownListeners(), 1, 'the presented response listens for Escape');
+  // An Escape another control already used (the search box clearing its query) is not a dismissal.
+  for (const fn of [...(documentListeners.get('keydown') ?? [])]) fn({ key: 'Escape', defaultPrevented: true });
+  assert.equal(dismissed, 0);
+  press('Enter');
+  assert.equal(dismissed, 0, 'another key is not a dismissal');
+  assert.deepEqual(press('Escape'), [], 'Escape is not swallowed');
+  assert.equal(dismissed, 1, 'Escape dismissed the sink response');
+  assert.equal(getPlaceSelection(), null, 'its place selection cleared with it');
+  assert.equal(keydownListeners(), 0, 'no Escape handler outlives the response');
+  press('Escape');
+  assert.equal(dismissed, 1, 'a second Escape does nothing');
+});
+
+// Review F1: the panel-foot listener is added before a studio's own, so a nested
+// surface's first Escape (a studio, the briefing, the key) reached it too.
+test('Escape inside a studio, the briefing or the key leaves the panel-foot response and its selection', async () => {
+  const selection = context('Sink Place');
+  const { click, ready } = harness({ place: [{ model: MODEL, selection, emphasis: [] }] }, { warm: true });
+  await ready;
+  let dismissed = 0;
+  coordinator.setResponseSink({ present: () => true, dismiss: () => { dismissed += 1; } });
+  click();
+  assert.equal(keydownListeners(), 1);
+  for (const root of ['#impact-panel', '#map-key', '#map-info-panel', '#place-studio-root', '#layers-studio-root']) {
+    const target = new FakeElement();
+    target.closest = (selectors) => (selectors.split(', ').includes(root) ? target : null);
+    for (const fn of [...(documentListeners.get('keydown') ?? [])]) fn({ key: 'Escape', defaultPrevented: false, target });
+    assert.equal(dismissed, 0, `Escape inside ${root} is that surface's`);
+  }
+  assert.equal(getPlaceSelection()?.context, selection, 'the place selection stays');
+  const outside = new FakeElement();
+  outside.closest = () => null;
+  for (const fn of [...(documentListeners.get('keydown') ?? [])]) fn({ key: 'Escape', defaultPrevented: false, target: outside });
+  assert.equal(dismissed, 1, 'Escape elsewhere still dismisses');
+  assert.equal(getPlaceSelection(), null);
+});
+
+// Audit round 6, R6-7: a response read in Drought Current stayed open after a
+// press of Wildfire or Near Term, still describing a surface no longer drawn.
+test('a mode or horizon change closes the open response, popup or panel foot, and leaves a briefing-owned selection', async () => {
+  const selection = context('Mode Place');
+  const { click, ready } = harness({ place: [{ model: MODEL, selection, emphasis: [] }] }, { warm: true });
+  await ready;
+  click();
+  const popup = globalThis.__ddmPopups.at(-1);
+  publishSnapshot({ selectedHazard: 'drought', cluster: 'custom', horizon: 'current' });
+  assert.equal(popup.removed, false, 'a republish in the same mode and horizon (a layer toggle) keeps the response');
+  publishSnapshot({ selectedHazard: 'wildfire', cluster: 'wildfire', horizon: 'current' });
+  assert.equal(popup.removed, true, 'a mode switch closes the popup');
+  assert.equal(getPlaceSelection(), null, 'the response took its own selection with it');
+
+  click();
+  publishSnapshot({ selectedHazard: 'wildfire', cluster: 'wildfire', horizon: 'weeks-ahead' });
+  assert.equal(globalThis.__ddmPopups.at(-1).removed, true, 'a horizon switch closes the popup');
+
+  let dismissed = 0;
+  coordinator.setResponseSink({ present: () => true, dismiss: () => { dismissed += 1; } });
+  click();
+  assert.equal(getPlaceSelection()?.context, selection, 'the panel foot holds the response');
+  // The briefing door's open replaces the response's selection with the briefing's own.
+  const briefing = { label: 'Mode Place', context: selection };
+  setPlaceSelection(briefing);
+  publishSnapshot({ selectedHazard: 'drought', cluster: 'drought', horizon: 'weeks-ahead' });
+  assert.equal(dismissed, 1, 'a mode switch dismisses the panel-foot response');
+  assert.equal(getPlaceSelection(), briefing, 'the briefing keeps its place');
+  assert.equal(keydownListeners(), 0, 'no Escape handler outlives the response');
+});
+
+test('a hazard-surface tap leaves the place the Place studio reopens on (DR-099)', async () => {
+  const { click, ready } = harness({ surface: [{ content: 'fixture surface' }] }, { warm: true });
+  await ready;
+  const watershed = { kind: 'watershed', id: '1701', label: 'Kootenai-Pend Oreille-Spokane' };
+  setTypedPlace(watershed);
+  try {
+    click();
+    assert.deepEqual(rendered, ['fixture surface'], 'the surface answered');
+    assert.equal(getPlaceSelection(), null, 'no place selection was written');
+    assert.equal(getTypedPlace(), watershed, 'the studio place is unchanged');
+  } finally {
+    setTypedPlace(null);
+  }
+});

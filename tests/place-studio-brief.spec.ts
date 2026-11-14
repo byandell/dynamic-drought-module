@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './offline-test';
 import type { FeatureCollection, MultiPolygon, Polygon } from 'geojson';
 
 import { createBriefingSkeleton } from '../src/impact/briefing';
@@ -39,6 +39,8 @@ function rectangle(
   };
 }
 
+// A collinear (zero-area) part is skipped since the engine moved to
+// polygon-clipping; only a non-finite coordinate still rejects the shape.
 function mixedValidityGeometry(valid: Polygon): MultiPolygon {
   return {
     type: 'MultiPolygon',
@@ -46,8 +48,8 @@ function mixedValidityGeometry(valid: Polygon): MultiPolygon {
       valid.coordinates,
       [[
         [-120, 46],
-        [-119, 46],
-        [-118, 46],
+        [-119, Number.NaN],
+        [-118, 47],
         [-120, 46]
       ]]
     ]
@@ -243,7 +245,8 @@ async function stubWatershedCandidates(page: Page): Promise<void> {
 async function selectWashington(page: Page): Promise<void> {
   await page.locator('#place-type-state').click();
   await page.locator('#place-studio-search').fill('Washington');
-  const stateList = page.locator('#place-list-panel');
+  // The States group: a search lists every place type (visual uniformity D11), and two Nations carry "Washington" in their names.
+  const stateList = page.locator('#place-list-panel [data-place-group="state"]');
   await stateList.locator('.place-studio-option').click();
   await expect(page.locator('#place-selection-title')).toHaveText('Washington');
 }
@@ -255,7 +258,12 @@ test.describe('PS-BRIEF pure narrative selector', () => {
       title: 'Washington',
       properties: { STUSPS: 'WA' },
       lngLat: { lng: -120.5, lat: 47.5 },
-      regionKey: null
+      regionKey: null,
+      // Washington's own STUSPS: the honest containing answer for a state
+      // boundary's own postal code (see `containingFromProperties`,
+      // src/impact/context.ts).
+      containing: { state: 'WA', basis: 'feature-property' },
+      place: { scheme: 'state', code: 'WA' }
     };
     const briefing = createBriefingSkeleton(context);
     expect(selectBriefNarrativeLine(briefing)).toBeNull();
@@ -264,12 +272,17 @@ test.describe('PS-BRIEF pure narrative selector', () => {
       makeClaim({
         text: 'Existing selected-place line.',
         source: 'Existing source',
+        // Generic stand-in for an already-settled current-horizon claim, not
+        // one real product; `usdm` is the current-horizon lane's own product
+        // (DDM-P14-T05 microtask 2).
+        product: 'usdm',
         evidence: 'observed',
         dates: { retrieved: '2026-07-21' }
       }),
       makeClaim({
         text: 'Later current claim.',
         source: 'Existing source',
+        product: 'usdm',
         evidence: 'observed',
         dates: { retrieved: '2026-07-21' }
       })
@@ -299,11 +312,12 @@ test.describe('PS-BRIEF PLACE studio rendering', () => {
     await expect(narrative.locator('.place-studio-selection-kind')).toHaveText(
       'State (Census cartographic boundary)'
     );
-    await expect(narrative.locator('#place-selection-title')).toHaveText(
-      'Washington'
-    );
+    await expect(
+      page.locator('#place-selection-bar #place-selection-title')
+    ).toHaveText('Washington');
+    await expect(narrative.locator('#place-selection-title')).toHaveCount(0);
     await expect(narrative.locator('#place-brief-line')).toHaveText(
-      "This location is in D2 Severe Drought as of this week's U.S. Drought Monitor. Crop or pasture losses are likely; water shortages are common and restrictions are imposed."
+      "D2 Severe Drought is the worst in this area as of this week's U.S. Drought Monitor. Crop or pasture losses are likely; water shortages are common and restrictions are imposed."
     );
 
     const columns = page.locator('#place-overlap-columns');
@@ -330,7 +344,17 @@ test.describe('PS-BRIEF PLACE studio rendering', () => {
     const tribalRow = overlapColumn.locator('[data-overlap-kind="tribe"]');
     await expect(tribalRow).toHaveCount(1);
     await expect(tribalRow).toContainText(FIXTURE_NATION_NAME);
-    await expect(tribalRow.locator('.place-overlap-tribal-caveat')).toHaveText(
+    // D13 (the look of 2026-11-05): the rows' public sources are named and
+    // the representation note stands once for the group, never per row.
+    await expect(tribalRow.locator('.place-overlap-tribal-caveat')).toHaveCount(0);
+    await expect(columns.locator('.place-overlap-tribal-caveat')).toHaveCount(2);
+    // Public naming, not the catalog's internal sourceLabels.
+    await expect(columns.locator('#place-overlap-tribal-source')).toHaveText(
+      'Tribal Nations: names from the Bureau of Indian Affairs Federal Register list of federally recognized Tribes (2026-01-30); boundaries from the Bureau of Indian Affairs American Indian and Alaska Native Land Area Representation (AIAN-LAR).'
+    );
+    await expect(columns.locator('#place-overlap-tribal-source')).not.toContainText('FeatureServer');
+    await expect(columns.locator('#place-overlap-tribal-source')).not.toContainText('LARNAME');
+    await expect(columns.locator('#place-overlap-tribal-representation')).toHaveText(
       caveatFor('bia-reservation')
     );
 
@@ -356,6 +380,8 @@ test.describe('PS-BRIEF PLACE studio rendering', () => {
     await expect(columns.locator('#place-overlap-empty')).toHaveText(
       'No overlapping places listed.'
     );
+    // No Tribal row, no Tribal source or representation note.
+    await expect(columns.locator('#place-overlap-tribal-note')).toHaveCount(0);
   });
 
   test('keeps declared watershed capabilities available when a geometry request fails', async ({
@@ -383,7 +409,8 @@ test.describe('PS-BRIEF PLACE studio rendering', () => {
     await gotoApp(page, '?view=brief&layers=places&studio=place');
     await page.locator('#place-type-watershed').click();
     await page.locator('#place-studio-search').fill('Yakima');
-    await page.locator('#place-list-panel .place-studio-option').click();
+    // The Watersheds group: a search lists every place type (visual uniformity D11), and "Yakima" also names two ecoregions.
+    await page.locator('#place-list-panel [data-place-group="watershed"] .place-studio-option').click();
 
     await expect(page.locator('#place-capability-briefable')).toContainText('available');
     await expect(page.locator('#place-capability-overlap-computable')).toContainText(
@@ -544,6 +571,198 @@ test.describe('PS-BRIEF return hand-off', () => {
     await page.locator('#place-studio-back').click();
 
     await expect(page.locator(PLACE_ROOT)).toHaveCount(0);
+    await expect(page.locator('#impact-panel')).toHaveCount(0);
+  });
+
+  test('browser Back while Back to map waits steps history back once', async ({ page }) => {
+    let releaseGeometry = (): void => {};
+    const geometryHeld = new Promise<void>((resolve) => {
+      releaseGeometry = resolve;
+    });
+    await page.route('**/wbd/MapServer/*/query?*', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.searchParams.get('resultRecordCount') === '1') {
+        // Hold the selected watershed's boundary so Back to map waits on it.
+        await geometryHeld;
+        await route
+          .fulfill({ status: 200, contentType: 'application/geo+json', body: EMPTY_COLLECTION })
+          .catch(() => {});
+        return;
+      }
+      const layer = url.pathname.split('/').at(-2);
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          features: [
+            {
+              attributes:
+                layer === '1'
+                  ? { huc2: '17', name: 'Pacific Northwest' }
+                  : { huc4: '1703', name: 'Yakima' }
+            }
+          ]
+        })
+      });
+    });
+    await gotoApp(page, '?view=brief&layers=places');
+    // A same-document entry under the studio's, so a second step is counted instead of leaving the page.
+    await page.evaluate(() => {
+      const counted = window as unknown as { __ddmPops: number };
+      history.pushState(null, '', location.href);
+      counted.__ddmPops = 0;
+      window.addEventListener('popstate', () => {
+        counted.__ddmPops += 1;
+      });
+    });
+    await page.locator('#studio-entry-pair #place-studio-entry').click();
+    await page.locator('#place-type-watershed').click();
+    await page.locator('#place-studio-search').fill('Yakima');
+    // The Watersheds group: a search lists every place type (visual uniformity D11), and "Yakima" also names two ecoregions.
+    await page.locator('#place-list-panel [data-place-group="watershed"] .place-studio-option').click();
+
+    const back = page.locator('#place-studio-back');
+    await back.click();
+    await expect(back).toBeDisabled();
+    await page.goBack();
+    await expect(page.locator(PLACE_ROOT)).toHaveCount(0);
+    releaseGeometry();
+    // The studio's cleanup aborted the wait; two frames is past its settling.
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+    expect(
+      await page.evaluate(() => (window as unknown as { __ddmPops: number }).__ddmPops)
+    ).toBe(1);
+  });
+});
+
+/**
+ * Before DR-169, a sidebar hazard click reached the studio's deferred
+ * hand-off (src/ui/island/shell.tsx runDisplayCommand,
+ * setPlaceReturnDisplayCommand) while the Place studio stayed open,
+ * and this describe pinned that the display command composed with the
+ * return hand-off's briefing rather than replacing it (/code-review,
+ * 2026-09-10: the exposed-sidebar fix, Codex finding 6,
+ * tests/studio-restore.spec.ts, first wrote the click into the single slot
+ * the studio uses for the selected place's briefing, so selecting
+ * Washington and then clicking Wildfire landed on Wildfire with no
+ * briefing; the two now live in separate slots composed at exit, display
+ * command first, then briefing).
+ *
+ * DR-169 (ratified 2026-09-29, RATIFICATION-8) makes the whole #app,
+ * sidebar included, inert while ANY studio is open
+ * (src/ui/island/studio-inert.ts, applyStudioInertScope), so that click can
+ * no longer arrive while the studio is open at all: the button stays
+ * visible (the sidebar column is never covered) but is unreachable by any
+ * real input until the studio closes. These two cases now pin that
+ * unreachability (a forced click on the visible, inert button changes
+ * nothing and the studio stays open) and then prove the return hand-off
+ * still composes exactly as before once the studio is closed by hand: Back
+ * opens the briefing the selection promised (unchanged, see "PS-BRIEF
+ * return hand-off" above), and a plain click on Wildfire after that lands
+ * on Wildfire without touching that briefing (no code path closes the
+ * impact panel on a hazard-cluster change: src/state/cluster-service.ts's
+ * requestCluster/applyCluster write only the hazard-cluster store;
+ * src/ui/view-shell.ts's closeImpactPanel fires only on a switch to console
+ * mode). With no selection, Back opens nothing (D-0.7.0-041) and the later
+ * Wildfire click still briefs nothing.
+ *
+ * These cases boot on `layers=states`, NOT the file's usual `layers=places`.
+ * City & Town Labels is a reference-role layer outside every cluster's
+ * composition, so a hazard chosen over it commits DEMOTED by design
+ * (src/state/cluster-service.ts applyCluster, handoff step 5): the recipe
+ * applies, the extra survives, and the URL keeps the granular `layers=`
+ * truth with no button pressed (D-0.7.0-044). That is what the same click
+ * does outside any studio from the same boot (verified 2026-09-11), so it is
+ * not the hand-off's doing and must not be what these cases assert against.
+ * State Boundaries is default-on and inside the composition, so the commit
+ * stays clean and `cluster=wildfire` is the honest claim.
+ */
+const COMPOSABLE_BOOT_LAYERS = 'states';
+
+test.describe('PS-BRIEF return hand-off composes with a sidebar hazard closed by hand (DR-169)', () => {
+  test.use({ viewport: { width: 1280, height: 900 } });
+
+  test.beforeEach(async ({ page }) => {
+    await stubStateGeometry(page);
+    await stubBriefingSources(page);
+    await stubTribalCandidates(page, false);
+    await stubEcoregionCandidates(page, false);
+    await stubWatershedCandidates(page);
+    // The Wildfire cluster's smoke layer must not reach the network.
+    await page.route('**/NOAA_Satellite_Smoke_Detection*/**', (route) =>
+      route.fulfill({ contentType: 'application/geo+json', body: EMPTY_COLLECTION })
+    );
+  });
+
+  test('a sidebar hazard chosen after a selection is inert while the studio is open, then lands on Wildfire with the briefing still open once the studio closes', async ({
+    page
+  }) => {
+    await gotoApp(page, `?view=brief&layers=${COMPOSABLE_BOOT_LAYERS}&studio=place`);
+    await selectWashington(page);
+
+    const wildfire = page.locator('.shell-cluster-btn[data-cluster="wildfire"]');
+    await expect(wildfire).toBeVisible();
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'false');
+
+    // DR-169: the button stays on screen (the sidebar column is never
+    // covered at this width) but the whole #app is now inert, so a real
+    // click at its coordinates lands on nothing that can act on it; only a
+    // forced click proves it changes nothing. Web-first: the studio applies
+    // `inert` in an effect after its first render (see studio-restore.spec.ts).
+    await expect(page.locator('#app')).toHaveJSProperty('inert', true);
+    await wildfire.click({ force: true });
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'false');
+    await expect(page).not.toHaveURL(/cluster=wildfire/);
+    await expect(page.locator(PLACE_ROOT)).toBeVisible();
+
+    await page.locator('#place-studio-back').click();
+    await expect(page.locator(PLACE_ROOT)).toHaveCount(0);
+    expect(await page.locator('#app').evaluate((el) => (el as HTMLElement).inert)).toBe(false);
+    await expect(page).not.toHaveURL(/studio=place/);
+
+    // The return hand-off, unchanged: Back opens the briefing the selection
+    // promised.
+    const panel = page.locator('#impact-panel');
+    await expect(panel).toBeVisible();
+    await expect(panel.locator('.impact-panel-title')).toHaveText('Washington');
+
+    // With the sidebar live again, a plain click lands on Wildfire exactly
+    // as it always has, and leaves the briefing exactly as it was: no code
+    // path closes the impact panel on a hazard-cluster change.
+    await wildfire.click();
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'true', { timeout: 10_000 });
+    await expect(page).toHaveURL(/cluster=wildfire/);
+    await expect(panel).toBeVisible();
+    await expect(panel.locator('.impact-panel-title')).toHaveText('Washington');
+  });
+
+  test('a sidebar hazard chosen with no selection is inert while the studio is open, then lands on Wildfire and briefs nothing once the studio closes', async ({
+    page
+  }) => {
+    // The control: composing must not invent a briefing (D-0.7.0-041, never
+    // an unsolicited briefing).
+    await gotoApp(page, `?view=brief&layers=${COMPOSABLE_BOOT_LAYERS}&studio=place`);
+    await expect(page.locator(PLACE_ROOT)).toBeVisible();
+
+    const wildfire = page.locator('.shell-cluster-btn[data-cluster="wildfire"]');
+    await expect(wildfire).toBeVisible();
+    // Web-first: the studio applies `inert` in an effect after its first render.
+    await expect(page.locator('#app')).toHaveJSProperty('inert', true);
+    await wildfire.click({ force: true });
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'false');
+    await expect(page).not.toHaveURL(/cluster=wildfire/);
+    await expect(page.locator(PLACE_ROOT)).toBeVisible();
+
+    await page.locator('#place-studio-back').click();
+    await expect(page.locator(PLACE_ROOT)).toHaveCount(0);
+    expect(await page.locator('#app').evaluate((el) => (el as HTMLElement).inert)).toBe(false);
+    await expect(page.locator('#impact-panel')).toHaveCount(0);
+
+    await wildfire.click();
+    await expect(wildfire).toHaveAttribute('aria-pressed', 'true', { timeout: 10_000 });
+    await expect(page).toHaveURL(/cluster=wildfire/);
     await expect(page.locator('#impact-panel')).toHaveCount(0);
   });
 });

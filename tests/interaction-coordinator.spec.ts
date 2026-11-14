@@ -1,5 +1,15 @@
-import { test, expect, type Page } from '@playwright/test';
-import { gotoApp, waitForLayerSettled } from './helpers';
+import { test, expect, type Page } from './offline-test';
+import {
+  gotoApp,
+  layerCheckbox,
+  layerPill,
+  PILL,
+  search,
+  stubHeatRiskCatalog,
+  urlLayers,
+  waitForLayerSettled
+} from './helpers';
+import { BIA_ROUTE, NOTCH_BOUNDS, concaveBiaBody, routeGeojson } from './tribal-fixtures';
 
 /**
  * The InteractionCoordinator click-collision contract (D-0.7.0-058
@@ -76,6 +86,37 @@ async function clickCenterUntilPrimary(
   }).toPass({ timeout: 20_000 });
 }
 
+/** A synthetic SPC Day 1 polygon covering the whole fixture area. */
+async function routeSpcBlanket(page: Page): Promise<void> {
+  await page.route('**/SPC_firewx/MapServer/**', (route) =>
+    route.fulfill({
+      contentType: 'application/geo+json',
+      body: JSON.stringify({
+        type: 'FeatureCollection',
+        features: [
+          {
+            type: 'Feature',
+            id: 1,
+            properties: { dn: 5, valid: '202607171200', expire: '209912312359' },
+            geometry: {
+              type: 'Polygon',
+              coordinates: [
+                [
+                  [-124.5, 45.6],
+                  [-117.0, 45.6],
+                  [-117.0, 48.9],
+                  [-124.5, 48.9],
+                  [-124.5, 45.6]
+                ]
+              ]
+            }
+          }
+        ]
+      })
+    })
+  );
+}
+
 /** Boot with both live Tribal layers settled over the collision fixtures. */
 async function bootCollision(page: Page): Promise<void> {
   // The layers= order deliberately activates aiannh FIRST: under the old
@@ -83,7 +124,7 @@ async function bootCollision(page: Page): Promise<void> {
   // a rank-blind implementation would answer with the first-registered
   // layer. The assertions below then prove the table, not the order,
   // decides the primary.
-  await gotoApp(page, '?view=console&layers=aiannh,bia-reservations');
+  await gotoApp(page, '?region=washington_state&view=console&layers=aiannh,bia-reservations');
   await waitForLayerSettled(page, 'aiannh');
   await waitForLayerSettled(page, 'bia-reservations');
 }
@@ -111,29 +152,56 @@ test.describe('InteractionCoordinator: one click, one response', () => {
       'Synthetic Legal Fixture Area'
     );
 
-    // Frozen-head layout (maintainer directive 2026-07-18): the head
-    // carries the title, then the briefing door, then the features
-    // switcher, in that order; the caveat and links live in the scrolling
-    // body, not the head.
+    // Frozen-head layout, AMENDED by the owner 2026-09-10 (superseding the
+    // 2026-07-18 maintainer directive this comment used to describe) and
+    // carried by the popup frame since D1 M24 (src/ui/popup-frame.ts): the
+    // head carries the title, then the issuer line with its role
+    // (.popup-agency, the alias the frame keeps), then the value slot that
+    // holds the Conditions line (src/ui/popup-conditions.ts; each condition's
+    // full row stands first in the body since the owner's 2026-10-01
+    // "present-only head"), then the clock
+    // and the source, then the actions slot holding the briefing door, then
+    // the features switcher, in that order. The boundary detail (acres,
+    // classification, and the like) and the representation caveat still
+    // scroll in the body, not the head -- that part of the old directive
+    // stands.
     const head = popup.locator('.coordinated-response-head');
     await expect(head.locator('.popup-title')).toHaveText('Synthetic Reservation Fixture');
-    await expect(head.locator('[data-ddm-impact-trigger]')).toBeVisible();
+    await expect(head.locator('.popup-agency')).toBeVisible();
+    await expect(head.locator('[data-popup-slot="value"]')).toBeVisible();
+    await expect(head.locator('[data-popup-slot="actions"] [data-ddm-impact-trigger]')).toBeVisible();
     await expect(head.locator('.popup-other-features')).toBeVisible();
     const headOrder = await head.evaluate((el) =>
       [...el.children].map((c) =>
         c.matches('.popup-title')
           ? 'title'
-          : c.matches('[data-ddm-impact-trigger]')
-            ? 'briefing'
-            : c.matches('.popup-other-features')
-              ? 'features'
-              : c.tagName.toLowerCase()
+          : c.matches('.popup-agency')
+            ? 'agency'
+            : c.matches('[data-popup-slot="value"]')
+              ? 'conditions'
+              : c.matches('[data-popup-slot="clock"]')
+                ? 'clock'
+                : c.matches('[data-popup-slot="source"]')
+                  ? 'source'
+                  : c.matches('[data-popup-slot="actions"]') && c.querySelector('[data-ddm-impact-trigger]')
+                    ? 'briefing'
+                    : c.matches('.popup-other-features')
+                      ? 'features'
+                      : c.tagName.toLowerCase()
       )
     );
-    expect(headOrder).toEqual(['title', 'briefing', 'features']);
-    // The descriptive caveat scrolls in the body, not the frozen head.
-    await expect(popup.locator('.coordinated-response-body .popup-description')).toHaveCount(1);
-    await expect(head.locator('.popup-description')).toHaveCount(0);
+    expect(headOrder).toEqual(['title', 'agency', 'conditions', 'clock', 'source', 'briefing', 'features']);
+    // The head fits (S30D block 3, the director's Tier 2 call): the head's
+    // clock slot keeps the FIRST clock only (the LAR publication year); the
+    // reservation's retrieval stamp stands in the body's more-clocks slot.
+    await expect(head.locator('[data-popup-slot="clock"] [data-clock-meaning]')).toHaveCount(1);
+    await expect(head.locator('[data-popup-slot="clock"]')).toContainText('LAR definitions published');
+    await expect(head).not.toContainText('Retrieved on');
+    await expect(popup.locator('.coordinated-response-body [data-popup-slot="more-clocks"]')).toContainText('Retrieved on');
+    // The boundary meta and the descriptive caveat still scroll in the
+    // body, not the frozen head: one representation note, none in the head.
+    await expect(popup.locator('.coordinated-response-body [data-popup-slot="note"][data-representation]')).toHaveCount(1);
+    await expect(head.locator('[data-popup-slot="note"]')).toHaveCount(0);
   });
 
   test('choosing a disclosure entry replaces the response in place; the former primary joins the list', async ({
@@ -200,8 +268,8 @@ test.describe('InteractionCoordinator: one click, one response', () => {
     // point-event. Discovery upstreams are aborted so the curated seed
     // markers render deterministically offline (the honest catch path).
     await page.route('**/ddm-proxy.atniclimate.workers.dev/**', (route) => route.abort('failed'));
-    await page.route('**/waterservices.usgs.gov/**', (route) => route.abort('failed'));
-    await gotoApp(page, '?view=console&layers=aiannh,bia-reservations,telemetry');
+    await page.route('**/api.waterdata.usgs.gov/**', (route) => route.abort('failed'));
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh,bia-reservations,telemetry');
     await waitForLayerSettled(page, 'bia-reservations');
     await waitForLayerSettled(page, 'telemetry');
 
@@ -215,40 +283,79 @@ test.describe('InteractionCoordinator: one click, one response', () => {
     await expect(page.locator('.maplibregl-popup-content')).toContainText(
       'Puget Sound Vital Signs'
     );
+    const close = popup.getByRole('button', { name: 'Close popup' });
+    await close.focus();
+    await page.keyboard.press('Escape');
+    await expect(popup).toHaveCount(0);
+    await expect(marker).toBeFocused();
   });
+
+  for (const key of ['Enter', 'Space'] as const) {
+    test(`a focused station marker opens once with ${key}, and Escape returns focus on each open`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      // Keep the curated markers fixed while testing the actual MapLibre
+      // marker key handler. Discovery failure is an intentional offline fixture.
+      await page.route('**/ddm-proxy.atniclimate.workers.dev/**', (route) => route.abort('failed'));
+      await page.route('**/api.waterdata.usgs.gov/**', (route) => route.abort('failed'));
+      await gotoApp(page, '?region=washington_state&view=console&layers=telemetry');
+      await waitForLayerSettled(page, 'telemetry');
+      const marker = page.locator('[data-telemetry-station-id="ps_vital_signs"]');
+      const popup = page.locator('.maplibregl-popup');
+      await expect(marker).toHaveCount(1);
+      await expect(marker).toHaveAttribute('tabindex', '0');
+      await expect(marker).toHaveAttribute('role', 'button');
+      for (let opened = 0; opened < 2; opened++) {
+        await marker.focus();
+        await expect(marker).toBeFocused();
+        await page.keyboard.press(key);
+        await expect(popup).toHaveCount(1);
+        await expect(popup.locator('[data-popup-frame]')).toContainText('Puget Sound Vital Signs');
+        await expect(popup).toHaveAttribute('data-ddm-external-response', '');
+        const close = popup.getByRole('button', { name: 'Close popup' });
+        await close.focus();
+        await expect(close).toBeFocused();
+        await page.keyboard.press('Escape');
+        await expect(popup).toHaveCount(0);
+        await expect(marker).toBeFocused();
+      }
+    });
+  }
+
+  for (const view of ['console', 'brief'] as const) {
+    test(`Escape after a Water & Snow ${view} opener returns to its visible button or the canvas`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 900 });
+      await page.route('**/ddm-proxy.atniclimate.workers.dev/**', (route) => route.abort('failed'));
+      await page.route('**/api.waterdata.usgs.gov/**', (route) => route.abort('failed'));
+      await gotoApp(page, `?region=washington_state&view=${view}&layers=telemetry`);
+      await waitForLayerSettled(page, 'telemetry');
+      if (view === 'brief') await page.locator('#layers-studio-entry').click();
+      await page.locator('#telemetry-reveal').click();
+      const item = page.locator('.telemetry-item', { hasText: 'Ice Harbor Dam' });
+      await item.focus();
+      await expect(item).toBeFocused();
+      await page.keyboard.press('Enter');
+      const popup = page.locator('.maplibregl-popup');
+      await expect(popup).toHaveCount(1);
+      await expect(popup.locator('.popup-title')).toHaveText('Ice Harbor Dam');
+      await popup.getByRole('button', { name: 'Close popup' }).focus();
+      await page.keyboard.press('Escape');
+      await expect(popup).toHaveCount(0);
+      if (view === 'console') {
+        await expect(item).toBeVisible();
+        await expect(item).toBeFocused();
+      } else {
+        await expect(page.locator('.layers-studio')).toHaveCount(0);
+        await expect(item).toBeHidden();
+        await expect(page.locator('#map canvas.maplibregl-canvas')).toBeFocused();
+      }
+    });
+  }
 
   test('a broad surface never blankets a boundary: SPC ranks as a condition surface', async ({
     page
   }) => {
-    // A synthetic Day 1 polygon covering the whole fixture area.
-    await page.route('**/SPC_firewx/MapServer/**', (route) =>
-      route.fulfill({
-        contentType: 'application/geo+json',
-        body: JSON.stringify({
-          type: 'FeatureCollection',
-          features: [
-            {
-              type: 'Feature',
-              id: 1,
-              properties: { dn: 2, valid: '202607171200', expire: '202607180000' },
-              geometry: {
-                type: 'Polygon',
-                coordinates: [
-                  [
-                    [-124.5, 45.6],
-                    [-117.0, 45.6],
-                    [-117.0, 48.9],
-                    [-124.5, 48.9],
-                    [-124.5, 45.6]
-                  ]
-                ]
-              }
-            }
-          ]
-        })
-      })
-    );
-    await gotoApp(page, '?view=console&layers=aiannh,bia-reservations,spc-fire-weather');
+    await routeSpcBlanket(page);
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh,bia-reservations,spc-fire-weather');
     // Settle ALL THREE hit layers before the click: the disclosure-count
     // assertion needs every fixture rendered, and under full-suite load a
     // late activation can lag past the first successful click (the
@@ -285,9 +392,12 @@ test.describe('InteractionCoordinator: one click, one response', () => {
     await waitForLayerSettled(page, 'bia-reservations');
     await waitForLayerSettled(page, 'states');
 
-    // Select Washington through the shared search (summary-first: a
-    // selection with no popup and no feature-state emphasis; the promotion
-    // must ride the place-selection label, not the emphasis store).
+    // Select Washington through the shared search: the pick opens its
+    // briefing (owner 2026-11-13) and sets a selection with no popup and no
+    // feature-state emphasis; the promotion must ride the place-selection
+    // label, not the emphasis store. The briefing covers the map as a studio
+    // does, and its "Back to map" keeps the place selected and lit (owner,
+    // 2026-11-13), so the probe below runs on the map after that Back.
     await page.locator('#catalog-search [data-ddm-search]').fill('washington');
     await page
       .locator('[data-search-group="place"] [data-search-kind="place"]', {
@@ -296,24 +406,23 @@ test.describe('InteractionCoordinator: one click, one response', () => {
       .first()
       .click();
     await expect(page.locator('#app')).toHaveAttribute('data-place-selected', '');
+    await expect(page.locator('#impact-panel.open')).toBeVisible();
+    await page.locator('#impact-panel .impact-panel-close').click();
+    await expect(page.locator('#impact-panel')).toBeHidden();
+    await expect(page.locator('#app')).toHaveAttribute('data-place-selected', '');
 
     // The search flew the camera to Washington; the flyTo briefly widens
     // the view before settling, so the click must wait until the camera has
     // landed ON Washington, not merely on some state. The hover inspector
     // reads us-states-fill, so poll the center until its State readout reads
     // Washington: that holds only once the fly has settled over WA and the
-    // state fill is painted and queryable there. A close-reset retry cannot
-    // be used here (closing would clear the very selection under test) and a
-    // single click mid-fly would commit the wrong state and overwrite it, so
-    // the settle gate must precede one deliberate click.
+    // state fill is painted and queryable there. A single click mid-fly
+    // would commit the wrong state and overwrite the selection under test,
+    // so the settle gate must precede one deliberate click.
     const box = await page.locator('#map').boundingBox();
     if (!box) throw new Error('map container has no box');
-    // Bias the probe WEST of screen centre: the briefing fit pads for the
-    // sidebar, which pushes Washington's centre toward the right and leaves
-    // screen centre near the eastern WA / Idaho border. A left-of-centre
-    // point lands firmly in central-western Washington, over the fixtures
-    // and well clear of the border.
-    const cx = box.x + box.width * 0.32;
+    // The briefing fit pads every side alike now, so Washington sits at the map's centre.
+    const cx = box.x + box.width / 2;
     const cy = box.y + box.height / 2;
     const inspector = page.locator('#hover-inspector');
     const stateReadout = inspector.locator('.hover-item', { hasText: 'State' });
@@ -342,27 +451,292 @@ test.describe('InteractionCoordinator: one click, one response', () => {
   });
 
   test('entering a studio dismisses the open response', async ({ page }) => {
-    await gotoApp(page, '?view=brief&layers=aiannh,bia-reservations');
-    await waitForLayerSettled(page, 'bia-reservations');
-    // S4: in desktop Brief the place-bearing response rehosts at the
-    // panel foot (the coordinator's swappable sink); the dismissal seam
-    // under test is the same coordinator seam, whichever surface holds
-    // the response.
-    const box = await page.locator('#map').boundingBox();
-    if (!box) throw new Error('map container has no box');
-    const foot = page.locator('#panel-response .coordinated-response');
-    await expect(async () => {
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-      await expect(foot).toBeVisible({ timeout: 1500 });
-    }).toPass({ timeout: 20_000 });
-    await expect(page.locator('.maplibregl-popup')).toHaveCount(0);
+    // The studio doors stand in the desktop Brief shell, where a place click
+    // opens its briefing (owner, 2026-11-13) and no response is held; a
+    // non-place response still opens the coordinator's map popup there, so
+    // the case opens one on the SPC surface. The dismissal seam under test
+    // is the same coordinator seam, whatever the response answers on.
+    await routeSpcBlanket(page);
+    await gotoApp(page, '?region=washington_state&view=brief&layers=spc-fire-weather');
+    await waitForLayerSettled(page, 'spc-fire-weather');
+    await clickCenterForResponse(page);
+    await expect(page.locator('.maplibregl-popup')).toHaveCount(1);
 
     // The PLACE studio is a left-side route on desktop: without the
     // dismissal seam the response would stay painted beside the studio
     // (adversarial finding 5).
     await page.locator('#place-studio-entry').click();
     await expect(page).toHaveURL(/studio=place/);
-    await expect(foot).toHaveCount(0);
     await expect(page.locator('.maplibregl-popup')).toHaveCount(0);
+    await expect(page.locator('#panel-response .coordinated-response')).toHaveCount(0);
+  });
+});
+
+/**
+ * The Conditions block's ABSENCE claims, pinned (S24, 2026-09-10).
+ *
+ * The block shipped in the S23 popup lane with no test on any of its
+ * sentences, and an adversarial pass found two places where it turned "we do
+ * not know" into "there is nothing here". Nothing about a boundary popup is
+ * worth more than that distinction: a person reads this card to decide
+ * whether to prepare, and a false all-clear is the one failure this project
+ * treats as unacceptable. These cases exist so a future change cannot quietly
+ * restore either overstatement with a green suite.
+ */
+test.describe('the Conditions block never claims an absence it did not read', () => {
+  const WWA_QUERY = '/eventdriven/rest/services/WWA/watch_warn_adv/MapServer/1/query';
+
+  /** Boot the collision fixture WITH the NWS alerts layer, answering its
+   * query with `body`, and open the reservation popup. */
+  async function bootWithAlerts(
+    page: Page,
+    fulfil: (route: import('./offline-test').Route) => Promise<void> | void
+  ): Promise<void> {
+    await page.route((url) => url.pathname.endsWith(WWA_QUERY), fulfil);
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh,bia-reservations,nws-alerts');
+    await waitForLayerSettled(page, 'aiannh');
+    await waitForLayerSettled(page, 'bia-reservations');
+    await clickCenterUntilPrimary(page, 'Synthetic Reservation Fixture', 1);
+  }
+
+  test('a condition layer that failed to load is named as unread, never as nothing here and never as nothing asked for', async ({
+    page
+  }) => {
+    // A failed member of a committed mode stays checked. A custom layers=
+    // boot instead unchecks a failed activation, so it cannot establish the
+    // switched-on-but-unread precondition this case protects.
+    await page.route((url) => url.pathname.endsWith(WWA_QUERY), (route) => route.abort());
+    await stubHeatRiskCatalog(page);
+    await gotoApp(page, '?region=washington_state&view=console&cluster=heat');
+    await waitForLayerSettled(page, 'aiannh');
+    await waitForLayerSettled(page, 'bia-reservations');
+    await waitForLayerSettled(page, 'nws-alerts');
+    await expect(layerCheckbox(page, 'nws-alerts')).toBeChecked();
+    await expect(layerPill(page, 'nws-alerts')).toHaveClass(/\berror\b/);
+    await expect(layerPill(page, 'nws-alerts')).toHaveText(PILL.unavailable);
+    await expect(page.locator('.shell-cluster-btn[data-cluster="heat"]')).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    const params = new URLSearchParams(await search(page));
+    expect(params.get('cluster')).toBe('heat');
+    expect(params.has('layers')).toBe(false);
+    await clickCenterUntilPrimary(page, 'Synthetic Reservation Fixture');
+
+    const conditions = page.locator('.maplibregl-popup-content [data-popup-slot="value"]');
+    await expect(conditions).toBeVisible();
+    // An activation that never succeeded leaves no active key and no
+    // rendered fill, so the alerts row itself is absent; what must NOT
+    // happen is the card describing that as a quiet sky, or as nobody
+    // having asked for the layer at all.
+    await expect(conditions).not.toContainText('No active');
+    await expect(conditions).not.toContainText('No condition layer');
+    await expect(conditions).toContainText('could not be read');
+    // The condition rows stand in the body's conditions slot (D1 M24), so the
+    // same two false sentences are refused there too: the head line and every
+    // body condition row, read once after the head line has settled.
+    const said = (
+      await page
+        .locator('.maplibregl-popup-content')
+        .locator('[data-popup-slot="value"], [data-popup-slot="conditions"]')
+        .allTextContents()
+    ).join(' ');
+    expect(said, 'a condition slot claims an absence it did not read').not.toContain('No active');
+    expect(said, 'a condition slot says no layer was asked for').not.toContain('No condition layer');
+  });
+
+  test('a failed custom condition layer is unchecked and is not described as switched on', async ({
+    page
+  }) => {
+    // Keep the original custom boot and its one-other-feature collision
+    // assertion: a stored error alone must not imply current layer intent.
+    await bootWithAlerts(page, (route) => route.abort());
+    await waitForLayerSettled(page, 'nws-alerts');
+    await expect(layerCheckbox(page, 'nws-alerts')).not.toBeChecked();
+    await expect(layerPill(page, 'nws-alerts')).toHaveClass(/\berror\b/);
+    await expect(layerPill(page, 'nws-alerts')).toHaveText(PILL.unavailable);
+    expect((await urlLayers(page)).has('nws-alerts')).toBe(false);
+
+    const conditions = page.locator('.maplibregl-popup-content [data-popup-slot="value"]');
+    await expect(conditions).toBeVisible();
+    await expect(conditions.locator('.popup-value-text')).toHaveText(
+      'No condition layer (drought, NWS alerts, or wildfire perimeters) is currently active on the map.'
+    );
+    await expect(conditions).not.toContainText('could not be read');
+    await expect(conditions).not.toContainText('No active');
+  });
+
+  test('a successful empty read scopes its absence to the products actually requested', async ({
+    page
+  }) => {
+    // The layer asks for seven heat and fire weather products only here
+    // (HEAT_FIRE_ALERTS in src/config/clusters.ts). An absence sentence that
+    // said "no NWS watch, warning, or advisory" spoke past that query and
+    // would have denied an active Flash Flood Warning.
+    await bootWithAlerts(page, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/geo+json',
+        body: JSON.stringify({ type: 'FeatureCollection', features: [] })
+      })
+    );
+
+    // The condition rows stand in the body's conditions slot (D1 M24, the
+    // owner's present-only head); a confirmed zero is not named in the head.
+    const conditions = page.locator('.maplibregl-popup-content [data-popup-slot="conditions"]');
+    await expect(conditions).toBeVisible();
+    await expect(page.locator('.maplibregl-popup-content [data-popup-slot="value"]')).not.toContainText('NWS alert');
+    const alertRow = conditions.locator('[data-value-row]', {
+      hasText: 'NWS alert'
+    });
+    await expect(alertRow).toHaveCount(1);
+    await expect(alertRow).toContainText('heat or fire weather');
+    await expect(alertRow).toContainText('Only those products are requested');
+  });
+});
+
+/**
+ * The Conditions block attributes an alert to a place only when the alert
+ * actually touches that place (Codex adversarial review 2026-09-10, finding 3;
+ * the ATTRIBUTION FIX in src/ui/popup-conditions.ts, whose predicate is unit-
+ * tested in tests/polygon-overlap.spec.ts).
+ *
+ * The card retrieves alert candidates with the clicked place's screen-space
+ * BOUNDING BOX, deliberately and for a reason that has not changed: nws-alerts
+ * registers as the highest-ranked `point-event` kind, so an alert covering the
+ * clicked pixel wins the click outright and a bare point query would make the
+ * alert row unreachable from a boundary popup entirely. A rectangle is
+ * therefore the right RETRIEVAL shape. It is the wrong ATTRIBUTION shape,
+ * because a concave place's rectangle also contains ground that is not that
+ * place, and until the fix a warning in that gap was reported as this place's
+ * warning AND pulsed its briefing door.
+ *
+ * The pair below is the evidence, and it is a pair on purpose. Both cases boot
+ * the SAME camera and the SAME fixture alert at the SAME coordinates; the only
+ * thing that differs is whether the reservation polygon has a notch where that
+ * alert sits. Same box, same pixels, opposite answers. A single case could be
+ * passing because the alert never painted at all.
+ */
+test.describe('the Conditions block attributes an alert only where it touches the place', () => {
+  const WWA_QUERY = '/eventdriven/rest/services/WWA/watch_warn_adv/MapServer/1/query';
+
+  /** A Red Flag Warning square, `[w, s, e, n]`, shaped as the layer's own
+   * validator requires (a requested product name and an expiry that parses).
+   * Placed inside NOTCH_BOUNDS so the concave fixture excludes it. */
+  function redFlagAt(w: number, s: number, e: number, n: number): unknown {
+    // The window is relative to the run, because src/layers/nws-alerts.ts
+    // (activeFeaturesAt) drops an alert whose expiry has passed: fixed dates
+    // of 2026-09-10/11 made this block fail from 02:00 UTC on 2026-09-11
+    // onward, on every tree (found by the S28 decision-A worker, which saw
+    // it fail identically with its change stashed).
+    const hour = 3_600_000;
+    const onset = new Date(Date.now() - 6 * hour).toISOString();
+    const expiry = new Date(Date.now() + 6 * hour).toISOString();
+    return {
+      type: 'FeatureCollection',
+      features: [
+        {
+          type: 'Feature',
+          properties: {
+            prod_type: 'Red Flag Warning', // vocab-allow: verbatim NWS product name, quoted source data
+            onset,
+            ends: expiry,
+            expiration: expiry,
+            wfo: 'OTX'
+          },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [
+              [
+                [w, s],
+                [e, s],
+                [e, n],
+                [w, n],
+                [w, s]
+              ]
+            ]
+          }
+        }
+      ]
+    };
+  }
+
+  /**
+   * Boot with the alerts layer holding one Red Flag Warning in the notch, and
+   * with the reservation shaped either as the plain rectangle (which CONTAINS
+   * the notch region) or as the L (which does not).
+   */
+  async function bootWithNotchAlert(page: Page, shape: 'rectangle' | 'concave'): Promise<void> {
+    const [w, s, e, n] = NOTCH_BOUNDS;
+    // Inset from the notch edges so neither answer depends on a boundary case.
+    const alert = redFlagAt(w + 0.5, s + 0.2, e - 0.5, n - 0.2);
+    await page.route(
+      (url) => url.pathname.endsWith(WWA_QUERY),
+      (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'application/geo+json',
+          body: JSON.stringify(alert)
+        })
+    );
+    if (shape === 'concave') {
+      await routeGeojson(page, BIA_ROUTE, concaveBiaBody());
+    }
+    await gotoApp(page, '?region=washington_state&view=console&layers=bia-reservations,nws-alerts');
+    await waitForLayerSettled(page, 'bia-reservations');
+    await waitForLayerSettled(page, 'nws-alerts');
+    await clickCenterUntilPrimary(page, 'Synthetic Reservation Fixture');
+  }
+
+  test('a rectangular place that really contains the warning reports it', async ({ page }) => {
+    // The control. Without this the negative case below proves nothing: it
+    // establishes that this alert, at these coordinates, IS retrieved by the
+    // box query and IS reportable, so the negative case can only be the
+    // polygon test doing its work.
+    await bootWithNotchAlert(page, 'rectangle');
+
+    // The row in the body's conditions slot; its label, present, in the head.
+    const conditions = page.locator('.maplibregl-popup-content [data-popup-slot="conditions"]');
+    await expect(conditions).toBeVisible();
+    await expect(page.locator('.maplibregl-popup-content [data-popup-slot="value"]')).toContainText('NWS alert');
+    const alertRow = conditions.locator('[data-value-row]', { hasText: 'NWS alert' });
+    await expect(alertRow).toContainText('Red Flag Warning');
+    // The place-wide scope is stated, so a reader never reads a box query as a
+    // measurement at the pixel they clicked.
+    await expect(alertRow).toContainText('in this area');
+
+    // And the emphasis IS earned here: a Warning-tier product really does
+    // cover this place, so the briefing door pulses. The negative case asserts
+    // the opposite on the same fixture, which is what makes either meaningful.
+    const door = page.locator('.maplibregl-popup-content [data-ddm-impact-trigger]');
+    await expect(door).toHaveClass(/popup-impact-btn--pulse/);
+  });
+
+  test('a concave place whose notch holds the warning does not report it, and does not pulse', async ({
+    page
+  }) => {
+    await bootWithNotchAlert(page, 'concave');
+
+    // The row in the body's conditions slot; an absence is never named in the head.
+    const conditions = page.locator('.maplibregl-popup-content [data-popup-slot="conditions"]');
+    await expect(conditions).toBeVisible();
+    await expect(page.locator('.maplibregl-popup-content [data-popup-slot="value"]')).not.toContainText('NWS alert');
+    const alertRow = conditions.locator('[data-value-row]', { hasText: 'NWS alert' });
+    // The row still exists: the layer read cleanly and found nothing HERE,
+    // which is a confirmed zero and must be said, not omitted.
+    await expect(alertRow).toHaveCount(1);
+    await expect(alertRow).not.toContainText('Red Flag Warning');
+    await expect(alertRow).toContainText('No active NWS heat or fire weather');
+
+    // Amendment A2 gates the briefing door's emphasis on real issuer evidence
+    // AT the clicked place. Somewhere else's warning must not pulse it
+    // (`popup-impact-btn--pulse`, src/ui/popup-frame.ts doorHtml).
+    const door = page.locator('.maplibregl-popup-content [data-ddm-impact-trigger]');
+    await expect(door).toHaveCount(1);
+    await expect(door).not.toHaveClass(/popup-impact-btn--pulse/);
+    await expect(door).toHaveAttribute(
+      'class',
+      /popup-impact-btn/
+    );
   });
 });

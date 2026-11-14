@@ -20,8 +20,7 @@ import {
 test('classifyUrl separates the served app, stubbed basemap tiles, and upstream sources', () => {
   const origin = 'http://127.0.0.1:4173';
   assert.equal(classifyUrl('http://127.0.0.1:4173/data/us-states.geojson', origin), 'app');
-  assert.equal(classifyUrl('https://tile.openstreetmap.org/5/5/11.png', origin), 'stubbed');
-  assert.equal(classifyUrl('https://a.tile.opentopomap.org/5/5/11.png', origin), 'stubbed');
+  assert.equal(classifyUrl('http://127.0.0.1:4173/data/ddm-base-na-2026-11.pmtiles', origin), 'app');
   assert.equal(classifyUrl('https://satellitemaps.nesdis.noaa.gov/arcgis/rest/services/MERGEDGC_Last_24hr/ImageServer/exportImage?bbox=1,2,3,4&f=image', origin), 'stubbed');
   assert.equal(classifyUrl('https://satellitemaps.nesdis.noaa.gov/arcgis/rest/services/MERGEDGC_Last_24hr/ImageServer/query?where=1%3D1&f=json', origin), 'source');
   assert.deepEqual(STUBBED_TILE_GLOBS, ['https://satellitemaps.nesdis.noaa.gov/**/exportImage**']);
@@ -29,14 +28,15 @@ test('classifyUrl separates the served app, stubbed basemap tiles, and upstream 
     classifyUrl('https://services3.arcgis.com/T4QMspbfLg3qTGWY/ArcGIS/rest/services/WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query?f=geojson', origin),
     'source',
   );
-  assert.ok(STUBBED_HOSTS.includes('tile.openstreetmap.org'));
+  // DDM's own base map is same-origin: no tile host is stubbed any more.
+  assert.deepEqual(STUBBED_HOSTS, []);
   assert.ok(CACHE_HEADERS.includes('age'));
 });
 
 test('every stubbed host and tile glob names a host the runtime registry actually uses', async () => {
-  // The catalog plus its boot slice (DR-008a, 2026-09-03): the OpenStreetMap
-  // tile template lives in urls-boot.ts and is re-exported by urls.ts under
-  // its old key, so the literal host appears only in the boot file.
+  // The catalog plus its boot slice (DR-008a, 2026-09-03): a boot literal
+  // lives in urls-boot.ts and is re-exported by urls.ts under its old key,
+  // so its host may appear only in the boot file.
   const urls =
     (await readFile(new URL('../src/config/urls.ts', import.meta.url), 'utf8')) +
     (await readFile(new URL('../src/config/urls-boot.ts', import.meta.url), 'utf8'));
@@ -48,10 +48,9 @@ test('every stubbed host and tile glob names a host the runtime registry actuall
   }
 });
 
-test('countRecords reads GeoJSON, ArcGIS JSON, WaterML, and arrays, and returns null otherwise', () => {
+test('countRecords reads GeoJSON, ArcGIS JSON, and arrays, and returns null otherwise', () => {
   assert.equal(countRecords('application/geo+json', JSON.stringify({ type: 'FeatureCollection', features: [{}, {}] })), 2);
   assert.equal(countRecords('application/json; charset=utf-8', JSON.stringify({ features: [{}] })), 1);
-  assert.equal(countRecords('application/json', JSON.stringify({ value: { timeSeries: [{}, {}, {}] } })), 3);
   assert.equal(countRecords('application/json', JSON.stringify([1, 2])), 2);
   assert.equal(countRecords('image/png', 'not json'), null);
   assert.equal(countRecords('application/json', '{"error":{"code":400}}'), null);
@@ -73,8 +72,17 @@ test('evaluateLayerHealth: ok, slow, large, and aborted answers', () => {
   const aborted = { ...good, failed: [{ url: 'https://x/tile', failure: 'net::ERR_ABORTED' }], requests: 2 };
   assert.equal(evaluateLayerHealth(aborted, opts).verdict, 'warn');
   assert.match(evaluateLayerHealth(aborted, opts).reasons[0], /aborted by the runtime/);
-  const moved = { ...good, finalStatus: 'ready', status: 'ready' };
-  assert.equal(evaluateLayerHealth(moved, opts).verdict, 'ok');
+});
+
+test('evaluateLayerHealth: an error the driver caught after the pill went terminal is a breach', () => {
+  // The pill read `ready` (or `zoom-in`), then a later page.evaluate threw;
+  // the driver keeps that message in row.reasons and the verdict must not be ok.
+  const thrown = ['Execution context was destroyed'];
+  assert.deepEqual(evaluateLayerHealth({ ...good, reasons: thrown }, opts), { verdict: 'breach', reasons: [] });
+  const zoom = { key: 'hydrography', status: 'zoom-in', settleMs: 200, responses: [], failed: [], requests: 0, reasons: thrown };
+  assert.equal(evaluateLayerHealth(zoom, opts).verdict, 'breach');
+  const slow = { ...good, responses: [{ ...goodResponse, ms: 12_000 }], reasons: [] };
+  assert.equal(evaluateLayerHealth(slow, opts).verdict, 'warn', 'an empty driver list changes nothing');
 });
 
 test('evaluateLayerHealth: breaches from the terminal state', () => {

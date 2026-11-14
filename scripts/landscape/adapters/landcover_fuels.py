@@ -1156,6 +1156,23 @@ def _download_tiled_window(
                     ),
                     service_returned=True,
                 )
+                # Congruent is not enough: the mosaic places this tile at
+                # the REQUESTED offset, so it must be the requested window.
+                if (
+                    returned.width != tile_w
+                    or returned.height != tile_h
+                    or abs(returned.transform.c - t_minx)
+                    > GRID_RETURNED_ORIGIN_TOL_M
+                    or abs(returned.transform.f - t_maxy)
+                    > GRID_RETURNED_ORIGIN_TOL_M
+                ):
+                    raise GridCongruenceError(
+                        f"{key} service-returned tile at row {row_off}, "
+                        f"column {col_off} is {returned.width}x"
+                        f"{returned.height} at ({returned.transform.c!r}, "
+                        f"{returned.transform.f!r}), not the requested "
+                        f"{tile_w}x{tile_h} at ({t_minx!r}, {t_maxy!r})"
+                    )
                 facts = grid_deviation_facts_30m(
                     returned.crs, returned.transform)
                 core.log(
@@ -1337,9 +1354,11 @@ def download_whp_zip(
     mode = "ab" if resume_at else "wb"
     with open(part, mode) as fh:
         for chunk in resp.iter_content(chunk_size=1 << 20):
-            fh.write(chunk)
+            # Checked before the write, so a finished stream never leaves a
+            # complete .part whose resume Range would only get HTTP 416.
             if time.monotonic() - started > time_budget_s:
                 resp.close()
+                fh.flush()
                 raise WhpDownloadIncomplete(
                     f"WHP zip download hit the per-invocation time budget "
                     f"({time_budget_s:.0f}s) at {part.stat().st_size} of "
@@ -1347,6 +1366,7 @@ def download_whp_zip(
                     f"re-invoke the capture to resume (the resume spends "
                     f"rds-whp-zip again)"
                 )
+            fh.write(chunk)
     if total is not None and part.stat().st_size != total:
         raise RuntimeError(
             f"WHP zip download ended short: {part.stat().st_size} of "
@@ -2127,7 +2147,8 @@ def aggregate(
     its required artifacts). NEVER fetches and NEVER materializes;
     prepared is exactly the acquire() return shape (the orchestrator
     path and the fixture path go through the same validation). Returns a
-    dict keyed by code_field values, one entry per input row."""
+    dict keyed by code_field values, one entry per code (rows sharing a
+    code are dissolved first)."""
     if run_info is not None:
         for key, stem in RUN_INFO_STEMS.items():
             entry = prepared.get(key)
@@ -2152,6 +2173,7 @@ def aggregate(
             if err is None:
                 datasets[key] = rasterio.open(prepared[key]["path"])
 
+        gdf = core.dissolve_by_code(gdf, code_field)
         out: dict = {}
         n = len(gdf)
         for i, (_, row) in enumerate(gdf.iterrows(), start=1):

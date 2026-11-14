@@ -1,5 +1,6 @@
-import { test, expect } from '@playwright/test';
-import { gotoApp, search } from './helpers';
+import { continueLocalRoute } from './offline-test';
+import { test, expect } from './offline-test';
+import { gotoApp, search, showFullDetail } from './helpers';
 
 const PANEL_RUNTIME_PRIMARY =
   '**/assets/impact-panel-runtime-primary-*.js';
@@ -18,6 +19,7 @@ test.describe('lazy impact briefing cluster', () => {
     const panel = page.locator('#impact-panel');
     await expect(panel).toBeVisible({ timeout: 15_000 });
     await expect(panel.locator('#impact-panel-title')).toHaveText('Washington');
+    await showFullDetail(page);
     await expect(
       panel.locator('.impact-claim-derived', {
         hasText: 'Relative Oceanic Nino Index'
@@ -48,11 +50,7 @@ test.describe('lazy impact briefing cluster', () => {
     await expect(panel).toHaveClass(/\bsheet-hosted\b/);
     await expect(panel).toHaveClass(/\bopen\b/);
     await expect(panel).toHaveAttribute('aria-modal', 'false');
-    await expect(app).toHaveAttribute('data-sheet-detent', 'half');
-    await expect(page.locator('#sheet-report-door')).toBeVisible();
-    await expect(page.locator('.sheet-at-hand-title')).toHaveText('Washington');
-
-    await page.locator('#sheet-report-door').click();
+    // The report opens in the full-screen window at once (owner, 2026-11-13).
     await expect(app).toHaveAttribute('data-sheet-detent', 'full');
     await expect(panel).toBeVisible();
     await expect(panel.locator('.impact-capability-unavailable')).toContainText(
@@ -62,10 +60,17 @@ test.describe('lazy impact briefing cluster', () => {
       'application module could not load'
     );
 
-    await panel.locator('.impact-panel-close').click();
-    await expect(app).toHaveAttribute('data-sheet-detent', 'half');
+    // Back to map closes the window, keeps the briefing and returns focus to the lit door.
+    await page.locator('#sheet-close').click();
+    await expect(app).toHaveAttribute('data-sheet-detent', 'closed');
     await expect(panel).toHaveClass(/\bopen\b/);
-    await expect(page.locator('#sheet-report-door')).toBeFocused();
+    await expect(page.locator('#mobile-footer-nav button[data-tab="brief"]')).toBeFocused();
+
+    // The Place window still names the place and offers its report.
+    await page.locator('#mobile-footer-nav button[data-tab="place"]').click();
+    await expect(app).toHaveAttribute('data-sheet-detent', 'full');
+    await expect(page.locator('#sheet-report-door')).toBeVisible();
+    await expect(page.locator('.sheet-at-hand-title')).toHaveText('Washington');
     expect(pageErrors).toEqual([]);
   });
 
@@ -111,7 +116,7 @@ test.describe('lazy impact briefing cluster', () => {
     });
     await page.route(PANEL_RUNTIME_PRIMARY, (route) => route.abort('failed'));
 
-    await gotoApp(page, '?view=console');
+    await gotoApp(page, '?region=washington_state&view=console');
     const trigger = page.locator('#region-briefing-btn');
     await trigger.focus();
     await page.keyboard.press('Enter');
@@ -127,6 +132,7 @@ test.describe('lazy impact briefing cluster', () => {
     await page.keyboard.press('Enter');
     await expect(panel).toBeVisible({ timeout: 15_000 });
     await expect(panel.locator('#impact-panel-title')).toHaveText('Washington');
+    await showFullDetail(page);
     await expect(panel.locator('.impact-horizons')).toBeVisible();
     await expect(panel.locator('.impact-capability-unavailable')).toHaveCount(0);
 
@@ -156,7 +162,7 @@ test.describe('lazy impact briefing cluster', () => {
     await page.route(PANEL_RUNTIME_PRIMARY, async (route) => {
       markRuntimeStarted();
       await runtimeRelease;
-      await route.continue();
+      await continueLocalRoute(route);
     });
 
     await gotoApp(page, '?select=state:WA');

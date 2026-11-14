@@ -1,5 +1,95 @@
-import { test, expect } from '@playwright/test';
-import { gotoApp } from './helpers';
+import { continueLocalRoute } from './offline-test';
+import { test, expect } from './offline-test';
+import type { Page } from './offline-test';
+import { HAZARD_CLUSTERS, HAZARD_CLUSTER_KEYS } from '../src/config/clusters';
+import { URLS } from '../src/config/urls';
+import { gotoApp, showFullDetail, waitForLayerSettled } from './helpers';
+
+/**
+ * A minimal NWS point-heat stub (mirrors `stubBrowserNwsHeat` in
+ * `tests/heat-h2-point-heat.spec.ts`, kept local rather than shared across
+ * spec files): answers the Worker-wrapped NWS proxy route with a fixed
+ * office/grid and three populated grid metrics, so the M19 disclosure-state
+ * cases below never depend on a live network. Coordinates in the fixture
+ * URLs are fixed and not read from the request: the NWS `/points/` response
+ * always claims the same downstream gridpoints path.
+ */
+const NWS_PROXY_ROUTE_A11Y = new RegExp(
+  `^${URLS.workerProxy.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/proxy\\?url=${encodeURIComponent(
+    `${URLS.nwsApi}/`
+  )}`
+);
+
+function nwsA11yUpstreamUrl(requestUrl: string): string {
+  const request = new URL(requestUrl);
+  const worker = new URL(URLS.workerProxy);
+  const upstream = request.searchParams.get('url');
+  if (
+    request.origin !== worker.origin ||
+    request.pathname !== '/proxy' ||
+    upstream === null ||
+    !upstream.startsWith(`${URLS.nwsApi}/`)
+  ) {
+    throw new Error(`Expected a Worker-wrapped NWS URL, received ${requestUrl}`);
+  }
+  return upstream;
+}
+
+async function stubGridGuidance(page: Page): Promise<void> {
+  await page.route(NWS_PROXY_ROUTE_A11Y, (route) => {
+    const url = new URL(nwsA11yUpstreamUrl(route.request().url()));
+    let body: unknown;
+    if (url.pathname.startsWith('/points/')) {
+      body = {
+        properties: {
+          forecastGridData: 'https://api.weather.gov/gridpoints/TOP/31,80',
+          observationStations:
+            'https://api.weather.gov/gridpoints/TOP/31,80/stations',
+          forecast: 'https://api.weather.gov/gridpoints/TOP/31,80/forecast',
+          cwa: 'TOP',
+          gridId: 'TOP'
+        }
+      };
+    } else if (url.pathname === '/gridpoints/TOP/31,80/stations') {
+      body = { type: 'FeatureCollection', features: [] };
+    } else if (url.pathname === '/gridpoints/TOP/31,80/forecast') {
+      body = {
+        properties: { updateTime: '2026-07-29T11:00:00+00:00', periods: [] }
+      };
+    } else if (url.pathname === '/gridpoints/TOP/31,80') {
+      body = {
+        properties: {
+          updateTime: '2026-07-29T10:00:00+00:00',
+          temperature: {
+            uom: 'wmoUnit:degC',
+            values: [{ validTime: '2026-07-29T00:00:00+00:00/P2D', value: 31 }]
+          },
+          apparentTemperature: {
+            uom: 'wmoUnit:degC',
+            values: [
+              { validTime: '2026-07-30T12:00:00+00:00/PT3H', value: 34 }
+            ]
+          },
+          heatIndex: {
+            uom: 'wmoUnit:degC',
+            values: [
+              { validTime: '2026-07-30T12:00:00+00:00/PT3H', value: 36 }
+            ]
+          }
+        }
+      };
+    } else if (url.pathname === '/alerts/active') {
+      body = { type: 'FeatureCollection', features: [] };
+    } else {
+      return route.abort();
+    }
+    return route.fulfill({
+      status: 200,
+      contentType: 'application/geo+json',
+      body: JSON.stringify(body)
+    });
+  });
+}
 
 /**
  * Impact briefing panel accessibility (critical-review #16, WCAG 2.4.3 / 2.1.2).
@@ -40,11 +130,11 @@ test.describe('impact panel accessibility', () => {
   test('the region briefing trigger opens the state briefing and restores focus (#9, #16)', async ({
     page
   }) => {
-    // Default region washington_state is anchored to the WA state briefing.
+    // Pins region=washington_state, anchored to the WA state briefing.
     // The region briefing trigger lives in the region panel, which is a
     // console-only "where" control since U3e (D-0.7.0-009: Brief leads with
     // the place search), so exercise the trigger in console mode.
-    await gotoApp(page, '?view=console');
+    await gotoApp(page, '?region=washington_state&view=console');
 
     const trigger = page.locator('#region-briefing-btn');
     await expect(trigger).toBeVisible();
@@ -67,9 +157,283 @@ test.describe('impact panel accessibility', () => {
     await expect(trigger).toBeFocused();
   });
 
+  test('Tab reaches Technical information after resources and wraps within the modal', async ({ page }) => {
+    await gotoApp(page, '?select=state:WA');
+    const panel = page.locator('#impact-panel');
+    // found-110: wait on the settled modal, not only its flag. The panel is
+    // visible (its first paint is done), no horizon cell and no point-heat
+    // card is still loading (each settling lane re-renders the body, which
+    // replaces every focusable in it), and the catalog row below has landed.
+    await expect(panel).toBeVisible({ timeout: 15_000 });
+    await expect(panel).toHaveAttribute('aria-modal', 'true');
+    await expect(panel.locator('.impact-horizon-loading')).toHaveCount(0);
+    await expect(panel.locator('.point-heat-pill-loading')).toHaveCount(0);
+    const lastResource = panel.locator('.impact-resources a[href]').last();
+    const technical = panel.locator('.impact-technical-information');
+    const summary = technical.locator('summary');
+    // "Back to map" leads the header (owner, 2026-11-13: the briefing covers
+    // the map as a studio does), so it is the header's first focusable, where
+    // the trap wraps a forward Tab from the panel's last focusable.
+    const back = panel.locator('.impact-panel-close');
+
+    // Resource-catalog hydration replaces the whole body independently of
+    // horizon hydration. Wait for the deterministic WA catalog row so that
+    // replacement cannot retire the focused last link between focus and Tab.
+    await expect(
+      panel.getByRole('link', { name: 'Drought relief and recovery information' })
+    ).toBeVisible();
+    // Visual uniformity D10: the empty Nation's-own slot draws nothing, its heading included.
+    await expect(panel.locator('.impact-resources')).not.toContainText("Nation's own resources");
+    await lastResource.focus();
+    await page.keyboard.press('Tab');
+    await expect(summary).toBeFocused();
+    await page.keyboard.press('Enter');
+    await expect(technical).toHaveJSProperty('open', true);
+    await expect(technical.locator('#impact-technical-drought')).toBeVisible();
+    // Value-only migration (S30D D1 M22): the Acknowledgements section is
+    // the body's last child now, one Tab stop after Technical information
+    // (design record acknowledgements-table.md section 1.3), so the wrap
+    // to Mail comes one Tab later and Shift+Tab returns through it.
+    const acknowledgements = panel.locator('.impact-acknowledgements > summary');
+    // Technical information holds source links (map-technical-information.ts), so
+    // the stop before Acknowledgements is its last link, not its summary.
+    const lastTechnicalLink = technical.locator('a[href]').last();
+    await lastTechnicalLink.focus();
+    await page.keyboard.press('Tab');
+    await expect(acknowledgements).toBeFocused();
+    await page.keyboard.press('Tab');
+    await expect(back).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(acknowledgements).toBeFocused();
+    await page.keyboard.press('Shift+Tab');
+    await expect(lastTechnicalLink).toBeFocused();
+  });
+
+  test('the Email control is a mailto whose subject is the briefing title and whose body carries the share link, with select=state:XX only for a state place', async ({
+    page
+  }) => {
+    await gotoApp(page, '?select=state:WA');
+    const panel = page.locator('#impact-panel');
+    await expect(panel).toBeVisible({ timeout: 15_000 });
+    await expect(panel.locator('#impact-panel-title')).toHaveText('Washington');
+
+    const mail = panel.locator('.impact-panel-action-mail');
+    const href = await mail.getAttribute('href');
+    if (!href || !href.startsWith('mailto:?')) {
+      throw new Error(`expected a wired mailto: href, got ${JSON.stringify(href)}`);
+    }
+    const params = new URLSearchParams(href.slice('mailto:?'.length));
+    expect(params.get('subject')).toBe('Washington');
+
+    const body = params.get('body') ?? '';
+    const lines = body.split('\n');
+    expect(lines[0]).toBe('Washington');
+    expect(lines[1]).toBe('');
+    const shareLink = new URL(lines[2] ?? '');
+    expect(shareLink.searchParams.get('select')).toBe('state:WA');
+  });
+
+  test('the Email link carries a URL change made after the briefing settled (found-098)', async ({
+    page
+  }) => {
+    await gotoApp(page, '?select=state:WA');
+    const panel = page.locator('#impact-panel');
+    await expect(panel).toBeVisible({ timeout: 15_000 });
+    await expect(panel.locator('#impact-panel-title')).toHaveText('Washington');
+    await expect(panel.locator('.impact-horizon-loading')).toHaveCount(0);
+    await expect(
+      panel.getByRole('link', { name: 'Drought relief and recovery information' })
+    ).toBeVisible();
+
+    // A durable URL key changes without any briefing re-render: collapsing
+    // the sidebar writes `sidebar=closed` (replaceState, src/ui/sidebar.ts)
+    // and paints nothing inside the panel, so a mailto href baked only at
+    // settle time would miss it.
+    await page.locator('#sidebar-collapse').click();
+    await expect(page).toHaveURL(/sidebar=closed/);
+
+    const mail = panel.locator('.impact-panel-action-mail');
+    await mail.focus();
+    const href = await mail.getAttribute('href');
+    if (!href || !href.startsWith('mailto:?')) {
+      throw new Error(`expected a wired mailto: href, got ${JSON.stringify(href)}`);
+    }
+    const params = new URLSearchParams(href.slice('mailto:?'.length));
+    const body = params.get('body') ?? '';
+    const shareLink = new URL(body.split('\n')[2] ?? '');
+    expect(shareLink.searchParams.get('sidebar')).toBe('closed');
+  });
+
+  test("a Tribal Nation briefing's mailto carries no place token and names the Nation in words", async ({
+    page
+  }) => {
+    // Opened the way tests/interaction-coordinator.spec.ts opens a
+    // reservation or AIANNH representation's briefing: the two live Tribal
+    // layers over tests/tribal-fixtures.ts's synthetic collision fixtures,
+    // a centre click for the coordinated response, then its briefing door.
+    await gotoApp(page, '?region=washington_state&view=console&layers=aiannh,bia-reservations');
+    await waitForLayerSettled(page, 'aiannh');
+    await waitForLayerSettled(page, 'bia-reservations');
+
+    const box = await page.locator('#map').boundingBox();
+    if (!box) throw new Error('map container has no box');
+    const popup = page.locator('.maplibregl-popup-content');
+    await expect(async () => {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await expect(popup).toBeVisible({ timeout: 1500 });
+    }).toPass({ timeout: 20_000 });
+    await popup.locator('[data-ddm-impact-trigger]').click();
+
+    const panel = page.locator('#impact-panel');
+    await expect(panel).toBeVisible();
+    const title = (await panel.locator('#impact-panel-title').textContent())?.trim() ?? '';
+    expect(title.length).toBeGreaterThan(0);
+
+    const mail = panel.locator('.impact-panel-action-mail');
+    const href = await mail.getAttribute('href');
+    if (!href || !href.startsWith('mailto:?')) {
+      throw new Error(`expected a wired mailto: href, got ${JSON.stringify(href)}`);
+    }
+    const params = new URLSearchParams(href.slice('mailto:?'.length));
+    expect(params.get('subject')).toBe(title);
+
+    const body = params.get('body') ?? '';
+    expect(body.startsWith(`${title}\n\n`)).toBe(true);
+    expect(body).not.toContain('select=');
+  });
+
   test('a region spanning several states shows no briefing trigger (#9)', async ({ page }) => {
     // The national framing has no single briefable boundary, so no trigger.
     await gotoApp(page, '?region=national');
     await expect(page.locator('#region-briefing-btn')).toBeHidden();
+  });
+
+  test('after a minimap framing click elsewhere the briefing door says it opens the last selected place, or hides', async ({
+    page
+  }) => {
+    // Start anchored to Washington in Brief, where the inline minimap is
+    // visible (the region panel is console-only for the door's OWN click
+    // per the test above; the minimap itself renders only in Brief).
+    await gotoApp(page, '?region=washington_state&view=brief');
+    const trigger = page.locator('#region-briefing-btn');
+    await expect(trigger).toBeVisible();
+    await expect(trigger).toContainText('Washington');
+
+    // A framing camera takes the view away from Washington without any
+    // region= choice (S2 camera exclusivity).
+    await page.locator('.shell-minimap-map [data-framing="southeast-gulf"]').click();
+    await page.waitForFunction(() => window.location.search.includes('framing=southeast-gulf'));
+
+    // The door never keeps naming a place the camera has left (D1 M4,
+    // found-025): it hides rather than keep reading "Impact briefing:
+    // Washington" under the Southeast & Gulf Coast camera.
+    await expect(trigger).toBeHidden();
+  });
+
+  test('every NWS grid guidance disclosure starts closed in every HAZARD_CLUSTER_KEYS mode', async ({
+    page
+  }) => {
+    await page.clock.setFixedTime('2026-07-29T12:30:00+00:00');
+    // Registered once: page.route persists across the repeated gotoApp
+    // navigations in the loop below (DR-113: every mode is enumerated from
+    // HAZARD_CLUSTER_KEYS, never a literal four-item list).
+    await stubGridGuidance(page);
+
+    for (const key of HAZARD_CLUSTER_KEYS) {
+      const token = HAZARD_CLUSTERS[key].urlToken;
+      const clusterQuery = token ? `&cluster=${token}` : '';
+      await gotoApp(page, `?select=state:WA${clusterQuery}`);
+
+      const panel = page.locator('#impact-panel');
+      await expect(panel).toBeVisible({ timeout: 15_000 });
+      await showFullDetail(page);
+      const series = panel.locator('.impact-horizons .point-heat-series');
+      await expect(series.first(), `${key}: grid guidance renders`).toBeVisible();
+      expect(
+        await series.count(),
+        `${key}: at least one NWS grid disclosure renders`
+      ).toBeGreaterThan(0);
+      await expect(
+        panel.locator('.impact-horizons .point-heat-series[open]'),
+        `${key}: no NWS grid disclosure starts open`
+      ).toHaveCount(0);
+    }
+  });
+
+  test("a reader's open or closed briefing disclosure survives a briefing refresh", async ({
+    page
+  }) => {
+    await page.clock.setFixedTime('2026-07-29T12:30:00+00:00');
+    await stubGridGuidance(page);
+    // Delay the independent F3 resource-catalog rehydrate so its own,
+    // LATER refreshOpenBriefing call is guaranteed to land after this
+    // test's toggle below, rather than racing it.
+    await page.route(/\/data\/resources\//, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await continueLocalRoute(route);
+    });
+    await gotoApp(page, '?select=state:WA');
+
+    const panel = page.locator('#impact-panel');
+    await expect(panel).toBeVisible({ timeout: 15_000 });
+    await showFullDetail(page);
+    const series = panel.locator('.point-heat-series');
+    await expect(series.first()).toBeVisible();
+    await expect(panel.locator('.point-heat-series[open]')).toHaveCount(0);
+
+    const heatIndexSeries = panel.locator('.point-heat-series', {
+      hasText: 'Heat index'
+    });
+    await heatIndexSeries.locator('summary').click();
+    await expect(heatIndexSeries).toHaveAttribute('open', '');
+    await expect(panel.locator('.point-heat-series[open]')).toHaveCount(1);
+
+    // The F3 resource rehydrate lands later and calls refreshOpenBriefing a
+    // second time: waiting for its known WA fixture row proves a refresh
+    // happened, not just the panel's first paint.
+    await expect(
+      panel.getByRole('link', { name: 'Drought relief and recovery information' })
+    ).toBeVisible();
+
+    await expect(panel.locator('.point-heat-series[open]')).toHaveCount(1);
+    await expect(heatIndexSeries).toHaveAttribute('open', '');
+  });
+});
+
+/**
+ * D1 M13 repair (register found-017): the copy confirmation is announced
+ * through a dedicated status region that exists from boot, so assistive
+ * tech has already found it before the first Share press (the first
+ * build's lazily-role'd `#copy-toast` attached its live-region attributes
+ * in the same tick as its first text change, and was `hidden` between
+ * toasts, which screen readers announce unreliably).
+ */
+test.describe('D1 M13: the Share confirmation is announced (found-017)', () => {
+  test('a boot-present status region announces the Share confirmation; the toast itself carries no role', async ({
+    page
+  }) => {
+    await gotoApp(page);
+
+    // Before any Share press: the status region already exists, already
+    // wired for assistive tech, and is never hidden.
+    const status = page.locator('#copy-toast-status');
+    await expect(status).toHaveAttribute('role', 'status');
+    await expect(status).toHaveAttribute('aria-live', 'polite');
+    await expect(status).toHaveAttribute('aria-atomic', 'true');
+    await expect(status).not.toHaveAttribute('hidden', '');
+
+    // #copy-toast carries neither: nothing double-announces.
+    const toast = page.locator('#copy-toast');
+    await expect(toast).not.toHaveAttribute('role', /.+/);
+    await expect(toast).not.toHaveAttribute('aria-live', /.+/);
+
+    await page.locator('#share-btn').click();
+
+    // After Share: the status region holds the success message, and stays
+    // present (never hidden), while the toast still carries no role.
+    await expect(status).toContainText(/Link copied|Copy blocked/);
+    await expect(status).not.toHaveAttribute('hidden', '');
+    await expect(toast).not.toHaveAttribute('role', /.+/);
+    await expect(toast).toContainText(/Link copied|Copy blocked/);
   });
 });

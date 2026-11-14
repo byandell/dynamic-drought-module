@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './offline-test';
 
 import {
   POWER_MIN_ZOOM,
@@ -16,14 +16,14 @@ import {
 import { getPowerContextState } from '../src/state/power-context';
 import { registry } from '../src/state/registry';
 import {
-  buildPowerLinePopupHtml,
-  buildPowerPlantPopupHtml
+  buildPowerLinePopupModel,
+  buildPowerPlantPopupModel
 } from '../src/ui/power-popups';
 import {
-  PMTILES_V3_HEADER_PREFIX,
   captureWarnings,
   fakeMapHarness,
-  installFakeBrowser
+  installFakeBrowser,
+  pmtilesHeaderResponse
 } from './map-harness';
 import { PLANTS_STUB_FC } from './wildfire-fixtures';
 
@@ -59,7 +59,7 @@ function stubHealthyFetch(): () => void {
     if (String(input).includes('Power_Plants_in_the_US')) {
       return new Response(JSON.stringify(PLANTS_STUB_FC), { status: 200 });
     }
-    return new Response(PMTILES_V3_HEADER_PREFIX, { status: 206 });
+    return pmtilesHeaderResponse();
   }) as typeof fetch;
   return () => {
     globalThis.fetch = originalFetch;
@@ -176,7 +176,7 @@ test('below the gate nothing is fetched or drawn and the pill says zoom in', asy
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => {
     requests += 1;
-    return new Response(PMTILES_V3_HEADER_PREFIX, { status: 206 });
+    return pmtilesHeaderResponse();
   }) as typeof fetch;
   const harness = fakeMapHarness({ zoom: POWER_MIN_ZOOM - 1 });
 
@@ -290,7 +290,7 @@ test('both sources dead is unavailable, not an empty success', async () => {
 // ---------------------------------------------------------------------------
 
 test('a plant popup prints the issuer fields with the vintage beside the capacity', () => {
-  const html = buildPowerPlantPopupHtml({
+  const model = buildPowerPlantPopupModel({
     Plant_Name: 'Synthetic Falls',
     PrimSource: 'hydroelectric',
     Total_MW: 24,
@@ -298,17 +298,23 @@ test('a plant popup prints the issuer fields with the vintage beside the capacit
     Period: '202502'
   });
 
-  expect(html).toContain('Synthetic Falls');
-  expect(html).toContain('hydroelectric');
-  expect(html).toContain('24 MW');
-  expect(html).toContain('Synthetic Power');
-  expect(html).toContain('2025-02');
+  expect(model.title).toBe('Synthetic Falls');
+  expect(model.issuer.name).toBe('U.S. EIA · Forms 860/860M');
+  expect(model.value).toEqual([{ text: 'Nameplate capacity: 24 MW' }]);
+  expect(model.details).toEqual([
+    { kind: 'row', label: 'Primary energy source', text: 'hydroelectric' },
+    { kind: 'row', label: 'Utility', text: 'Synthetic Power' }
+  ]);
+  expect(model.clocks).toEqual([{
+    kind: 'point', meaning: 'data-period', label: 'Issuer reporting period',
+    at: { precision: 'month', month: '2025-02' }
+  }]);
   // A nameplate rating is not current output, and the popup says so.
-  expect(html).toContain('rated maximum');
+  expect(model.qualifications?.join(' ')).toContain('rated maximum');
 });
 
 test('a line popup never prints the issuer unknown sentinels as values', () => {
-  const html = buildPowerLinePopupHtml({
+  const model = buildPowerLinePopupModel({
     VOLT_CLASS: 'NOT AVAILABLE',
     OWNER: 'NOT AVAILABLE',
     STATUS: 'IN SERVICE',
@@ -318,26 +324,32 @@ test('a line popup never prints the issuer unknown sentinels as values', () => {
 
   // -999999 is the issuer's unknown marker; printing it would fabricate a
   // reading, and 'NOT AVAILABLE' is an absence, not an owner named that.
-  expect(html).not.toContain('-999999');
-  expect(html).not.toContain('999,999');
-  expect(html).not.toContain('NOT AVAILABLE');
-  expect(html).toContain('Voltage class: not published');
-  expect(html).toContain('Owner: not published');
-  expect(html).toContain('IN SERVICE');
+  expect(JSON.stringify(model)).not.toContain('-999999');
+  expect(JSON.stringify(model)).not.toContain('999,999');
+  expect(JSON.stringify(model)).not.toContain('NOT AVAILABLE');
+  expect(model.value).toEqual([{ text: 'Voltage class: not published' }]);
+  expect(model.details).toEqual([
+    { kind: 'row', label: 'Owner', text: 'not published' },
+    { kind: 'row', label: 'Operational status', text: 'IN SERVICE' },
+    { kind: 'row', label: 'Type', text: 'AC' }
+  ]);
   // The archive caveat is mandatory on every line response.
-  expect(html).toContain('2024-09-30');
-  expect(html).toContain('no longer maintained');
+  expect(model.clocks).toEqual([{
+    kind: 'point', meaning: 'edition', label: 'Last data update',
+    at: { precision: 'date', date: '2024-09-30' }
+  }]);
+  expect(model.qualifications?.join(' ')).toContain('no one maintains it');
 });
 
 test('a line popup prints a real published voltage', () => {
-  const html = buildPowerLinePopupHtml({
+  const model = buildPowerLinePopupModel({
     VOLT_CLASS: '500',
     OWNER: 'BONNEVILLE POWER ADMINISTRATION',
     STATUS: 'IN SERVICE',
     VOLTAGE: 500
   });
-  expect(html).toContain('500 kV');
-  expect(html).toContain('BONNEVILLE POWER ADMINISTRATION');
+  expect(model.details).toContainEqual({ kind: 'row', label: 'Voltage', text: '500 kV' });
+  expect(model.details).toContainEqual({ kind: 'row', label: 'Owner', text: 'BONNEVILLE POWER ADMINISTRATION' });
 });
 
 test('the shared qualification names the absent surfaces and why', () => {
@@ -351,4 +363,216 @@ test('the shared qualification names the absent surfaces and why', () => {
   expect(POWER_SHARED_QUALIFICATION).toContain(
     'not evidence that none are present'
   );
+});
+
+// ---------------------------------------------------------------------------
+// The re-read after a slow first read (S30D B6-POWER, found-125)
+// ---------------------------------------------------------------------------
+
+/**
+ * The delays the layer's own timers use: the three re-read delays
+ * (src/layers/power-3d.ts RETRY_DELAYS_MS), the archive probe's budget
+ * (src/util/pmtiles-probe.ts, 10 s) and the plants read's budget (15 s; the
+ * module clears both budgets as soon as its read settles).
+ */
+const MODULE_TIMER_DELAYS = new Set([5_000, 10_000, 15_000, 45_000]);
+/** Explicit, and not one of the delays above, so a poll's own deadline stays real. */
+const POLL = { timeout: 3_000 };
+
+/**
+ * A manual clock for the module's timers: a timer set with one of
+ * MODULE_TIMER_DELAYS waits here until the case runs it; every other timer
+ * stays real, so `expect.poll` (given POLL) keeps working. The module calls
+ * the global `setTimeout`, so no seam in src/layers/power-3d.ts is needed.
+ */
+function installManualClock(): {
+  /** Delays of the long timers still pending, in the order they were set. */
+  pending: () => number[];
+  /** Run the earliest pending long timer. */
+  runNext: () => void;
+  restore: () => void;
+} {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const timers = new Map<string, { delay: number; run: () => void }>();
+  let nextId = 0;
+  globalThis.setTimeout = ((handler: () => void, delay?: number, ...args: unknown[]) => {
+    if (!MODULE_TIMER_DELAYS.has(delay ?? 0)) return realSetTimeout(handler, delay, ...args);
+    nextId += 1;
+    const id = `manual-${nextId}`;
+    timers.set(id, { delay: delay ?? 0, run: handler });
+    return id;
+  }) as unknown as typeof setTimeout;
+  globalThis.clearTimeout = ((id?: unknown) => {
+    if (typeof id === 'string' && timers.delete(id)) return;
+    realClearTimeout(id as Parameters<typeof clearTimeout>[0]);
+  }) as typeof clearTimeout;
+  return {
+    pending: () => [...timers.values()].map((timer) => timer.delay),
+    runNext: () => {
+      const [id, timer] = [...timers.entries()][0] ?? [];
+      if (id === undefined || timer === undefined) throw new Error('no pending long timer');
+      timers.delete(id);
+      timer.run();
+    },
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  };
+}
+
+/**
+ * Plants always answer; the line archive answers by `archiveAnswers` (true
+ * for a healthy header, false for a failed read) one call at a time, and
+ * every read is counted per half.
+ */
+function stubCountingFetch(archiveAnswers: (call: number) => boolean): {
+  archive: () => number;
+  plants: () => number;
+  restore: () => void;
+} {
+  const originalFetch = globalThis.fetch;
+  let archive = 0;
+  let plants = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    if (String(input).includes('Power_Plants_in_the_US')) {
+      plants += 1;
+      return new Response(JSON.stringify(PLANTS_STUB_FC), { status: 200 });
+    }
+    archive += 1;
+    if (!archiveAnswers(archive)) throw new TypeError('the read outlived the page');
+    return pmtilesHeaderResponse();
+  }) as typeof fetch;
+  return {
+    archive: () => archive,
+    plants: () => plants,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    }
+  };
+}
+
+/** Every status the layer writes, in order. */
+function recordStatusWrites(): { writes: string[]; stop: () => void } {
+  const writes: string[] = [];
+  const stop = registry.on('status-change', (key, status) => {
+    if (key === POWER_LAYER_KEY) writes.push(status);
+  });
+  return { writes, stop };
+}
+
+test('a failed first archive read is read again and the layer reaches ready', async () => {
+  const browser = installFakeBrowser({ desktop: true, reducedMotion: false });
+  const clock = installManualClock();
+  const reads = stubCountingFetch((call) => call > 1);
+  const warnings = captureWarnings();
+  const harness = fakeMapHarness({ zoom: POWER_MIN_ZOOM + 2 });
+
+  try {
+    await activate(harness.map);
+    expect(registry.getStatus(POWER_LAYER_KEY)).toBe('degraded');
+    expect(getPowerContextState()).toMatchObject({ linesOn: false, plantsOn: true });
+    // One re-read is waiting, at the first delay; the reads' own budgets
+    // were cleared when they settled.
+    expect(clock.pending()).toEqual([5_000]);
+    expect({ archive: reads.archive(), plants: reads.plants() }).toEqual({ archive: 1, plants: 1 });
+
+    clock.runNext();
+    await expect.poll(() => registry.getStatus(POWER_LAYER_KEY), POLL).toBe('ready');
+
+    // Only the missing half was read again; the live plants were not refetched.
+    expect({ archive: reads.archive(), plants: reads.plants() }).toEqual({ archive: 2, plants: 1 });
+    expect(getPowerContextState()).toEqual({ linesOn: true, plantsOn: true, periodLabel: '2025-02' });
+    expect(harness.layerSpecs.has('power-lines')).toBe(true);
+    expect(harness.layerSpecs.has('power-plants')).toBe(true);
+    // Complete: nothing further is scheduled.
+    expect(clock.pending()).toEqual([]);
+
+    deactivate(harness.map);
+  } finally {
+    warnings.restore();
+    reads.restore();
+    clock.restore();
+    browser.restore();
+  }
+});
+
+test('switching off or zooming out before the delay cancels the pending re-read', async () => {
+  const browser = installFakeBrowser({ desktop: true, reducedMotion: false });
+  const clock = installManualClock();
+  const reads = stubCountingFetch(() => false);
+  const warnings = captureWarnings();
+
+  try {
+    // Switched off before the delay.
+    const offHarness = fakeMapHarness({ zoom: POWER_MIN_ZOOM + 2 });
+    await activate(offHarness.map);
+    expect(registry.getStatus(POWER_LAYER_KEY)).toBe('degraded');
+    expect(clock.pending()).toEqual([5_000]);
+    deactivate(offHarness.map);
+    expect(clock.pending(), 'switching off clears the re-read').toEqual([]);
+    expect({ archive: reads.archive(), plants: reads.plants() }).toEqual({ archive: 1, plants: 1 });
+
+    // Zoomed out below the gate before the delay.
+    const zoomHarness = fakeMapHarness({ zoom: POWER_MIN_ZOOM + 2 });
+    await activate(zoomHarness.map);
+    expect(registry.getStatus(POWER_LAYER_KEY)).toBe('degraded');
+    expect(clock.pending()).toEqual([5_000]);
+    zoomHarness.setZoom(POWER_MIN_ZOOM - 1);
+    await expect.poll(() => registry.getStatus(POWER_LAYER_KEY), POLL).toBe('zoom-in');
+    expect(clock.pending(), 'dropping below the gate clears the re-read').toEqual([]);
+
+    // Nothing fires later: no read and no status write.
+    const status = recordStatusWrites();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    status.stop();
+    expect(status.writes).toEqual([]);
+    expect({ archive: reads.archive(), plants: reads.plants() }).toEqual({ archive: 2, plants: 2 });
+
+    deactivate(zoomHarness.map);
+  } finally {
+    warnings.restore();
+    reads.restore();
+    clock.restore();
+    browser.restore();
+  }
+});
+
+test('after three failed re-reads the partial state stands and no fourth is scheduled', async () => {
+  const browser = installFakeBrowser({ desktop: true, reducedMotion: false });
+  const clock = installManualClock();
+  const reads = stubCountingFetch(() => false);
+  const warnings = captureWarnings();
+  const harness = fakeMapHarness({ zoom: POWER_MIN_ZOOM + 2 });
+  const status = recordStatusWrites();
+
+  try {
+    await activate(harness.map);
+    expect(registry.getStatus(POWER_LAYER_KEY)).toBe('degraded');
+
+    // Each failed re-read schedules the next delay, and only that one.
+    for (const [index, delay] of [5_000, 15_000, 45_000].entries()) {
+      await expect.poll(() => clock.pending(), POLL).toEqual([delay]);
+      clock.runNext();
+      await expect.poll(() => reads.archive(), POLL).toBe(2 + index);
+    }
+
+    // Let the third re-read settle, then nothing more is waiting.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(clock.pending(), 'no fourth re-read').toEqual([]);
+    expect({ archive: reads.archive(), plants: reads.plants() }).toEqual({ archive: 4, plants: 1 });
+    expect(registry.getStatus(POWER_LAYER_KEY)).toBe('degraded');
+    expect(getPowerContextState()).toMatchObject({ linesOn: false, plantsOn: true });
+    // The re-reads never flipped the pill: loading once, then partial once.
+    expect(status.writes).toEqual(['loading', 'degraded']);
+
+    deactivate(harness.map);
+  } finally {
+    status.stop();
+    warnings.restore();
+    reads.restore();
+    clock.restore();
+    browser.restore();
+  }
 });

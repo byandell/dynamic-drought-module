@@ -1,6 +1,10 @@
 import type * as maplibregl from 'maplibre-gl';
+import type { Fire3DPhoneRefusal } from './fire3d-phone';
+import {
+  FIRE3D_TERRAIN_COVERAGE, terrainCoverageSentence, type TerrainBox, type TerrainCoverage
+} from './terrain-coverage';
 
-import { HILLSHADE_SHADOW } from './palette';
+import { HILLSHADE_SHADOW, MAP_GROUND_COLOR } from './interface-tokens';
 import {
   NIFC_MAX_ALLOWABLE_OFFSET_DEG,
   WILDFIRE_STATIC_COLOR
@@ -34,8 +38,9 @@ import {
  *  - the smoke volume's extrusion heights are literal meters and stay
  *    literal, so raising this makes stylized plumes read shorter against
  *    the relief (see HMS_VOLUME_HEIGHT_SCALE_METERS);
- *  - building extrusions are the issuer's published heights in meters and
- *    must stay so; they are not to be scaled to "match" the terrain.
+ *  - building extrusions are one stated presentation height in meters (the
+ *    source publishes none) and must stay literal; they are not to be
+ *    scaled to "match" the terrain.
  */
 export const FIRE3D_TERRAIN_EXAGGERATION = 2.4;
 
@@ -48,14 +53,14 @@ export const FIRE3D_CAMERA_TRANSITION_MS = 800;
 
 /**
  * Sky and fog for the pitched scene, tuned to the app's dark palette: the
- * base style's background '#0b1220' (src/map/style.ts) and the hillshade
+ * base style's background (src/map/style.ts) and the hillshade
  * shadow tone carry into the horizon so the 3D scene stays in the same
  * visual family as the flat map instead of introducing a daylight sky.
  */
 export const FIRE3D_SKY_SPECIFICATION: maplibregl.SkySpecification = {
-  'sky-color': '#0b1220',
+  'sky-color': MAP_GROUND_COLOR,
   'horizon-color': HILLSHADE_SHADOW,
-  'fog-color': '#0b1220',
+  'fog-color': MAP_GROUND_COLOR,
   'fog-ground-blend': 0.8,
   'horizon-fog-blend': 0.6,
   'sky-horizon-blend': 0.7,
@@ -78,12 +83,241 @@ export const FIRE3D_SKY_CLEAR_SPECIFICATION: maplibregl.SkySpecification = {
 };
 
 /**
- * Honest coverage statement rendered beside the toggle whenever the control
- * shows: the bundled DEM archive covers the Pacific Northwest only, and the
- * mode must not imply national relief.
+ * The bundled terrain archive's own extent (DDM-P9-T04), read from the
+ * committed public/data/hillshade-dem-pnw.pmtiles PMTiles v3 header
+ * (min/max zoom at header bytes 100-101, the WGS84 bounding box at bytes
+ * 102-117, int32 degrees times 1e-7 per the spec) rather than typed by
+ * hand, so a re-bake that shifts the box makes this constant wrong and the
+ * archive-header test in tests/fire3d-mode.spec.ts catches it before the
+ * sentence below can silently claim ground the new archive does not cover.
+ * The archive is USGS 3D Elevation Program elevation data served through
+ * the 3DEPElevation ImageServer (src/layers/hillshade.ts:4-6); it carries
+ * no vertical-accuracy claim, and none is made here.
  */
-export const FIRE3D_COVERAGE_NOTE =
-  'Terrain relief covers the Pacific Northwest data bake; outside it the ground renders flat. Bundled structure data covers the central Oregon pilot area only, from zoom 13.';
+export { FIRE3D_TERRAIN_COVERAGE } from './terrain-coverage';
+
+/**
+ * Whether a lng/lat sits inside the bundled terrain archive's own extent.
+ * Compared directly against FIRE3D_TERRAIN_COVERAGE's own numbers, never a
+ * second hand-typed box, so a re-bake that moves the coverage changes this
+ * test the same way it changes the sentence below. The box is a closed
+ * interval (inclusive at every edge): the archive's own bounding box is
+ * itself inclusive, so a view centered exactly on an edge coordinate is
+ * inside, not outside.
+ *
+ * FIRE3D_TERRAIN_COVERAGE.maxZoom plays no part here: this answers ONLY the
+ * geographic question (is there any baked elevation here at all), never the
+ * separate and non-boundary question of how deep the bake goes once inside
+ * the box (see terrainCoverageSentence's own comment on why the two must
+ * stay apart).
+ */
+export function isWithinTerrainCoverage(
+  lng: number, lat: number, coverage: TerrainCoverage = FIRE3D_TERRAIN_COVERAGE
+): boolean {
+  // A multi-box archive carries elevation only inside its boxes, not across its whole header rectangle.
+  return (coverage.boxes ?? [coverage]).some((box) =>
+    lng >= box.west &&
+    lng <= box.east &&
+    lat >= box.south &&
+    lat <= box.north
+  );
+}
+
+/** A geographic box, the shape MapLibre's `LngLatBounds` reports. */
+export interface ViewBox {
+  readonly west: number;
+  readonly south: number;
+  readonly east: number;
+  readonly north: number;
+}
+
+/**
+ * How much of a VIEW the bundled archive covers: all of it, some of it, or
+ * none of it.
+ *
+ * `full` earns no sentence, `none` earns the wholly-outside sentence, and
+ * `partial` earns its own, because those are three different facts about the
+ * ground and only two of them were ever said.
+ */
+export type TerrainCoverageReading = 'full' | 'partial' | 'none';
+
+/**
+ * Classify a view's footprint against the archive's extent (Codex adversarial
+ * review 2026-09-10, finding 8).
+ *
+ * The predicate this replaces asked `isWithinTerrainCoverage` about the view's
+ * CENTER and then made a categorical claim about the whole view. A point
+ * cannot carry that claim: at the eastern edge, a viewport straddling
+ * longitude -110.5 said nothing at all while half its ground was unmodelled,
+ * and two thousandths of a degree of pan later the same mixed scene announced
+ * that "this view is outside" the extent and "the ground here carries no
+ * archived elevation". Both readings were wrong about the same picture.
+ *
+ * The view box is a SUPERSET of the visible ground when the camera is pitched
+ * (MapLibre reports the bounding box of a trapezoid), and that asymmetry is
+ * deliberate here: a superset can turn a `full` into a `partial`, which
+ * over-qualifies, and can never turn a `partial` into a `full`, which would
+ * under-qualify. Coverage prose is allowed to be cautious; it is not allowed
+ * to be confident and wrong.
+ *
+ * Edges are inclusive, matching `isWithinTerrainCoverage` and the archive's
+ * own inclusive bounding box: a view touching an edge without crossing it is
+ * still fully covered. Antimeridian-naive, like every other box in this
+ * codebase.
+ *
+ * A multi-box archive is `full` only inside one box, `none` when the view
+ * meets no box, else `partial`: a view spanning two touching boxes reads
+ * `partial`, which is cautious and allowed.
+ */
+export function classifyTerrainCoverage(
+  view: ViewBox, coverage: TerrainCoverage = FIRE3D_TERRAIN_COVERAGE
+): TerrainCoverageReading {
+  const boxes = coverage.boxes ?? [coverage];
+  const disjoint = (box: TerrainBox): boolean =>
+    view.west > box.east ||
+    view.east < box.west ||
+    view.south > box.north ||
+    view.north < box.south;
+  if (boxes.every(disjoint)) return 'none';
+  const contained = boxes.some((box) =>
+    view.west >= box.west &&
+    view.east <= box.east &&
+    view.south >= box.south &&
+    view.north <= box.north);
+  return contained ? 'full' : 'partial';
+}
+
+export { formatLatitudeDeg, formatLongitudeDeg } from './terrain-coverage';
+
+/**
+ * The 3D scene's terrain clause (src/config/terrain-coverage.ts holds the
+ * shared formatter and the flat Terrain Shading's own form). Formatted from
+ * the archive that actually resolved (DR-083): the bundled zoom 8 depth
+ * before activation, the deep archive's own header depth once it answers. A
+ * bare number keeps the bundled box at that depth.
+ */
+export function fire3dTerrainCoverageSentence(terrain: number | TerrainCoverage): string {
+  const coverage = typeof terrain === 'number'
+    ? { ...FIRE3D_TERRAIN_COVERAGE, maxZoom: terrain } : terrain;
+  return terrainCoverageSentence('3D relief', coverage);
+}
+
+/**
+ * The 3D scene's edge fade. Outside the archive box MapLibre has no
+ * elevation, so relief and its shading stop on a straight line. MapLibre has
+ * no spatially varying terrain exaggeration, hillshade or DEM alpha, so the
+ * cheapest soft transition is a draped veil: one line of the scene's own fog
+ * colour on the box edge, blurred by half its width so its alpha falls
+ * linearly from the seam to nothing at both sides (a true gradient, no
+ * bands). The seam it hides is the box itself: the bake zero-fills each
+ * edge tile beyond the box, so the ground drops from about 1,500 m to sea
+ * level there and the drape stretches up that face. Further out, where the
+ * edge tiles end (40.98N at zooms 4 to 9), both sides are sea level and
+ * Terrain Shading draws nothing on flat ground, so no terrain seam remains
+ * there. Its width is half a degree of ground from zoom 3 to 9 (a soft edge,
+ * not a hairline, while the whole region is in view), held in screen pixels
+ * past zoom 9 so the half width stays inside the source tile buffer. It
+ * hides the seam, not the geometric step; nothing about the elevation changes.
+ */
+const TERRAIN_EDGE_DEG = 0.5;
+const edgePx = (zoom: number): number => (TERRAIN_EDGE_DEG * 512 * 2 ** zoom) / 360;
+const edgeWidth = (scale: number): maplibregl.ExpressionSpecification =>
+  ['interpolate', ['exponential', 2], ['zoom'], 3, edgePx(3) * scale, 9, edgePx(9) * scale];
+
+/** GeoJSON tile buffer (512 is a whole tile): above the 182 px half width at zoom 9, so no tile edge cuts the fade. */
+export const TERRAIN_EDGE_BUFFER = 256;
+
+export const TERRAIN_EDGE_PAINT: NonNullable<maplibregl.LineLayerSpecification['paint']> = {
+  'line-color': MAP_GROUND_COLOR,
+  'line-width': edgeWidth(1),
+  'line-blur': edgeWidth(0.5),
+  'line-opacity': ['interpolate', ['linear'], ['zoom'], 6, 0, 8, 0.9]
+};
+
+/** The archive box's edge as one closed line; a multi-box archive gets every box ring. */
+export function terrainEdgeLine(
+  coverage: TerrainCoverage
+): GeoJSON.Feature<GeoJSON.LineString | GeoJSON.MultiLineString> {
+  const ring = ({ west: w, south: s, east: e, north: n }: TerrainBox): GeoJSON.Position[] =>
+    [[w, s], [e, s], [e, n], [w, n], [w, s]];
+  return {
+    type: 'Feature',
+    properties: {},
+    geometry: coverage.boxes
+      ? { type: 'MultiLineString', coordinates: coverage.boxes.map(ring) }
+      : { type: 'LineString', coordinates: ring(coverage) }
+  };
+}
+
+/**
+ * Honest coverage statement rendered beside the toggle whenever the control
+ * shows: names the issuer and the bundled DEM archive's own extent (derived
+ * from FIRE3D_TERRAIN_COVERAGE, not typed by hand), so the mode never
+ * implies national relief or a precision the archive does not carry.
+ */
+export function fire3dCoverageNote(terrain: number | TerrainCoverage): string {
+  return fire3dTerrainCoverageSentence(terrain);
+}
+
+/**
+ * The note in its bundled-archive form: what the control shows before a
+ * scene has resolved an archive (the bundled one is what ships, so it is
+ * the honest pre-activation claim) and what an active scene shows when the
+ * bundled archive is the one that answered. An active scene that resolved
+ * the deep archive renders `fire3dCoverageNote(status.terrainMaxZoom)`
+ * instead (DR-083 step 1).
+ */
+export const FIRE3D_COVERAGE_NOTE = fire3dCoverageNote(FIRE3D_TERRAIN_COVERAGE.maxZoom);
+
+/**
+ * What the scene's live status line adds the moment the view sits WHOLLY
+ * outside FIRE3D_TERRAIN_COVERAGE while the mode is active.
+ *
+ * "Wholly", since 2026-09-10: this used to be published from the view's
+ * CENTER, so it also fired for a view whose ground was half covered, and
+ * stayed silent for a view whose ground was half MISSING. A view that only
+ * overlaps the extent gets FIRE3D_PARTIAL_COVERAGE_STATUS instead, and only a
+ * view with no covered ground at all gets this one. See
+ * `classifyTerrainCoverage`.
+ *
+ * FIRE3D_COVERAGE_NOTE states the box once, always, beside the toggle,
+ * whether or not it is presently true of the view; a reader who has not
+ * memorized four coordinates cannot tell from a standing paragraph whether
+ * THIS view is inside it. MapLibre's own terrain sampler falls back to
+ * elevation 0 for a location its raster-dem source does not cover, which
+ * renders identically to terrain never having been wired at all: a person
+ * cannot otherwise tell "verified no elevation data here" from "the scene is
+ * broken" (the no-data/unavailable distinction docs/design/README.md
+ * requires). This sentence answers that, at the moment it is true, beside
+ * the live status line, and it stops rendering the moment a pan returns the
+ * view to the box. It reuses FIRE3D_TERRAIN_COVERAGE.issuer rather than
+ * naming the source a second way.
+ */
+export const FIRE3D_OUT_OF_COVERAGE_STATUS =
+  `This view is outside the ${FIRE3D_TERRAIN_COVERAGE.issuer}'s ` +
+  'elevation extent, so the ground here carries no archived elevation and ' +
+  'renders flat; that is a coverage gap, not a failed scene.';
+
+/**
+ * What the status line says when the view STRADDLES the extent's edge: some
+ * of the visible ground is modelled and some of it is not.
+ *
+ * The third reading the center-point test could not express (Codex adversarial
+ * review 2026-09-10, finding 8). It has to exist as its own sentence rather
+ * than reusing either neighbour, because both neighbours are categorical
+ * about the whole view and this case is the one where that is false. It makes
+ * the same no-data-versus-broken distinction the wholly-outside sentence
+ * makes, and for the same reason: MapLibre's sampler returns elevation 0 for
+ * uncovered ground, which is indistinguishable from an unwired scene unless
+ * the interface says which it is. It names no boundary coordinate, because
+ * the standing FIRE3D_COVERAGE_NOTE already states the box and repeating it
+ * mid-sentence would read as a second, competing claim.
+ */
+export const FIRE3D_PARTIAL_COVERAGE_STATUS =
+  `Part of this view lies outside the ${FIRE3D_TERRAIN_COVERAGE.issuer}'s ` +
+  'elevation extent; that ground carries no archived elevation and ' +
+  'renders flat, while the rest of the view is modelled. That is a coverage ' +
+  'gap, not a failed scene.';
 
 /**
  * Always-visible non-prediction disclosure for the 3D view and its context
@@ -96,11 +330,35 @@ export const FIRE3D_COVERAGE_NOTE =
 export const FIRE3D_NON_PREDICTION_NOTE =
   'The 3D view shows each source\'s published data as context. It computes no fire behavior: nothing here shows or implies spread, ignition, or an all-clear.';
 
-/** The desktop gate; mirrors the shell's DESKTOP_SHELL_QUERY breakpoint. */
-export const FIRE3D_MIN_WIDTH_QUERY = '(min-width: 721px)';
+/**
+ * The narrowest viewport the scene may be presented in.
+ *
+ * Until 2026-11-09 this was the desktop breakpoint, so no phone ever entered
+ * the scene. Owner direction 2026-11-09 (sprint), DR-pending, lifts that:
+ * a phone enters through one cell in its right-edge column
+ * (src/ui/fire3d-phone.ts), so the floor is now the narrowest phone that
+ * cell is offered on, FIRE3D_PHONE_MIN_WIDTH_PX in src/config/fire3d-phone.ts,
+ * which states the measurement behind it. Equal to FIRE3D_CHUNK_WIDTH_QUERY
+ * in src/state/fire3d-store.ts; the two move together, and
+ * tests/fire3d-phone.test.mjs fails when they part.
+ *
+ * Width alone no longer says which shell presents the scene: at and above
+ * FIRE3D_CONSOLE_WIDTH_QUERY it is the desktop console, below it the phone
+ * shell, and each keeps its own height floor (`shouldFire3DBeActive`).
+ */
+export const FIRE3D_MIN_WIDTH_QUERY = '(min-width: 360px)';
 
 /**
- * Viewport-height floor for the tilted camera, in CSS pixels.
+ * The desktop console's width: mirrors the shell's DESKTOP_SHELL_QUERY
+ * breakpoint. At and above it the sidebar control offers the scene and the
+ * 520 px floor below applies. Under it the console says nothing about 3D,
+ * because the phone shell offers the scene from its own cell.
+ */
+export const FIRE3D_CONSOLE_WIDTH_QUERY = '(min-width: 721px)';
+
+/**
+ * Viewport-height floor for the tilted camera, in CSS pixels, wherever the
+ * desktop console presents the scene.
  *
  * DR-025a admits tablets (the 721 to 1024 px band of DR-036) and excludes
  * landscape phones, which a width query alone cannot separate: a landscape
@@ -114,11 +372,135 @@ export const FIRE3D_MIN_WIDTH_QUERY = '(min-width: 721px)';
  * phones) and well below the shortest tablet landscape viewport (768 CSS px),
  * so it separates the two classes with margin on both sides rather than
  * tracking any one model. Raise it only with a measurement.
+ *
+ * The phone shell keeps a taller floor of its own
+ * (FIRE3D_PHONE_MIN_HEIGHT_PX, src/config/fire3d-phone.ts), because there the
+ * two statements stand on the map itself and take their height from it.
  */
 export const FIRE3D_MIN_HEIGHT_PX = 520;
 
 /** The height floor as a media query, beside the width query above. */
 export const FIRE3D_MIN_HEIGHT_QUERY = `(min-height: ${FIRE3D_MIN_HEIGHT_PX}px)`;
+
+/**
+ * What the shell offers where the 3D toggle would be (DDM-P9-T02).
+ *
+ * `control` is the toggle itself. `silent` is the case where the feature is
+ * not the subject at all, so the panel says nothing about it. The remaining
+ * two are REFUSALS, and each one is a sentence a person reads.
+ *
+ * These are CONTROL affordances, not layer states. The six honest layer
+ * states (`loading`, `live`, `live (partial)`, `unavailable`, `no data`,
+ * `zoom in to load`) gain no seventh member here and lend none of their
+ * words to this vocabulary; the toggle's own status line keeps speaking
+ * them for the scene once the scene exists.
+ */
+export type Fire3DRefusal = 'no-webgl2' | 'short-window';
+export type Fire3DOffer = 'control' | 'silent' | Fire3DRefusal;
+
+/**
+ * What the interface SAYS when it refuses. One sentence each, in the words
+ * of a person who is not a specialist, and each says only what was
+ * observed: the probe found no WebGL 2 context, or the window is shorter
+ * than the floor above. Neither names a cause it has not established
+ * ("your graphics card is too old" would be a guess), neither promises a
+ * fix, and neither asks the user to do anything.
+ */
+export const FIRE3D_REFUSAL_TEXT: Readonly<Record<Fire3DRefusal, string>> = {
+  'no-webgl2':
+    'This browser cannot render the 3D scene, so there is nothing here to turn on.',
+  'short-window':
+    'This window is too short for the 3D Fire view, so there is nothing here to turn on.'
+};
+
+/**
+ * What the phone shell says once when a shared `fire3d=true` link opens on a
+ * phone that cannot hold the scene (owner direction 2026-11-09 (sprint),
+ * DR-pending). The console's two sentences are reused word for word; the
+ * third covers the one refusal only a phone can meet, in the same voice:
+ * what was observed, no cause, no fix, nothing to do.
+ */
+export const FIRE3D_PHONE_REFUSAL_TEXT: Readonly<Record<Fire3DPhoneRefusal, string>> = {
+  'no-webgl2': FIRE3D_REFUSAL_TEXT['no-webgl2'],
+  'short-window': FIRE3D_REFUSAL_TEXT['short-window'],
+  'narrow-window':
+    'This screen is too narrow for the 3D Fire view, so there is nothing here to turn on.'
+};
+
+/**
+ * The steps of an entry into the scene that the orchestrator WAITS on, in
+ * order (docs/design/fire3d-entry.md, "The entry transaction"; owner
+ * direction 2026-11-09 (sprint), DR-pending).
+ *
+ * That note names six phases for a transaction that is not built: it would
+ * hold the camera flat until the terrain for the view had loaded. The built
+ * transaction does not wait there (src/map/fire3d.ts `activateScene` installs
+ * terrain, sky and the tilt in one turn), so only the three steps it really
+ * awaits are published as phases, and the terrain's own loading is read
+ * afterwards from `Fire3DStatus.transport`. A phase is a fact about what the
+ * scene is doing now, never a promise about how long it will take.
+ */
+export type Fire3DEntryPhase = 'probe' | 'atmosphere' | 'context';
+
+/**
+ * The sentence each step shows while it runs, in the words of
+ * docs/design/fire3d-entry.md's phase table. `terrain` is the sentence for
+ * the stretch after the scene first reads live while its own sources are
+ * still streaming, and `chunk` the one for the moment before the scene's
+ * code has arrived, when no phase exists yet.
+ */
+export const FIRE3D_ENTRY_TEXT: Readonly<Record<Fire3DEntryPhase | 'chunk' | 'terrain', string>> = {
+  chunk: 'Loading the 3D view',
+  probe: 'Checking the terrain archive',
+  atmosphere: 'Loading smoke and perimeters',
+  context: 'Loading the hazard drape',
+  terrain: 'Loading terrain relief'
+};
+
+/** What the shell island reads about the device and the committed view. */
+export interface Fire3DOfferInput {
+  /** The viewport meets FIRE3D_CONSOLE_WIDTH_QUERY. */
+  readonly wideEnough: boolean;
+  /** The viewport meets FIRE3D_MIN_HEIGHT_QUERY. */
+  readonly tallEnough: boolean;
+  /** The once-per-page renderer probe's answer (`webGl2Capability()`). */
+  readonly webgl2: boolean;
+  /** The committed cluster is Wildfire, which is the only view that offers
+   * the scene today. */
+  readonly fireView: boolean;
+}
+
+/**
+ * Decide what stands where the 3D toggle would be. Pure, so the decision is
+ * Node-testable beside `shouldFire3DBeActive`, which asks the same three
+ * questions of the map (DR-025a).
+ *
+ * Silence versus a sentence is the whole point of this function. Before
+ * 2026-09-03 the control simply rendered nothing whenever the gate refused,
+ * so a person on a device that cannot hold the scene met an interface
+ * indistinguishable from one where the feature had never been built. Now a
+ * refusal that a person could otherwise mistake for a missing button says
+ * so, once, quietly, where the button would have been.
+ *
+ * The two silences are deliberate and are NOT refusals to explain:
+ *  - another hazard view has no 3D toggle to miss, so naming one would be
+ *    an advertisement rather than an answer;
+ *  - a viewport below the desktop breakpoint is the phone chrome, which
+ *    since 2026-11-09 offers the scene from its own cell in the right-edge
+ *    column and answers for itself (`fire3dPhoneOffer`,
+ *    src/config/fire3d-phone.ts); a second answer here, inside a sheet the
+ *    reader may never open, would only repeat it.
+ *
+ * Capability is tested before geometry so the deeper refusal wins: a device
+ * that cannot render the scene at all would not begin to hold it in a
+ * taller window.
+ */
+export function fire3dControlOffer(input: Fire3DOfferInput): Fire3DOffer {
+  if (!input.fireView || !input.wideEnough) return 'silent';
+  if (!input.webgl2) return 'no-webgl2';
+  if (!input.tallEnough) return 'short-window';
+  return 'control';
+}
 
 // ---------------------------------------------------------------------------
 // The mapped wildfire perimeter ribbon (DR-064, owner rendering specification)
@@ -217,11 +599,16 @@ export const PERIMETER_RIBBON_SCREEN_HEIGHT_PX = 16;
  */
 export const PERIMETER_RIBBON_ZOOM_STOPS = [5, 15] as const;
 
-/** The ribbon's full height in meters at `zoom`, at the reference latitude. */
-export function perimeterRibbonHeightMeters(zoom: number): number {
+/**
+ * The ribbon's full height in meters at `zoom`, at `latitudeDeg` (the map
+ * centre where it is drawn; the reference latitude by default). Once terrain
+ * is national a fixed 45 N would draw the ribbon about 1.6 times tall at 64 N.
+ */
+export function perimeterRibbonHeightMeters(
+  zoom: number, latitudeDeg: number = PERIMETER_RIBBON_REFERENCE_LATITUDE_DEG
+): number {
   const groundResolution =
-    (MERCATOR_METERS_PER_PIXEL_AT_ZOOM_0 *
-      Math.cos((PERIMETER_RIBBON_REFERENCE_LATITUDE_DEG * Math.PI) / 180)) /
+    (MERCATOR_METERS_PER_PIXEL_AT_ZOOM_0 * Math.cos((latitudeDeg * Math.PI) / 180)) /
     2 ** zoom;
   return PERIMETER_RIBBON_SCREEN_HEIGHT_PX * groundResolution;
 }
@@ -279,7 +666,7 @@ export function perimeterRibbonSlabOpacity(index: number): number {
  * its pixel height.
  */
 function perimeterRibbonHeightCurve(
-  fraction: number
+  fraction: number, latitudeDeg: number
 ): maplibregl.ExpressionSpecification {
   const [low, high] = PERIMETER_RIBBON_ZOOM_STOPS;
   return [
@@ -287,9 +674,9 @@ function perimeterRibbonHeightCurve(
     ['exponential', 0.5],
     ['zoom'],
     low,
-    fraction * perimeterRibbonHeightMeters(low),
+    fraction * perimeterRibbonHeightMeters(low, latitudeDeg),
     high,
-    fraction * perimeterRibbonHeightMeters(high)
+    fraction * perimeterRibbonHeightMeters(high, latitudeDeg)
   ];
 }
 
@@ -303,16 +690,16 @@ function perimeterRibbonHeightCurve(
  * outline (WILDFIRE_PULSE_PAINT_TARGETS in src/layers/nifc-fires.ts).
  */
 export function buildPerimeterRibbonSlabPaint(
-  index: number
+  index: number, latitudeDeg: number = PERIMETER_RIBBON_REFERENCE_LATITUDE_DEG
 ): NonNullable<maplibregl.FillExtrusionLayerSpecification['paint']> {
   return {
     'fill-extrusion-color': WILDFIRE_STATIC_COLOR,
     'fill-extrusion-base':
       index === 0
         ? 0
-        : perimeterRibbonHeightCurve(index / PERIMETER_RIBBON_SLAB_COUNT),
+        : perimeterRibbonHeightCurve(index / PERIMETER_RIBBON_SLAB_COUNT, latitudeDeg),
     'fill-extrusion-height': perimeterRibbonHeightCurve(
-      (index + 1) / PERIMETER_RIBBON_SLAB_COUNT
+      (index + 1) / PERIMETER_RIBBON_SLAB_COUNT, latitudeDeg
     ),
     'fill-extrusion-opacity': perimeterRibbonSlabOpacity(index),
     // MapLibre's own vertical gradient shades the FOOT of an extrusion

@@ -11,6 +11,7 @@ import type * as maplibregl from 'maplibre-gl';
 import type { GeoJsonProperties } from 'geojson';
 
 import { URLS } from '../config/urls';
+import { CDM_CATEGORIES } from '../config/palette';
 import { registerClickTarget } from '../map/interaction-coordinator';
 import { registry } from '../state/registry';
 import {
@@ -19,9 +20,9 @@ import {
   renderSwatchLegend,
   showLegend
 } from '../ui/legend-registry';
+import type { IssuedModel, PopupClock } from '../ui/popup-frame';
 import { clearTimeBar, setTimeBar } from '../ui/time-bar';
-import { escapeHtml } from '../util/escape';
-import { fetchWithBudget } from '../util/fetch';
+import { fetchBufferedWithBudget } from '../util/fetch';
 
 const LAYER_KEY = 'cdm-drought';
 const SOURCE_ID = 'cdm-drought-areas';
@@ -31,8 +32,8 @@ const BEFORE_ID = 'first-symbol';
 const FETCH_TIMEOUT_MS = 15_000;
 const FILL_OPACITY = 0.54;
 const OUTLINE_OPACITY = 0.45;
-const CLASS_CODES = ['D0', 'D1', 'D2', 'D3', 'D4'] as const;
-const CLASS_COLORS = ['#FFFF00', '#FCD37F', '#FFAA00', '#E60000', '#730000'] as const;
+const CLASS_CODES = CDM_CATEGORIES.map(({ code }) => code);
+const CLASS_COLORS = CDM_CATEGORIES.map(({ color }) => color);
 const SNAPSHOT_EVENT = 'ddm:cdm-snapshot';
 const LICENSE_TITLE = 'Open Government Licence - Canada';
 const LICENSE_URL =
@@ -86,15 +87,15 @@ const COLOR_EXPRESSION: maplibregl.ExpressionSpecification = [
   'match',
   ['get', 'dm'],
   0,
-  CLASS_COLORS[0],
+  CDM_CATEGORIES[0].color,
   1,
-  CLASS_COLORS[1],
+  CDM_CATEGORIES[1].color,
   2,
-  CLASS_COLORS[2],
+  CDM_CATEGORIES[2].color,
   3,
-  CLASS_COLORS[3],
+  CDM_CATEGORIES[3].color,
   4,
-  CLASS_COLORS[4],
+  CDM_CATEGORIES[4].color,
   'rgba(0,0,0,0)'
 ];
 
@@ -269,7 +270,12 @@ function showCdmTimeBar(artifact: CdmArtifact): void {
   setTimeBar(LAYER_KEY, {
     ariaLabel: 'Canadian Drought Monitor snapshot month',
     stamp: {
-      headline: `Month ${monthLabel(artifact.month)}`,
+      horizon: 'current',
+      // The month is a file committed with the site (npm run build:cdm), never
+      // refreshed at runtime, so the statement says so in the layer source
+      // line's own words (the WHP edition stamp's pattern).
+      // DRAFT wording (pending the owner's read-back)
+      headline: `Month ${monthLabel(artifact.month)} · committed monthly snapshot`,
       detail:
         'Canadian Drought Monitor · Agriculture and Agri-Food Canada · monthly classification',
       register: 'observed'
@@ -351,7 +357,7 @@ export async function activate(map: maplibregl.Map): Promise<void> {
 
   let artifact: CdmArtifact;
   try {
-    const response = await fetchWithBudget(
+    const response = await fetchBufferedWithBudget(
       URLS.cdmDroughtAreasLocal,
       null,
       signal,
@@ -396,22 +402,47 @@ export function deactivate(map: maplibregl.Map): void {
   dispatchSnapshot('inactive', null);
 }
 
-function popupHtml(properties: GeoJsonProperties): string {
+/** The frame's explanation for issuer time text DDM does not parse (PF1). */
+const SUPPLIED_TIME_EXPLANATION = 'As the issuer states it; DDM does not read it as a full date.';
+
+/**
+ * The CDM polygon's popup model (D1 M25; the frame's surface head). The
+ * month is the committed artifact's (`YYYY-MM`, month precision: never a
+ * day). The dataset is the primary source; the licence link stays a more
+ * link (its sentence lives in Acknowledgements, DR-106).
+ */
+export function buildCdmPopupModel(properties: GeoJsonProperties, month: string | null): IssuedModel {
   const dm = Number(properties?.['dm']);
-  const code =
-    Number.isInteger(dm) && dm >= 0 && dm <= 4 ? CLASS_CODES[dm]! : 'Unknown';
-  const month = activeArtifact?.month ?? null;
-  return `
-    <div class="popup-title">${escapeHtml(code)}</div>
-    <div class="popup-agency">Canadian Drought Monitor · Agriculture and Agri-Food Canada</div>
-    <div class="popup-treaty-meta">Month: ${escapeHtml(month ? monthLabel(month) : 'unavailable')}</div>
-    <div class="popup-description">Monthly Canadian Drought Monitor classification. This feature is not blended with a United States or provincial product.</div>
-    <div class="popup-treaty-meta">Areas without a polygon are not assigned class zero by this artifact.</div>
-    <div class="popup-links">
-      <a href="${DATASET_URL}" target="_blank" rel="noopener">Canadian Drought Monitor source</a>
-      <a href="${LICENSE_URL}" target="_blank" rel="noopener">${LICENSE_TITLE}</a>
-    </div>
-  `;
+  const known = Number.isInteger(dm) && dm >= 0 && dm <= 4;
+  const code = known ? CLASS_CODES[dm]! : 'Unknown';
+  const clock: PopupClock =
+    month === null || month.trim() === ''
+      ? { kind: 'not-stated', label: 'Month', reason: 'unavailable' }
+      : {
+          kind: 'point',
+          meaning: 'month',
+          label: 'Month',
+          at: /^\d{4}-(0[1-9]|1[0-2])$/.test(month)
+            ? { precision: 'month', month }
+            : { precision: 'supplied', text: month, explanation: SUPPLIED_TIME_EXPLANATION }
+        };
+  return {
+    kind: 'surface',
+    title: 'Canadian Drought Monitor',
+    issuer: { role: 'issued-by', name: 'Agriculture and Agri-Food Canada', productKey: 'cdm-drought' },
+    value: [
+      known
+        ? { text: code, swatch: { table: 'CLASS_COLORS', classKey: code, color: CLASS_COLORS[dm]! } }
+        : { text: code }
+    ],
+    clocks: [clock],
+    source: { link: { label: 'Canadian Drought Monitor source', href: DATASET_URL } },
+    moreLinks: [{ label: LICENSE_TITLE, href: LICENSE_URL }],
+    qualifications: [
+      'Monthly Canadian Drought Monitor classification. This feature is not blended with a United States or provincial product.',
+      'Areas without a polygon are not assigned class zero by this artifact.'
+    ]
+  };
 }
 
 export function bindPopups(map: maplibregl.Map): void {
@@ -425,7 +456,7 @@ export function bindPopups(map: maplibregl.Map): void {
         : null;
     },
     respond: (feature) => ({
-      content: popupHtml(feature.properties ?? {})
+      model: buildCdmPopupModel(feature.properties ?? {}, activeArtifact?.month ?? null)
     })
   });
   map.on('mouseenter', FILL_ID, () => {
